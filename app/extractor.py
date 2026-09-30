@@ -214,12 +214,18 @@ def derive_occurrence_date(mgmt: str) -> Tuple[Optional[date], str]:
 # Canonical spellings written to Excel (user-provided controlled list).  Matching is
 # case-/accent-insensitive and whitespace tolerant; output always uses these strings.
 CANONICAL_VENDORS: List[str] = ["CNC IT", "Assy IT", "Sơn IT", "Nhựa IT", "Mtech", "Mtech VN", "Mtech 4",
-                                "Teawon", "Tesung", "Doaltech", "APV", "An Lập", "Yongsong", "HK"]
-# Known source spellings of canonical vendors (NOT arbitrary spelling correction: only
-# variants that clearly identify a vendor of the controlled list are listed here).
-VENDOR_ALIASES: Dict[str, str] = {"Taewon": "Teawon", "Tae Won": "Teawon", "Daoltech": "Doaltech", "Doal Tech": "Doaltech",
-                                  "Tae Sung": "Tesung", "Yong Song": "Yongsong", "M-tech": "Mtech",
-                                  "M-tech VN": "Mtech VN", "M-tech 4": "Mtech 4"}
+                                "Teawon", "Tesung", "Doaltech", "APV", "An Lập", "Yongsong", "HK", "JT Tech Vina"]
+# Known source spellings / historical workbook aliases of canonical vendors (NOT arbitrary
+# spelling correction: only variants that clearly identify a controlled-list vendor).
+# Used for Vendor identification and comparison only – never to rewrite PPTX or Excel text.
+VENDOR_ALIASES: Dict[str, str] = {
+    # historical aliases used in the production workbook
+    "Lắp ráp IT": "Assy IT", "Sơn Intops": "Sơn IT", "CNC Intops": "CNC IT", "NCC JT": "JT Tech Vina",
+    "JT Tech": "JT Tech Vina",
+    # known report spellings
+    "Taewon": "Teawon", "Tae Won": "Teawon", "Daoltech": "Doaltech", "Doal Tech": "Doaltech",
+    "Tae Sung": "Tesung", "Yong Song": "Yongsong", "M-tech": "Mtech", "M-tech VN": "Mtech VN", "M-tech 4": "Mtech 4",
+}
 
 
 def _fold(text: str) -> str:
@@ -249,27 +255,43 @@ def _vendor_table(vendors: Optional[List[str]] = None) -> List[Tuple["re.Pattern
 
 
 def find_vendors(text: str, vendors: Optional[List[str]] = None) -> List[Tuple[int, str]]:
-    """All controlled-list vendors in ``text`` as (position, canonical) in first-occurrence order.
+    """All controlled-list vendors in ``text`` as (position, canonical) in first-occurrence order."""
+    return [(a, c) for a, _b, c in _vendor_spans(text, vendors)]
+
+
+def _vendor_spans(text: str, vendors: Optional[List[str]] = None) -> List[Tuple[int, int, str]]:
+    """(start, end, canonical) of every controlled-list vendor / alias occurrence in ``text``.
 
     Longer names are matched first and their span is masked, so 'Mtech VN' never also
     yields 'Mtech' and 'Assy IT' never yields a bare 'IT' (which is not a vendor).
     """
     folded = _fold(text)
     taken = [False] * len(folded)
-    found: List[Tuple[int, str]] = []
+    found: List[Tuple[int, int, str]] = []
     for pat, canon in _vendor_table(vendors):
         for m in pat.finditer(folded):
             if any(taken[m.start():m.end()]):
                 continue
             for i in range(m.start(), m.end()):
                 taken[i] = True
-            found.append((m.start(), canon))
+            found.append((m.start(), m.end(), canon))
     found.sort()
-    out: List[Tuple[int, str]] = []
-    for pos, c in found:
-        if c not in [x[1] for x in out]:
-            out.append((pos, c))
+    out: List[Tuple[int, int, str]] = []
+    for a, b, c in found:
+        if c not in [x[2] for x in out]:
+            out.append((a, b, c))
     return out
+
+
+def _is_only_vendor_names(part: str, vendors: Optional[List[str]] = None) -> bool:
+    """True when ``part`` consists (up to punctuation/whitespace) of vendor names/aliases only."""
+    spans = _vendor_spans(part, vendors)
+    if not spans:
+        return False
+    covered = sum(b - a for a, b, _ in spans)
+    significant = len(re.sub(r"[\s.,;:()\-–/|]+", "", part))
+    matched = sum(len(re.sub(r"[\s\-]+", "", part[a:b])) for a, b, _ in spans)
+    return covered > 0 and significant - matched <= 2
 
 
 def canonical_vendors(text: str, vendors: Optional[List[str]] = None) -> List[str]:
@@ -286,14 +308,9 @@ def canonicalize_vendor_value(value: str, vendors: Optional[List[str]] = None) -
         part = part.strip(" \t.-–")
         if not part:
             continue
-        hits = canonical_vendors(part, vendors)
-        folded_len = len(_fold(part).strip())
-        # the part must be (essentially) one canonical name, not a sentence containing one
-        if len(hits) == 1 and folded_len <= len(_fold(hits[0])) + 2:
-            if hits[0] not in canon:
-                canon.append(hits[0])
-        elif len(hits) > 1 and folded_len <= sum(len(h) for h in hits) + 3 * len(hits):
-            for h in hits:
+        # the part must be (essentially) vendor names / aliases only, not a sentence containing one
+        if _is_only_vendor_names(part, vendors):
+            for h in canonical_vendors(part, vendors):
                 if h not in canon:
                     canon.append(h)
         else:
@@ -339,8 +356,7 @@ def unknown_vendor_candidates(text: str, vendors: Optional[List[str]] = None) ->
     """'công đoạn assy X' names that do not resolve to any controlled-list vendor."""
     out = []
     for cand in find_vendor_candidates(text):
-        hits = canonical_vendors(cand, vendors)
-        if hits and len(_fold(cand).strip()) <= max(len(_fold(h)) for h in hits) + 2:
+        if _is_only_vendor_names(cand, vendors):
             continue                      # e.g. 'IT' of 'Assy IT' is covered by the canonical phrase
         if norm_key(cand) in ("it",):     # 'IT' alone is never a vendor
             continue

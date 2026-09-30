@@ -530,3 +530,66 @@ def test_missing_qpn_and_defect_stay_blank_with_review(report_factory, template,
     assert ws.cell(row=4, column=5).value == "A185"                      # what exists is still written
     reasons = proc.results[0].review_reasons
     assert "Không tìm thấy QPN trong báo cáo" in reasons and "Không tìm thấy Nội dung lỗi trong báo cáo" in reasons
+
+
+# ---------------------------------------------------------------- historical workbook aliases
+def test_historical_aliases_map_to_canonical():
+    assert canonical_vendors("Lắp ráp IT") == ["Assy IT"]
+    assert canonical_vendors("lắp  ráp  it") == ["Assy IT"]               # case / whitespace tolerant
+    assert canonical_vendors("Sơn Intops") == ["Sơn IT"]
+    assert canonical_vendors("CNC Intops") == ["CNC IT"]
+    assert canonical_vendors("NCC JT") == ["JT Tech Vina"]
+    assert canonical_vendors("JT Tech Vina") == ["JT Tech Vina"]
+    assert "JT Tech Vina" in CANONICAL_VENDORS
+    # alias never yields a second / partial vendor
+    assert canonical_vendors("Tại công đoạn lắp ráp IT thao tác") == ["Assy IT"]
+    assert canonical_vendors("Tại công đoạn lắp ráp Rear") == []
+
+
+def test_jt_vendor_detected_in_report_text():
+    rec = _vendor_rec("Tại công đoạn Assy JT Tech Vina kiểm tra lại; NCC JT bổ sung khay")
+    assert rec.vendors == ["JT Tech Vina"] and rec.review_reasons == []
+
+
+def test_excel_alias_cells_normalise_for_comparison():
+    assert canonicalize_vendor_value("Mtech\nTesung\nLắp ráp IT") == (["Mtech", "Tesung", "Assy IT"], [])
+    assert canonicalize_vendor_value("Sơn Intops\nCNC Intops") == (["Sơn IT", "CNC IT"], [])
+    assert canonicalize_vendor_value("NCC JT") == (["JT Tech Vina"], [])
+    assert canonicalize_vendor_value("Công ty Mtech Việt Nam") == ([], ["Công ty Mtech Việt Nam"])   # a sentence is not a vendor list
+
+
+def _upd(template, tmp_path, excel_vendor, ppt_vendors, name="w.xlsx"):
+    _prefill(template, [("260601038-VOC", excel_vendor, None)])
+    w = ExcelWriter(template, tmp_path / name)
+    rec = ex.ExtractedRecord(management_number="260601038-VOC", vendors=list(ppt_vendors),
+                             vendor="\n".join(ppt_vendors))
+    notes = w.update_record(4, rec)
+    w.save()
+    return notes, load_workbook(tmp_path / name)["Kiểm chứng"].cell(row=4, column=3).value
+
+
+def test_alias_sets_equivalent_no_conflict_cell_preserved(template, tmp_path):
+    notes, cell = _upd(template, tmp_path, "Mtech\nTesung\nLắp ráp IT", ["Mtech", "Tesung", "Assy IT"])
+    assert notes == [] and cell == "Mtech\nTesung\nLắp ráp IT"           # historical spelling kept verbatim
+    notes, cell = _upd(template, tmp_path, "NCC JT", ["JT Tech Vina"], "w2.xlsx")
+    assert notes == [] and cell == "NCC JT"
+    notes, cell = _upd(template, tmp_path, "Sơn Intops\nCNC Intops", ["Sơn IT", "CNC IT"], "w3.xlsx")
+    assert notes == [] and cell == "Sơn Intops\nCNC Intops"
+
+
+def test_order_difference_is_not_a_conflict(template, tmp_path):
+    notes, cell = _upd(template, tmp_path, "Assy IT; Tesung, mtech", ["Mtech", "Tesung", "Assy IT"])
+    assert notes == [] and cell == "Assy IT; Tesung, mtech"
+
+
+def test_genuine_difference_still_conflicts_despite_aliases(template, tmp_path):
+    notes, cell = _upd(template, tmp_path, "Sơn Intops\nCNC Intops", ["HK", "Sơn IT"])
+    assert cell == "Sơn Intops\nCNC Intops"                                # Excel kept
+    assert len(notes) == 1
+    assert "Vendor trong Excel: Sơn IT / CNC IT" in notes[0]
+    assert "Vendor trong báo cáo: HK / Sơn IT" in notes[0]
+
+
+def test_blank_excel_vendor_gets_canonical_names(template, tmp_path):
+    notes, cell = _upd(template, tmp_path, None, ["Mtech", "Tesung", "Assy IT"])
+    assert notes == [] and cell == "Mtech\nTesung\nAssy IT"
