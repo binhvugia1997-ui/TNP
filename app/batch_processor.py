@@ -18,6 +18,8 @@ from .classifier import classify
 from .excel_writer import ExcelWriter
 from .extractor import extract_record
 from .history import History, fingerprint
+from .extractor import management_number_from_filename
+from .excel_writer import MANAGED_FIELDS
 from .image_extractor import build_improvement_image
 from .logger import BatchResultLog, FileResult, setup_logging
 from .ollama_client import OllamaClient
@@ -42,7 +44,7 @@ STAGE_LABELS_VI = {
     "completed": "Hoàn thành",
     "needs_review": "Cần kiểm tra",
     "error": "Lỗi",
-    "skipped": "Đã xử lý trước đó",
+    "skipped": "Bỏ qua — đã cập nhật",
     "not_written": "Không tìm thấy Management Number",
 }
 
@@ -191,14 +193,43 @@ class BatchProcessor:
                 fr.fingerprint = fingerprint(path)
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(f"Không đọc được file: {e}") from e
-            prev = history.lookup(fr.fingerprint)
-            if prev and not self.opts.force_reprocess and Path(prev.get("output", "")) == Path(self.opts.output_file):
-                fr.status = "skipped"
-                fr.excel_row = prev.get("row")
-                fr.error = f"Đã xử lý trước đó (dòng {prev.get('row')})"
-                self.summary.skipped += 1
-                self.on_file(idx, "skipped", fr.error)
-                return fr
+            row: Optional[int] = None
+            missing: Optional[List[str]] = None
+            if self.opts.row_mode == "match":
+                # Fixed-master rules: the destination row decides BEFORE any parsing / Qwen call.
+                mgmt = management_number_from_filename(path.name)
+                fr.management_number = mgmt
+                if not mgmt:
+                    return self._not_written(idx, fr, None, "Không xác định được Management Number từ tên file")
+                rows = writer.find_rows_by_management_number(mgmt)
+                if not rows:
+                    return self._not_written(idx, fr, None,
+                                             f"Không tìm thấy Management Number {mgmt} trong file Kiểm chứng")
+                if len(rows) > 1:
+                    return self._not_written(idx, fr, None,
+                                             f"Management Number {mgmt} xuất hiện nhiều dòng ({rows})")
+                row = rows[0]
+                missing = writer.missing_managed_fields(row)
+                if not missing and not self.opts.force_reprocess:
+                    fr.status = "skipped"
+                    fr.excel_row = row
+                    fr.error = f"Bỏ qua — đã cập nhật (dòng {row})"
+                    self.summary.skipped += 1
+                    LOG.info("%s: row %s already complete – skipped (no Qwen, no extraction)", path.name, row)
+                    self.on_file(idx, "skipped", fr.error)
+                    return fr
+                if missing and len(missing) < len([f for f in MANAGED_FIELDS if f in writer.columns]) \
+                        and not self.opts.force_reprocess:
+                    LOG.info("%s: row %s partially complete – filling only %s", path.name, row, missing)
+            else:
+                prev = history.lookup(fr.fingerprint)
+                if prev and not self.opts.force_reprocess and Path(prev.get("output", "")) == Path(self.opts.output_file):
+                    fr.status = "skipped"
+                    fr.excel_row = prev.get("row")
+                    fr.error = f"Đã xử lý trước đó (dòng {prev.get('row')})"
+                    self.summary.skipped += 1
+                    self.on_file(idx, "skipped", fr.error)
+                    return fr
 
             # --- 1. read PPTX ------------------------------------------------
             self.on_file(idx, "reading", "")
@@ -266,24 +297,28 @@ class BatchProcessor:
             # --- 6. write Excel ------------------------------------------------
             self.on_file(idx, "writing_excel", "")
             if self.opts.row_mode == "match":
-                # Management Number (from file name) is the key of the destination row
-                if not rec.management_number:
-                    return self._not_written(idx, fr, rec, "Không xác định được Management Number từ tên file")
-                rows = writer.find_rows_by_management_number(rec.management_number)
-                if not rows:
-                    return self._not_written(idx, fr, rec,
-                                             f"Không tìm thấy Management Number {rec.management_number} trong file Kiểm chứng")
-                if len(rows) > 1:
-                    return self._not_written(idx, fr, rec,
-                                             f"Management Number {rec.management_number} xuất hiện nhiều dòng ({rows})")
-                row = rows[0]
-                conflicts = writer.update_record(row, rec, qpn_png, imp_jpg, fill_temporary=self.opts.fill_temporary_column)
+                assert row is not None and missing is not None
+                if self.opts.force_reprocess:
+                    # explicit user request: rewrite every extractor-managed field
+                    conflicts = writer.update_record(row, rec, qpn_png, imp_jpg,
+                                                     fill_temporary=self.opts.fill_temporary_column)
+                else:
+                    # auto fill: ONLY the blank fields, populated cells are preserved
+                    conflicts = writer.fill_missing_fields(row, rec, missing, qpn_png, imp_jpg)
+                    rec.review_reasons = filter_review_reasons(rec.review_reasons, missing)
+                    fr.filled_fields = [f for f in missing if _rec_has(rec, f, qpn_png, imp_jpg)]
                 rec.review_reasons.extend(conflicts)
                 note = "; ".join(rec.review_reasons)
+                if "status" in writer.columns:
+                    cell, _ = writer._anchor(row, writer.columns["status"])
+                    if rec.review_reasons:
+                        writer._set_cell(row, "status", "Cần kiểm tra")
+                    elif str(cell.value or "").strip() == "Cần kiểm tra":
+                        writer._set_cell(row, "status", "")        # our earlier flag, now resolved
+                        if "note" in writer.columns:
+                            writer._set_cell(row, "note", "")
                 if note and "note" in writer.columns:
                     writer._set_cell(row, "note", note)
-                if rec.review_reasons and "status" in writer.columns:
-                    writer._set_cell(row, "status", "Cần kiểm tra")
             else:
                 note = "; ".join(rec.review_reasons)
                 row = writer.append_record(rec, qpn_png, imp_jpg,
@@ -314,10 +349,14 @@ class BatchProcessor:
         return fr
 
     def _not_written(self, idx: int, fr: FileResult, rec, reason: str) -> FileResult:
-        """Match mode: destination row cannot be determined -> nothing is written, report it."""
+        """Match mode: destination row cannot be determined -> nothing is written, report it.
+
+        Nothing has been parsed or sent to Qwen at this point; the report stays eligible for a rerun once the
+        user adds the Management Number to the master workbook.
+        """
         fr.status = "not_written"
-        fr.review_reasons = [f"Cần kiểm tra: {reason}", *rec.review_reasons]
-        fr.blank_fields = list(rec.blank_fields)
+        fr.review_reasons = [f"Cần kiểm tra: {reason}", *(rec.review_reasons if rec else [])]
+        fr.blank_fields = list(rec.blank_fields) if rec else []
         fr.error = f"Cần kiểm tra: {reason}"
         fr.finished_at = datetime.now().isoformat(timespec="seconds")
         self.summary.not_written += 1
@@ -329,6 +368,32 @@ class BatchProcessor:
     def _log(self, msg: str) -> None:
         LOG.info(msg)
         self.on_log(msg)
+
+
+# review reason -> managed field it concerns (reasons about already-populated fields are dropped in fill mode)
+_REASON_FIELD = (("Nội dung lỗi", "defect_content"), ("QPN", "qpn"), ("Nguyên nhân", "root_cause"),
+                 ("Nội dung đối sách cải tiến", "improvement"), ("hình ảnh cải tiến", "improvement_image"),
+                 ("Model", "model"), ("Vendor", "vendor"), ("vendor", "vendor"))
+
+
+def filter_review_reasons(reasons: List[str], missing: List[str]) -> List[str]:
+    """Keep only reasons that concern a field we actually had to fill (or generic ones)."""
+    kept: List[str] = []
+    for r in reasons:
+        fld = next((f for key, f in _REASON_FIELD if key in r), None)
+        if fld is None or fld in missing:
+            kept.append(r)
+    return kept
+
+
+def _rec_has(rec, field: str, qpn_png, imp_jpg) -> bool:
+    if field == "qpn":
+        return bool(qpn_png)
+    if field == "improvement_image":
+        return bool(imp_jpg)
+    if field == "occurrence_date":
+        return bool(rec.occurrence_date)
+    return bool(getattr(rec, field, ""))
 
 
 def format_file_diagnostics(fr: FileResult) -> str:
@@ -352,6 +417,7 @@ def format_file_diagnostics(fr: FileResult) -> str:
         f"Slide kiểm chứng   : {fr.verify_slides or '-'}  (WEEK +1..+8 luôn để trống)",
         f"Renderer QPN       : {fr.qpn_renderer or '-'}",
         f"Trường để trống    : {', '.join(fr.blank_fields) if fr.blank_fields else '(không)'}",
+        f"Trường đã điền     : {', '.join(fr.filled_fields) if fr.filled_fields else '(không)'}",
         f"Cần kiểm tra thủ công: {'; '.join(fr.review_reasons) if fr.review_reasons else '(không)'}",
     ]
     if fr.classifier_notes:

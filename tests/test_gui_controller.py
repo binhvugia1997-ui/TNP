@@ -96,7 +96,7 @@ def test_status_mapping_vietnamese():
     assert STATUS_VI["completed"] == "Hoàn thành"
     assert STATUS_VI["needs_review"] == "Cần kiểm tra"
     assert STATUS_VI["not_written"] == "Không tìm thấy Management Number"
-    assert STATUS_VI["error"] == "Lỗi" and STATUS_VI["skipped"] == "Bỏ qua"
+    assert STATUS_VI["error"] == "Lỗi" and STATUS_VI["skipped"] == "Bỏ qua — đã cập nhật"
     assert status_label("analyzing") == "Đang phân tích Qwen"
     assert status_label("extracting") == "Đang trích xuất nguyên nhân / đối sách cải tiến"
     assert status_label("extracting_qpn") == "Đang trích xuất QPN"

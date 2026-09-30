@@ -61,8 +61,15 @@ ReportExtractor.exe --cli D:\Reports --template D:\Templates\Verification.xlsx -
 3. **Thư mục báo cáo**: chọn thư mục hoặc kéo-thả thư mục / file `.pptx` vào danh
    sách. Toàn bộ thư mục con được quét tự động.
 4. **File kết quả**: file `.xlsx` tổng hợp (không bao giờ ghi đè form gốc). Chạy
-   lại với cùng file kết quả sẽ ghi tiếp; báo cáo đã xử lý được đánh dấu
-   *Đã xử lý trước đó* (tick “Xử lý lại…” để ép xử lý lại).
+   lại với cùng file kết quả sẽ ghi tiếp theo quy tắc master cố định:
+   - Management Number không có trong file → *Không tìm thấy Management Number*
+     (không tạo dòng mới, bổ sung số rồi chạy lại);
+   - dòng đã đủ mọi trường tự động → *Bỏ qua — đã cập nhật* (không gọi Qwen,
+     không trích xuất lại, không ghi lại QPN/ảnh);
+   - dòng còn thiếu trường → tự động **chỉ điền các ô còn trống**, ô đã có dữ liệu
+     (kể cả WEEK +1..+8, cột thủ công) giữ nguyên;
+   - lần trước Lỗi / bị dừng / Cần kiểm tra → được xử lý lại.
+   Tick “Xử lý lại…” (`--force`) mới ghi đè các trường tự động.
 5. **BẮT ĐẦU TRÍCH XUẤT** – theo dõi trạng thái từng file; **Dừng sau file hiện tại**
    dừng an toàn sau khi ghi xong file đang xử lý.
 6. Kết thúc: **Mở file kết quả**, **Mở thư mục kết quả**, **Xem chi tiết lỗi**, **Chẩn đoán**.
@@ -70,7 +77,7 @@ ReportExtractor.exe --cli D:\Reports --template D:\Templates\Verification.xlsx -
 Cấu hình (máy AI, model, các đường dẫn cuối) được lưu vào `config.json` cạnh exe.
 
 ### Trạng thái
-`Đang chờ · Đang đọc PPTX · Đang phân tích (AI) · Đang trích xuất QPN · Đang trích xuất hình ảnh · Đang ghi Excel · Hoàn thành · Cần kiểm tra · Lỗi · Đã xử lý trước đó`
+`Đang chờ · Đang đọc PPTX · Đang phân tích (AI) · Đang trích xuất QPN · Đang trích xuất hình ảnh · Đang ghi Excel · Hoàn thành · Cần kiểm tra · Không tìm thấy Management Number · Lỗi · Bỏ qua — đã cập nhật`
 
 ## 3. Business rules (fixed)
 

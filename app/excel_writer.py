@@ -38,6 +38,12 @@ LOG = logging.getLogger("report_extractor.excel")
 MAPPING_SHEET_KEYS = ("phan loai", "classification", "mapping", "danh muc")
 # a sheet qualifies as the destination table only when ALL of these columns are present
 REQUIRED_FIELDS = ("management_number", "qpn", "root_cause", "improvement")
+# Fields the extractor owns in an existing (matched) row.  Everything else – Management Number, WEEK +1..+8,
+# manual columns – is never touched.  Text fields are "complete" when non-blank, image fields when a picture is
+# anchored in the cell.
+MANAGED_TEXT_FIELDS = ("vendor", "occurrence_date", "model", "item", "defect_content", "root_cause", "improvement")
+MANAGED_IMAGE_FIELDS = ("qpn", "improvement_image")
+MANAGED_FIELDS = MANAGED_TEXT_FIELDS + MANAGED_IMAGE_FIELDS
 # the full expected set – used for the diagnostic message and for ranking
 EXPECTED_FIELDS = ("management_number", "vendor", "occurrence_date", "model", "item", "defect_content",
                    "qpn", "root_cause", "improvement", "improvement_image")
@@ -477,6 +483,33 @@ class ExcelWriter:
         else:
             cell.number_format = template_fmt   # keep the template's own date format
 
+    def _has_image_in_cell(self, row: int, field: str) -> bool:
+        if field not in self.columns:
+            return False
+        cell, _ = self._anchor(row, self.columns[field])
+        for img in getattr(self.ws, "_images", []):
+            try:
+                fr = img.anchor._from
+                if fr.row + 1 == cell.row and fr.col + 1 == cell.column:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def missing_managed_fields(self, row: int) -> List[str]:
+        """Extractor-managed fields of ``row`` that are still blank (only columns present in the sheet)."""
+        missing: List[str] = []
+        for f in MANAGED_TEXT_FIELDS:
+            if f not in self.columns:
+                continue
+            cell, _ = self._anchor(row, self.columns[f])
+            if cell.value in (None, "") or (isinstance(cell.value, str) and not cell.value.strip()):
+                missing.append(f)
+        for f in MANAGED_IMAGE_FIELDS:
+            if f in self.columns and not self._has_image_in_cell(row, f):
+                missing.append(f)
+        return missing
+
     def _remove_images_in_cell(self, row: int, field: str) -> None:
         if field not in self.columns:
             return
@@ -588,6 +621,29 @@ class ExcelWriter:
             self._set_cell(row, "status", status_text)
         if note_text or notes:
             self._set_cell(row, "note", "; ".join(x for x in [note_text, *notes] if x))
+        return notes
+
+    def fill_missing_fields(self, row: int, rec, missing: List[str], qpn_png: Optional[Path] = None,
+                            improvement_jpg: Optional[Path] = None) -> List[str]:
+        """Partial update of an EXISTING row: write ONLY the fields listed in ``missing``.
+
+        Populated cells are preserved even when the report holds another value (Vendor / Ngày phát sinh keep
+        their conflict notes as before).  Returns the conflict notes.
+        """
+        notes = self._write_vendor_and_date(row, rec, overwrite_blank_only=True)
+        heights = [self.ws.row_dimensions[row].height or 15.0]
+        for f in ("model", "item", "defect_content", "root_cause", "improvement"):
+            if f in missing:
+                val = getattr(rec, f, "") or ""
+                if val:
+                    self._set_cell(row, f, val)
+                    heights.append(self._text_height_pt(row, f, val))
+        if "qpn" in missing and qpn_png:
+            heights.append(self._embed_image(row, "qpn", Path(qpn_png)))
+        if "improvement_image" in missing and improvement_jpg:
+            heights.append(self._embed_image(row, "improvement_image", Path(improvement_jpg)))
+        self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
+        self._dirty = True
         return notes
 
     def _refresh_images(self) -> None:

@@ -69,6 +69,7 @@ class FileResult:
     excel_row: Optional[int] = None
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)
+    filled_fields: List[str] = field(default_factory=list)     # match mode: managed fields written this run
     classifier_notes: List[str] = field(default_factory=list)
     confidence: Optional[float] = None
     error: str = ""

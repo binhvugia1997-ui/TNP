@@ -32,7 +32,7 @@ STATUS_VI: Dict[str, str] = {
     "needs_review": "Cần kiểm tra",
     "not_written": "Không tìm thấy Management Number",
     "error": "Lỗi",
-    "skipped": "Bỏ qua",
+    "skipped": "Bỏ qua — đã cập nhật",
 }
 FINAL_STATUSES = ("completed", "needs_review", "not_written", "error", "skipped")
 WORKING_STAGES = ("reading", "analyzing", "analyzing_heuristic", "extracting", "extracting_qpn",
@@ -419,6 +419,7 @@ class GuiController:
             "Slide ảnh cải tiến": str(fr.improvement_image_slides or "(không có)"),
             "Bộ phân loại": fr.classifier or "-",
             "Độ tin cậy AI": f"{fr.confidence:.2f}" if fr.confidence is not None else "-",
+            "Trường đã điền": ", ".join(fr.filled_fields) if fr.filled_fields else "-",
             "Lý do cần kiểm tra": "\n".join(fr.review_reasons) if fr.review_reasons else "-",
             "Lỗi": fr.error or "-",
             "Thời gian Ollama": timing or "-",
