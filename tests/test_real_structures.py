@@ -198,7 +198,8 @@ def test_ole_qpn_renders_and_flows_to_record(tmp_path):
     assert cls.qpn_slide == 2 and cls.cause_slides == [3] and cls.improvement_slides == [4]
     assert 2 not in cls.improvement_image_slides
     rec = extract_record(r, cls)
-    assert rec.qpn_slide == 2 and not any("QPN" in x for x in rec.review_reasons)
+    assert rec.qpn_slide == 2 and cls.qpn_source == "metadata"
+    assert not any("Không tìm thấy QPN" in x or "chỉ do AI" in x for x in rec.review_reasons)
     png, backend = render_qpn(r, 2, tmp_path / "qpn.png", SlideRenderer(prefer=("builtin",)))
     with Image.open(png) as im:
         # the OLE preview picture (light blue) must be drawn on the rendered slide

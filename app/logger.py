@@ -73,6 +73,10 @@ class FileResult:
     confidence: Optional[float] = None
     error: str = ""
     classifier: str = ""               # "qwen" | "qwen+heuristic" | "heuristic"
+    qpn_source: str = ""               # explicit_text | metadata | qpn_heading | defect_structure | structural | llm
+    qpn_override: str = ""             # why an LLM QPN suggestion was rejected
+    image_slides_structural: List[int] = field(default_factory=list)
+    image_slides_llm: List[int] = field(default_factory=list)
     qpn_renderer: str = ""
     fingerprint: str = ""
     started_at: str = ""

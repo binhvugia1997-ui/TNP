@@ -146,7 +146,7 @@ def test_llm_merge_guards_qpn_and_validates_indices(a185_report):
     assert 99 not in c.improvement_slides
     assert 7 in c.improvement_slides              # heading-detected slide appended
     assert 4 in c.temporary_slides
-    assert c.improvement_image_slides == [5]
+    assert c.improvement_image_slides == [5, 6]           # LLM can never narrow the structural set
 
 
 class FakeOllama:

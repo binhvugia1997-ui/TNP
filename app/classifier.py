@@ -16,7 +16,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .pptx_parser import ReportData, SlideData, norm_key
 
@@ -111,6 +111,11 @@ class Classification:
     ambiguities: List[str] = field(default_factory=list)   # -> "Cần kiểm tra"
     raw_llm: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    # diagnostics (batch_result.json)
+    qpn_source: str = ""               # explicit_text | metadata | qpn_heading | defect_structure | structural | llm | ""
+    qpn_override: str = ""             # why an LLM qpn_slide was not accepted
+    image_slides_structural: List[int] = field(default_factory=list)   # deterministic candidates
+    image_slides_llm: List[int] = field(default_factory=list)          # what the LLM proposed
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -140,26 +145,65 @@ def _slide_kinds(slide: SlideData) -> Dict[str, int]:
 
 def find_qpn_slide(report: ReportData) -> Optional[int]:
     """Slide containing 'Quality Problem Notice' text (exact/close), else 'QPN' heading."""
-    best: Optional[int] = None
+    return find_qpn_evidence(report)[0]
+
+
+def find_qpn_evidence(report: ReportData) -> Tuple[Optional[int], str]:
+    """Explicit QPN evidence -> (slide, source).  Sources: explicit_text (slide text),
+    metadata (alt text / OLE or picture names / notes recovered from XML), qpn_heading."""
     for s in report.slides:
         k = norm_key(s.text)
         if any(m in k for m in QPN_MARKERS):
-            return s.number
+            return s.number, "explicit_text"
     # text hidden in alt-text / OLE object names / picture names / speaker notes
     for s in report.slides:
         meta = " ".join([*s.alt_texts, *(b.shape_name for b in s.blocks), s.notes])
         k = norm_key(meta)
         if any(m in k for m in QPN_MARKERS) or re.search(r"(?<![a-z])qpn(?![a-z])", k):
-            return s.number
+            return s.number, "metadata"
     for s in report.slides:
         for b in s.text_blocks:
             first = b.text.strip().split("\n")[0]
             if norm_key(first) in ("qpn", "qpn sheet", "phieu qpn") or re.fullmatch(r"qpn.{0,20}", norm_key(first)):
-                best = s.number
-                break
-        if best:
-            return best
-    return None
+                return s.number, "qpn_heading"
+    return None, ""
+
+
+def slide_has_qpn_evidence(report: ReportData, n: Optional[int]) -> bool:
+    """True when slide ``n`` itself carries explicit QPN evidence (text / metadata / heading)."""
+    if not n:
+        return False
+    s = report.slide(n)
+    if s is None:
+        return False
+    one = ReportData(path=report.path, slides=[s], slide_width=report.slide_width, slide_height=report.slide_height)
+    return find_qpn_evidence(one)[0] is not None
+
+
+def _largest_picture_ratio(slide: SlideData) -> float:
+    """Area of the largest picture relative to the slide (0 when sizes are unknown)."""
+    if not slide.pictures or not slide.width or not slide.height:
+        return 0.0
+    area = slide.width * slide.height
+    return max((p.width * p.height) for p in slide.pictures) / float(area) if area else 0.0
+
+
+def structural_qpn_candidate(report: ReportData, cover: bool, first_cause: Optional[int]) -> Optional[int]:
+    """QPN form present only as a picture/OLE object: the first body slide (right after the
+    cover) when it carries a large picture and is not later than the root-cause section.
+    Deterministic, unique by construction; None when the layout does not match."""
+    first_body = 2 if cover else 1
+    s = report.slide(first_body)
+    if s is None or not s.pictures:
+        return None
+    if first_cause and first_body > first_cause:
+        return None
+    if first_heading_kind(s) in ("temporary", "improvement", "verify", "standard"):
+        return None
+    ratio = _largest_picture_ratio(s)
+    if s.width and s.height and ratio < 0.12:
+        return None                          # small logo / icon, not a form
+    return first_body
 
 
 def first_heading_kind(slide: SlideData) -> Optional[str]:
@@ -211,9 +255,23 @@ def select_improvement_image_slides(report: ReportData, improvement_slides: List
     return out
 
 
+def is_safe_improvement_image_candidate(report: ReportData, n: int, improvement_slides: List[int],
+                                        qpn_slide: Optional[int], defect_slide: Optional[int],
+                                        temporary_slides: List[int]) -> bool:
+    """Structural safety check applied to LLM-proposed improvement-image slides: the slide
+    must belong to the improvement section, carry pictures and not be the cover, the
+    QPN/defect slide, a temporary-handling slide or a verification-led slide."""
+    s = report.slide(n)
+    if s is None or not s.pictures or n not in improvement_slides:
+        return False
+    if n in (qpn_slide, defect_slide) or n in temporary_slides or is_cover_slide(report, s):
+        return False
+    return first_heading_kind(s) not in ("verify", "temporary", "defect", "qpn", "cause")
+
+
 def heuristic_classify(report: ReportData) -> Classification:
     c = Classification(source="heuristic")
-    c.qpn_slide = find_qpn_slide(report)
+    c.qpn_slide, c.qpn_source = find_qpn_evidence(report)
     current = None   # section carried across slides when a slide has no heading
     for s in report.slides:
         kinds = _slide_kinds(s)
@@ -254,14 +312,26 @@ def heuristic_classify(report: ReportData) -> Classification:
             current = last_kind if last_kind in ("cause", "improvement", "temporary") else None
     if not c.defect_slide:
         c.defect_slide = c.qpn_slide
-    # QPN fallback: no "Quality Problem Notice" text anywhere -> the defect / HIỆN TRẠNG page that
-    # carries a picture is the source QPN evidence; flagged for manual review, never invented.
+    # QPN precedence when no explicit text: (2) defect / HIỆN TRẠNG page carrying a picture,
+    # (3) structural: first body slide with a large picture before the cause section.
     if not c.qpn_slide and c.defect_slide and report.slide(c.defect_slide) and report.slide(c.defect_slide).pictures:
         c.qpn_slide = c.defect_slide
-        c.ambiguities.append(f"Không có chữ 'Quality Problem Notice'; QPN lấy theo trang hiện trạng/nội dung lỗi "
-                             f"(slide {c.defect_slide}) – cần kiểm tra")
+        c.qpn_source = "defect_structure"
+        c.notes.append(f"QPN = trang hiện trạng/nội dung lỗi có hình (slide {c.defect_slide}); "
+                       f"không có chữ 'Quality Problem Notice' trong text")
+    if not c.qpn_slide:
+        cover = report.slides and is_cover_slide(report, report.slides[0])
+        cand = structural_qpn_candidate(report, bool(cover), c.cause_slides[0] if c.cause_slides else None)
+        if cand:
+            c.qpn_slide = cand
+            c.qpn_source = "structural"
+            if not c.defect_slide:
+                c.defect_slide = cand
+            c.notes.append(f"QPN = slide {cand} theo cấu trúc (trang đầu thân báo cáo có hình biểu mẫu, "
+                           f"trước phần nguyên nhân)")
     c.improvement_image_slides = select_improvement_image_slides(
         report, c.improvement_slides, c.qpn_slide, c.defect_slide, c.temporary_slides)
+    c.image_slides_structural = list(c.improvement_image_slides)
     return c
 
 
@@ -460,14 +530,27 @@ def merge_llm_with_heuristic(llm_raw: Dict[str, Any], heur: Classification, repo
     c.improvement_image_slides = _as_int_list(llm.get("improvement_image_slides"), n)
     c.verify_slides = _as_int_list(llm.get("verify_slides"), n)
 
-    # --- guards: the exact QPN text always wins --------------------------------
-    if heur.qpn_slide and c.qpn_slide != heur.qpn_slide:
-        if c.qpn_slide:
-            c.notes.append(f"LLM qpn_slide={c.qpn_slide} overridden by exact text match slide {heur.qpn_slide}")
+    # --- guards: deterministic QPN evidence always wins over the LLM -------------
+    llm_qpn = c.qpn_slide
+    c.image_slides_llm = list(c.improvement_image_slides)
+    if heur.qpn_slide:
+        c.qpn_source = heur.qpn_source
+        if llm_qpn and llm_qpn != heur.qpn_slide:
+            c.qpn_override = (f"LLM qpn_slide={llm_qpn} rejected: deterministic evidence "
+                              f"({heur.qpn_source}) = slide {heur.qpn_slide}")
+            c.notes.append(c.qpn_override)
+            c.source = "qwen+heuristic"
         c.qpn_slide = heur.qpn_slide
-        c.source = "qwen+heuristic"
-    elif c.qpn_slide and not heur.qpn_slide:
-        c.ambiguities.append(f"QPN (slide {c.qpn_slide}) chỉ do AI xác định, không có chữ 'Quality Problem Notice'")
+    elif llm_qpn:
+        cover = report.slides and is_cover_slide(report, report.slides[0]) and llm_qpn == 1
+        if cover and not slide_has_qpn_evidence(report, llm_qpn):
+            c.qpn_override = f"LLM qpn_slide={llm_qpn} rejected: cover slide without QPN evidence"
+            c.notes.append(c.qpn_override)
+            c.qpn_slide = None
+            c.source = "qwen+heuristic"
+        else:
+            c.qpn_source = "llm"
+            c.ambiguities.append(f"QPN (slide {llm_qpn}) chỉ do AI xác định, không có bằng chứng QPN trong cấu trúc")
     # --- ambiguity: AI and keyword detection disagree completely ----------------
     if c.improvement_slides and heur.improvement_slides and not set(c.improvement_slides) & set(heur.improvement_slides):
         c.ambiguities.append(f"Slide đối sách không thống nhất: AI {c.improvement_slides} / từ khoá {heur.improvement_slides}")
@@ -504,17 +587,28 @@ def merge_llm_with_heuristic(llm_raw: Dict[str, Any], heur: Classification, repo
         c.defect_slide = heur.defect_slide
     structural = select_improvement_image_slides(report, c.improvement_slides, c.qpn_slide, c.defect_slide,
                                                  c.temporary_slides)
-    # the LLM may narrow the structural set (e.g. drop a slide without evidence) but never widen it
-    llm_imgs = [s for s in c.improvement_image_slides if s in structural]
-    dropped = [s for s in c.improvement_image_slides if s not in structural]
-    if dropped:
-        c.notes.append(f"LLM improvement_image_slides {dropped} rejected (not an improvement-section slide)")
-    c.improvement_image_slides = llm_imgs or structural
+    c.image_slides_structural = list(structural)
+    # final = deterministic set UNION safe LLM candidates; the LLM can never remove a valid slide
+    added, rejected = [], []
+    for s_no in c.image_slides_llm:
+        if s_no in structural:
+            continue
+        if is_safe_improvement_image_candidate(report, s_no, c.improvement_slides, c.qpn_slide,
+                                               c.defect_slide, c.temporary_slides):
+            added.append(s_no)
+        else:
+            rejected.append(s_no)
+    if rejected:
+        c.notes.append(f"LLM improvement_image_slides {rejected} rejected (fail structural checks)")
+    if added:
+        c.notes.append(f"LLM improvement_image_slides {added} added (pass structural checks)")
+    narrowed = [s_no for s_no in structural if s_no not in c.image_slides_llm]
+    if narrowed and c.image_slides_llm:
+        c.notes.append(f"LLM omitted structural improvement images {narrowed}; kept")
+    c.improvement_image_slides = sorted(set(structural) | set(added))
     if not c.qpn_slide and heur.qpn_slide:
         c.qpn_slide = heur.qpn_slide
-    if c.qpn_slide == heur.qpn_slide:
-        # heuristic QPN chosen by fallback (HIỆN TRẠNG page) keeps its "needs review" flag
-        c.ambiguities.extend(a for a in heur.ambiguities if "Quality Problem Notice" in a and a not in c.ambiguities)
+    c.notes.extend(n_ for n_ in heur.notes if n_.startswith("QPN =") and n_ not in c.notes)
     # never let the QPN slide be treated as improvement text
     c.improvement_slides = [s for s in c.improvement_slides if s != c.qpn_slide]
     return c

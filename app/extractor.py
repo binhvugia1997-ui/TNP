@@ -453,8 +453,9 @@ def extract_item(report: ReportData, cls: Classification, item_mapping: Optional
 
 
 def extract_defect_content(report: ReportData, cls: Classification) -> str:
+    # only the defect / QPN slides are sources; the cover, titles and the file name never are
     slides: List[SlideData] = []
-    for n in [cls.defect_slide, cls.qpn_slide, 1]:
+    for n in [cls.defect_slide, cls.qpn_slide]:
         s = report.slide(n) if n else None
         if s and s not in slides:
             slides.append(s)
@@ -486,6 +487,26 @@ def extract_defect_content(report: ReportData, cls: Classification) -> str:
                 if txt:
                     return txt
     return ""
+
+
+def defect_only_in_image(report: ReportData, cls: Classification) -> bool:
+    """True when the QPN/defect slide carries a picture but its defect region (text before the
+    first cause/temporary/improvement heading) has no copyable text.  Text of other sections
+    on the same slide (e.g. NGUYÊN NHÂN under the QPN form) does not count as defect text."""
+    for n in [cls.defect_slide, cls.qpn_slide]:
+        ds = report.slide(n) if n else None
+        if ds is None or not ds.pictures:
+            continue
+        region_text = []
+        for sec in split_sections(ds, "defect"):
+            if sec.kind in ("cause", "temporary", "improvement", "verify", "standard"):
+                break
+            for ln in sec.lines:
+                if section_kind_of_heading(ln) is None and not _is_noise(ln) and ln.strip():
+                    region_text.append(ln)
+        if not region_text:
+            return True
+    return False
 
 
 def extract_record(report: ReportData, cls: Classification,
@@ -536,12 +557,9 @@ def extract_record(report: ReportData, cls: Classification,
         if not val:
             rec.blank_fields.append(name)
     if not rec.defect_content:
-        ds = report.slide(cls.defect_slide) if cls.defect_slide else None
-        if ds is not None and ds.pictures and not any(
-                ln.strip() for b in ds.text_blocks for ln in b.text.split("\n")
-                if section_kind_of_heading(ln) is None and not _is_noise(ln)):
+        if defect_only_in_image(report, cls):
             rec.review_reasons.append(
-                f"Nội dung lỗi chỉ nằm trong hình ảnh (slide {ds.number}), không có dạng chữ – cần nhập tay")
+                "Nội dung lỗi chỉ có trong hình ảnh QPN, không có text để sao chép – cần bổ sung thủ công")
         else:
             rec.review_reasons.append("Không tìm thấy Nội dung lỗi trong báo cáo")
     return rec

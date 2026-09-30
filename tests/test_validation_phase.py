@@ -62,12 +62,17 @@ def test_llm_only_qpn_and_disagreement_flag_review(report_factory):
     assert heur.qpn_slide is None
     raw = {"qpn_slide": 1, "cause_slides": [7], "improvement_slides": [2], "temporary_slides": [3]}
     c = merge_llm_with_heuristic(raw, heur, r)
-    assert c.qpn_slide == 1                                   # accepted (no exact text anywhere)
-    assert any("chỉ do AI" in a for a in c.ambiguities)
+    # the cover slide is never accepted as QPN on the LLM's word alone
+    assert c.qpn_slide is None and "cover slide without QPN evidence" in c.qpn_override
+    assert not any("chỉ do AI" in a for a in c.ambiguities)
     assert any("đối sách không thống nhất" in a for a in c.ambiguities)
     assert any("nguyên nhân không thống nhất" in a for a in c.ambiguities)
     rec = extract_record(r, c)
-    assert any("chỉ do AI" in x for x in rec.review_reasons)
+    assert "Không tìm thấy QPN trong báo cáo" in rec.review_reasons   # never guessed silently
+    # a non-cover slide proposed by the LLM without evidence is accepted but flagged
+    raw2 = {"qpn_slide": 3, "cause_slides": [7], "improvement_slides": [2], "temporary_slides": [3]}
+    c2 = merge_llm_with_heuristic(raw2, heur, r)
+    assert c2.qpn_slide == 3 and c2.qpn_source == "llm" and any("chỉ do AI" in a for a in c2.ambiguities)
 
 
 def test_temporary_heading_slide_removed_from_llm_improvement(a185_report):

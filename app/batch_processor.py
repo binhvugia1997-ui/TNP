@@ -217,6 +217,10 @@ class BatchProcessor:
             fr.defect_slide = cls.defect_slide
             fr.confidence = cls.confidence
             fr.classifier_notes = list(cls.notes)
+            fr.qpn_source = cls.qpn_source
+            fr.qpn_override = cls.qpn_override
+            fr.image_slides_structural = list(cls.image_slides_structural)
+            fr.image_slides_llm = list(cls.image_slides_llm)
             for n in cls.notes:
                 LOG.info("%s: %s", path.name, n)
             LOG.info("%s: classifier=%s qpn=%s cause=%s temp=%s improvement=%s images=%s conf=%s",
@@ -338,7 +342,8 @@ def format_file_diagnostics(fr: FileResult) -> str:
         f"Slide nguyên nhân  : {fr.cause_slides or '(không thấy)'}",
         f"Slide xử lý tạm thời: {fr.temporary_slides or '-'}  (loại khỏi đối sách)",
         f"Slide đối sách     : {fr.improvement_slides or '(không thấy)'}",
-        f"Slide hình cải tiến: {fr.improvement_image_slides or '(không có)'}",
+        f"Slide hình cải tiến: {fr.improvement_image_slides or '(không có)'}  (cấu trúc {fr.image_slides_structural}, AI {fr.image_slides_llm})",
+        f"Nguồn QPN          : {fr.qpn_source or '-'}" + (f"  – {fr.qpn_override}" if fr.qpn_override else ""),
         f"Slide kiểm chứng   : {fr.verify_slides or '-'}  (WEEK +1..+8 luôn để trống)",
         f"Renderer QPN       : {fr.qpn_renderer or '-'}",
         f"Trường để trống    : {', '.join(fr.blank_fields) if fr.blank_fields else '(không)'}",

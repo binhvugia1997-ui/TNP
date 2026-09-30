@@ -142,9 +142,11 @@ def test_a1285_structure_classification(tmp_path):
     assert 8 in c.improvement_slides                        # ĐỐI SÁCH LÂU DÀI text lives there
     # images: only slides whose own section is improvement
     assert c.improvement_image_slides == [5, 6, 7]
-    # QPN: no "Quality Problem Notice" text anywhere -> HIỆN TRẠNG page with picture, flagged
-    assert c.qpn_slide == 2
-    assert any("Quality Problem Notice" in a for a in c.ambiguities)
+    # QPN: no "Quality Problem Notice" text anywhere -> HIỆN TRẠNG page with picture (deterministic,
+    # source 'defect_structure'); resolved structurally -> no 'Cần kiểm tra' for the QPN itself
+    assert c.qpn_slide == 2 and c.qpn_source == "defect_structure"
+    assert not any("QPN" in a or "Quality Problem Notice" in a for a in c.ambiguities)
+    assert any(n.startswith("QPN = trang hiện trạng") for n in c.notes)
 
 
 def test_a1285_record_contents(tmp_path):
@@ -160,9 +162,8 @@ def test_a1285_record_contents(tmp_path):
     assert "BÁO CÁO CẢI TIẾN" not in rec.improvement        # cover text not copied
     # defect text exists only inside the picture -> blank + explicit review reason (no fabrication)
     assert rec.defect_content == ""
-    assert any("chỉ nằm trong hình ảnh (slide 2)" in x for x in rec.review_reasons)
-    assert any("Quality Problem Notice" in x for x in rec.review_reasons)
-    assert not any(x == "Không tìm thấy trang QPN (Quality Problem Notice)" for x in rec.review_reasons)
+    assert "Nội dung lỗi chỉ có trong hình ảnh QPN, không có text để sao chép – cần bổ sung thủ công" in rec.review_reasons
+    assert not any("Không tìm thấy QPN" in x or "chỉ do AI" in x for x in rec.review_reasons)
     assert rec.vendor == "" and rec.occurrence_date is None and all(v == "" for v in rec.weeks.values())
 
 
@@ -181,7 +182,8 @@ def test_llm_cannot_widen_image_slides_to_cover_or_hien_trang(tmp_path):
     c = merge_llm_with_heuristic(raw, heur, r)
     assert c.improvement_image_slides == [5, 6, 7]
     assert 2 not in c.improvement_slides
-    assert c.qpn_slide == 2 and any("Quality Problem Notice" in a for a in c.ambiguities)
+    assert c.qpn_slide == 2 and c.qpn_source == "defect_structure"
+    assert not any("chỉ do AI" in a for a in c.ambiguities)
 
 
 def test_utf8_report_file(tmp_path):
