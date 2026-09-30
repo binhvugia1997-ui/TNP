@@ -82,13 +82,19 @@ def inspect_report(path: Path, template: Path | None = None, server: str = "", m
     if server and model:
         from app.ollama_client import OllamaClient
         out.append(f"\n--- Qwen ({server} / {model}) ---")
+        prompt = build_prompt(r)
+        out.append(f"prompt: {len(prompt)} chars (+system {len(SYSTEM_PROMPT)}), {len(r.slides)} slides, "
+                   f"think=false stream=false format=json")
+        client = OllamaClient(server)
         try:
-            raw = OllamaClient(server).generate_json(model, build_prompt(r), system=SYSTEM_PROMPT)
+            raw = client.generate_json(model, prompt, system=SYSTEM_PROMPT, num_ctx=4096, num_predict=256)
+            out.append("TIMING: " + json.dumps(client.last_call, ensure_ascii=False))
             out.append("RAW JSON:\n" + json.dumps(raw, ensure_ascii=False, indent=1))
             out.append("NORMALISED:\n" + json.dumps(normalize_llm_response(raw), ensure_ascii=False, indent=1, default=str))
             cls = merge_llm_with_heuristic(raw, heur, r)
             out.append("MERGED:\n" + json.dumps(cls.to_dict(), ensure_ascii=False, indent=1))
         except Exception as e:  # noqa: BLE001
+            out.append("TIMING: " + json.dumps(getattr(client, "last_call", {}), ensure_ascii=False))
             out.append(f"Qwen FAILED -> heuristic fallback: {type(e).__name__}: {e}")
 
     rec = extract_record(r, cls, item_mapping, known_models)

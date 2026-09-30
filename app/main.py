@@ -66,6 +66,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ReportExtractor", description="Report Extractor – PPTX → Excel kiểm chứng")
     parser.add_argument("--diag", action="store_true", help="in chẩn đoán hệ thống rồi thoát")
     parser.add_argument("--no-ollama-check", action="store_true")
+    parser.add_argument("--ollama-test", action="store_true",
+                        help="gửi 1 yêu cầu JSON nhỏ tới Ollama (cùng mã nguồn với xử lý thật) và in thời gian")
     parser.add_argument("--cli", dest="inputs", nargs="+", metavar="PATH", help="chạy không giao diện: thư mục / file pptx")
     parser.add_argument("--template", help="form Excel .xlsx")
     parser.add_argument("--output", help="file Excel kết quả")
@@ -99,10 +101,21 @@ def main(argv=None) -> int:
         print(text)
         print(f"\n[Đã ghi UTF-8: {out.resolve()}]")
         return 0
+    if args.ollama_test:
+        from .config import AppConfig, normalize_ollama_url
+        from .diagnostics import format_diagnostics, ollama_smoke_rows
+        cfg = AppConfig.load()
+        server = normalize_ollama_url(args.server or cfg.ollama_server)
+        model = args.model if args.model is not None else cfg.model
+        if not model:
+            print("Chưa chọn model (dùng --model qwen3:4b).")
+            return 2
+        print(format_diagnostics(ollama_smoke_rows(server, model, timeout=int(cfg.request_timeout or 180))))
+        return 0
     if args.diag:
         from .config import AppConfig
         from .diagnostics import format_diagnostics, run_diagnostics
-        print(format_diagnostics(run_diagnostics(AppConfig.load(), check_ollama=not args.no_ollama_check)))
+        print(format_diagnostics(run_diagnostics(AppConfig.load(), check_ollama=not args.no_ollama_check, smoke=True)))
         return 0
     if args.inputs:
         if not args.template or not args.output:

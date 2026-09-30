@@ -31,7 +31,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         Handler.last_payload = json.loads(self.rfile.read(n))
-        self._send({"model": "qwen3:4b", "response": json.dumps({"qpn_slide": 2, "cause_slides": [3]}), "done": True})
+        if Handler.last_payload.get("prompt", "").startswith("Slides of a PowerPoint quality report (2 slides)"):
+            resp = {"qpn_slide": 1, "cause_slides": [2], "confidence": 0.9}      # smoke-test prompt
+        else:
+            resp = {"qpn_slide": 2, "cause_slides": [3]}
+        self._send({"model": "qwen3:4b", "response": json.dumps(resp), "done": True,
+                    "total_duration": 1_500_000_000, "load_duration": 200_000_000,
+                    "prompt_eval_count": 120, "prompt_eval_duration": 300_000_000,
+                    "eval_count": 25, "eval_duration": 900_000_000})
 
 
 @pytest.fixture(scope="module")
@@ -61,3 +68,41 @@ def test_generate_json_uses_temperature_zero_and_json_format(server):
 def test_connection_failure_is_clean_error():
     with pytest.raises(OllamaError):
         OllamaClient("127.0.0.1:1").list_models(timeout=1)
+
+
+def test_every_generate_request_disables_thinking(server, sample_tree):
+    """Captures the real HTTP body: think=false, stream=false, format=json for the production prompt."""
+    from app.classifier import classify
+    from app.pptx_parser import parse_pptx
+    client = OllamaClient(server)
+    report = parse_pptx(sample_tree["files"][0])
+    cls = classify(report, client, "qwen3:4b")
+    p = Handler.last_payload
+    assert p["think"] is False
+    assert p["stream"] is False and p["format"] == "json"
+    assert p["options"]["temperature"] == 0
+    assert p["options"]["num_predict"] <= 256 and p["options"]["num_ctx"] <= 4096
+    assert p["model"] == "qwen3:4b"
+    assert cls.source.startswith("qwen")
+    # the smoke test goes through the very same code path / payload builder
+    res = client.smoke_test("qwen3:4b")
+    assert res["ok"] and res["result"]["qpn_slide"] == 1
+    assert Handler.last_payload["think"] is False and Handler.last_payload["stream"] is False
+    assert Handler.last_payload["format"] == "json"
+
+
+def test_generate_records_timing_diagnostics(server):
+    client = OllamaClient(server)
+    client.generate_json("qwen3:4b", "hello", system="sys")
+    st = client.last_call
+    assert st["status"] == 200 and isinstance(st["seconds"], float)
+    assert st["response_chars"] > 0 and st["prompt_chars"] == len("hello") + len("sys")
+    assert st["load_s"] == 0.2 and st["prompt_eval_count"] == 120 and st["eval_count"] == 25
+    assert "thinking_chars" not in st                         # nothing hidden is stored or logged
+
+
+def test_timeout_records_duration_and_is_clean_error():
+    client = OllamaClient("127.0.0.1:1", timeout=1)
+    with pytest.raises(OllamaError) as ei:
+        client.generate_json("qwen3:4b", "x")
+    assert "Lỗi gọi Ollama" in str(ei.value) and client.last_call["seconds"] is not None

@@ -14,8 +14,28 @@ from .ollama_client import OllamaClient, OllamaError
 from .qpn_renderer import renderer_status
 
 
+def ollama_smoke_rows(server: str, model: str, timeout: int = 180) -> List[Tuple[str, str]]:
+    """Tiny JSON classification request using exactly the production client code."""
+    client = OllamaClient(server, timeout=timeout)
+    res = client.smoke_test(model)
+    st = res.get("stats") or {}
+    rows = [("Ollama smoke test", (f"OK – {res['seconds']}s" if res["ok"] else f"LỖI sau {res['seconds']}s – {res['error']}")
+             + f" (model {model}, think=false, stream=false, format=json)")]
+    if st:
+        rows.append(("Ollama timing", f"HTTP {st.get('status')}, request {st.get('seconds')}s, load {st.get('load_s', '?')}s, "
+                                      f"prompt_eval {st.get('prompt_eval_s', '?')}s/{st.get('prompt_eval_count', '?')} tok, "
+                                      f"eval {st.get('eval_s', '?')}s/{st.get('eval_count', '?')} tok, "
+                                      f"response {st.get('response_chars', '?')} chars"
+                                      + (f", thinking {st['thinking_chars']} chars (KHÔNG mong muốn)" if st.get("thinking_chars") else "")))
+    if res["ok"]:
+        got = res["result"]
+        rows.append(("Ollama JSON", f"{got} – mong đợi qpn_slide=1, cause_slides=[2]"))
+    return rows
+
+
 def run_diagnostics(cfg: AppConfig, template: Optional[str] = None,
-                    output_folder: Optional[str] = None, check_ollama: bool = True) -> List[Tuple[str, str]]:
+                    output_folder: Optional[str] = None, check_ollama: bool = True,
+                    smoke: bool = False) -> List[Tuple[str, str]]:
     rows: List[Tuple[str, str]] = []
     rows.append(("Report Extractor", f"v{__version__} ({'portable' if getattr(sys, 'frozen', False) else 'dev'})"))
     rows.append(("Python/runtime", f"OK – {platform.python_version()} / {platform.system()} {platform.release()}"))
@@ -36,6 +56,8 @@ def run_diagnostics(cfg: AppConfig, template: Optional[str] = None,
             chosen = cfg.model or info.get("preferred") or ""
             ok = chosen in info["models"]
             rows.append(("Model Qwen đã chọn", f"{chosen or '(chưa chọn)'}" + ("" if ok else " – KHÔNG có trên server")))
+            if smoke and chosen:
+                rows.extend(ollama_smoke_rows(cfg.ollama_server, chosen, timeout=int(cfg.request_timeout or 180)))
         except OllamaError as e:
             rows.append(("Ollama server", f"Chưa kết nối – {e}"))
             rows.append(("Model Qwen đã chọn", cfg.model or "(chưa chọn)"))

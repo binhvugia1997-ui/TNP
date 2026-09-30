@@ -14,10 +14,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
-from .pptx_parser import ReportData, SlideData, norm_key, slide_text_for_llm
+from .pptx_parser import ReportData, SlideData, norm_key
 
 LOG = logging.getLogger("report_extractor.classifier")
 
@@ -268,43 +269,58 @@ def heuristic_classify(report: ReportData) -> Classification:
 # LLM classifier
 # ----------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are a strict document-structure classifier for Vietnamese/English quality reports "
-    "(8D / countermeasure reports). You NEVER rewrite, translate or summarize content. "
-    "You only answer with JSON that points to slide numbers."
+    "You classify slides of a Vietnamese/English quality countermeasure report. "
+    "Answer with one compact JSON object of slide numbers only. Never rewrite, translate or "
+    "summarize content. No explanations, no reasoning text."
 )
 
-PROMPT_TEMPLATE = """Below is the text of every slide of a PowerPoint quality report (file name: {filename}).
-Slides are numbered starting at 1. Pictures are indicated as [N picture(s)].
-
-Identify WHERE information is located. Return ONLY a JSON object with exactly these keys:
-{{
-  "management_number": string,   // e.g. "260918080-VOC" if present in text/file name, else ""
-  "model": string,               // product model code e.g. "A185" or "SM-A185", else ""
-  "item": string,                // part/item name exactly as written e.g. "Rear", "Main", "Sub", "PBA", else ""
-  "qpn_slide": int|null,         // slide containing the "Quality Problem Notice" (QPN) table
-  "defect_slide": int|null,      // slide describing the defect content / quantities
-  "cause_slides": [int],         // slides with root cause analysis (NGUYÊN NHÂN)
-  "temporary_slides": [int],     // slides with temporary handling (XỬ LÝ TẠM THỜI / containment)
-  "improvement_slides": [int],   // slides with corrective/improvement actions (CẢI TIẾN, ĐỐI SÁCH, ĐỐI SÁCH LÂU DÀI)
-  "improvement_image_slides": [int], // improvement slides that contain before/after evidence pictures
-  "verify_slides": [int],        // slides with verification / effect confirmation results
-  "confidence": number           // 0..1, how sure you are about the slide classification
-}}
-Rules: use slide numbers only; do not include temporary-handling slides in improvement_slides
-unless the same slide also contains permanent improvement content; copy model/item/management
-number exactly as written; use "" or null or [] when unsure. No explanations.
-
-=== SLIDES ===
+# Compact prompt: the LLM only says WHERE things are (slide numbers).  Text values
+# (management number, model, item, defect, cause, improvement) are always copied from the
+# PPTX by the program, so they are not requested here.
+PROMPT_TEMPLATE = """Slides of a PowerPoint quality report ({n} slides). Each line: S<number> | title | pics=<pictures> | text.
+Return ONLY this JSON (slide numbers as ints; null/[] when unsure):
+{{"qpn_slide":int|null,"defect_slide":int|null,"cause_slides":[int],"temporary_slides":[int],"improvement_slides":[int],"improvement_image_slides":[int],"verify_slides":[int],"confidence":0..1}}
+qpn_slide = "Quality Problem Notice" table; defect_slide = defect content/quantities (HIỆN TRẠNG);
+cause_slides = root cause (NGUYÊN NHÂN); temporary_slides = XỬ LÝ TẠM THỜI/containment (never in improvement_slides);
+improvement_slides = CẢI TIẾN/ĐỐI SÁCH/ĐỐI SÁCH LÂU DÀI; improvement_image_slides = improvement slides with before/after pictures;
+verify_slides = verification/effect results.
 {slides}
-=== END ===
 """
 
+MAX_PROMPT_CHARS_PER_SLIDE = 420
+MAX_TITLE_CHARS = 90
 
-def build_prompt(report: ReportData, max_chars_per_slide: int = 1800) -> str:
-    parts = []
-    for s in report.slides:
-        parts.append(f"--- Slide {s.number} ---\n{slide_text_for_llm(s, max_chars_per_slide)}")
-    return PROMPT_TEMPLATE.format(filename=report.filename, slides="\n".join(parts))
+
+def compact_slide_line(slide: SlideData, max_chars: int = MAX_PROMPT_CHARS_PER_SLIDE) -> str:
+    """One compact line per slide: number, title, picture count, de-duplicated text.
+
+    Repeated shape text, table pipes and blank lines are collapsed; only text is sent –
+    never XML, image data or shape inventories.
+    """
+    lines: List[str] = []
+    seen = set()
+    for blk in slide.text_blocks:
+        for ln in blk.text.split("\n"):
+            t = re.sub(r"\s*\|\s*", " ", ln).strip()
+            t = re.sub(r"\s+", " ", t)
+            if len(t) < 2:
+                continue
+            k = norm_key(t)
+            if k in seen:
+                continue
+            seen.add(k)
+            lines.append(t)
+    title = lines[0][:MAX_TITLE_CHARS] if lines else ""
+    body = " / ".join(lines[1:])
+    budget = max_chars - len(title)
+    if len(body) > budget:
+        body = body[:max(0, budget)].rstrip() + "…"
+    return f"S{slide.number} | {title} | pics={len(slide.pictures)} | {body}"
+
+
+def build_prompt(report: ReportData, max_chars_per_slide: int = MAX_PROMPT_CHARS_PER_SLIDE) -> str:
+    slides = "\n".join(compact_slide_line(s, max_chars_per_slide) for s in report.slides)
+    return PROMPT_TEMPLATE.format(n=len(report.slides), slides=slides)
 
 
 def _ints_from_any(v: Any) -> List[int]:
@@ -511,11 +527,20 @@ def classify(report: ReportData, ollama_client=None, model: str = "") -> Classif
         heur.notes.append("Ollama not used (no server/model configured)")
         return heur
     prompt = build_prompt(report)
+    LOG.info("Ollama request: %s slides, prompt %d chars (+system %d), model %s",
+             len(report.slides), len(prompt), len(SYSTEM_PROMPT), model)
+    t0 = time.perf_counter()
     try:
-        llm = ollama_client.generate_json(model, prompt, system=SYSTEM_PROMPT)
+        llm = ollama_client.generate_json(model, prompt, system=SYSTEM_PROMPT, num_ctx=4096, num_predict=256)
         LOG.debug("LLM classification for %s: %s", report.filename, json.dumps(llm, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
-        LOG.warning("Ollama classification failed for %s, using heuristics: %s", report.filename, e)
-        heur.notes.append(f"Ollama failed, heuristic fallback: {e}")
+        LOG.warning("Ollama classification failed for %s after %.1fs, using heuristics: %s",
+                    report.filename, time.perf_counter() - t0, e)
+        heur.notes.append(f"Ollama failed after {time.perf_counter() - t0:.1f}s, heuristic fallback: {e}")
         return heur
-    return merge_llm_with_heuristic(llm, heur, report)
+    c = merge_llm_with_heuristic(llm, heur, report)
+    stats = getattr(ollama_client, "last_call", None) or {}
+    c.notes.append(f"Ollama ok in {time.perf_counter() - t0:.1f}s (prompt {len(prompt)} chars, "
+                   f"response {stats.get('response_chars', '?')} chars, HTTP {stats.get('status', '?')})")
+    LOG.info("Classifier for %s: %s", report.filename, c.source)
+    return c

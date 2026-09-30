@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -51,6 +52,7 @@ class OllamaClient:
     def __init__(self, server: str, timeout: int = 180):
         self.base = normalize_ollama_url(server)
         self.timeout = timeout
+        self.last_call: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     def list_models(self, timeout: Optional[float] = None) -> List[str]:
@@ -70,12 +72,9 @@ class OllamaClient:
                 "preferred": preferred_model(models)}
 
     # ------------------------------------------------------------------
-    def generate_json(self, model: str, prompt: str, system: str = "",
-                      num_ctx: int = 8192, num_predict: int = 1024) -> Dict[str, Any]:
-        """Call ``/api/generate`` with ``format=json`` and temperature 0.
-
-        Returns the parsed JSON object produced by the model.
-        """
+    def build_generate_payload(self, model: str, prompt: str, system: str = "",
+                               num_ctx: int = 4096, num_predict: int = 256) -> Dict[str, Any]:
+        """Exact body sent to ``POST /api/generate`` (exposed so tests can assert on it)."""
         payload = {
             "model": model,
             "prompt": prompt,
@@ -94,17 +93,72 @@ class OllamaClient:
         }
         if system:
             payload["system"] = system
+        return payload
+
+    def generate_json(self, model: str, prompt: str, system: str = "",
+                      num_ctx: int = 4096, num_predict: int = 256) -> Dict[str, Any]:
+        """Call ``/api/generate`` with ``format=json``, ``stream=false``, ``think=false``, temperature 0.
+
+        Returns the parsed JSON object produced by the model.  Timing/size statistics of
+        the last call are kept in ``self.last_call`` (no model text is stored there).
+        """
+        payload = self.build_generate_payload(model, prompt, system, num_ctx, num_predict)
         url = f"{self.base}/api/generate"
+        self.last_call = {"model": model, "prompt_chars": len(prompt) + len(system), "status": None,
+                          "seconds": None, "response_chars": None}
+        LOG.info("Ollama POST %s model=%s prompt=%d chars think=false stream=false format=json timeout=%ss",
+                 url, model, len(prompt) + len(system), self.timeout)
+        t0 = time.perf_counter()
         try:
             r = requests.post(url, json=payload, timeout=self.timeout)
+            self.last_call["status"] = r.status_code
+            self.last_call["seconds"] = round(time.perf_counter() - t0, 2)
             r.raise_for_status()
             data = r.json()
         except requests.RequestException as e:
-            raise OllamaError(f"Lỗi gọi Ollama ({url}): {e}") from e
+            self.last_call["seconds"] = round(time.perf_counter() - t0, 2)
+            LOG.warning("Ollama request failed after %.1fs (HTTP %s): %s", self.last_call["seconds"],
+                        self.last_call["status"], e)
+            raise OllamaError(f"Lỗi gọi Ollama ({url}) sau {self.last_call['seconds']}s: {e}") from e
         text = data.get("response", "") if isinstance(data, dict) else ""
+        self.last_call["response_chars"] = len(text)
+        if isinstance(data, dict):
+            # server-side timings reported by Ollama (nanoseconds)
+            for k in ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration"):
+                if isinstance(data.get(k), (int, float)):
+                    self.last_call[k.replace("_duration", "_s")] = round(data[k] / 1e9, 2)
+            for k in ("prompt_eval_count", "eval_count"):
+                if isinstance(data.get(k), int):
+                    self.last_call[k] = data[k]
+            if data.get("thinking"):
+                self.last_call["thinking_chars"] = len(str(data["thinking"]))   # length only, never logged
+        LOG.info("Ollama response: HTTP %s in %.1fs, %d chars, load %ss, prompt_eval %s tok, eval %s tok",
+                 self.last_call["status"], self.last_call["seconds"], len(text),
+                 self.last_call.get("load_s", "?"), self.last_call.get("prompt_eval_count", "?"),
+                 self.last_call.get("eval_count", "?"))
         # some servers ignore "think": strip a <think>...</think> preamble if present
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
         return parse_json_response(text)
+
+    def smoke_test(self, model: str) -> Dict[str, Any]:
+        """Tiny classification request through the SAME code path as production."""
+        prompt = ('Slides of a PowerPoint quality report (2 slides). Each line: S<number> | title | pics | text.\n'
+                  'Return ONLY this JSON: {"qpn_slide":int|null,"cause_slides":[int],"confidence":0..1}\n'
+                  'S1 | Quality Problem Notice | pics=1 | Model A185 Xước 15ea\n'
+                  'S2 | 2. NGUYÊN NHÂN | pics=0 | Khay chứa không có lớp lót')
+        t0 = time.perf_counter()
+        try:
+            obj = self.generate_json(model, prompt, system=SYSTEM_SMOKE, num_ctx=1024, num_predict=64)
+            ok = True
+            err = ""
+        except OllamaError as e:
+            obj, ok, err = {}, False, str(e)
+        return {"ok": ok, "error": err, "seconds": round(time.perf_counter() - t0, 2),
+                "result": obj, "stats": dict(getattr(self, "last_call", {}) or {}),
+                "expected": {"qpn_slide": 1, "cause_slides": [2]}}
+
+
+SYSTEM_SMOKE = "You classify slides. Answer with one compact JSON object of slide numbers only. No reasoning text."
 
 
 def parse_json_response(text: str) -> Dict[str, Any]:

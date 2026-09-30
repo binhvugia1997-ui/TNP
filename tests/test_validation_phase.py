@@ -153,8 +153,47 @@ def test_batch_result_has_diagnostics_and_review_report(sample_tree, tmp_path):
 
 def test_classifier_name_is_qwen_when_llm_used(a185_report):
     class Fake:
-        def generate_json(self, model, prompt, system=""):
+        def generate_json(self, model, prompt, system="", **kw):
             return {"qpn_slide": 2, "cause_slides": [3], "improvement_slides": [5, 6, 7],
                     "improvement_image_slides": [5, 6], "temporary_slides": [4], "confidence": 0.9}
     c = classify(parse_pptx(a185_report), Fake(), "qwen3:4b")
     assert c.source == "qwen" and c.confidence == 0.9 and c.ambiguities == []
+
+
+# ---------------------------------------------------------------- compact classifier prompt
+def test_prompt_is_compact_and_contains_only_slide_text(sample_tree):
+    from app.classifier import SYSTEM_PROMPT, build_prompt, compact_slide_line
+    from app.pptx_parser import parse_pptx
+    report = parse_pptx(sample_tree["files"][0])
+    prompt = build_prompt(report)
+    import re as _re
+    lines = [ln for ln in prompt.splitlines() if _re.match(r"^S\d+ \| ", ln)]
+    assert len(lines) == len(report.slides)
+    # one line per slide, hard cap per slide; no XML / image / shape data
+    for s in report.slides:
+        assert len(compact_slide_line(s)) <= 420 + len("S99 |  | pics=99 | ") + 90
+    slide_part = "\n".join(lines)
+    assert "<" not in slide_part and "xml" not in slide_part.lower() and "image/" not in slide_part
+    assert "shape" not in slide_part.lower() and "picture(s)" not in slide_part
+    assert "management_number" not in prompt and '"model"' not in prompt   # text values are not asked from the LLM
+    assert "think" not in SYSTEM_PROMPT.lower()
+    assert len(prompt) < 3000 and len(SYSTEM_PROMPT) < 300
+    # duplicated shape text is collapsed
+    from app.pptx_parser import Block, SlideData
+    sd = SlideData(number=1, blocks=[Block(kind="paragraph", text="Tiêu đề\nDòng A"), Block(kind="paragraph", text="Dòng A\nDòng A")])
+    assert compact_slide_line(sd) == "S1 | Tiêu đề | pics=0 | Dòng A"
+
+
+def test_ollama_failure_never_stops_batch_and_is_logged_with_timing(sample_tree, tmp_path, monkeypatch):
+    from app.batch_processor import BatchOptions, BatchProcessor
+    out = tmp_path / "o" / "r.xlsx"
+    # unreachable server, 1s timeout -> heuristic fallback, batch completes
+    opts = BatchOptions(files=[sample_tree["files"][0]], template=sample_tree["template"], output_file=out,
+                        ollama_server="127.0.0.1:1", model="qwen3:4b", use_ollama=True, request_timeout=1,
+                        row_mode="append")
+    proc = BatchProcessor(opts, on_file=lambda *a: None)
+    s = proc.run()
+    assert s.failed == 0 and s.completed + s.needs_review == 1
+    fr = proc.results[0]
+    assert fr.classifier == "heuristic"
+    assert any("heuristic fallback" in n and "s," in n for n in fr.classifier_notes)
