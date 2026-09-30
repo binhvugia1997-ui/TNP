@@ -267,3 +267,135 @@ def test_bare_key_matches_excel_row_without_stripping_suffix(sample_tree, templa
     assert ws.cell(row=4, column=2).value == 260601017                     # key cell untouched
     assert ws.cell(row=4, column=4).value.date() == dt.date(2026, 6, 1)
     assert ws.cell(row=6, column=5).value is None
+
+
+# ---------------------------------------------------------------- destination sheet found by structure
+import pytest  # noqa: E402
+from openpyxl import Workbook  # noqa: E402
+
+from app.excel_writer import TemplateError, validate_template  # noqa: E402
+
+DEST_HEADERS = ["STT", "Management number", "Tên vendor", "Ngày phát sinh", "Model", "Item",
+                "Nội dung lỗi", "QPN", "Nguyên nhân", "Nội dung đối sách cải tiến", "Hình ảnh cải tiến"]
+
+
+def _dest_sheet(wb, title, mgmt="260918080-VOC", weeks=True):
+    ws = wb.create_sheet(title)
+    ws["A1"] = "BẢNG KIỂM CHỨNG"
+    for i, h in enumerate(DEST_HEADERS, start=1):
+        ws.cell(row=2, column=i, value=h)
+        ws.merge_cells(start_row=2, start_column=i, end_row=3, end_column=i)
+    if weeks:
+        ws.merge_cells(start_row=2, start_column=12, end_row=2, end_column=19)
+        ws.cell(row=2, column=12, value="Theo dõi cải tiến")
+        for k in range(1, 9):
+            ws.cell(row=3, column=11 + k, value=f"WEEK +{k}")
+    ws.cell(row=4, column=1, value=1)
+    ws.cell(row=4, column=2, value=mgmt)
+    for k in range(12, 20):
+        ws.cell(row=4, column=k, value="OK")
+    return ws
+
+
+def _data_sheet(wb):
+    ds = wb.create_sheet("Data")
+    ds.append(["Management number", "Defect details", "Vendor", "Model", "Item", "Date"])
+    ds.append(["260918080-VOC", "DATA SHEET DEFECT TEXT", "DataVendor", "A185", "Rear", "01/01/2020"])
+    return ds
+
+
+def _workbook(path, dest_titles, with_data=True, first_title=None):
+    wb = Workbook()
+    wb.active.title = first_title or "Trang tính1"          # an unrelated first sheet
+    wb.active["A1"] = "ghi chú"
+    if with_data:
+        _data_sheet(wb)
+    for t in dest_titles:
+        _dest_sheet(wb, t)
+    m = wb.create_sheet("Phân loại")
+    m.append(["Model", "Item", "Từ khóa"])
+    m.append(["A185", "Rear", "rear; nắp lưng"])
+    wb.save(path)
+    return path
+
+
+@pytest.mark.parametrize("title", ["Sheet1", "Form", "Mau", "Bảng theo dõi đối sách lỗi"])
+def test_destination_sheet_found_by_structure_regardless_of_name(sample_tree, tmp_path, title):
+    tpl = _workbook(tmp_path / "t.xlsx", [title])
+    assert "Kiểm chứng" not in load_workbook(tpl).sheetnames
+    ok, msg = validate_template(tpl)
+    assert ok and title in msg
+    w = ExcelWriter(tpl, tmp_path / "probe.xlsx")
+    assert w.ws.title == title
+    assert {"management_number", "qpn", "root_cause", "improvement", "week_1", "week_8"} <= set(w.columns)
+    out = tmp_path / "out" / "k.xlsx"
+    summary, _, proc = _run([sample_tree["files"][0]], tpl, out)
+    assert summary.completed == 1 and proc.results[0].excel_row == 4
+    ws = load_workbook(out)[title]
+    assert ws.cell(row=4, column=2).value == "260918080-VOC"
+    assert ws.cell(row=4, column=5).value == "A185" and ws.cell(row=4, column=6).value == "Rear"
+    assert ws.cell(row=4, column=3).value == "Daoltech"
+    assert ws.cell(row=4, column=4).value.date() == dt.date(2026, 9, 18)
+    assert "ĐỐI SÁCH LÂU DÀI" in ws.cell(row=4, column=10).value
+    assert all(ws.cell(row=4, column=k).value == "OK" for k in range(12, 20))
+    assert ws.cell(row=5, column=2).value is None                     # no appended row
+
+
+def test_data_sheet_never_chosen_even_when_it_is_the_only_match(sample_tree, tmp_path):
+    # Data + one valid destination -> destination wins, Data untouched, Data values never copied
+    tpl = _workbook(tmp_path / "t.xlsx", ["Form"])
+    out = tmp_path / "out" / "k.xlsx"
+    summary, _, _ = _run([sample_tree["files"][0]], tpl, out)
+    assert summary.completed == 1
+    wb = load_workbook(out)
+    assert wb["Data"]["B2"].value == "DATA SHEET DEFECT TEXT" and wb["Data"]["C2"].value == "DataVendor"
+    ws = wb["Form"]
+    for c in range(1, 20):
+        v = ws.cell(row=4, column=c).value
+        assert v is None or ("DATA SHEET" not in str(v) and "DataVendor" not in str(v))
+    # a 'Data' sheet that even carries the full destination header set is still excluded
+    wb2 = Workbook()
+    wb2.active.title = "Trang tính1"
+    _dest_sheet(wb2, "Data")
+    p2 = tmp_path / "only_data.xlsx"
+    wb2.save(p2)
+    with pytest.raises(TemplateError) as ei:
+        ExcelWriter(p2, tmp_path / "o2.xlsx")
+    assert "Không tìm thấy sheet chứa bảng kiểm chứng" in str(ei.value)
+    assert not validate_template(p2)[0]
+
+
+def test_multiple_destination_sheets_are_not_guessed(sample_tree, tmp_path):
+    tpl = _workbook(tmp_path / "t.xlsx", ["Kiểm chứng", "Form"])
+    with pytest.raises(TemplateError) as ei:
+        ExcelWriter(tpl, tmp_path / "o.xlsx")
+    msg = str(ei.value)
+    assert msg.startswith("Cần kiểm tra") and "'Kiểm chứng'" in msg and "'Form'" in msg
+    ok, vmsg = validate_template(tpl)
+    assert not ok and "Cần kiểm tra" in vmsg and "'Form'" in vmsg
+    # batch: nothing written, every file reported with the reason
+    out = tmp_path / "out" / "k.xlsx"
+    summary, events, _ = _run([sample_tree["files"][0]], tpl, out)
+    assert summary.failed == 1 and summary.completed == 0
+    assert "Cần kiểm tra" in summary.errors[0]["error"]
+    assert all(s == "error" for i, s, d in events)
+
+
+def test_no_destination_sheet_gives_clear_diagnostic(tmp_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Kiểm chứng"                                  # right name, wrong structure
+    for i, h in enumerate(["STT", "Model", "Item", "Nội dung lỗi"], start=1):
+        ws.cell(row=1, column=i, value=h)
+    _data_sheet(wb)
+    p = tmp_path / "bad.xlsx"
+    wb.save(p)
+    with pytest.raises(TemplateError) as ei:
+        ExcelWriter(p, tmp_path / "o.xlsx")
+    msg = str(ei.value)
+    assert "Không tìm thấy sheet chứa bảng kiểm chứng" in msg
+    assert "'Kiểm chứng': thiếu cột" in msg
+    for label in ("Management number", "QPN", "Nguyên nhân", "Nội dung đối sách cải tiến"):
+        assert label in msg
+    ok, vmsg = validate_template(p)
+    assert not ok and "QPN" in vmsg

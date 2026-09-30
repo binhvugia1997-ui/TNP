@@ -2,9 +2,10 @@
 
 * Never overwrites the template: output workbook = copy of template (or the
   existing output workbook is re-opened so batches can be resumed / appended).
-* Sheet ``Kiểm chứng`` is located by (accent-insensitive) name; header cells
-  are matched by field aliases so the exact column layout of the template does
-  not matter.
+* The destination sheet is located by its STRUCTURE (header aliases of the
+  verification table), never by its name; header cells are matched by field
+  aliases so the exact column layout of the template does not matter.  A sheet
+  named "Data" (source data) and the "Phân loại" mapping sheet are never chosen.
 * Formatting of the previous data row (borders, fonts, alignment, single-row
   merges) is copied to every new row.
 * Images are embedded (not linked) and scaled to fit the target column.
@@ -32,8 +33,18 @@ from .pptx_parser import norm_key
 
 LOG = logging.getLogger("report_extractor.excel")
 
-TARGET_SHEET_KEY = "kiem chung"
 MAPPING_SHEET_KEYS = ("phan loai", "classification", "mapping", "danh muc")
+# a sheet qualifies as the destination table only when ALL of these columns are present
+REQUIRED_FIELDS = ("management_number", "qpn", "root_cause", "improvement")
+# the full expected set – used for the diagnostic message and for ranking
+EXPECTED_FIELDS = ("management_number", "vendor", "occurrence_date", "model", "item", "defect_content",
+                   "qpn", "root_cause", "improvement", "improvement_image")
+FIELD_LABELS = {"management_number": "Management number", "vendor": "Tên vendor", "occurrence_date": "Ngày phát sinh",
+                "model": "Model", "item": "Item", "defect_content": "Nội dung lỗi", "qpn": "QPN",
+                "root_cause": "Nguyên nhân", "improvement": "Nội dung đối sách cải tiến",
+                "improvement_image": "Hình ảnh cải tiến"}
+# sheets that are never a destination: source data / mapping
+EXCLUDED_SHEET_KEYS = ("data",)
 
 # field -> list of accent-insensitive aliases (norm_key form)
 FIELD_ALIASES: Dict[str, List[str]] = {
@@ -112,11 +123,10 @@ class ExcelWriter:
         if not self.output.exists():
             shutil.copyfile(self.template, self.output)
         self.wb = load_workbook(self.output)
-        self.ws = self._find_target_sheet()
         self.columns: Dict[str, int] = {}
         self.header_row = 0
         self.data_start = 0
-        self._detect_headers()
+        self.ws = self._find_target_sheet()          # also sets columns / header_row / data_start
         self.item_mapping, self.known_models = self._read_mapping_sheet()
         self._dirty = False
 
@@ -124,16 +134,45 @@ class ExcelWriter:
     # Template analysis
     # ------------------------------------------------------------------
     def _find_target_sheet(self):
+        """Pick the destination sheet by table structure, regardless of its name.
+
+        * exactly one sheet with all REQUIRED_FIELDS -> use it;
+        * several -> TemplateError('Cần kiểm tra: ...' + candidate names), no guessing;
+        * none -> TemplateError listing, per sheet, which required headers are missing.
+        'Data' (source data) and 'Phân loại' (mapping) sheets are never candidates.
+        """
+        candidates, report = [], []
         for ws in self.wb.worksheets:
-            if norm_key(ws.title) == TARGET_SHEET_KEY:
-                return ws
-        for ws in self.wb.worksheets:
-            if TARGET_SHEET_KEY in norm_key(ws.title):
-                return ws
-        raise TemplateError("Không tìm thấy sheet 'Kiểm chứng' trong form Excel")
+            key = norm_key(ws.title)
+            if key in EXCLUDED_SHEET_KEYS or any(k in key for k in MAPPING_SHEET_KEYS):
+                report.append(f"'{ws.title}': bỏ qua (sheet dữ liệu nguồn / phân loại)")
+                continue
+            try:
+                header, cols, data_start = self._analyse_sheet(ws)
+            except TemplateError:
+                report.append(f"'{ws.title}': không có dòng tiêu đề")
+                continue
+            missing = [f for f in REQUIRED_FIELDS if f not in cols]
+            if missing:
+                report.append(f"'{ws.title}': thiếu cột " + ", ".join(FIELD_LABELS[f] for f in missing))
+                continue
+            candidates.append((ws, header, cols, data_start))
+        if len(candidates) == 1:
+            ws, self.header_row, self.columns, self.data_start = candidates[0]
+            LOG.info("Destination sheet: '%s' (header row %s, columns %s)", ws.title, self.header_row, sorted(self.columns))
+            return ws
+        if len(candidates) > 1:
+            names = ", ".join(f"'{c[0].title}'" for c in candidates)
+            raise TemplateError("Cần kiểm tra: nhiều sheet có cấu trúc bảng kiểm chứng, không thể tự chọn: " + names)
+        raise TemplateError("Không tìm thấy sheet chứa bảng kiểm chứng (cần các cột: "
+                            + ", ".join(FIELD_LABELS[f] for f in REQUIRED_FIELDS) + "). "
+                            + "; ".join(report))
 
     def _detect_headers(self) -> None:
-        ws = self.ws
+        self.header_row, self.columns, self.data_start = self._analyse_sheet(self.ws)
+
+    def _analyse_sheet(self, ws) -> Tuple[int, Dict[str, int], int]:
+        """Locate the header band of ``ws``; returns (header_row, field->column, first data row)."""
         max_scan = min(ws.max_row, 30)
         row_matches: Dict[int, Dict[str, Tuple[int, int]]] = {}
         for r in range(1, max_scan + 1):
@@ -161,7 +200,7 @@ class ExcelWriter:
             if matches:
                 row_matches[r] = matches
         if not row_matches:
-            raise TemplateError("Không nhận diện được dòng tiêu đề trong sheet 'Kiểm chứng'")
+            raise TemplateError(f"Không nhận diện được dòng tiêu đề trong sheet '{ws.title}'")
         # header row = row with most strong matches
         def strength(r: int) -> Tuple[int, int]:
             m = row_matches[r]
@@ -191,32 +230,29 @@ class ExcelWriter:
                 field = f"week_{idx}"
                 if field in cols:
                     continue
-                parent = self._parent_header_key(r, c, header)
+                parent = self._parent_header_key(ws, r, c, header)
                 if parent and any(x in parent for x in WEEK_PARENT_KEYS):
                     cols[field] = c
         last_header = header
         for r in range(header + 1, header + 4):
             if r in row_matches and any(f.startswith("week_") or f in ("model", "item") for f in row_matches[r]):
                 last_header = r
-            elif any(cols.get(f"week_{i}") and self._cell_row_of_week(r, cols[f"week_{i}"]) for i in range(1, 9)):
+            elif any(cols.get(f"week_{i}") and self._cell_row_of_week(ws, r, cols[f"week_{i}"]) for i in range(1, 9)):
                 last_header = r
-        self.columns = cols
-        self.data_start = last_header + 1
-        missing = [f for f in ("improvement", "root_cause") if f not in cols]
-        if missing:
-            LOG.warning("Template columns not found: %s (columns found: %s)", missing, cols)
+        return header, cols, last_header + 1
 
-    def _cell_row_of_week(self, row: int, col: int) -> bool:
-        v = self.ws.cell(row=row, column=col).value
+    @staticmethod
+    def _cell_row_of_week(ws, row: int, col: int) -> bool:
+        v = ws.cell(row=row, column=col).value
         return v not in (None, "") and week_index(norm_key(str(v))) is not None
 
-    def _parent_header_key(self, row: int, col: int, header_row: int) -> str:
+    def _parent_header_key(self, ws, row: int, col: int, header_row: int) -> str:
         """Text of the merged/plain header cell(s) directly above (row-1, row-2) covering ``col``."""
         texts = []
         for r in (row - 1, row - 2, header_row):
             if r < 1 or r == row:
                 continue
-            cell, rng = self._anchor(r, col)
+            cell, rng = self._anchor_in(ws, r, col)
             if cell.value not in (None, ""):
                 texts.append(norm_key(str(cell.value)))
         return " ".join(texts)
@@ -276,10 +312,14 @@ class ExcelWriter:
     # ------------------------------------------------------------------
     def _anchor(self, row: int, col: int):
         """Top-left cell of the merged range containing (row, col), or the cell itself."""
-        for rng in self.ws.merged_cells.ranges:
+        return self._anchor_in(self.ws, row, col)
+
+    @staticmethod
+    def _anchor_in(ws, row: int, col: int):
+        for rng in ws.merged_cells.ranges:
             if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
-                return self.ws.cell(row=rng.min_row, column=rng.min_col), rng
-        return self.ws.cell(row=row, column=col), None
+                return ws.cell(row=rng.min_row, column=rng.min_col), rng
+        return ws.cell(row=row, column=col), None
 
     def _row_used(self, row: int) -> bool:
         check = [f for f in self.columns if f not in ("stt", "vendor", "occurrence_date", "status", "note", "temporary")
@@ -582,31 +622,34 @@ class ExcelWriter:
 
 
 def validate_template(template: Path) -> Tuple[bool, str]:
-    """Quick diagnostic: can we find the sheet and the key columns?"""
+    """Quick diagnostic: can we find the destination sheet (by structure) and its key columns?"""
     try:
         wb = load_workbook(template, read_only=False)
     except Exception as e:  # noqa: BLE001
         return False, f"Không mở được file: {e}"
     try:
-        ws = None
-        for w in wb.worksheets:
-            if TARGET_SHEET_KEY in norm_key(w.title):
-                ws = w
-                break
-        if ws is None:
-            return False, "Thiếu sheet 'Kiểm chứng'"
-        found = set()
-        for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 30)):
-            for c in row:
-                if isinstance(c.value, str):
-                    k = norm_key(c.value)
-                    for f in FIELD_ALIASES:
-                        if _alias_score(k, f):
-                            found.add(f)
-        need = {"improvement", "root_cause", "qpn"}
-        missing = need - found
-        if missing:
-            return False, "Thiếu cột: " + ", ".join(sorted(missing))
-        return True, f"OK ({len(found)} cột nhận diện)"
+        candidates, notes = [], []
+        for ws in wb.worksheets:
+            key = norm_key(ws.title)
+            if key in EXCLUDED_SHEET_KEYS or any(k in key for k in MAPPING_SHEET_KEYS):
+                continue
+            found = set()
+            for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 30)):
+                for c in row:
+                    if isinstance(c.value, str) and len(c.value.strip()) <= 60:
+                        k = norm_key(c.value)
+                        for f in FIELD_ALIASES:
+                            if _alias_score(k, f):
+                                found.add(f)
+            missing = [f for f in REQUIRED_FIELDS if f not in found]
+            if missing:
+                notes.append(f"'{ws.title}': thiếu " + ", ".join(FIELD_LABELS[f] for f in missing))
+            else:
+                candidates.append((ws.title, len(found)))
+        if len(candidates) == 1:
+            return True, f"OK – sheet '{candidates[0][0]}' ({candidates[0][1]} cột nhận diện)"
+        if candidates:
+            return False, "Cần kiểm tra: nhiều sheet có cấu trúc bảng kiểm chứng: " + ", ".join(f"'{n}'" for n, _ in candidates)
+        return False, "Không tìm thấy sheet chứa bảng kiểm chứng. " + "; ".join(notes)
     finally:
         wb.close()

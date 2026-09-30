@@ -75,13 +75,13 @@ def test_plain_number_subheaders_not_taken_as_weeks_without_parent(tmp_path):
     wb = Workbook()
     ws = wb.active
     ws.title = "Kiểm chứng"
-    for i, h in enumerate(["STT", "Model", "QPN", "Nguyên nhân", "Nội dung đối sách cải tiến"], start=1):
+    for i, h in enumerate(["STT", "Management number", "Model", "QPN", "Nguyên nhân", "Nội dung đối sách cải tiến"], start=1):
         ws.cell(row=1, column=i, value=h)
         ws.merge_cells(start_row=1, start_column=i, end_row=2, end_column=i)
-    ws.merge_cells("F1:H1")
-    ws["F1"] = "Số lượng lỗi"
+    ws.merge_cells("G1:I1")
+    ws["G1"] = "Số lượng lỗi"
     for k in range(1, 4):
-        ws.cell(row=2, column=5 + k, value=str(k))
+        ws.cell(row=2, column=6 + k, value=str(k))
     p = tmp_path / "t.xlsx"
     wb.save(p)
     w = ExcelWriter(p, tmp_path / "o.xlsx")
