@@ -37,10 +37,12 @@ IMPROVE_MARKERS = ["cai tien", "doi sach", "doi sach cai tien", "corrective acti
                    "countermeasure", "permanent action", "improvement", "khac phuc",
                    "doi sach lau dai", "cai tien trong san xuat", "cai tien trong kiem tra",
                    "bien phap khac phuc", "hanh dong khac phuc", "long term action"]
-DEFECT_MARKERS = ["noi dung loi", "hien tuong", "mo ta loi", "defect", "phenomenon",
-                  "problem description", "noi dung phat sinh", "tinh trang loi"]
-VERIFY_MARKERS = ["kiem chung", "xac nhan hieu qua", "verification", "effect confirmation",
-                  "theo doi", "ket qua kiem chung", "hieu qua doi sach", "week +", "w+1"]
+DEFECT_MARKERS = ["noi dung loi", "hien tuong", "hien trang", "thuc trang", "tinh trang", "mo ta loi", "defect",
+                  "phenomenon", "problem description", "problem", "current status", "noi dung phat sinh",
+                  "tinh trang loi", "mo ta van de", "noi dung van de"]
+VERIFY_MARKERS = ["kiem chung", "xac nhan hieu qua", "verification", "effect confirmation", "effectiveness",
+                  "theo doi", "ket qua kiem chung", "hieu qua doi sach", "hieu qua sau", "hieu qua cai tien",
+                  "ket qua sau cai tien", "ket qua theo doi", "week +", "w+1"]
 STANDARD_MARKERS = ["tieu chuan hoa", "standardization", "ngan ngua tai phat",
                     "horizontal deployment", "trien khai ngang"]
 
@@ -159,6 +161,55 @@ def find_qpn_slide(report: ReportData) -> Optional[int]:
     return None
 
 
+def first_heading_kind(slide: SlideData) -> Optional[str]:
+    """Kind of the first heading-like line in reading order (the slide's own section)."""
+    for b in slide.text_blocks:
+        for i, ln in enumerate(b.text.split("\n")):
+            if not ln.strip():
+                continue
+            k = section_kind_of_heading(ln)
+            if k and is_heading_like(ln, b.bold if i == 0 else False, b.size_pt if i == 0 else None):
+                return k
+    return None
+
+
+def is_cover_slide(report: ReportData, slide: SlideData) -> bool:
+    """Slide 1 is a cover when it has no section heading of its own and a later slide
+    starts the report body (defect / QPN / cause / temporary heading)."""
+    if slide.number != 1:
+        return False
+    if first_heading_kind(slide) in ("defect", "cause", "temporary", "qpn"):
+        return False
+    return any(first_heading_kind(s) in ("defect", "cause", "temporary", "qpn") or
+               any(m in norm_key(s.text) for m in QPN_MARKERS) for s in report.slides[1:])
+
+
+def select_improvement_image_slides(report: ReportData, improvement_slides: List[int],
+                                    qpn_slide: Optional[int], defect_slide: Optional[int],
+                                    temporary_slides: List[int] = ()) -> List[int]:
+    """Improvement evidence = pictures on slides whose OWN section is improvement.
+
+    A slide qualifies when it has pictures and either its first heading is an
+    improvement/standardisation heading, or it has no heading at all and directly
+    continues an improvement slide.  Cover, QPN, defect (HIỆN TRẠNG), temporary and
+    verification-led slides never qualify, even if some improvement text appears on them.
+    """
+    out: List[int] = []
+    imp = set(improvement_slides)
+    for s in report.slides:
+        n = s.number
+        if n not in imp or not s.pictures:
+            continue
+        if n in (qpn_slide, defect_slide) or n in temporary_slides or is_cover_slide(report, s):
+            continue
+        fk = first_heading_kind(s)
+        if fk in ("improvement", "standard"):
+            out.append(n)
+        elif fk is None and (n - 1) in imp and (n - 1) in out + [x for x in imp if first_heading_kind(report.slide(x)) in ("improvement", "standard")]:
+            out.append(n)
+    return out
+
+
 def heuristic_classify(report: ReportData) -> Classification:
     c = Classification(source="heuristic")
     c.qpn_slide = find_qpn_slide(report)
@@ -168,6 +219,9 @@ def heuristic_classify(report: ReportData) -> Classification:
         if s.number == c.qpn_slide:
             if "defect" in kinds or not c.defect_slide:
                 c.defect_slide = c.defect_slide or s.number
+            continue
+        if is_cover_slide(report, s):
+            c.notes.append("slide 1 treated as cover (no section content)")
             continue
         dominant = None
         if kinds:
@@ -182,8 +236,6 @@ def heuristic_classify(report: ReportData) -> Classification:
             c.cause_slides.append(s.number)
         if "improvement" in tagged or "standard" in tagged:
             c.improvement_slides.append(s.number)
-            if s.pictures:
-                c.improvement_image_slides.append(s.number)
         if "temporary" in tagged:
             c.temporary_slides.append(s.number)
         if "verify" in tagged:
@@ -200,7 +252,15 @@ def heuristic_classify(report: ReportData) -> Classification:
                         last_kind = k
             current = last_kind if last_kind in ("cause", "improvement", "temporary") else None
     if not c.defect_slide:
-        c.defect_slide = c.qpn_slide or (1 if report.slides else None)
+        c.defect_slide = c.qpn_slide
+    # QPN fallback: no "Quality Problem Notice" text anywhere -> the defect / HIỆN TRẠNG page that
+    # carries a picture is the source QPN evidence; flagged for manual review, never invented.
+    if not c.qpn_slide and c.defect_slide and report.slide(c.defect_slide) and report.slide(c.defect_slide).pictures:
+        c.qpn_slide = c.defect_slide
+        c.ambiguities.append(f"Không có chữ 'Quality Problem Notice'; QPN lấy theo trang hiện trạng/nội dung lỗi "
+                             f"(slide {c.defect_slide}) – cần kiểm tra")
+    c.improvement_image_slides = select_improvement_image_slides(
+        report, c.improvement_slides, c.qpn_slide, c.defect_slide, c.temporary_slides)
     return c
 
 
@@ -424,15 +484,21 @@ def merge_llm_with_heuristic(llm_raw: Dict[str, Any], heur: Classification, repo
         if s_no not in c.temporary_slides:
             c.temporary_slides.append(s_no)
     c.temporary_slides.sort()
-    if not c.improvement_image_slides:
-        c.improvement_image_slides = [s for s in c.improvement_slides
-                                      if report.slide(s) and report.slide(s).pictures]
-    else:
-        c.improvement_image_slides = [s for s in c.improvement_image_slides
-                                      if report.slide(s) and report.slide(s).pictures] or \
-                                     [s for s in c.improvement_slides if report.slide(s) and report.slide(s).pictures]
     if not c.defect_slide:
         c.defect_slide = heur.defect_slide
+    structural = select_improvement_image_slides(report, c.improvement_slides, c.qpn_slide, c.defect_slide,
+                                                 c.temporary_slides)
+    # the LLM may narrow the structural set (e.g. drop a slide without evidence) but never widen it
+    llm_imgs = [s for s in c.improvement_image_slides if s in structural]
+    dropped = [s for s in c.improvement_image_slides if s not in structural]
+    if dropped:
+        c.notes.append(f"LLM improvement_image_slides {dropped} rejected (not an improvement-section slide)")
+    c.improvement_image_slides = llm_imgs or structural
+    if not c.qpn_slide and heur.qpn_slide:
+        c.qpn_slide = heur.qpn_slide
+    if c.qpn_slide == heur.qpn_slide:
+        # heuristic QPN chosen by fallback (HIỆN TRẠNG page) keeps its "needs review" flag
+        c.ambiguities.extend(a for a in heur.ambiguities if "Quality Problem Notice" in a and a not in c.ambiguities)
     # never let the QPN slide be treated as improvement text
     c.improvement_slides = [s for s in c.improvement_slides if s != c.qpn_slide]
     return c

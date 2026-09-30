@@ -58,13 +58,30 @@ for _i in range(1, 9):
     FIELD_ALIASES[f"week_{_i}"] = [f"week +{_i}", f"week+{_i}", f"week {_i}", f"w +{_i}", f"w+{_i}",
                                    f"tuan +{_i}", f"tuan {_i}", f"w{_i}"]
 
+# "WEEK +1", "WEEK + 1", "Week+1", "W1", "+1", "Tuần 1", "T+1", "1W" ...
+WEEK_RE = re.compile(r"^(?:week|wk|w|tuan|t)?\s*\+?\s*([1-8])\s*(?:w|wk|week|tuan)?$")
+# merged parent headers that group the WEEK sub-columns
+WEEK_PARENT_KEYS = ("kiem chung", "theo doi", "week", "tuan", "verification", "xac nhan", "follow up",
+                    "followup", "hieu qua", "monitoring", "giam sat")
+
 MAX_ROW_HEIGHT_PT = 409.0
 EXCEL_DEFAULT_COL_WIDTH = 8.43
+
+
+def week_index(cell_key: str) -> Optional[int]:
+    m = WEEK_RE.match(cell_key or "")
+    return int(m.group(1)) if m else None
 
 
 def _alias_score(cell_key: str, field: str) -> int:
     if not cell_key:
         return 0
+    if field.startswith("week_"):
+        idx = week_index(cell_key)
+        if idx is None:
+            return 0
+        # bare numbers ("1") are only accepted through the merged-parent rule
+        return 3 if (idx == int(field[5:]) and re.search(r"[a-z+]", cell_key)) else 0
     best = 0
     for alias in FIELD_ALIASES[field]:
         if cell_key == alias:
@@ -127,6 +144,9 @@ class ExcelWriter:
                 if len(v.strip()) > 60 or v.count("\n") > 3:  # long data text, not a header label
                     continue
                 key = norm_key(v)                            # collapses line breaks / spaces / accents
+                # merged parents of the WEEK group ("Theo dõi cải tiến", "Kiểm chứng") are not data columns
+                if any(k in key for k in ("theo doi", "kiem chung")) and week_index(key) is None:
+                    continue
                 # "Nội dung đối sách tạm thời" must never be taken for the improvement column
                 if "tam thoi" in key or "temporary" in key or "containment" in key:
                     s = _alias_score(key, "temporary") or 1
@@ -164,14 +184,14 @@ class ExcelWriter:
                 if v in (None, ""):
                     continue
                 k = norm_key(str(v))
-                m = re.fullmatch(r"(?:week|w|tuan|t)?\s*\+?\s*([1-8])\s*(?:w|week|tuan)?", k)
-                if not m:
+                idx = week_index(k)
+                if idx is None:
                     continue
-                field = f"week_{m.group(1)}"
+                field = f"week_{idx}"
                 if field in cols:
                     continue
                 parent = self._parent_header_key(r, c, header)
-                if parent and any(x in parent for x in ("kiem chung", "week", "tuan", "verification", "xac nhan")):
+                if parent and any(x in parent for x in WEEK_PARENT_KEYS):
                     cols[field] = c
         last_header = header
         for r in range(header + 1, header + 4):
@@ -187,8 +207,7 @@ class ExcelWriter:
 
     def _cell_row_of_week(self, row: int, col: int) -> bool:
         v = self.ws.cell(row=row, column=col).value
-        return v not in (None, "") and bool(re.fullmatch(r"(?:week|w|tuan|t)?\s*\+?\s*[1-8]\s*(?:w|week|tuan)?",
-                                                          norm_key(str(v))))
+        return v not in (None, "") and week_index(norm_key(str(v))) is not None
 
     def _parent_header_key(self, row: int, col: int, header_row: int) -> str:
         """Text of the merged/plain header cell(s) directly above (row-1, row-2) covering ``col``."""

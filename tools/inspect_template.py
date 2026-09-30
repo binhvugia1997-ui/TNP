@@ -79,4 +79,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(2)
-    print(inspect_template(Path(sys.argv[1])))
+    from app.main import force_utf8_stdio, write_utf8_report
+    force_utf8_stdio()
+    text = inspect_template(Path(sys.argv[1]))
+    print(text)
+    print(f"\n[Đã ghi UTF-8: {write_utf8_report(text, Path('inspect_template.txt')).resolve()}]")

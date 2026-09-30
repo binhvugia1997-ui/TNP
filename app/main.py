@@ -12,6 +12,27 @@ import sys
 from pathlib import Path
 
 
+def force_utf8_stdio() -> None:
+    """Windows consoles default to a legacy code page (cp437/cp1252) which turns
+    Vietnamese into mojibake.  Re-open stdout/stderr as UTF-8 regardless of the
+    console / PowerShell settings.  Never touches the source data."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def write_utf8_report(text: str, path: Path) -> Path:
+    """Write diagnostics as UTF-8 with BOM so Notepad/Excel/PowerShell show Vietnamese correctly."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8-sig", newline="\n")
+    return path
+
+
 def _cli(args) -> int:
     from .batch_processor import STAGE_LABELS_VI, BatchOptions, BatchProcessor
     from .config import AppConfig, normalize_ollama_url
@@ -51,8 +72,10 @@ def main(argv=None) -> int:
     parser.add_argument("--no-ai", action="store_true", help="chỉ dùng nhận diện từ khoá")
     parser.add_argument("--force", action="store_true", help="xử lý lại file đã xử lý")
     parser.add_argument("--inspect", metavar="PATH", help="in cấu trúc file .pptx hoặc form .xlsx để kiểm tra mapping")
+    parser.add_argument("--out", metavar="FILE", help="ghi kết quả --inspect ra file UTF-8 (mặc định inspect_template.txt / inspect_report.txt)")
     parser.add_argument("--version", action="store_true")
     args = parser.parse_args(argv)
+    force_utf8_stdio()
 
     if args.version:
         from . import __version__
@@ -63,10 +86,15 @@ def main(argv=None) -> int:
         p = Path(args.inspect)
         if p.suffix.lower() in (".xlsx", ".xlsm"):
             from inspect_template import inspect_template
-            print(inspect_template(p))
+            text = inspect_template(p)
+            default_out = "inspect_template.txt"
         else:
             from inspect_report import inspect_report
-            print(inspect_report(p, Path(args.template) if args.template else None, args.server or "", args.model or ""))
+            text = inspect_report(p, Path(args.template) if args.template else None, args.server or "", args.model or "")
+            default_out = "inspect_report.txt"
+        out = write_utf8_report(text, Path(args.out or default_out))
+        print(text)
+        print(f"\n[Đã ghi UTF-8: {out.resolve()}]")
         return 0
     if args.diag:
         from .config import AppConfig

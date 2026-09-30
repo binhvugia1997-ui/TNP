@@ -119,4 +119,8 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="")
     ap.add_argument("--short", action="store_true", help="truncate slide text")
     a = ap.parse_args()
-    print(inspect_report(Path(a.pptx), Path(a.template) if a.template else None, a.server, a.model, not a.short))
+    from app.main import force_utf8_stdio, write_utf8_report
+    force_utf8_stdio()
+    text = inspect_report(Path(a.pptx), Path(a.template) if a.template else None, a.server, a.model, not a.short)
+    print(text)
+    print(f"\n[Đã ghi UTF-8: {write_utf8_report(text, Path('inspect_report.txt')).resolve()}]")

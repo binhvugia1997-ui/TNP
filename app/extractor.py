@@ -255,11 +255,14 @@ def extract_defect_content(report: ReportData, cls: Classification) -> str:
                 uniq.append(ln)
         if uniq:
             return "\n".join(uniq)
-    # 2) heading-delimited defect section
+    # 2) heading-delimited defect section (HIỆN TRẠNG / NỘI DUNG LỖI ...), heading line itself dropped
     for s in slides:
         for sec in split_sections(s, "other"):
             if sec.kind == "defect":
-                return sec.text
+                body = [ln for ln in sec.lines[1:]] if section_kind_of_heading(sec.lines[0]) == "defect" else sec.lines
+                txt = clean_text("\n".join(body))
+                if txt:
+                    return txt
     return ""
 
 
@@ -301,5 +304,12 @@ def extract_record(report: ReportData, cls: Classification,
         if not val:
             rec.blank_fields.append(name)
     if not rec.defect_content:
-        rec.review_reasons.append("Không tìm thấy Nội dung lỗi")
+        ds = report.slide(cls.defect_slide) if cls.defect_slide else None
+        if ds is not None and ds.pictures and not any(
+                ln.strip() for b in ds.text_blocks for ln in b.text.split("\n")
+                if section_kind_of_heading(ln) is None and not _is_noise(ln)):
+            rec.review_reasons.append(
+                f"Nội dung lỗi chỉ nằm trong hình ảnh (slide {ds.number}), không có dạng chữ – cần nhập tay")
+        else:
+            rec.review_reasons.append("Không tìm thấy Nội dung lỗi")
     return rec
