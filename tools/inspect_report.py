@@ -27,8 +27,10 @@ def inspect_report(path: Path, template: Path | None = None, server: str = "", m
     from pptx import Presentation
     from app.pptx_parser import raw_xml_text
     from app.classifier import is_heading_like, section_kind_of_heading
+    from app.content_region import classify_blocks
     prs = Presentation(str(path))
     for s, raw_slide in zip(r.slides, prs.slides):
+        roles = {id(ro.block): ro for ro in classify_blocks(s)}
         out.append(f"\n=== Slide {s.number}  ({len(s.text_blocks)} text blocks, {len(s.pictures)} pictures) ===")
         out.append(f"XML inventory: {s.xml_stats}")
         out.append("Shapes (reading order):")
@@ -41,8 +43,10 @@ def inspect_report(path: Path, template: Path | None = None, server: str = "", m
             else:
                 preview = b.text.replace("\n", " ⏎ ")
                 preview = preview if full_text else preview[:200]
+                ro = roles.get(id(b))
+                role = f" role={ro.role}" + (f"/{ro.caption_kind}" if ro and ro.caption_kind else "") if ro else ""
                 out.append(f"  [{b.kind.upper()} {b.origin}] id={b.shape_id} name={b.shape_name!r} bold={b.bold} "
-                           f"size={b.size_pt} {pos}: {preview}")
+                           f"size={b.size_pt} prst={b.prst!r}{role} {pos}: {preview}")
         hits = []
         for b in s.text_blocks:
             for i, ln in enumerate(b.text.split("\n")):
@@ -110,7 +114,9 @@ def inspect_report(path: Path, template: Path | None = None, server: str = "", m
     out.append(f"Nguyên nhân ({len(rec.root_cause)} chars):\n{rec.root_cause}")
     out.append(f"Nội dung đối sách cải tiến ({len(rec.improvement)} chars):\n{rec.improvement}")
     out.append(f"[EXCLUDED] Xử lý tạm thời ({len(rec.temporary_excluded)} chars):\n{rec.temporary_excluded}")
-    out.append(f"Hình ảnh cải tiến   : slides {rec.improvement_image_slides}")
+    out.append(f"Slide cải tiến có ảnh: {rec.improvement_image_slides}")
+    out.append(f"Ảnh Sau cải tiến    : {[p.label for p in rec.after_pictures]} (slides {rec.after_picture_slides})")
+    out.append("Quyết định từng ảnh :\n  " + "\n  ".join(rec.picture_notes))
     out.append("WEEK +1..+8         : blank")
     out.append(f"Blank fields        : {rec.blank_fields}")
     out.append(f"Cần kiểm tra        : {rec.review_reasons}")

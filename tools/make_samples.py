@@ -75,6 +75,29 @@ def _textbox(slide, text, left, top, width, height, size=14, bold=False):
     return tb
 
 
+def _sidebar(slide, text, top):
+    """Left-side circular section label (decorative, must never reach Excel)."""
+    from pptx.enum.shapes import MSO_SHAPE
+    shp = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(0.15), top, Inches(1.3), Inches(1.3))
+    shp.text_frame.text = text
+    shp.text_frame.paragraphs[0].runs[0].font.size = Pt(11)
+    return shp
+
+
+def _caption(slide, text, left, top, width=Inches(1.6)):
+    """Image caption button ("Trước cải tiến" / "Sau cải tiến")."""
+    from pptx.enum.shapes import MSO_SHAPE
+    shp = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, left, top, width, Inches(0.35))
+    shp.text_frame.text = text
+    shp.text_frame.paragraphs[0].runs[0].font.size = Pt(11)
+    return shp
+
+
+def _furniture(slide, W):
+    slide.shapes.add_picture(_pic("#eeeeee", "LOGO", (200, 80)), W - Inches(1.4), Inches(0.1), Inches(1.2), Inches(0.45))
+    _textbox(slide, "CTMS – Confidential", Inches(0.3), Inches(7.05), Inches(4), Inches(0.35), 8)
+
+
 def make_report(path: Path, model="SM-A185", item="Rear", mgmt="260918080-VOC",
                 with_qpn=True, with_improvement=True) -> Path:
     prs = Presentation()
@@ -112,8 +135,10 @@ def make_report(path: Path, model="SM-A185", item="Rear", mgmt="260918080-VOC",
     # slide 3 – root cause
     s = prs.slides.add_slide(blank)
     _textbox(s, "2. NGUYÊN NHÂN", Inches(0.5), Inches(0.3), Inches(8), Inches(0.7), 24, True)
-    _textbox(s, CAUSE_TEXT_1, Inches(0.5), Inches(1.2), W - Inches(1), Inches(2.4), 14)
-    _textbox(s, CAUSE_TEXT_2, Inches(0.5), Inches(3.8), W - Inches(1), Inches(1.5), 14)
+    _sidebar(s, "Nguyên nhân", Inches(2.5))
+    _textbox(s, CAUSE_TEXT_1, Inches(1.7), Inches(1.2), W - Inches(2.2), Inches(2.4), 14)
+    _textbox(s, CAUSE_TEXT_2, Inches(1.7), Inches(3.8), W - Inches(2.2), Inches(1.5), 14)
+    _furniture(s, W)
 
     # slide 4 – temporary handling (must be excluded)
     s = prs.slides.add_slide(blank)
@@ -125,14 +150,20 @@ def make_report(path: Path, model="SM-A185", item="Rear", mgmt="260918080-VOC",
         # slide 5 – improvement in production (with before/after pictures)
         s = prs.slides.add_slide(blank)
         _textbox(s, "3. CẢI TIẾN TRONG SẢN XUẤT", Inches(0.5), Inches(0.3), Inches(8), Inches(0.7), 24, True)
-        _textbox(s, IMPROVEMENT_TEXT, Inches(0.5), Inches(1.1), Inches(7.5), Inches(5.5), 12)
-        s.shapes.add_picture(_pic("#ffe0b2", "Before: khay cũ"), Inches(8.3), Inches(1.2), Inches(4.5), Inches(2.5))
-        s.shapes.add_picture(_pic("#c8e6c9", "After: khay lót EVA"), Inches(8.3), Inches(4.0), Inches(4.5), Inches(2.5))
+        _sidebar(s, "Cải tiến trong sản xuất", Inches(3.0))
+        _textbox(s, IMPROVEMENT_TEXT, Inches(1.7), Inches(1.1), Inches(6.4), Inches(5.5), 12)
+        _caption(s, "Trước cải tiến", Inches(8.3), Inches(1.15))
+        s.shapes.add_picture(_pic("#ffe0b2", "Before: khay cũ"), Inches(8.3), Inches(1.55), Inches(4.5), Inches(2.3))
+        _caption(s, "Sau cải tiến", Inches(8.3), Inches(4.0))
+        s.shapes.add_picture(_pic("#c8e6c9", "After: khay lót EVA"), Inches(8.3), Inches(4.4), Inches(4.5), Inches(2.3))
+        _furniture(s, W)
 
         # slide 6 – improvement in inspection
         s = prs.slides.add_slide(blank)
         _textbox(s, "4. CẢI TIẾN TRONG KIỂM TRA", Inches(0.5), Inches(0.3), Inches(8), Inches(0.7), 24, True)
-        _textbox(s, IMPROVEMENT_TEXT_2, Inches(0.5), Inches(1.1), Inches(7.5), Inches(3), 14)
+        _sidebar(s, "Cải tiến trong kiểm tra", Inches(3.0))
+        _textbox(s, IMPROVEMENT_TEXT_2, Inches(1.7), Inches(1.1), Inches(6.4), Inches(3), 14)
+        _furniture(s, W)
         s.shapes.add_picture(_pic("#b3e5fc", "Đèn kiểm tra 3 hướng"), Inches(8.3), Inches(1.2), Inches(4.5), Inches(2.5))
         s.shapes.add_picture(_pic("#d1c4e9", "Đào tạo nhân viên"), Inches(8.3), Inches(4.0), Inches(4.5), Inches(2.5))
 

@@ -191,7 +191,7 @@ def test_llm_cannot_narrow_structural_improvement_images(real_like, key, llm_img
     assert c.image_slides_structural == [4, 5, 6] and c.image_slides_llm == llm_imgs
     assert c.improvement_slides == [4, 5, 6, 7]
     rec = extract_record(r, c)
-    assert "ĐỐI SÁCH LÂU DÀI" in rec.improvement and "Sorting 100%" not in rec.improvement
+    assert "Cập nhật SOP Rev.03" in rec.improvement and "ĐỐI SÁCH LÂU DÀI" not in rec.improvement and "Sorting 100%" not in rec.improvement
     assert rec.improvement_image_slides == [4, 5, 6]
 
 
@@ -254,7 +254,7 @@ def test_five_report_batch_expectations(real_like, template, tmp_path, monkeypat
         assert fr.occurrence_date == "01/06/2026"
         assert ws.cell(row=row, column=4).value.date() == dt.date(2026, 6, 1)
         assert ws.cell(row=row, column=5).value == "A185" and ws.cell(row=row, column=6).value == "Rear"
-        assert "ĐỐI SÁCH LÂU DÀI" in ws.cell(row=row, column=10).value
+        assert "Cập nhật SOP Rev.03" in ws.cell(row=row, column=10).value
         assert "Sorting 100%" not in ws.cell(row=row, column=10).value
         assert all(ws.cell(row=row, column=k).value == "OK" for k in range(12, 20))
         assert ws.cell(row=row, column=7).value == "xước"                            # from the file name

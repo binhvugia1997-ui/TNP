@@ -48,6 +48,9 @@ class Block:
     level: int = 0                                        # paragraph indent level
     alt_text: str = ""                                    # cNvPr/@descr or @title (pictures, OLE objects)
     origin: str = "shape"                                 # "shape" | "ole" | "alternate_content"
+    prst: str = ""                                        # preset geometry (rect, ellipse, roundRect, rightArrow…)
+    rotation: float = 0.0                                 # degrees
+    n_lines: int = 0                                      # paragraphs in the text frame
 
     @property
     def is_text(self) -> bool:
@@ -174,6 +177,23 @@ def _iter_shapes(shapes, offset=(0, 0)) -> Iterator[Tuple[Any, Tuple[int, int]]]
             yield shape, offset
 
 
+def _shape_geometry(shape) -> Tuple[str, float]:
+    """(preset geometry name, rotation in degrees) – best effort."""
+    prst = ""
+    try:
+        g = shape._element.xpath(".//a:prstGeom")
+        if g:
+            prst = g[0].get("prst", "") or ""
+    except Exception:
+        pass
+    rot = 0.0
+    try:
+        rot = float(shape.rotation or 0.0)
+    except Exception:
+        pass
+    return prst, rot
+
+
 def _frame_blocks(shape, offset, is_title: bool) -> List[Block]:
     blocks: List[Block] = []
     tf = shape.text_frame
@@ -208,7 +228,9 @@ def _frame_blocks(shape, offset, is_title: bool) -> List[Block]:
         bold=lines[0][2] if lines else False,
         size_pt=lines[0][3] if lines else None,
         level=lines[0][1] if lines else 0,
+        n_lines=len(lines),
     )
+    b.prst, b.rotation = _shape_geometry(shape)
     blocks.append(b)
     return blocks
 

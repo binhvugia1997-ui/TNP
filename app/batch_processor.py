@@ -20,7 +20,7 @@ from .extractor import extract_record
 from .history import History, fingerprint
 from .extractor import management_number_from_filename
 from .excel_writer import MANAGED_FIELDS
-from .image_extractor import build_improvement_image
+from .image_extractor import build_after_pictures_image
 from .logger import BatchResultLog, FileResult, setup_logging
 from .ollama_client import OllamaClient
 from .pptx_parser import parse_pptx
@@ -205,9 +205,15 @@ class BatchProcessor:
                 if not rows:
                     return self._not_written(idx, fr, None,
                                              f"Không tìm thấy Management Number {mgmt} trong file Kiểm chứng")
+                duplicate_note = ""
                 if len(rows) > 1:
-                    return self._not_written(idx, fr, None,
-                                             f"Management Number {mgmt} xuất hiện nhiều dòng ({rows})")
+                    # rule: topmost row is the canonical destination; the other rows stay untouched but are
+                    # highlighted red so the user can clean the master up; the batch continues.
+                    extra = rows[1:]
+                    writer.mark_rows_red(extra)
+                    duplicate_note = (f"Management Number {mgmt} xuất hiện {len(rows)} dòng ({', '.join(map(str, rows))}); "
+                                      f"đã cập nhật dòng {rows[0]}, các dòng trùng {', '.join(map(str, extra))} được tô đỏ")
+                    LOG.warning("%s: %s", path.name, duplicate_note)
                 row = rows[0]
                 missing = writer.missing_managed_fields(row)
                 if not missing and not self.opts.force_reprocess:
@@ -266,6 +272,7 @@ class BatchProcessor:
             self.on_file(idx, "extracting", "")
             rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None)
             fr.management_number = rec.management_number
+            fr.after_picture_slides = list(rec.after_picture_slides)
             fr.vendor = rec.vendor
             fr.occurrence_date = rec.occurrence_date_text
             fr.model = rec.model
@@ -282,17 +289,20 @@ class BatchProcessor:
                     LOG.warning("%s: QPN render failed: %s", path.name, e)
                     rec.review_reasons.append(f"Không render được QPN: {e}")
 
-            # --- 5. improvement images ---------------------------------------
+            # --- 5. improvement images: ONLY "Sau cải tiến" pictures -----------
             imp_jpg: Optional[Path] = None
-            if rec.improvement_image_slides:
-                self.on_file(idx, "extracting_images", f"slide {rec.improvement_image_slides}")
+            fr.after_pictures = [r.label for r in rec.after_pictures]
+            fr.picture_notes = list(rec.picture_notes)
+            if rec.after_pictures:
+                self.on_file(idx, "extracting_images", f"{len(rec.after_pictures)} ảnh Sau cải tiến")
                 try:
-                    imp_jpg, _ = build_improvement_image(
-                        report, rec.improvement_image_slides, assets / f"{prefix}_IMPROVEMENT.jpg",
-                        renderer, pictures_dir=assets / f"{prefix}_IMPROVEMENT_pics")
+                    imp_jpg, problems = build_after_pictures_image(
+                        report, rec.after_pictures, assets / f"{prefix}_IMPROVEMENT.jpg",
+                        pictures_dir=assets / f"{prefix}_IMPROVEMENT_pics")
+                    rec.review_reasons.extend(problems)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("%s: improvement image failed: %s", path.name, e)
-                    rec.review_reasons.append(f"Không render được hình ảnh cải tiến: {e}")
+                    rec.review_reasons.append(f"Không tạo được hình ảnh cải tiến: {e}")
 
             # --- 6. write Excel ------------------------------------------------
             self.on_file(idx, "writing_excel", "")
@@ -308,6 +318,8 @@ class BatchProcessor:
                     rec.review_reasons = filter_review_reasons(rec.review_reasons, missing)
                     fr.filled_fields = [f for f in missing if _rec_has(rec, f, qpn_png, imp_jpg)]
                 rec.review_reasons.extend(conflicts)
+                if duplicate_note:
+                    rec.review_reasons.append(duplicate_note)
                 note = "; ".join(rec.review_reasons)
                 if "status" in writer.columns:
                     cell, _ = writer._anchor(row, writer.columns["status"])
@@ -418,6 +430,8 @@ def format_file_diagnostics(fr: FileResult) -> str:
         f"Renderer QPN       : {fr.qpn_renderer or '-'}",
         f"Trường để trống    : {', '.join(fr.blank_fields) if fr.blank_fields else '(không)'}",
         f"Trường đã điền     : {', '.join(fr.filled_fields) if fr.filled_fields else '(không)'}",
+        f"Ảnh Sau cải tiến   : {', '.join(fr.after_pictures) if fr.after_pictures else '(không)'} "
+        f"(slide {fr.after_picture_slides})",
         f"Cần kiểm tra thủ công: {'; '.join(fr.review_reasons) if fr.review_reasons else '(không)'}",
     ]
     if fr.classifier_notes:

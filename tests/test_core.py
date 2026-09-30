@@ -103,7 +103,7 @@ def test_parse_pptx_preserves_unicode_and_order(a185_report):
     assert "Quality Problem Notice" in r.slides[1].text
     assert "NGUYÊN NHÂN" in r.slides[2].text
     assert r.slides[1].text_blocks[0].text == "Quality Problem Notice"   # title first (top)
-    assert len(r.slides[4].pictures) == 2
+    assert len(r.slides[4].pictures) == 3          # Before + After + logo picture
     assert "Đèn kiểm tra tại OQC không đủ sáng (800 lux)" in r.slides[2].text
 
 
@@ -186,8 +186,11 @@ def test_extraction_preserves_original_text_and_excludes_temporary(a185_report):
     for line in IMPROVEMENT_TEXT.split("\n") + IMPROVEMENT_TEXT_2.split("\n") + LONG_TERM_TEXT.split("\n"):
         if line.strip():
             assert line in rec.improvement, line
-    assert rec.improvement.index("3. CẢI TIẾN TRONG SẢN XUẤT") < rec.improvement.index("4. CẢI TIẾN TRONG KIỂM TRA") \
-        < rec.improvement.index("5. ĐỐI SÁCH LÂU DÀI")
+    # slide titles are page structure (content-region rule) – content blocks keep their source order
+    for t in ("3. CẢI TIẾN TRONG SẢN XUẤT", "4. CẢI TIẾN TRONG KIỂM TRA", "5. ĐỐI SÁCH LÂU DÀI", "2. NGUYÊN NHÂN"):
+        assert t not in rec.improvement and t not in rec.root_cause
+    assert rec.improvement.index("Lỗi xước rear do va chạm") < rec.improvement.index("Cải tiến trong kiểm tra") \
+        < rec.improvement.index("Đưa hạng mục kiểm tra khay/jig vào checklist")
     # temporary handling excluded from improvement
     for line in TEMP_TEXT.split("\n"):
         assert line not in rec.improvement

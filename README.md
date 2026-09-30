@@ -81,6 +81,25 @@ Cấu hình (máy AI, model, các đường dẫn cuối) được lưu vào `co
 
 ## 3. Business rules (fixed)
 
+### Vùng nội dung (content-region) – Nguyên nhân / Nội dung đối sách cải tiến
+Chỉ **vùng nội dung chính** của slide được sao chép (nguyên văn, đúng thứ tự). Loại bỏ theo cấu trúc/hình học
+(tỷ lệ theo kích thước slide, không dùng toạ độ tuyệt đối): tiêu đề slide (`1. NGUYÊN NHÂN`, `3. CẢI TIẾN TRONG
+SẢN XUẤT`…), nhãn tròn bên trái (`Nguyên nhân`, `Cải tiến trong kiểm tra`), nút chú thích ảnh (`Trước cải tiến`,
+`Sau cải tiến`), logo, footer, mũi tên. Tiêu đề phụ trong nội dung (`Nguyên nhân trong kiểm tra:`) và các dòng
+`+ Trước:` / `+ Sau:` là nội dung nghiệp vụ và được giữ nguyên. `XỬ LÝ TẠM THỜI` vẫn bị loại; `ĐỐI SÁCH LÂU DÀI`
+vẫn được lấy (phần nội dung).
+
+### Hình ảnh cải tiến = CHỈ ảnh "Sau cải tiến" của cải tiến sản xuất
+Neo = nút chú thích `Trước/Sau cải tiến` hoặc dòng `+ Trước:` / `+ Sau:`; mỗi ảnh được gán theo hình học tương đối
+với neo (ảnh cùng hàng cạnh ảnh đã có chú thích dùng chung chú thích). Ảnh Trước, mũi tên, logo, ảnh của slide/mục
+`Cải tiến trong kiểm tra` / `kiểm soát` không được chèn. Ảnh không xác định chắc chắn → **không chèn** và ghi
+`Cần kiểm tra: Không xác định chắc chắn ảnh Sau cải tiến tại slide X` (không bao giờ chèn toàn bộ ảnh của slide).
+Qwen chỉ chọn slide/mục, không chọn từng ảnh. Chi tiết quyết định từng ảnh: `python run.py --inspect <pptx>`.
+
+### Management Number trùng nhiều dòng
+Dòng trên cùng là đích; các dòng trùng giữ nguyên và được tô đỏ; batch tiếp tục (Cần kiểm tra).
+
+
 | Field | Rule |
 |---|---|
 | Management number | From file name / report text (e.g. `260918080-VOC`); blank if not found |

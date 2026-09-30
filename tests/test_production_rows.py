@@ -135,7 +135,7 @@ def test_match_mode_updates_existing_row_and_preserves_key(sample_tree, template
     d = ws.cell(row=5, column=4).value
     assert isinstance(d, dt.datetime) and d.date() == dt.date(2026, 9, 18)
     assert ws.cell(row=5, column=4).number_format == "DD/MM/YYYY"
-    assert "ĐỐI SÁCH LÂU DÀI" in ws.cell(row=5, column=10).value
+    assert "checklist đầu ca" in ws.cell(row=5, column=10).value   # long-term content (title excluded)
     assert all(ws.cell(row=5, column=k).value == "OK" for k in range(12, 20))  # WEEK untouched
     # row 4 (other key) and no new row appended
     assert ws.cell(row=4, column=5).value is None and ws.cell(row=6, column=2).value is None
@@ -148,14 +148,18 @@ def test_match_mode_not_found_duplicate_and_missing_key(sample_tree, template, t
     files = [sample_tree["files"][0], sample_tree["files"][1], nokey]      # not found / duplicate / no key
     out = tmp_path / "out" / "k.xlsx"
     summary, events, proc = _run(files, template, out)
-    assert summary.not_written == 3 and summary.completed == 0 and summary.needs_review == 0
+    assert summary.not_written == 2 and summary.completed == 0 and summary.needs_review == 1
     msgs = [r.error for r in proc.results]
     assert "Không tìm thấy Management Number 260918080-VOC trong file Kiểm chứng" in msgs[0]
-    assert "xuất hiện nhiều dòng" in msgs[1]
     assert "Không xác định được Management Number từ tên file" in msgs[2]
-    assert all(s == "not_written" for i, s, d in events if s in ("completed", "needs_review", "not_written"))
-    ws = load_workbook(out)["Kiểm chứng"] if out.exists() else load_workbook(template)["Kiểm chứng"]
-    for r in range(4, 8):                                                  # nothing written anywhere
+    # duplicate key: topmost row is the canonical destination, the other row stays untouched but is marked red
+    dup = proc.results[1]
+    assert dup.status == "needs_review" and dup.excel_row == 4
+    assert any("xuất hiện 2 dòng (4, 5)" in r and "tô đỏ" in r for r in dup.review_reasons)
+    ws = load_workbook(out)["Kiểm chứng"]
+    assert ws.cell(row=4, column=5).value == "A185" and ws.cell(row=5, column=5).value is None
+    assert ws.cell(row=5, column=2).fill.fgColor.rgb.endswith("FFC7CE") and not str(ws.cell(row=4, column=2).fill.fgColor.rgb).endswith("FFC7CE")
+    for r in (6, 7):                                                       # nothing written anywhere else
         assert ws.cell(row=r, column=5).value is None and ws.cell(row=r, column=10).value is None
     # not_written results are not recorded as processed -> a re-run after fixing the template works
     _prefill(template, [("260918080-VOC", None, None)])
@@ -331,7 +335,7 @@ def test_destination_sheet_found_by_structure_regardless_of_name(sample_tree, tm
     assert ws.cell(row=4, column=5).value == "A185" and ws.cell(row=4, column=6).value == "Rear"
     assert ws.cell(row=4, column=3).value == "Doaltech"
     assert ws.cell(row=4, column=4).value.date() == dt.date(2026, 9, 18)
-    assert "ĐỐI SÁCH LÂU DÀI" in ws.cell(row=4, column=10).value
+    assert "checklist đầu ca" in ws.cell(row=4, column=10).value
     assert all(ws.cell(row=4, column=k).value == "OK" for k in range(12, 20))
     assert ws.cell(row=5, column=2).value is None                     # no appended row
 

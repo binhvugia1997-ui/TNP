@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as XLImage
-from openpyxl.styles import Alignment
+from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 
@@ -622,6 +622,19 @@ class ExcelWriter:
         if note_text or notes:
             self._set_cell(row, "note", "; ".join(x for x in [note_text, *notes] if x))
         return notes
+
+    def mark_rows_red(self, rows: List[int]) -> None:
+        """Highlight duplicate Management Number rows (values untouched)."""
+        red = PatternFill("solid", fgColor="FFC7CE")
+        last_col = max(self.columns.values()) if self.columns else self.ws.max_column
+        for r in rows:
+            for c in range(1, last_col + 1):
+                cell = self.ws.cell(row=r, column=c)
+                try:
+                    cell.fill = red
+                except AttributeError:      # MergedCell
+                    pass
+        self._dirty = True
 
     def fill_missing_fields(self, row: int, rec, missing: List[str], qpn_png: Optional[Path] = None,
                             improvement_jpg: Optional[Path] = None) -> List[str]:

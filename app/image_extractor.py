@@ -1,10 +1,9 @@
 """Improvement image extraction.
 
-Strategy (first implementation, keeps context):
-  * render every improvement-image slide completely (same renderer chain as QPN);
-  * stack the rendered slides vertically into one contact sheet (JPEG);
-  * additionally save every original picture of those slides into the assets
-    folder for audit (``NNNN_IMPROVEMENT_pics/``).
+Production rule: "Hình ảnh cải tiến" = ONLY the "Sau cải tiến" pictures selected by
+:mod:`improvement_pictures`, stacked vertically in source order
+(:func:`build_after_pictures_image`).  The older whole-slide contact sheet
+(:func:`build_improvement_image`) is kept for diagnostics / audit only.
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ from typing import List, Optional, Sequence, Tuple
 from PIL import Image, ImageDraw
 
 from .pptx_parser import ReportData
+from .improvement_pictures import PictureRef
 from .qpn_renderer import SlideRenderer, get_font
 
 LOG = logging.getLogger("report_extractor.images")
@@ -103,3 +103,52 @@ def build_improvement_image(report: ReportData, slide_numbers: Sequence[int], ta
         except Exception as e:  # noqa: BLE001
             LOG.debug("save_original_pictures failed: %s", e)
     return target_jpg, renderer.last_backend
+
+
+def build_after_pictures_image(report: ReportData, refs: Sequence["PictureRef"], target_jpg: Path,
+                               width: int = 1600, pictures_dir: Optional[Path] = None
+                               ) -> Tuple[Optional[Path], List[str]]:
+    """Stack ONLY the selected "Sau cải tiến" pictures vertically (source order) into ``target_jpg``.
+
+    Returns (path or None when nothing could be embedded, list of problems for 'Cần kiểm tra').
+    Original pictures are decoded from the PPTX blobs – nothing is re-rendered or altered.
+    """
+    problems: List[str] = []
+    images: List[Image.Image] = []
+    saved_dir = None
+    if pictures_dir is not None:
+        pictures_dir.mkdir(parents=True, exist_ok=True)
+        saved_dir = pictures_dir
+    for i, ref in enumerate(refs, start=1):
+        blob = ref.block.image_blob
+        ext = (ref.block.image_ext or "").lower()
+        if not blob:
+            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không đọc được dữ liệu – cần bổ sung thủ công")
+            continue
+        if ext in ("emf", "wmf"):
+            if saved_dir is not None:
+                (saved_dir / f"after{i:02d}_slide{ref.slide:02d}.{ext}").write_bytes(blob)
+            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} ở định dạng {ext.upper()} không chèn được – "
+                            f"cần bổ sung thủ công")
+            continue
+        try:
+            im = Image.open(BytesIO(blob))
+            im.load()
+            im = im.convert("RGB")
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không giải mã được ({type(e).__name__}) – "
+                            f"cần bổ sung thủ công")
+            continue
+        images.append(im)
+        if saved_dir is not None:
+            try:
+                im.save(saved_dir / f"after{i:02d}_slide{ref.slide:02d}.png", "PNG")
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("cannot save after picture: %s", e)
+    if not images:
+        return None, problems
+    max_w = max(im.width for im in images)
+    sheet = combine_vertically(images, width=min(width, max(400, max_w)))
+    target_jpg.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(target_jpg, "JPEG", quality=90, optimize=True)
+    return target_jpg, problems

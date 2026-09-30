@@ -417,6 +417,9 @@ class GuiController:
             "Slide xử lý tạm thời": str(fr.temporary_slides or "-"),
             "Slide đối sách cải tiến": str(fr.improvement_slides or "(không thấy)"),
             "Slide ảnh cải tiến": str(fr.improvement_image_slides or "(không có)"),
+            "Ảnh Sau cải tiến": (", ".join(fr.after_pictures) + f" (slide {fr.after_picture_slides})")
+            if fr.after_pictures else "(không có)",
+            "Quyết định từng ảnh": "\n".join(fr.picture_notes) if fr.picture_notes else "-",
             "Bộ phân loại": fr.classifier or "-",
             "Độ tin cậy AI": f"{fr.confidence:.2f}" if fr.confidence is not None else "-",
             "Trường đã điền": ", ".join(fr.filled_fields) if fr.filled_fields else "-",

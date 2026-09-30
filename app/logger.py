@@ -70,6 +70,9 @@ class FileResult:
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)
     filled_fields: List[str] = field(default_factory=list)     # match mode: managed fields written this run
+    after_pictures: List[str] = field(default_factory=list)    # "S5#12" labels of the inserted Sau cải tiến pictures
+    after_picture_slides: List[int] = field(default_factory=list)
+    picture_notes: List[str] = field(default_factory=list)     # every picture decision (before/after/excluded/ambiguous)
     classifier_notes: List[str] = field(default_factory=list)
     confidence: Optional[float] = None
     error: str = ""

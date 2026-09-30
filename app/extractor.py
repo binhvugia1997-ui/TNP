@@ -18,6 +18,8 @@ from pathlib import Path
 
 from .classifier import Classification, is_heading_like, section_kind_of_heading
 from .pptx_parser import ReportData, SlideData, norm_key, clean_text
+from .improvement_pictures import PictureRef, select_after_pictures
+from .content_region import ROLE_CONTENT, ROLE_TITLE, classify_blocks, is_slide_level_heading
 
 LOG = logging.getLogger("report_extractor.extractor")
 
@@ -53,7 +55,10 @@ class ExtractedRecord:
     cause_sections: List[Section] = field(default_factory=list)
     improvement_sections: List[Section] = field(default_factory=list)
     qpn_slide: Optional[int] = None
-    improvement_image_slides: List[int] = field(default_factory=list)
+    improvement_image_slides: List[int] = field(default_factory=list)     # classified improvement slides with pictures
+    after_pictures: List["PictureRef"] = field(default_factory=list)      # ONLY "Sau cải tiến" pictures (source order)
+    after_picture_slides: List[int] = field(default_factory=list)
+    picture_notes: List[str] = field(default_factory=list)                # diagnostics: every picture decision
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
     # Vendor: detected from the ORIGINAL improvement text ("Tại công đoạn assy <Vendor>")
@@ -82,10 +87,26 @@ def _is_noise(line: str) -> bool:
 
 
 def split_sections(slide: SlideData, default_kind: str = "other") -> List[Section]:
-    """Walk a slide in reading order and split text into heading-delimited sections."""
+    """Walk the slide's MAIN CONTENT REGION in reading order and split it into heading-delimited sections.
+
+    Title/header, sidebar labels, caption buttons and page furniture (see :mod:`content_region`) are
+    never copied; the slide title still decides the section kind.  Sub-headings that live inside the
+    content ("Nguyên nhân trong kiểm tra:") are business text and stay, in source order, verbatim.
+    """
     sections: List[Section] = []
     cur = Section(kind=default_kind, slide=slide.number)
-    for b in slide.text_blocks:
+    first_content = True
+    for role in classify_blocks(slide):
+        b = role.block
+        if role.role == ROLE_TITLE:
+            kind = section_kind_of_heading(_first_line_of(b))
+            if kind:
+                if cur.lines:
+                    sections.append(cur)
+                cur = Section(kind=kind, slide=slide.number)
+            continue
+        if role.role != ROLE_CONTENT:
+            continue
         lines = b.text.split("\n")
         for i, ln in enumerate(lines):
             if _is_noise(ln):
@@ -99,9 +120,14 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
                 # sub-sections such as "Nguyên nhân trong kiểm tra" stay separate
                 if cur.lines:
                     sections.append(cur)
-                cur = Section(kind=kind, slide=slide.number, lines=[ln.strip()])
+                if i == 0 and first_content and is_slide_level_heading(ln):
+                    # "2. NGUYÊN NHÂN" typed into the first content frame = slide header, not content
+                    cur = Section(kind=kind, slide=slide.number)
+                else:
+                    cur = Section(kind=kind, slide=slide.number, lines=[ln.strip()])
                 continue
             cur.lines.append(ln.rstrip())
+        first_content = False
         # blank line between separate shapes keeps paragraphs apart
         if cur.lines and cur.lines[-1] != "":
             cur.lines.append("")
@@ -112,6 +138,10 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
         while s.lines and s.lines[-1] == "":
             s.lines.pop()
     return [s for s in sections if s.lines]
+
+
+def _first_line_of(b) -> str:
+    return b.text.strip().splitlines()[0] if b.text.strip() else ""
 
 
 def collect_sections(report: ReportData, cls: Classification) -> List[Section]:
@@ -596,7 +626,16 @@ def extract_record(report: ReportData, cls: Classification,
         rec.review_reasons.append("Không tìm thấy Nguyên nhân trong báo cáo")
     if not rec.improvement:
         rec.review_reasons.append("Không tìm thấy Nội dung đối sách cải tiến trong báo cáo")
-    if not rec.improvement_image_slides:
+    # improvement pictures: After-only, deterministic geometry (never "all pictures of the slide")
+    if rec.improvement_image_slides:
+        sel = select_after_pictures(report, rec.improvement_image_slides)
+        rec.after_pictures = list(sel.after)
+        rec.after_picture_slides = list(sel.slides_with_after)
+        rec.picture_notes = list(sel.notes)
+        rec.review_reasons.extend(sel.reasons)
+        if not sel.after and not sel.reasons:
+            rec.review_reasons.append("Không tìm thấy ảnh Sau cải tiến trong các slide cải tiến")
+    else:
         rec.review_reasons.append("Không có hình ảnh cải tiến")
     # ambiguous classification -> manual review rather than guessing
     rec.review_reasons.extend(cls.ambiguities)
