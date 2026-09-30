@@ -82,6 +82,8 @@ class OllamaClient:
             "stream": False,
             "format": "json",
             "keep_alive": "10m",
+            # qwen3 family: disable "thinking" so the response is the JSON object only
+            "think": False,
             "options": {
                 "temperature": 0,
                 "top_p": 1,
@@ -100,6 +102,8 @@ class OllamaClient:
         except requests.RequestException as e:
             raise OllamaError(f"Lỗi gọi Ollama ({url}): {e}") from e
         text = data.get("response", "") if isinstance(data, dict) else ""
+        # some servers ignore "think": strip a <think>...</think> preamble if present
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
         return parse_json_response(text)
 
 

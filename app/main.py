@@ -26,7 +26,8 @@ def _cli(args) -> int:
     model = args.model if args.model is not None else cfg.model
     opts = BatchOptions(files=files, template=Path(args.template), output_file=Path(args.output),
                         ollama_server=server, model=model or "", force_reprocess=args.force,
-                        use_ollama=bool(model) and not args.no_ai)
+                        use_ollama=bool(model) and not args.no_ai,
+                        fill_temporary_column=bool(cfg.fill_temporary_column))
 
     def on_file(i, stage, detail):
         print(f"[{i + 1}/{len(files)}] {files[i].name}: {STAGE_LABELS_VI.get(stage, stage)} {detail}".rstrip(), flush=True)
@@ -49,12 +50,23 @@ def main(argv=None) -> int:
     parser.add_argument("--model", help="tên model Ollama (rỗng = không dùng AI)")
     parser.add_argument("--no-ai", action="store_true", help="chỉ dùng nhận diện từ khoá")
     parser.add_argument("--force", action="store_true", help="xử lý lại file đã xử lý")
+    parser.add_argument("--inspect", metavar="PATH", help="in cấu trúc file .pptx hoặc form .xlsx để kiểm tra mapping")
     parser.add_argument("--version", action="store_true")
     args = parser.parse_args(argv)
 
     if args.version:
         from . import __version__
         print(f"Report Extractor {__version__}")
+        return 0
+    if args.inspect:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+        p = Path(args.inspect)
+        if p.suffix.lower() in (".xlsx", ".xlsm"):
+            from inspect_template import inspect_template
+            print(inspect_template(p))
+        else:
+            from inspect_report import inspect_report
+            print(inspect_report(p, Path(args.template) if args.template else None, args.server or "", args.model or ""))
         return 0
     if args.diag:
         from .config import AppConfig

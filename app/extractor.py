@@ -51,6 +51,7 @@ class ExtractedRecord:
     qpn_slide: Optional[int] = None
     improvement_image_slides: List[int] = field(default_factory=list)
     review_reasons: List[str] = field(default_factory=list)
+    blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
     # Business rule: user fills these manually -> always blank
     vendor: str = ""
     occurrence_date: str = ""
@@ -292,4 +293,13 @@ def extract_record(report: ReportData, cls: Classification,
         rec.review_reasons.append("Không tìm thấy mục Đối sách cải tiến")
     if not rec.improvement_image_slides:
         rec.review_reasons.append("Không có hình ảnh cải tiến")
+    # ambiguous classification -> manual review rather than guessing
+    rec.review_reasons.extend(cls.ambiguities)
+    for name, val in (("Management number", rec.management_number), ("Model", rec.model), ("Item", rec.item),
+                      ("Nội dung lỗi", rec.defect_content), ("Nguyên nhân", rec.root_cause),
+                      ("Nội dung đối sách cải tiến", rec.improvement)):
+        if not val:
+            rec.blank_fields.append(name)
+    if not rec.defect_content:
+        rec.review_reasons.append("Không tìm thấy Nội dung lỗi")
     return rec

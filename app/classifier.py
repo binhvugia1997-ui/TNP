@@ -103,7 +103,9 @@ class Classification:
     improvement_image_slides: List[int] = field(default_factory=list)
     temporary_slides: List[int] = field(default_factory=list)
     verify_slides: List[int] = field(default_factory=list)
-    source: str = "heuristic"          # "ollama" | "heuristic" | "ollama+heuristic"
+    source: str = "heuristic"          # "qwen" | "heuristic" | "qwen+heuristic"
+    confidence: Optional[float] = None # reported by the LLM when available (0..1)
+    ambiguities: List[str] = field(default_factory=list)   # -> "Cần kiểm tra"
     raw_llm: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
 
@@ -219,7 +221,8 @@ Identify WHERE information is located. Return ONLY a JSON object with exactly th
   "temporary_slides": [int],     // slides with temporary handling (XỬ LÝ TẠM THỜI / containment)
   "improvement_slides": [int],   // slides with corrective/improvement actions (CẢI TIẾN, ĐỐI SÁCH, ĐỐI SÁCH LÂU DÀI)
   "improvement_image_slides": [int], // improvement slides that contain before/after evidence pictures
-  "verify_slides": [int]         // slides with verification / effect confirmation results
+  "verify_slides": [int],        // slides with verification / effect confirmation results
+  "confidence": number           // 0..1, how sure you are about the slide classification
 }}
 Rules: use slide numbers only; do not include temporary-handling slides in improvement_slides
 unless the same slide also contains permanent improvement content; copy model/item/management
@@ -238,20 +241,120 @@ def build_prompt(report: ReportData, max_chars_per_slide: int = 1800) -> str:
     return PROMPT_TEMPLATE.format(filename=report.filename, slides="\n".join(parts))
 
 
+def _ints_from_any(v: Any) -> List[int]:
+    """Pull slide numbers out of ints, "3", "Slide 3", "3, 5-7", [..], {"slide": 3}, {"slides": [...]}."""
+    out: List[int] = []
+    if v is None or isinstance(v, bool):
+        return out
+    if isinstance(v, (int, float)):
+        return [int(v)]
+    if isinstance(v, str):
+        txt = v.lower()
+        if txt.strip() in ("", "null", "none", "n/a", "na", "-"):
+            return out
+        for a, b in re.findall(r"(\d+)\s*[-–]\s*(\d+)", txt):
+            out.extend(range(int(a), int(b) + 1))
+        txt = re.sub(r"\d+\s*[-–]\s*\d+", " ", txt)
+        out.extend(int(x) for x in re.findall(r"\d+", txt))
+        return out
+    if isinstance(v, dict):
+        for k in ("slide", "slides", "slide_number", "slide_numbers", "number", "index", "page", "pages"):
+            if k in v:
+                out.extend(_ints_from_any(v[k]))
+        if not out:
+            for val in v.values():
+                out.extend(_ints_from_any(val))
+        return out
+    if isinstance(v, (list, tuple, set)):
+        for x in v:
+            out.extend(_ints_from_any(x))
+    return out
+
+
 def _as_int_list(v: Any, n: int) -> List[int]:
     out: List[int] = []
-    if v is None:
-        return out
-    if isinstance(v, (int, str)):
-        v = [v]
-    for x in v if isinstance(v, list) else []:
-        try:
-            i = int(str(x).strip().lstrip("Ss").replace("lide", ""))
-        except ValueError:
-            continue
+    for i in _ints_from_any(v):
         if 1 <= i <= n and i not in out:
             out.append(i)
     return sorted(out)
+
+
+# alias groups: canonical key -> accepted key fragments (normalised: lower, non-alnum -> _)
+_KEY_ALIASES: Dict[str, List[str]] = {
+    "management_number": ["management_number", "management_no", "managementnumber", "mgmt_no", "management",
+                          "ma_quan_ly", "so_quan_ly"],
+    "model": ["model", "model_name", "model_code", "product_model"],
+    "item": ["item", "item_name", "part", "part_name", "hang_muc", "linh_kien"],
+    "qpn_slide": ["qpn_slide", "qpn_slides", "qpn", "quality_problem_notice", "quality_problem_notice_slide", "qpn_page"],
+    "defect_slide": ["defect_slide", "defect_slides", "defect", "defect_content_slide", "noi_dung_loi", "phenomenon_slide",
+                     "problem_slide"],
+    "cause_slides": ["cause_slides", "cause_slide", "root_cause_slides", "root_cause_slide", "root_cause", "cause",
+                     "causes", "nguyen_nhan", "analysis_slides"],
+    "temporary_slides": ["temporary_slides", "temporary_slide", "temporary_handling_slides", "temporary_handling",
+                         "temporary_action_slides", "temporary_actions", "containment_slides", "containment",
+                         "xu_ly_tam_thoi", "temp_slides", "interim_action_slides"],
+    "improvement_slides": ["improvement_slides", "improvement_slide", "improvement", "corrective_action_slides",
+                           "corrective_actions", "corrective_action", "countermeasure_slides", "countermeasures",
+                           "countermeasure", "permanent_action_slides", "permanent_actions", "action_slides",
+                           "doi_sach", "cai_tien", "long_term_slides", "long_term_action_slides", "long_term_actions"],
+    "improvement_image_slides": ["improvement_image_slides", "improvement_images", "image_slides", "picture_slides",
+                                 "evidence_slides", "before_after_slides", "improvement_picture_slides", "images"],
+    "verify_slides": ["verify_slides", "verification_slides", "verification", "effect_slides",
+                      "effect_confirmation_slides", "kiem_chung", "result_slides"],
+    "confidence": ["confidence", "confidence_score", "certainty", "score"],
+}
+
+
+def _norm_json_key(k: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(k).lower()).strip("_")
+
+
+def normalize_llm_response(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Map arbitrary-but-reasonable LLM JSON onto our canonical keys.
+
+    Handles nested containers (``{"slides": {...}}``, ``{"result": {...}}``), key
+    synonyms, and long-term action keys (merged into improvement_slides).
+    """
+    flat: Dict[str, Any] = {}
+
+    def walk(obj: Any, depth: int = 0) -> None:
+        if not isinstance(obj, dict) or depth > 3:
+            return
+        for k, v in obj.items():
+            nk = _norm_json_key(k)
+            if isinstance(v, dict) and not any(x in nk for x in ("slide", "qpn", "cause", "improvement", "temporary")):
+                walk(v, depth + 1)      # generic container ("result", "classification", "slides")
+                continue
+            flat.setdefault(nk, v)
+            if isinstance(v, dict):
+                walk(v, depth + 1)
+    walk(raw or {})
+
+    out: Dict[str, Any] = {}
+    for canon, aliases in _KEY_ALIASES.items():
+        vals = [flat[a] for a in aliases if a in flat]
+        if not vals:
+            # fuzzy: alias contained in key (e.g. "qpn_slide_number")
+            vals = [v for k, v in flat.items() if any(k.startswith(a) or k.endswith(a) for a in aliases)]
+        if not vals:
+            continue
+        if canon in ("management_number", "model", "item"):
+            v = vals[0]
+            out[canon] = "" if v is None else (str(v).strip() if not isinstance(v, (list, dict)) else "")
+        elif canon == "confidence":
+            try:
+                c = float(vals[0])
+                out[canon] = c / 100.0 if c > 1 else c
+            except (TypeError, ValueError):
+                pass
+        elif canon in ("qpn_slide", "defect_slide"):
+            out[canon] = vals[0]
+        else:
+            merged: List[Any] = []
+            for v in vals:
+                merged.append(v)
+            out[canon] = merged
+    return out
 
 
 def _as_int(v: Any, n: int) -> Optional[int]:
@@ -259,9 +362,11 @@ def _as_int(v: Any, n: int) -> Optional[int]:
     return lst[0] if lst else None
 
 
-def merge_llm_with_heuristic(llm: Dict[str, Any], heur: Classification, report: ReportData) -> Classification:
+def merge_llm_with_heuristic(llm_raw: Dict[str, Any], heur: Classification, report: ReportData) -> Classification:
     n = len(report.slides)
-    c = Classification(source="ollama", raw_llm=llm)
+    llm = normalize_llm_response(llm_raw)
+    c = Classification(source="qwen", raw_llm=llm_raw)
+    c.confidence = llm.get("confidence")
     c.management_number = str(llm.get("management_number") or "").strip()
     c.model = str(llm.get("model") or "").strip()
     c.item = str(llm.get("item") or "").strip()
@@ -278,16 +383,31 @@ def merge_llm_with_heuristic(llm: Dict[str, Any], heur: Classification, report: 
         if c.qpn_slide:
             c.notes.append(f"LLM qpn_slide={c.qpn_slide} overridden by exact text match slide {heur.qpn_slide}")
         c.qpn_slide = heur.qpn_slide
-        c.source = "ollama+heuristic"
+        c.source = "qwen+heuristic"
+    elif c.qpn_slide and not heur.qpn_slide:
+        c.ambiguities.append(f"QPN (slide {c.qpn_slide}) chỉ do AI xác định, không có chữ 'Quality Problem Notice'")
+    # --- ambiguity: AI and keyword detection disagree completely ----------------
+    if c.improvement_slides and heur.improvement_slides and not set(c.improvement_slides) & set(heur.improvement_slides):
+        c.ambiguities.append(f"Slide đối sách không thống nhất: AI {c.improvement_slides} / từ khoá {heur.improvement_slides}")
+    if c.cause_slides and heur.cause_slides and not set(c.cause_slides) & set(heur.cause_slides):
+        c.ambiguities.append(f"Slide nguyên nhân không thống nhất: AI {c.cause_slides} / từ khoá {heur.cause_slides}")
+    # temporary slides (by heading) must never be used as improvement text
+    tmp_only = [s_no for s_no in heur.temporary_slides if s_no in c.improvement_slides
+                and s_no not in heur.improvement_slides]
+    if tmp_only:
+        c.notes.append(f"slides {tmp_only} removed from improvement_slides (temporary-handling heading)")
+        c.improvement_slides = [s_no for s_no in c.improvement_slides if s_no not in tmp_only]
+    if c.confidence is not None and c.confidence < 0.5:
+        c.ambiguities.append(f"AI báo độ tin cậy thấp ({c.confidence:.2f})")
     # --- fill gaps from heuristics ----------------------------------------------
     if not c.cause_slides and heur.cause_slides:
         c.cause_slides = list(heur.cause_slides)
         c.notes.append("cause_slides from heuristic")
-        c.source = "ollama+heuristic"
+        c.source = "qwen+heuristic"
     if not c.improvement_slides and heur.improvement_slides:
         c.improvement_slides = list(heur.improvement_slides)
         c.notes.append("improvement_slides from heuristic")
-        c.source = "ollama+heuristic"
+        c.source = "qwen+heuristic"
     # heuristic-detected improvement headings that LLM missed are appended
     for s_no in heur.improvement_slides:
         if s_no not in c.improvement_slides and s_no not in c.temporary_slides and s_no != c.qpn_slide:
@@ -316,7 +436,7 @@ def classify(report: ReportData, ollama_client=None, model: str = "") -> Classif
     """Full classification: heuristics + (optional) remote Qwen."""
     heur = heuristic_classify(report)
     if ollama_client is None or not model:
-        heur.notes.append("Ollama not used")
+        heur.notes.append("Ollama not used (no server/model configured)")
         return heur
     prompt = build_prompt(report)
     try:
@@ -324,6 +444,6 @@ def classify(report: ReportData, ollama_client=None, model: str = "") -> Classif
         LOG.debug("LLM classification for %s: %s", report.filename, json.dumps(llm, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
         LOG.warning("Ollama classification failed for %s, using heuristics: %s", report.filename, e)
-        heur.notes.append(f"Ollama failed: {e}")
+        heur.notes.append(f"Ollama failed, heuristic fallback: {e}")
         return heur
     return merge_llm_with_heuristic(llm, heur, report)

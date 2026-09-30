@@ -61,6 +61,7 @@ class AppConfig:
     request_timeout: int = 180
     render_dpi: int = 150
     force_reprocess: bool = False
+    fill_temporary_column: bool = False   # write "Xử lý tạm thời" text into its own column (never into improvement)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------

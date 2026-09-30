@@ -55,6 +55,7 @@ class BatchOptions:
     request_timeout: int = 180
     render_width: int = 1920
     use_ollama: bool = True
+    fill_temporary_column: bool = False
 
 
 @dataclass
@@ -161,6 +162,10 @@ class BatchProcessor:
                 LOG.error("Final save failed: %s", e)
             writer.close()
             result_log.finish(self.summary.as_dict())
+            try:
+                write_review_report(self.results, logs / "review_report.txt", self.summary)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("review_report.txt failed: %s", e)
             self._log(f"Kết thúc. Tổng: {self.summary.total}  Hoàn thành: {self.summary.completed}  "
                       f"Cần kiểm tra: {self.summary.needs_review}  Lỗi: {self.summary.failed}  "
                       f"Bỏ qua: {self.summary.skipped}")
@@ -201,8 +206,16 @@ class BatchProcessor:
             fr.cause_slides = list(cls.cause_slides)
             fr.improvement_slides = list(cls.improvement_slides)
             fr.improvement_image_slides = list(cls.improvement_image_slides)
+            fr.temporary_slides = list(cls.temporary_slides)
+            fr.verify_slides = list(cls.verify_slides)
+            fr.defect_slide = cls.defect_slide
+            fr.confidence = cls.confidence
+            fr.classifier_notes = list(cls.notes)
             for n in cls.notes:
                 LOG.info("%s: %s", path.name, n)
+            LOG.info("%s: classifier=%s qpn=%s cause=%s temp=%s improvement=%s images=%s conf=%s",
+                     path.name, cls.source, cls.qpn_slide, cls.cause_slides, cls.temporary_slides,
+                     cls.improvement_slides, cls.improvement_image_slides, cls.confidence)
 
             # --- 3. extract original content (program copies WHAT) ----------
             rec = extract_record(report, cls, writer.item_mapping, writer.known_models)
@@ -239,10 +252,11 @@ class BatchProcessor:
             note = "; ".join(rec.review_reasons)
             row = writer.append_record(rec, qpn_png, imp_jpg,
                                        status_text="Cần kiểm tra" if rec.review_reasons else "",
-                                       note_text=note)
+                                       note_text=note, fill_temporary=self.opts.fill_temporary_column)
             writer.save()                       # save after every successful record
             fr.excel_row = row
             fr.review_reasons = list(rec.review_reasons)
+            fr.blank_fields = list(rec.blank_fields)
             fr.status = status
             history.record(fr.fingerprint, path, Path(self.opts.output_file), row, status)
             if status == "completed":
@@ -264,3 +278,41 @@ class BatchProcessor:
     def _log(self, msg: str) -> None:
         LOG.info(msg)
         self.on_log(msg)
+
+
+def format_file_diagnostics(fr: FileResult) -> str:
+    """Human readable per-report diagnostics (also shown by the GUI)."""
+    lines = [
+        f"Báo cáo            : {fr.source_file}",
+        f"Trạng thái         : {fr.status}" + (f"  (dòng Excel {fr.excel_row})" if fr.excel_row else ""),
+        f"Bộ phân loại       : {fr.classifier or '-'}" + (f"  (độ tin cậy AI {fr.confidence:.2f})" if fr.confidence is not None else ""),
+        f"Management number  : {fr.management_number or '(trống)'}",
+        f"Model              : {fr.model or '(trống)'}",
+        f"Item               : {fr.item or '(trống)'}",
+        f"Slide QPN          : {fr.qpn_slide or '(không thấy)'}",
+        f"Slide nội dung lỗi : {fr.defect_slide or '-'}",
+        f"Slide nguyên nhân  : {fr.cause_slides or '(không thấy)'}",
+        f"Slide xử lý tạm thời: {fr.temporary_slides or '-'}  (loại khỏi đối sách)",
+        f"Slide đối sách     : {fr.improvement_slides or '(không thấy)'}",
+        f"Slide hình cải tiến: {fr.improvement_image_slides or '(không có)'}",
+        f"Slide kiểm chứng   : {fr.verify_slides or '-'}  (WEEK +1..+8 luôn để trống)",
+        f"Renderer QPN       : {fr.qpn_renderer or '-'}",
+        f"Trường để trống    : {', '.join(fr.blank_fields) if fr.blank_fields else '(không)'}",
+        f"Cần kiểm tra thủ công: {'; '.join(fr.review_reasons) if fr.review_reasons else '(không)'}",
+    ]
+    if fr.classifier_notes:
+        lines.append("Ghi chú phân loại  : " + " | ".join(fr.classifier_notes))
+    if fr.error:
+        lines.append(f"Lỗi                : {fr.error}")
+    return "\n".join(lines)
+
+
+def write_review_report(results: List[FileResult], path: Path, summary: BatchSummary) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    head = (f"BÁO CÁO KIỂM TRA TRÍCH XUẤT – {datetime.now():%Y-%m-%d %H:%M}\n"
+            f"Tổng: {summary.total}  Hoàn thành: {summary.completed}  Cần kiểm tra: {summary.needs_review}  "
+            f"Lỗi: {summary.failed}  Bỏ qua: {summary.skipped}\n"
+            f"Nguyên tắc: Tên vendor, Ngày phát sinh, WEEK +1..+8 luôn để trống (người dùng nhập tay).\n")
+    body = "\n\n".join(("=" * 78) + "\n" + format_file_diagnostics(fr) for fr in results)
+    path.write_text(head + "\n" + body + "\n", encoding="utf-8")
+    return path

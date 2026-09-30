@@ -46,6 +46,8 @@ FIELD_ALIASES: Dict[str, List[str]] = {
     "defect_content": ["noi dung loi", "defect content", "noi dung khong phu hop", "hien tuong", "defect"],
     "qpn": ["qpn", "quality problem notice", "hinh anh qpn"],
     "root_cause": ["nguyen nhan", "root cause", "cause"],
+    "temporary": ["xu ly tam thoi", "phuong phap xu ly tam thoi", "doi sach tam thoi", "bien phap tam thoi",
+                  "temporary action", "temporary handling", "containment"],
     "improvement": ["noi dung doi sach cai tien", "noi dung doi sach", "doi sach cai tien", "doi sach",
                     "countermeasure", "corrective action", "cai tien"],
     "improvement_image": ["hinh anh cai tien", "hinh anh doi sach", "hinh anh", "image", "improvement image"],
@@ -125,6 +127,12 @@ class ExcelWriter:
                 if len(v) > 60 or "\n" in v.strip():      # data text, not a header label
                     continue
                 key = norm_key(v)
+                # "Nội dung đối sách tạm thời" must never be taken for the improvement column
+                if "tam thoi" in key or "temporary" in key or "containment" in key:
+                    s = _alias_score(key, "temporary") or 1
+                    if "temporary" not in matches or s > matches["temporary"][1]:
+                        matches["temporary"] = (c, s)
+                    continue
                 for field in FIELD_ALIASES:
                     s = _alias_score(key, field)
                     if s and (field not in matches or s > matches[field][1]):
@@ -219,7 +227,7 @@ class ExcelWriter:
         return self.ws.cell(row=row, column=col), None
 
     def _row_used(self, row: int) -> bool:
-        check = [f for f in self.columns if f not in ("stt", "vendor", "occurrence_date", "status", "note")
+        check = [f for f in self.columns if f not in ("stt", "vendor", "occurrence_date", "status", "note", "temporary")
                  and not f.startswith("week_")]
         for f in check:
             cell, _ = self._anchor(row, self.columns[f])
@@ -318,7 +326,7 @@ class ExcelWriter:
     # Public API
     # ------------------------------------------------------------------
     def append_record(self, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
-                      status_text: str = "", note_text: str = "") -> int:
+                      status_text: str = "", note_text: str = "", fill_temporary: bool = False) -> int:
         """Write one report as one new row. Returns the Excel row number."""
         row = self.next_row()
         src = row - 1 if row - 1 >= self.data_start else self.data_start
@@ -335,6 +343,8 @@ class ExcelWriter:
         self._set_cell(row, "defect_content", rec.defect_content)
         self._set_cell(row, "root_cause", rec.root_cause)
         self._set_cell(row, "improvement", rec.improvement)
+        # "Xử lý tạm thời" column: kept separate from improvement; blank unless explicitly enabled
+        self._set_cell(row, "temporary", rec.temporary_excluded if fill_temporary else "")
         for i in range(1, 9):   # WEEK +1..+8: blank unless real source data (none parsed) -> blank
             self._set_cell(row, f"week_{i}", rec.weeks.get(i, "") or "", wrap=False)
         if status_text:

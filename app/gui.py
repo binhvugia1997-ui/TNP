@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
 
 from . import APP_NAME, __version__
-from .batch_processor import STAGE_LABELS_VI, BatchOptions, BatchProcessor, BatchSummary
+from .batch_processor import STAGE_LABELS_VI, BatchOptions, BatchProcessor, BatchSummary, format_file_diagnostics
 from .config import AppConfig, normalize_ollama_url
 from .diagnostics import format_diagnostics, run_diagnostics
 from .ollama_client import OllamaClient, OllamaError, preferred_model
@@ -143,6 +143,7 @@ class ReportExtractorApp:
         self.tree.tag_configure("error", foreground="#c62828")
         self.tree.tag_configure("skipped", foreground="#666666")
         self.tree.tag_configure("working", foreground="#0b57d0")
+        self.tree.bind("<Double-1>", self._on_row_double_click)
         if _DND_OK:
             for w in (self.tree, lf, r):
                 try:
@@ -346,7 +347,8 @@ class ReportExtractorApp:
                 return
         opts = BatchOptions(files=list(self.files), template=Path(template), output_file=Path(output),
                             ollama_server=server, model=model, force_reprocess=bool(self.var_force.get()),
-                            request_timeout=self.cfg.request_timeout, use_ollama=use_ai)
+                            request_timeout=self.cfg.request_timeout, use_ollama=use_ai,
+                            fill_temporary_column=bool(self.cfg.fill_temporary_column))
         self.error_details = []
         self.summary = None
         for i in self.file_items:
@@ -434,6 +436,26 @@ class ReportExtractorApp:
         messagebox.showinfo(APP_NAME, msg)
 
     # ------------------------------------------------------------------
+    def _on_row_double_click(self, _event=None) -> None:
+        sel = self.tree.selection()
+        if not sel or not self.processor:
+            return
+        idx = next((i for i, iid in self.file_items.items() if iid == sel[0]), None)
+        if idx is None:
+            return
+        src = str(self.files[idx])
+        fr = next((r for r in self.processor.results if r.source_file == src), None)
+        if fr is None:
+            messagebox.showinfo(APP_NAME, "Báo cáo này chưa được xử lý.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"Chẩn đoán trích xuất – {self.files[idx].name}")
+        win.geometry("820x460")
+        t = tk.Text(win, wrap="word", font=("Consolas", 10))
+        t.pack(fill="both", expand=True)
+        t.insert("end", format_file_diagnostics(fr))
+        t.configure(state="disabled")
+
     def show_errors(self) -> None:
         lines = list(self.error_details)
         if not lines:
@@ -447,7 +469,9 @@ class ReportExtractorApp:
         t.insert("end", "\n".join(lines))
         out = self.var_output.get().strip()
         if out:
-            t.insert("end", f"\n\nXem thêm: {Path(out).parent / 'logs' / 'errors.log'}")
+            t.insert("end", f"\n\nXem thêm: {Path(out).parent / 'logs' / 'errors.log'}"
+                            f"\n          {Path(out).parent / 'logs' / 'review_report.txt'}"
+                            f"\n(Nháy đúp vào một dòng trong danh sách để xem chẩn đoán chi tiết của báo cáo đó)")
         t.configure(state="disabled")
 
     def show_diagnostics(self) -> None:

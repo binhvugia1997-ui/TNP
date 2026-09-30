@@ -61,10 +61,16 @@ class FileResult:
     cause_slides: List[int] = field(default_factory=list)
     improvement_slides: List[int] = field(default_factory=list)
     improvement_image_slides: List[int] = field(default_factory=list)
+    temporary_slides: List[int] = field(default_factory=list)
+    verify_slides: List[int] = field(default_factory=list)
+    defect_slide: Optional[int] = None
     excel_row: Optional[int] = None
     review_reasons: List[str] = field(default_factory=list)
+    blank_fields: List[str] = field(default_factory=list)
+    classifier_notes: List[str] = field(default_factory=list)
+    confidence: Optional[float] = None
     error: str = ""
-    classifier: str = ""               # "ollama" | "heuristic"
+    classifier: str = ""               # "qwen" | "qwen+heuristic" | "heuristic"
     qpn_renderer: str = ""
     fingerprint: str = ""
     started_at: str = ""

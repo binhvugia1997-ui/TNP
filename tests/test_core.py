@@ -167,7 +167,7 @@ def test_classify_uses_only_slide_text_and_falls_back(a185_report):
     fake = FakeOllama({"qpn_slide": 2, "cause_slides": [3], "improvement_slides": [5, 6, 7],
                        "improvement_image_slides": [5, 6], "temporary_slides": [4], "model": "SM-A185"})
     c = classify(r, fake, "qwen3:4b")
-    assert c.source.startswith("ollama")
+    assert c.source.startswith("qwen")
     assert "--- Slide 2 ---" in fake.prompts[0] and "Quality Problem Notice" in fake.prompts[0]
     assert "PK\x03" not in fake.prompts[0]        # no binary sent
     c2 = classify(r, FakeOllama(fail=True), "qwen3:4b")
