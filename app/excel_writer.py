@@ -124,9 +124,9 @@ class ExcelWriter:
                 v = ws.cell(row=r, column=c).value
                 if not isinstance(v, str) or not v.strip():
                     continue
-                if len(v) > 60 or "\n" in v.strip():      # data text, not a header label
+                if len(v.strip()) > 60 or v.count("\n") > 3:  # long data text, not a header label
                     continue
-                key = norm_key(v)
+                key = norm_key(v)                            # collapses line breaks / spaces / accents
                 # "Nội dung đối sách tạm thời" must never be taken for the improvement column
                 if "tam thoi" in key or "temporary" in key or "containment" in key:
                     s = _alias_score(key, "temporary") or 1
@@ -149,22 +149,57 @@ class ExcelWriter:
         header = max(row_matches, key=strength)
         self.header_row = header
         cols: Dict[str, int] = {}
-        # merge header row + up to 2 sub-header rows (WEEK +1.. often sit below a merged title)
-        for r in (header, header + 1, header + 2):
+        # header band: the header row, up to 2 rows above (merged parent titles) and 3 rows below
+        band = [r for r in range(max(1, header - 2), header + 4) if r <= max_scan]
+        for r in [header] + [r for r in band if r != header]:
             if r in row_matches:
                 for f, (c, s) in row_matches[r].items():
                     if f not in cols:
                         cols[f] = c
+        # WEEK columns inherited from a merged parent header ("Kiểm chứng" / "WEEK" / "Tuần")
+        # whose sub-cells are only "+1", "1", "W1", "1W", "T1" ...
+        for r in band:
+            for c in range(1, min(ws.max_column, 80) + 1):
+                v = ws.cell(row=r, column=c).value
+                if v in (None, ""):
+                    continue
+                k = norm_key(str(v))
+                m = re.fullmatch(r"(?:week|w|tuan|t)?\s*\+?\s*([1-8])\s*(?:w|week|tuan)?", k)
+                if not m:
+                    continue
+                field = f"week_{m.group(1)}"
+                if field in cols:
+                    continue
+                parent = self._parent_header_key(r, c, header)
+                if parent and any(x in parent for x in ("kiem chung", "week", "tuan", "verification", "xac nhan")):
+                    cols[field] = c
         last_header = header
-        for r in (header + 1, header + 2):
+        for r in range(header + 1, header + 4):
             if r in row_matches and any(f.startswith("week_") or f in ("model", "item") for f in row_matches[r]):
                 last_header = r
-        # if row below header has any string cells that look like headers (all strings, no numbers), skip it
+            elif any(cols.get(f"week_{i}") and self._cell_row_of_week(r, cols[f"week_{i}"]) for i in range(1, 9)):
+                last_header = r
         self.columns = cols
         self.data_start = last_header + 1
         missing = [f for f in ("improvement", "root_cause") if f not in cols]
         if missing:
             LOG.warning("Template columns not found: %s (columns found: %s)", missing, cols)
+
+    def _cell_row_of_week(self, row: int, col: int) -> bool:
+        v = self.ws.cell(row=row, column=col).value
+        return v not in (None, "") and bool(re.fullmatch(r"(?:week|w|tuan|t)?\s*\+?\s*[1-8]\s*(?:w|week|tuan)?",
+                                                          norm_key(str(v))))
+
+    def _parent_header_key(self, row: int, col: int, header_row: int) -> str:
+        """Text of the merged/plain header cell(s) directly above (row-1, row-2) covering ``col``."""
+        texts = []
+        for r in (row - 1, row - 2, header_row):
+            if r < 1 or r == row:
+                continue
+            cell, rng = self._anchor(r, col)
+            if cell.value not in (None, ""):
+                texts.append(norm_key(str(cell.value)))
+        return " ".join(texts)
 
     def _read_mapping_sheet(self) -> Tuple[Dict[str, str], List[str]]:
         mapping: Dict[str, str] = {}

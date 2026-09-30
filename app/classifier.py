@@ -142,6 +142,12 @@ def find_qpn_slide(report: ReportData) -> Optional[int]:
         k = norm_key(s.text)
         if any(m in k for m in QPN_MARKERS):
             return s.number
+    # text hidden in alt-text / OLE object names / picture names / speaker notes
+    for s in report.slides:
+        meta = " ".join([*s.alt_texts, *(b.shape_name for b in s.blocks), s.notes])
+        k = norm_key(meta)
+        if any(m in k for m in QPN_MARKERS) or re.search(r"(?<![a-z])qpn(?![a-z])", k):
+            return s.number
     for s in report.slides:
         for b in s.text_blocks:
             first = b.text.strip().split("\n")[0]

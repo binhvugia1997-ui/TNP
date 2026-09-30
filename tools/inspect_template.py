@@ -26,13 +26,30 @@ def inspect_template(path: Path, max_rows: int = 12, max_cols: int = 40) -> str:
         out.append(f"Merged ranges ({len(merged)}): {merged[:40]}{' …' if len(merged) > 40 else ''}")
         widths = {k: v.width for k, v in ws.column_dimensions.items() if v.width}
         out.append(f"Column widths: {widths}")
+        def merged_of(r, c):
+            for rng in ws.merged_cells.ranges:
+                if rng.min_row <= r <= rng.max_row and rng.min_col <= c <= rng.max_col:
+                    return str(rng)
+            return ""
+        from app.excel_writer import FIELD_ALIASES, _alias_score
         for r in range(1, min(ws.max_row, max_rows) + 1):
             cells = []
+            scores = {}
             for c in range(1, min(ws.max_column, max_cols) + 1):
                 v = ws.cell(row=r, column=c).value
-                if v not in (None, ""):
-                    cells.append(f"{ws.cell(row=r, column=c).coordinate}={str(v)[:40]!r}")
-            out.append(f"  R{r}: " + ("  ".join(cells) if cells else "(empty)"))
+                if v in (None, ""):
+                    continue
+                coord = ws.cell(row=r, column=c).coordinate
+                mg = merged_of(r, c)
+                cells.append(f"{coord}{'[' + mg + ']' if mg else ''}={str(v)[:50]!r} key={norm_key(str(v))!r}")
+                if isinstance(v, str):
+                    for f in FIELD_ALIASES:
+                        sc = _alias_score(norm_key(v), f)
+                        if sc:
+                            scores[f"{f}@{coord}"] = sc
+            out.append(f"  R{r} (h={ws.row_dimensions[r].height}): " + ("  ".join(cells) if cells else "(empty)"))
+            if scores:
+                out.append(f"      alias hits: {scores}")
     ok, msg = validate_template(path)
     out.append(f"\nvalidate_template: {'OK' if ok else 'FAIL'} – {msg}")
     with tempfile.TemporaryDirectory() as tmp:

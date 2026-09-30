@@ -24,10 +24,48 @@ def inspect_report(path: Path, template: Path | None = None, server: str = "", m
     out = [f"REPORT: {path}"]
     r = parse_pptx(path)
     out.append(f"Slides: {len(r.slides)}  size: {r.slide_width}x{r.slide_height} EMU")
-    for s in r.slides:
+    from pptx import Presentation
+    from app.pptx_parser import raw_xml_text
+    from app.classifier import is_heading_like, section_kind_of_heading
+    prs = Presentation(str(path))
+    for s, raw_slide in zip(r.slides, prs.slides):
         out.append(f"\n=== Slide {s.number}  ({len(s.text_blocks)} text blocks, {len(s.pictures)} pictures) ===")
-        txt = s.text if full_text else s.text[:600]
-        out.append(txt or "(no text)")
+        out.append(f"XML inventory: {s.xml_stats}")
+        out.append("Shapes (reading order):")
+        for b in s.blocks:
+            pos = f"@({b.left // 12700},{b.top // 12700})pt {b.width // 12700}x{b.height // 12700}"
+            if b.kind == "picture":
+                size = len(b.image_blob) if b.image_blob else 0
+                out.append(f"  [PIC {b.origin}] id={b.shape_id} name={b.shape_name!r} ext={b.image_ext} bytes={size} "
+                           f"alt={b.alt_text!r} {pos}")
+            else:
+                preview = b.text.replace("\n", " ⏎ ")
+                preview = preview if full_text else preview[:200]
+                out.append(f"  [{b.kind.upper()} {b.origin}] id={b.shape_id} name={b.shape_name!r} bold={b.bold} "
+                           f"size={b.size_pt} {pos}: {preview}")
+        hits = []
+        for b in s.text_blocks:
+            for i, ln in enumerate(b.text.split("\n")):
+                k = section_kind_of_heading(ln)
+                if k:
+                    hits.append((ln.strip()[:60], k, is_heading_like(ln, b.bold if i == 0 else False, b.size_pt if i == 0 else None)))
+        out.append(f"Heading hits (line, kind, heading-like): {hits or 'none'}")
+        try:
+            rels = [(rel.reltype.rsplit('/', 1)[-1], str(rel.target_part.partname), len(rel.target_part.blob))
+                    for rel in raw_slide.part.rels.values() if not rel.is_external
+                    and rel.reltype.rsplit('/', 1)[-1] in ("image", "oleObject", "package", "chart")]
+            out.append(f"Related parts: {rels or 'none'}")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"Related parts: ? ({e})")
+        raw_txt = raw_xml_text(raw_slide)
+        parsed = s.text
+        missed = [ln for ln in raw_txt.split("\n") if ln.strip() and ln.strip() not in parsed]
+        if missed:
+            out.append(f"TEXT IN XML BUT NOT PARSED ({len(missed)} lines): {missed[:15]}")
+        if s.notes:
+            out.append(f"Notes: {s.notes[:300]!r}")
+        out.append("Text:")
+        out.append(parsed or "(no text)")
     heur = heuristic_classify(r)
     out.append("\n--- Heuristic classification ---")
     out.append(json.dumps(heur.to_dict(), ensure_ascii=False, indent=1))
