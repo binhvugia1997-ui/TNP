@@ -350,6 +350,7 @@ class ReportExtractorApp:
                             ollama_server=server, model=model, force_reprocess=bool(self.var_force.get()),
                             request_timeout=self.cfg.request_timeout, use_ollama=use_ai,
                             fill_temporary_column=bool(self.cfg.fill_temporary_column),
+                            vendors=list(self.cfg.vendors or []),
                             row_mode=self.cfg.row_mode or "match")
         self.error_details = []
         self.summary = None

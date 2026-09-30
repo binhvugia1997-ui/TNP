@@ -54,41 +54,36 @@ def test_occurrence_date_is_not_filename_date(report_factory):
 
 
 # ---------------------------------------------------------------- vendor
-def test_vendor_phrase_variants():
+def test_vendor_phrase_candidates_are_raw_source_spelling():
+    # raw 'công đoạn assy X' names (used only to report unknown candidates)
     assert find_vendor_candidates("Tại công đoạn assy Taewon, thao tác lấy hàng ...") == ["Taewon"]
-    assert find_vendor_candidates("Áp dụng cải tiến 17/9 – Công đoạn Assy Daoltech:") == ["Daoltech"]
     assert find_vendor_candidates("Công đoạn Assy Sung Kwang Vina thực hiện") == ["Sung Kwang Vina"]
-    # repeated -> one; case preserved exactly as in source
-    assert find_vendor_candidates("công đoạn assy Taewon ... Tại công đoạn Assy Taewon") == ["Taewon"]
-    # conflicting vendors are both reported
-    assert find_vendor_candidates("công đoạn assy Taewon ... công đoạn assy Daoltech") == ["Taewon", "Daoltech"]
-    # no structural phrase -> nothing (the word 'vendor' alone is not enough)
     assert find_vendor_candidates("Vendor: CÔNG TY TNHH ABC VINA\nNhà cung cấp Taewon") == []
-    # 'công đoạn lắp ráp Rear' is an item, not a vendor phrase
     assert find_vendor_candidates("Tại công đoạn lắp ráp Rear, thao tác ...") == []
 
 
 def test_vendor_from_improvement_not_from_cover(a185_report):
     rep = parse_pptx(a185_report)
     rec = extract_record(rep, heuristic_classify(rep))
-    assert rec.vendor == "Daoltech"                    # from "Công đoạn Assy Daoltech" in the improvement
+    assert rec.vendors == ["Doaltech"]                 # "Công đoạn Assy Daoltech" -> canonical spelling
+    assert rec.vendor == "Doaltech"
     assert "ABC VINA" not in rec.vendor                # cover 'Vendor:' line is never used
-    assert rec.vendor_candidates == ["Daoltech"]
+    assert not any("Vendor" in r for r in rec.review_reasons)
 
 
-def test_vendor_conflict_and_missing(report_factory, monkeypatch):
+def test_vendor_conflict_and_missing(report_factory):
     from types import SimpleNamespace
     from app import extractor as ex
     empty = SimpleNamespace(all_text=lambda: "")
     rec = ex.ExtractedRecord(management_number="251119092-VOC",
                              improvement="Tại công đoạn assy Taewon ... Tại công đoạn assy Daoltech")
     ex.extract_vendor(rec, empty)
-    assert rec.vendor == "" and rec.vendor_candidates == ["Taewon", "Daoltech"]
-    assert any("Taewon" in r and "Daoltech" in r for r in rec.review_reasons)
+    assert rec.vendors == ["Teawon", "Doaltech"]       # several vendors are normal, no conflict
+    assert rec.vendor == "Teawon\nDoaltech" and rec.review_reasons == []
     rec2 = ex.ExtractedRecord(management_number="251119092-VOC", improvement="Không có cụm từ nào")
     ex.extract_vendor(rec2, empty)
-    assert rec2.vendor == ""
-    assert "Không xác định được Vendor từ nội dung đối sách" in rec2.review_reasons
+    assert rec2.vendor == "" and rec2.vendors == []
+    assert "Không xác định được Vendor từ nội dung báo cáo" in rec2.review_reasons
 
 
 # ---------------------------------------------------------------- excel: locate existing row
@@ -136,7 +131,7 @@ def test_match_mode_updates_existing_row_and_preserves_key(sample_tree, template
     ws = load_workbook(out)["Kiểm chứng"]
     assert ws.cell(row=5, column=2).value == "260918080-VOC"                  # key untouched
     assert ws.cell(row=5, column=5).value == "A185" and ws.cell(row=5, column=6).value == "Rear"
-    assert ws.cell(row=5, column=3).value == "Daoltech"
+    assert ws.cell(row=5, column=3).value == "Doaltech"
     d = ws.cell(row=5, column=4).value
     assert isinstance(d, dt.datetime) and d.date() == dt.date(2026, 9, 18)
     assert ws.cell(row=5, column=4).number_format == "DD/MM/YYYY"
@@ -169,15 +164,15 @@ def test_match_mode_not_found_duplicate_and_missing_key(sample_tree, template, t
 
 
 def test_vendor_and_date_conflicts_keep_existing_value(sample_tree, template, tmp_path):
-    _prefill(template, [("260918080-VOC", "Taewon", dt.datetime(2026, 9, 1))])
+    _prefill(template, [("260918080-VOC", "Teawon", dt.datetime(2026, 9, 1))])
     out = tmp_path / "out" / "k.xlsx"
     summary, events, proc = _run([sample_tree["files"][0]], template, out)
     assert summary.needs_review == 1
     ws = load_workbook(out)["Kiểm chứng"]
-    assert ws.cell(row=4, column=3).value == "Taewon"                        # kept, not overwritten
+    assert ws.cell(row=4, column=3).value == "Teawon"                        # kept, not overwritten
     assert ws.cell(row=4, column=4).value == dt.datetime(2026, 9, 1)
     reasons = " ".join(proc.results[0].review_reasons)
-    assert "Taewon" in reasons and "Daoltech" in reasons
+    assert "Vendor trong Excel: Teawon" in reasons and "Vendor trong báo cáo: Doaltech" in reasons
     assert "01/09/2026" in reasons and "18/09/2026" in reasons
 
 
@@ -206,7 +201,7 @@ def test_data_sheet_is_never_used(sample_tree, template, tmp_path):
     for c in range(1, 20):
         v = ws.cell(row=4, column=c).value
         assert v is None or ("DATA SHEET" not in str(v) and "DataVendor" not in str(v))
-    assert ws.cell(row=4, column=3).value == "Daoltech"
+    assert ws.cell(row=4, column=3).value == "Doaltech"
     assert ws.cell(row=4, column=4).value.date() == dt.date(2026, 9, 18)
     # the Data sheet itself is left as is
     assert load_workbook(out)["Data"]["B2"].value == "DATA SHEET DEFECT TEXT"
@@ -217,7 +212,7 @@ def test_append_mode_still_available(sample_tree, tmp_path):
     summary, _, _ = _run([sample_tree["files"][0]], sample_tree["template"], out, row_mode="append")
     assert summary.completed == 1
     ws = load_workbook(out)["Kiểm chứng"]
-    assert ws.cell(row=4, column=2).value == "260918080-VOC" and ws.cell(row=4, column=3).value == "Daoltech"
+    assert ws.cell(row=4, column=2).value == "260918080-VOC" and ws.cell(row=4, column=3).value == "Doaltech"
 
 
 
@@ -334,7 +329,7 @@ def test_destination_sheet_found_by_structure_regardless_of_name(sample_tree, tm
     ws = load_workbook(out)[title]
     assert ws.cell(row=4, column=2).value == "260918080-VOC"
     assert ws.cell(row=4, column=5).value == "A185" and ws.cell(row=4, column=6).value == "Rear"
-    assert ws.cell(row=4, column=3).value == "Daoltech"
+    assert ws.cell(row=4, column=3).value == "Doaltech"
     assert ws.cell(row=4, column=4).value.date() == dt.date(2026, 9, 18)
     assert "ĐỐI SÁCH LÂU DÀI" in ws.cell(row=4, column=10).value
     assert all(ws.cell(row=4, column=k).value == "OK" for k in range(12, 20))
@@ -399,3 +394,139 @@ def test_no_destination_sheet_gives_clear_diagnostic(tmp_path):
         assert label in msg
     ok, vmsg = validate_template(p)
     assert not ok and "QPN" in vmsg
+
+
+# ---------------------------------------------------------------- controlled multi-value Vendor
+from types import SimpleNamespace  # noqa: E402
+
+from app import extractor as ex  # noqa: E402
+from app.extractor import CANONICAL_VENDORS, canonical_vendors, canonicalize_vendor_value  # noqa: E402
+
+
+def _vendor_rec(improvement, other=""):
+    rec = ex.ExtractedRecord(management_number="260601038-VOC", improvement=improvement)
+    ex.extract_vendor(rec, SimpleNamespace(all_text=lambda: other))
+    return rec
+
+
+def test_it_alone_is_not_a_vendor():
+    assert canonical_vendors("Bộ phận IT kiểm tra; công đoạn IT; ITEM; IT.") == []
+    rec = _vendor_rec("Tại công đoạn IT thao tác lại")
+    assert rec.vendors == [] and rec.vendor == ""
+    assert "IT" not in rec.vendor_candidates
+    assert "Không xác định được Vendor từ nội dung báo cáo" in rec.review_reasons
+
+
+def test_it_vendors_keep_their_prefix():
+    # the real 260601038-VOC case: 'Assy IT' must never be reduced to 'IT'
+    assert canonical_vendors("Tại công đoạn Assy IT, thao tác lấy hàng") == ["Assy IT"]
+    assert canonical_vendors("Công đoạn CNC IT") == ["CNC IT"]
+    assert canonical_vendors("Công đoạn Sơn IT") == ["Sơn IT"]
+    assert canonical_vendors("Công đoạn Son IT") == ["Sơn IT"]          # accent-tolerant, canonical output
+    assert canonical_vendors("Công đoạn Nhựa IT") == ["Nhựa IT"]
+    assert canonical_vendors("công đoạn  assy   it") == ["Assy IT"]     # case / whitespace tolerant
+    rec = _vendor_rec("Tại công đoạn Assy IT thao tác")
+    assert rec.vendors == ["Assy IT"] and rec.review_reasons == []      # no 'unknown candidate IT' noise
+
+
+def test_mtech_variants_stay_distinct():
+    assert canonical_vendors("Vendor Mtech") == ["Mtech"]
+    assert canonical_vendors("Vendor Mtech VN") == ["Mtech VN"]
+    assert canonical_vendors("Vendor Mtech 4") == ["Mtech 4"]
+    assert canonical_vendors("Mtech VN và Mtech 4 và Mtech") == ["Mtech VN", "Mtech 4", "Mtech"]
+
+
+def test_all_canonical_vendors_recognised():
+    text = "Tesung; Doaltech; APV; An Lập; Yongsong; HK; Teawon; công đoạn assy Taewon"
+    assert canonical_vendors(text) == ["Tesung", "Doaltech", "APV", "An Lập", "Yongsong", "HK", "Teawon"]
+    for v in CANONICAL_VENDORS:
+        assert canonical_vendors(f"Tại công đoạn {v} thao tác") == [v]
+        assert canonical_vendors(f"tại công đoạn {v.lower()} thao tác") == [v]
+        assert canonical_vendors(f"TẠI CÔNG ĐOẠN {v.upper()} THAO TÁC") == [v]
+
+
+def test_multiple_vendors_dedupe_and_source_order():
+    text = ("Công đoạn Sơn IT: kiểm tra bề mặt\nTại công đoạn Assy IT: thay khay\n"
+            "Vendor Mtech bổ sung film\nSơn IT kiểm tra lại\nAssy IT xác nhận")
+    rec = _vendor_rec(text)
+    assert rec.vendors == ["Sơn IT", "Assy IT", "Mtech"]
+    assert rec.vendor == "Sơn IT\nAssy IT\nMtech"                        # one per line
+    assert not any("Vendor" in r for r in rec.review_reasons)           # multiple vendors are normal
+
+
+def test_unknown_vendor_candidate_not_invented():
+    rec = _vendor_rec("Tại công đoạn assy Sung Kwang Vina thao tác; công đoạn Assy IT kiểm tra")
+    assert rec.vendors == ["Assy IT"]                                   # unknown name never written
+    assert any("Sung Kwang Vina" in r and "không có trong danh sách chuẩn" in r for r in rec.review_reasons)
+    rec2 = _vendor_rec("Tại công đoạn assy Sung Kwang Vina thao tác")
+    assert rec2.vendors == [] and "Sung Kwang Vina" in rec2.vendor_candidates
+    assert "Không xác định được Vendor từ nội dung báo cáo" in rec2.review_reasons
+    assert any("Sung Kwang Vina" in r for r in rec2.review_reasons)
+
+
+def test_excel_vendor_cell_normalisation():
+    assert canonicalize_vendor_value("Mtech / Tesung") == (["Mtech", "Tesung"], [])
+    assert canonicalize_vendor_value("Mtech\nAssy IT; tesung, son it") == (["Mtech", "Assy IT", "Tesung", "Sơn IT"], [])
+    assert canonicalize_vendor_value("Công ty ABC") == ([], ["Công ty ABC"])
+    assert canonicalize_vendor_value("") == ([], [])
+
+
+def test_multi_vendor_written_one_per_line_with_wrap(sample_tree, template, tmp_path, report_factory):
+    _prefill(template, [("260918080-VOC", None, None)])
+    out = tmp_path / "out" / "k.xlsx"
+    summary, _, _ = _run([sample_tree["files"][0]], template, out)      # sample has 'Công đoạn Assy Daoltech'
+    ws = load_workbook(out)["Kiểm chứng"]
+    assert ws.cell(row=4, column=3).value == "Doaltech" and ws.cell(row=4, column=3).alignment.wrap_text
+    # a multi-vendor record through the writer directly
+    w = ExcelWriter(template, tmp_path / "w.xlsx")
+    rec = ex.ExtractedRecord(management_number="260918080-VOC", vendors=["Sơn IT", "Assy IT", "Mtech"],
+                             vendor="Sơn IT\nAssy IT\nMtech", model="A185", item="Rear")
+    notes = w.update_record(4, rec)
+    w.save()
+    c = load_workbook(tmp_path / "w.xlsx")["Kiểm chứng"].cell(row=4, column=3)
+    assert c.value == "Sơn IT\nAssy IT\nMtech" and c.alignment.wrap_text and notes == []
+
+
+def test_equivalent_multi_vendor_sets_do_not_conflict(template, tmp_path):
+    _prefill(template, [("260601038-VOC", "tesung; mtech", None), ("260601017", "Mtech\nTesung", None)])
+    w = ExcelWriter(template, tmp_path / "w.xlsx")
+    rec = ex.ExtractedRecord(management_number="260601038-VOC", vendors=["Mtech", "Tesung"], vendor="Mtech\nTesung")
+    assert w.update_record(4, rec) == []
+    assert w.update_record(5, rec) == []
+    w.save()
+    ws = load_workbook(tmp_path / "w.xlsx")["Kiểm chứng"]
+    assert ws.cell(row=4, column=3).value == "tesung; mtech"            # existing cell preserved verbatim
+    assert ws.cell(row=5, column=3).value == "Mtech\nTesung"
+
+
+def test_different_multi_vendor_sets_preserve_excel_and_review(template, tmp_path):
+    _prefill(template, [("260601038-VOC", "Mtech / Tesung", None)])
+    w = ExcelWriter(template, tmp_path / "w.xlsx")
+    rec = ex.ExtractedRecord(management_number="260601038-VOC", vendors=["Mtech", "Assy IT", "Tesung"],
+                             vendor="Mtech\nAssy IT\nTesung")
+    notes = w.update_record(4, rec)
+    w.save()
+    assert len(notes) == 1
+    assert "Vendor trong Excel: Mtech / Tesung" in notes[0]
+    assert "Vendor trong báo cáo: Mtech / Assy IT / Tesung" in notes[0]
+    assert load_workbook(tmp_path / "w.xlsx")["Kiểm chứng"].cell(row=4, column=3).value == "Mtech / Tesung"
+
+
+def test_missing_qpn_and_defect_stay_blank_with_review(report_factory, template, tmp_path):
+    p = report_factory("(CTMS)_1_260601017_ Đối sách A185.pptx", mgmt="260601017", with_qpn=False)
+    rep = parse_pptx(p)
+    rec = extract_record(rep, heuristic_classify(rep))
+    assert rec.qpn_slide in (None, 0) or "Không tìm thấy QPN trong báo cáo" in rec.review_reasons
+    assert "Không tìm thấy QPN trong báo cáo" in rec.review_reasons
+    assert rec.defect_content == "" and "Không tìm thấy Nội dung lỗi trong báo cáo" in rec.review_reasons
+    assert "Nội dung lỗi" in rec.blank_fields
+    # end-to-end: row written with blanks, status Cần kiểm tra, nothing guessed
+    _prefill(template, [("260601017", None, None)])
+    out = tmp_path / "out" / "k.xlsx"
+    summary, _, proc = _run([p], template, out)
+    assert summary.needs_review == 1 and summary.completed == 0
+    ws = load_workbook(out)["Kiểm chứng"]
+    assert ws.cell(row=4, column=7).value in (None, "")                  # Nội dung lỗi blank
+    assert ws.cell(row=4, column=5).value == "A185"                      # what exists is still written
+    reasons = proc.results[0].review_reasons
+    assert "Không tìm thấy QPN trong báo cáo" in reasons and "Không tìm thấy Nội dung lỗi trong báo cáo" in reasons

@@ -49,6 +49,7 @@ def _cli(args) -> int:
                         ollama_server=server, model=model or "", force_reprocess=args.force,
                         use_ollama=bool(model) and not args.no_ai,
                         fill_temporary_column=bool(cfg.fill_temporary_column),
+                        vendors=list(cfg.vendors or []),
                         row_mode="append" if args.append else (cfg.row_mode or "match"))
 
     def on_file(i, stage, detail):

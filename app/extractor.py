@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -57,7 +58,9 @@ class ExtractedRecord:
     blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
     # Vendor: detected from the ORIGINAL improvement text ("Tại công đoạn assy <Vendor>")
     vendor: str = ""
-    vendor_candidates: List[str] = field(default_factory=list)
+    vendors: List[str] = field(default_factory=list)            # canonical vendors, source order
+    vendors: List[str] = field(default_factory=list)            # canonical vendors, source order
+    vendor_candidates: List[str] = field(default_factory=list)  # diagnostics: found + unknown names
     # Ngày phát sinh: derived from the Management Number (YYMMDD prefix) as a real date
     occurrence_date: Optional[date] = None
     # WEEK +1..+8: always blank (never invented)
@@ -205,7 +208,100 @@ def derive_occurrence_date(mgmt: str) -> Tuple[Optional[date], str]:
         return None, f"Ngày trong Management Number không hợp lệ (YYMMDD={m.group(1)})"
 
 
-# "Tại công đoạn assy Taewon", "Công đoạn Assy Daoltech", "công đoạn ASSY  ABC Vina):"
+# ----------------------------------------------------------------------------
+# Vendor: controlled multi-value field
+# ----------------------------------------------------------------------------
+# Canonical spellings written to Excel (user-provided controlled list).  Matching is
+# case-/accent-insensitive and whitespace tolerant; output always uses these strings.
+CANONICAL_VENDORS: List[str] = ["CNC IT", "Assy IT", "Sơn IT", "Nhựa IT", "Mtech", "Mtech VN", "Mtech 4",
+                                "Teawon", "Tesung", "Doaltech", "APV", "An Lập", "Yongsong", "HK"]
+# Known source spellings of canonical vendors (NOT arbitrary spelling correction: only
+# variants that clearly identify a vendor of the controlled list are listed here).
+VENDOR_ALIASES: Dict[str, str] = {"Taewon": "Teawon", "Tae Won": "Teawon", "Daoltech": "Doaltech", "Doal Tech": "Doaltech",
+                                  "Tae Sung": "Tesung", "Yong Song": "Yongsong", "M-tech": "Mtech",
+                                  "M-tech VN": "Mtech VN", "M-tech 4": "Mtech 4"}
+
+
+def _fold(text: str) -> str:
+    """Length-preserving fold: lower-case, one base character per input character."""
+    out = []
+    for ch in text or "":
+        if ch in "đĐ":
+            out.append("d")
+            continue
+        d = unicodedata.normalize("NFD", ch)
+        out.append(d[0].lower() if d and unicodedata.category(d[0]) != "Mn" else ch.lower())
+    return "".join(out)
+
+
+def _vendor_pattern(name: str) -> "re.Pattern[str]":
+    words = [re.escape(_fold(w)) for w in name.split()]
+    return re.compile(r"(?<![a-z0-9])" + r"[\s\-]*".join(words) + r"(?![a-z0-9])")
+
+
+def _vendor_table(vendors: Optional[List[str]] = None) -> List[Tuple["re.Pattern[str]", str]]:
+    """(pattern, canonical) pairs; longer names first so 'Mtech VN' wins over 'Mtech'."""
+    canon = list(vendors) if vendors else list(CANONICAL_VENDORS)
+    pairs: List[Tuple[str, str]] = [(v, v) for v in canon]
+    pairs += [(a, c) for a, c in VENDOR_ALIASES.items() if c in canon]
+    pairs.sort(key=lambda x: -len(x[0]))
+    return [(_vendor_pattern(a), c) for a, c in pairs]
+
+
+def find_vendors(text: str, vendors: Optional[List[str]] = None) -> List[Tuple[int, str]]:
+    """All controlled-list vendors in ``text`` as (position, canonical) in first-occurrence order.
+
+    Longer names are matched first and their span is masked, so 'Mtech VN' never also
+    yields 'Mtech' and 'Assy IT' never yields a bare 'IT' (which is not a vendor).
+    """
+    folded = _fold(text)
+    taken = [False] * len(folded)
+    found: List[Tuple[int, str]] = []
+    for pat, canon in _vendor_table(vendors):
+        for m in pat.finditer(folded):
+            if any(taken[m.start():m.end()]):
+                continue
+            for i in range(m.start(), m.end()):
+                taken[i] = True
+            found.append((m.start(), canon))
+    found.sort()
+    out: List[Tuple[int, str]] = []
+    for pos, c in found:
+        if c not in [x[1] for x in out]:
+            out.append((pos, c))
+    return out
+
+
+def canonical_vendors(text: str, vendors: Optional[List[str]] = None) -> List[str]:
+    """Canonical vendor names found in ``text`` (deduplicated, source order)."""
+    return [c for _, c in find_vendors(text, vendors)]
+
+
+def canonicalize_vendor_value(value: str, vendors: Optional[List[str]] = None) -> Tuple[List[str], List[str]]:
+    """Split an Excel vendor cell (line breaks / commas / semicolons / slashes) into
+    (canonical names, unrecognised parts)."""
+    canon: List[str] = []
+    unknown: List[str] = []
+    for part in re.split(r"[\n\r,;/|]+", str(value or "")):
+        part = part.strip(" \t.-–")
+        if not part:
+            continue
+        hits = canonical_vendors(part, vendors)
+        folded_len = len(_fold(part).strip())
+        # the part must be (essentially) one canonical name, not a sentence containing one
+        if len(hits) == 1 and folded_len <= len(_fold(hits[0])) + 2:
+            if hits[0] not in canon:
+                canon.append(hits[0])
+        elif len(hits) > 1 and folded_len <= sum(len(h) for h in hits) + 3 * len(hits):
+            for h in hits:
+                if h not in canon:
+                    canon.append(h)
+        else:
+            unknown.append(part)
+    return canon, unknown
+
+
+# Structural phrase naming a production stage: "Tại công đoạn assy Taewon", "Công đoạn Assy Daoltech"
 _VENDOR_PHRASE = re.compile(
     r"(?i:c[oô]ng\s+[dđ]o[aạ]n\s+(?:assy|ass\.?y|assembly))\s*[:\-–]?\s*"
     # the name itself is matched case-sensitively: Capitalised words / upper-case codes only
@@ -227,7 +323,8 @@ def _clean_vendor(token: str) -> str:
 
 
 def find_vendor_candidates(text: str) -> List[str]:
-    """Vendor names exactly as written in ``text`` (original spelling), de-duplicated case-insensitively."""
+    """Names following a 'công đoạn assy …' phrase exactly as written (original spelling),
+    de-duplicated case-insensitively.  Used only to report UNKNOWN candidates."""
     out: List[str] = []
     for m in _VENDOR_PHRASE.finditer(text or ""):
         v = _clean_vendor(m.group(1))
@@ -238,17 +335,39 @@ def find_vendor_candidates(text: str) -> List[str]:
     return out
 
 
-def extract_vendor(rec: "ExtractedRecord", report: ReportData) -> None:
-    """Vendor from improvement content first; other structural phrases elsewhere only as fallback."""
-    primary = find_vendor_candidates(rec.improvement)
-    candidates = primary or find_vendor_candidates(report.all_text())
-    rec.vendor_candidates = candidates
-    if len(candidates) == 1:
-        rec.vendor = candidates[0]
-    elif len(candidates) > 1:
-        rec.review_reasons.append("Phát hiện nhiều Vendor khác nhau trong nội dung đối sách: " + ", ".join(candidates))
-    else:
-        rec.review_reasons.append("Không xác định được Vendor từ nội dung đối sách")
+def unknown_vendor_candidates(text: str, vendors: Optional[List[str]] = None) -> List[str]:
+    """'công đoạn assy X' names that do not resolve to any controlled-list vendor."""
+    out = []
+    for cand in find_vendor_candidates(text):
+        hits = canonical_vendors(cand, vendors)
+        if hits and len(_fold(cand).strip()) <= max(len(_fold(h)) for h in hits) + 2:
+            continue                      # e.g. 'IT' of 'Assy IT' is covered by the canonical phrase
+        if norm_key(cand) in ("it",):     # 'IT' alone is never a vendor
+            continue
+        out.append(cand)
+    return out
+
+
+def extract_vendor(rec: "ExtractedRecord", report: ReportData, vendors: Optional[List[str]] = None) -> None:
+    """Vendors (controlled list, possibly several) from the improvement content first; the
+    rest of the report is only searched when the improvement content names none.
+    Never invents names: unknown 'công đoạn assy X' candidates are reported for review."""
+    primary = canonical_vendors(rec.improvement, vendors)
+    scope_text = rec.improvement if primary else report.all_text()
+    found = primary or canonical_vendors(scope_text, vendors)
+    rec.vendors = found
+    rec.vendor = "\n".join(found)
+    unknown = unknown_vendor_candidates(rec.improvement, vendors)
+    if not primary:
+        for u in unknown_vendor_candidates(report.all_text(), vendors):
+            if u not in unknown:
+                unknown.append(u)
+    rec.vendor_candidates = found + [u for u in unknown if u not in found]
+    if unknown:
+        rec.review_reasons.append("Phát hiện tên vendor không có trong danh sách chuẩn (không ghi vào Excel): "
+                                  + ", ".join(unknown))
+    if not found:
+        rec.review_reasons.append("Không xác định được Vendor từ nội dung báo cáo")
 
 
 def normalize_model(model: str) -> str:
@@ -355,7 +474,7 @@ def extract_defect_content(report: ReportData, cls: Classification) -> str:
 
 def extract_record(report: ReportData, cls: Classification,
                    item_mapping: Optional[Dict[str, str]] = None,
-                   known_models: Sequence[str] = ()) -> ExtractedRecord:
+                   known_models: Sequence[str] = (), vendors: Optional[List[str]] = None) -> ExtractedRecord:
     rec = ExtractedRecord()
     rec.qpn_slide = cls.qpn_slide
     rec.management_number = extract_management_number(report, cls.management_number)
@@ -373,7 +492,7 @@ def extract_record(report: ReportData, cls: Classification,
     rec.improvement_image_slides = list(cls.improvement_image_slides)
 
     # Vendor (from source text) and Ngày phát sinh (from Management Number)
-    extract_vendor(rec, report)
+    extract_vendor(rec, report, vendors)
     if rec.management_number:
         rec.occurrence_date, why = derive_occurrence_date(rec.management_number)
         if why:
@@ -383,13 +502,13 @@ def extract_record(report: ReportData, cls: Classification,
 
     # validation -> review reasons (never invent content)
     if not rec.model:
-        rec.review_reasons.append("Không tìm thấy Model")
+        rec.review_reasons.append("Không tìm thấy Model trong báo cáo")
     if not rec.qpn_slide:
-        rec.review_reasons.append("Không tìm thấy trang QPN (Quality Problem Notice)")
+        rec.review_reasons.append("Không tìm thấy QPN trong báo cáo")
     if not rec.root_cause:
-        rec.review_reasons.append("Không tìm thấy mục Nguyên nhân")
+        rec.review_reasons.append("Không tìm thấy Nguyên nhân trong báo cáo")
     if not rec.improvement:
-        rec.review_reasons.append("Không tìm thấy mục Đối sách cải tiến")
+        rec.review_reasons.append("Không tìm thấy Nội dung đối sách cải tiến trong báo cáo")
     if not rec.improvement_image_slides:
         rec.review_reasons.append("Không có hình ảnh cải tiến")
     # ambiguous classification -> manual review rather than guessing
@@ -408,5 +527,5 @@ def extract_record(report: ReportData, cls: Classification,
             rec.review_reasons.append(
                 f"Nội dung lỗi chỉ nằm trong hình ảnh (slide {ds.number}), không có dạng chữ – cần nhập tay")
         else:
-            rec.review_reasons.append("Không tìm thấy Nội dung lỗi")
+            rec.review_reasons.append("Không tìm thấy Nội dung lỗi trong báo cáo")
     return rec

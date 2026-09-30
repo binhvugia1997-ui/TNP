@@ -199,7 +199,7 @@ def test_extraction_preserves_original_text_and_excludes_temporary(a185_report):
         assert line in rec.root_cause
     assert len(rec.cause_sections) >= 2
     # vendor: no "công đoạn assy <Vendor>" phrase in this deck -> blank + review; date derived from mgmt no.
-    assert rec.vendor == "Daoltech"                      # exactly as written in the source
+    assert rec.vendor == "Doaltech"                      # source 'Daoltech' -> canonical controlled-list spelling
     assert rec.occurrence_date_text == "18/09/2026"      # from 260918080-VOC, not from slide text
     assert all(v == "" for v in rec.weeks.values())
     assert rec.review_reasons == []
@@ -235,7 +235,7 @@ def test_missing_sections_flag_needs_review(report_factory):
     rec = extract_record(r, heuristic_classify(r))
     assert rec.improvement == ""
     assert any("QPN" in x for x in rec.review_reasons)
-    assert any("Đối sách" in x for x in rec.review_reasons)
+    assert any("đối sách cải tiến" in x for x in rec.review_reasons)
 
 
 def test_prompt_is_reasonably_small(a185_report):

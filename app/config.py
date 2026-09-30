@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
@@ -62,7 +62,8 @@ class AppConfig:
     render_dpi: int = 150
     force_reprocess: bool = False
     fill_temporary_column: bool = False
-    row_mode: str = "match"               # "match" (Management Number -> existing row) | "append"   # write "Xử lý tạm thời" text into its own column (never into improvement)
+    row_mode: str = "match"               # "match" (Management Number -> existing row) | "append"
+    vendors: List[str] = field(default_factory=list)   # controlled Vendor list; empty -> built-in CANONICAL_VENDORS
     extra: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------

@@ -60,6 +60,7 @@ class BatchOptions:
     # "match": Management Number from the file name locates the EXISTING Excel row (production);
     # "append": every report becomes a new row (legacy / empty template)
     row_mode: str = "match"
+    vendors: List[str] = field(default_factory=list)   # controlled Vendor list override (empty -> built-in)
 
 
 @dataclass
@@ -223,7 +224,7 @@ class BatchProcessor:
                      cls.improvement_slides, cls.improvement_image_slides, cls.confidence)
 
             # --- 3. extract original content (program copies WHAT) ----------
-            rec = extract_record(report, cls, writer.item_mapping, writer.known_models)
+            rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None)
             fr.management_number = rec.management_number
             fr.vendor = rec.vendor
             fr.occurrence_date = rec.occurrence_date_text
@@ -328,7 +329,7 @@ def format_file_diagnostics(fr: FileResult) -> str:
         f"Trạng thái         : {fr.status}" + (f"  (dòng Excel {fr.excel_row})" if fr.excel_row else ""),
         f"Bộ phân loại       : {fr.classifier or '-'}" + (f"  (độ tin cậy AI {fr.confidence:.2f})" if fr.confidence is not None else ""),
         f"Management number  : {fr.management_number or '(trống)'}  (từ tên file – khoá dòng Excel)",
-        f"Vendor (từ đối sách): {fr.vendor or '(trống)'}",
+        f"Vendor (danh sách chuẩn, từ đối sách): {fr.vendor.replace(chr(10), ' / ') if fr.vendor else '(trống)'}",
         f"Ngày phát sinh     : {fr.occurrence_date or '(trống)'}  (suy ra từ Management Number YYMMDD)",
         f"Model              : {fr.model or '(trống)'}",
         f"Item               : {fr.item or '(trống)'}",
@@ -355,7 +356,8 @@ def write_review_report(results: List[FileResult], path: Path, summary: BatchSum
     head = (f"BÁO CÁO KIỂM TRA TRÍCH XUẤT – {datetime.now():%Y-%m-%d %H:%M}\n"
             f"Tổng: {summary.total}  Hoàn thành: {summary.completed}  Cần kiểm tra: {summary.needs_review}  "
             f"Lỗi: {summary.failed}  Bỏ qua: {summary.skipped}\n"
-            f"Nguyên tắc: Tên vendor, Ngày phát sinh, WEEK +1..+8 luôn để trống (người dùng nhập tay).\n")
+            f"Nguyên tắc: thông tin không có trong báo cáo được để trống + 'Cần kiểm tra' (không suy đoán); "
+            f"WEEK +1..+8 luôn giữ nguyên.\n")
     body = "\n\n".join(("=" * 78) + "\n" + format_file_diagnostics(fr) for fr in results)
     path.write_text(head + "\n" + body + "\n", encoding="utf-8")
     return path

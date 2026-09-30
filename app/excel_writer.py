@@ -29,6 +29,8 @@ from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 
+from .extractor import canonicalize_vendor_value
+
 from .pptx_parser import norm_key
 
 LOG = logging.getLogger("report_extractor.excel")
@@ -523,11 +525,19 @@ class ExcelWriter:
         if "vendor" in self.columns:
             cell, _ = self._anchor(row, self.columns["vendor"])
             existing = str(cell.value).strip() if cell.value not in (None, "") else ""
-            if rec.vendor:
+            ppt_set = list(getattr(rec, "vendors", None) or [v for v in (rec.vendor or "").split("\n") if v])
+            if ppt_set:
                 if not existing:
-                    cell.value = rec.vendor
-                elif existing.lower() != rec.vendor.lower():
-                    notes.append(f"Vendor trong Excel '{existing}' khác Vendor trong báo cáo '{rec.vendor}' (giữ giá trị Excel)")
+                    cell.value = "\n".join(ppt_set)                      # one vendor per line
+                    al = copy(cell.alignment) if cell.alignment else Alignment()
+                    cell.alignment = Alignment(horizontal=al.horizontal, vertical=al.vertical or "top",
+                                               wrap_text=True, indent=al.indent, text_rotation=al.text_rotation)
+                else:
+                    xl_set, unknown = canonicalize_vendor_value(existing)
+                    if set(xl_set) != set(ppt_set) or unknown:
+                        shown = " / ".join(xl_set + unknown) if (xl_set or unknown) else existing
+                        notes.append(f"Vendor trong Excel: {shown}; Vendor trong báo cáo: {' / '.join(ppt_set)} "
+                                     f"(giữ giá trị Excel)")
         if "occurrence_date" in self.columns:
             cell, _ = self._anchor(row, self.columns["occurrence_date"])
             existing = self._as_date(cell.value)
