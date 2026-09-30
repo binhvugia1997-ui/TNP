@@ -385,7 +385,13 @@ class ExcelWriter:
     # ------------------------------------------------------------------
     @staticmethod
     def _norm_mgmt(v: Any) -> str:
-        return str(v).strip().upper() if v not in (None, "") else ""
+        """Exact-key normalisation: trim + upper-case.  Bare numeric keys (260601017) may be
+        stored by Excel as numbers -> compare their integer text; suffixes are never stripped."""
+        if v in (None, ""):
+            return ""
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        return str(v).strip().upper()
 
     def find_rows_by_management_number(self, mgmt: str) -> List[int]:
         """Exact (trim/case-insensitive) matches in the Management Number column, data rows only."""

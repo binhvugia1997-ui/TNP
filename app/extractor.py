@@ -20,7 +20,8 @@ from .pptx_parser import ReportData, SlideData, norm_key, clean_text
 
 LOG = logging.getLogger("report_extractor.extractor")
 
-MGMT_RE = re.compile(r"(?<![0-9A-Za-z])(\d{6,12}-[A-Z]{2,6}(?:-\d+)?)(?![0-9A-Za-z])")
+# Management Number token: YYMMDD + sequence (>= 9 digits), optional "-VOC"-style suffix.
+MGMT_RE = re.compile(r"(?<![0-9A-Za-z])(\d{9,12}(?:-[A-Z]{2,6})?)(?![0-9A-Za-z])")
 MODEL_SM_RE = re.compile(r"\bSM-([A-Z]\d{3}[A-Z0-9]{0,3})\b")
 MODEL_PLAIN_RE = re.compile(r"(?<![A-Za-z0-9])([AMSFGXNJ]\d{3}[A-Z]?)(?![A-Za-z0-9])")
 QTY_RE = re.compile(r"\b\d+\s*(?:ea|pcs?|cái|chiếc|con|sp|units?)\b", re.IGNORECASE)
@@ -161,11 +162,24 @@ def management_number_from_filename(filename: str) -> str:
 
         (CTMS)_11107_251119092-VOC_ Đối sách ... (DRT ) 17.11.2025.pptx  ->  251119092-VOC
 
-    Pattern: digits + '-' + upper-case suffix, delimited by non-alphanumerics.  Other
-    numeric tokens (11107, dates 17.11.2025) never match.  Returns '' when absent.
+        (CTMS)_11108_260601017_ Đối sách ... 05.06.2026.pptx                  ->  260601017
+
+    Two valid forms: ``YYMMDD+seq-SUFFIX`` and bare ``YYMMDD+seq``.  A token is accepted
+    only when it is delimited by non-alphanumerics, has >= 9 digits and its first six
+    digits form a real YYMMDD calendar date.  CTMS prefixes (11107), file-name dates
+    (17.11.2025 / 17112025), model numbers (A185) therefore never match.  A suffixed
+    token is preferred when both forms occur.  Returns '' when absent.
     """
-    m = MGMT_RE.search(Path(filename).name if filename else "")
-    return m.group(1) if m else ""
+    name = Path(filename).name if filename else ""
+    suffixed, bare = [], []
+    for m in MGMT_RE.finditer(name):
+        tok = m.group(1)
+        if derive_occurrence_date(tok)[0] is None:
+            continue                                  # not YYMMDD-based -> not a Management Number
+        (suffixed if "-" in tok else bare).append(tok)
+    if suffixed:
+        return suffixed[0]
+    return bare[0] if bare else ""
 
 
 def extract_management_number(report: ReportData, llm_value: str = "") -> str:
@@ -177,10 +191,11 @@ def extract_management_number(report: ReportData, llm_value: str = "") -> str:
 def derive_occurrence_date(mgmt: str) -> Tuple[Optional[date], str]:
     """First six digits of the Management Number are YYMMDD (2000-based year).
 
-    251119092-VOC -> 19/11/2025.  Strict calendar validation; returns (None, reason)
-    when the prefix is missing or is not a real date.
+    251119092-VOC -> 19/11/2025, 260601017 -> 01/06/2026 (suffix is irrelevant).
+    Strict calendar validation; returns (None, reason) when the prefix is missing or
+    is not a real date.
     """
-    m = re.match(r"^\s*(\d{6})\d*-", mgmt or "")
+    m = re.match(r"^\s*(\d{6})\d*(?:-|$)", mgmt or "")
     if not m:
         return None, "Management Number không có tiền tố ngày YYMMDD"
     yy, mm, dd = int(m.group(1)[0:2]), int(m.group(1)[2:4]), int(m.group(1)[4:6])

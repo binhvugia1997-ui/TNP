@@ -220,3 +220,50 @@ def test_append_mode_still_available(sample_tree, tmp_path):
     assert ws.cell(row=4, column=2).value == "260918080-VOC" and ws.cell(row=4, column=3).value == "Daoltech"
 
 
+
+
+# ---------------------------------------------------------------- both Management Number formats
+def test_management_number_both_formats_realistic_filenames():
+    assert management_number_from_filename("(CTMS)_11107_260601038-VOC_ Đối sách lỗi xước Rear A185 05.06.2026.pptx") == "260601038-VOC"
+    assert management_number_from_filename("(CTMS)_11108_260601017_ Đối sách lỗi mẻ Main A175 05.06.2026.pptx") == "260601017"
+    assert management_number_from_filename("260601038-VOC.pptx") == "260601038-VOC"
+    assert management_number_from_filename("260601017.pptx") == "260601017"
+    assert management_number_from_filename(r"D:\real_data\reports\260601017 - A185.pptx") == "260601017"
+    assert management_number_from_filename("Đối sách 260601017-VOC (rev2).pptx") == "260601017-VOC"   # suffix kept
+
+
+def test_management_number_negative_tokens():
+    # CTMS prefix, file-name dates (dotted / compact / ISO), model numbers, timestamps: never a key
+    for name in ["(CTMS)_11107_ Đối sách A185 17.11.2025.pptx",
+                 "17112025_A185_Rear.pptx",
+                 "20260601_report.pptx",
+                 "A185_2026-06-01.pptx",
+                 "SM-A185_20251117123456.pptx",          # 14-digit timestamp
+                 "12345678-VOC.pptx",                     # only 8 digits
+                 "abc260601017.pptx",                     # glued to letters -> not delimited
+                 "991399001.pptx",                        # 9 digits but month 13 -> not YYMMDD
+                 "report3.pptx"]:
+        assert management_number_from_filename(name) == "", name
+
+
+def test_occurrence_date_both_formats():
+    assert derive_occurrence_date("260601017") == (dt.date(2026, 6, 1), "")
+    assert derive_occurrence_date("260601038-VOC") == (dt.date(2026, 6, 1), "")
+    assert derive_occurrence_date("260632017")[0] is None
+
+
+def test_bare_key_matches_excel_row_without_stripping_suffix(sample_tree, template, tmp_path, report_factory):
+    # Excel stores the bare key as a NUMBER (typical when typed by hand) and the suffixed one as text
+    _prefill(template, [(260601017, None, None), ("260601038-VOC", None, None), ("260601017-VOC", None, None)])
+    w = ExcelWriter(template, tmp_path / "o.xlsx")
+    assert w.find_rows_by_management_number("260601017") == [4]            # not row 6 (suffix differs)
+    assert w.find_rows_by_management_number("260601038-VOC") == [5]
+    assert w.find_rows_by_management_number("260601038") == []             # bare key never matches suffixed row
+    # end-to-end: bare-number file name -> its own row, date derived 01/06/2026
+    p = report_factory("(CTMS)_11108_260601017_ Đối sách A185 05.06.2026.pptx", mgmt="260601017")
+    summary, _, proc = _run([p], template, tmp_path / "out" / "k.xlsx")
+    assert summary.completed == 1 and proc.results[0].excel_row == 4
+    ws = load_workbook(tmp_path / "out" / "k.xlsx")["Kiểm chứng"]
+    assert ws.cell(row=4, column=2).value == 260601017                     # key cell untouched
+    assert ws.cell(row=4, column=4).value.date() == dt.date(2026, 6, 1)
+    assert ws.cell(row=6, column=5).value is None
