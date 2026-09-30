@@ -452,7 +452,57 @@ def extract_item(report: ReportData, cls: Classification, item_mapping: Optional
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Nội dung lỗi from the file name: "... LỖI BONG ATN, MỤN 22.9.2026 SEV.pptx" -> "BONG ATN, MỤN"
+# ---------------------------------------------------------------------------
+_DEFECT_MARKER_RE = re.compile(r"(?<![A-Za-zÀ-ỹ])[Ll][ỖỗOo][IiỊị](?![A-Za-zÀ-ỹ])[\s:_\-–]*", re.UNICODE)
+_TRAILING_DATE_RE = re.compile(r"(?:^|[\s_\-–(])\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?(?=$|[\s_\-–)])")
+_TRAILING_META_WORDS = ("sev", "sevt", "sev t", "dreamtech", "drt", "ctms", "final", "rev", "update", "cap nhat", "ver")
+
+
+def defect_content_from_filename(filename: str) -> str:
+    """Defect names written in the report file name (after the marker LỖI), trailing metadata
+    (date, SEV, parentheses, extension, underscores) removed.  Returns '' when the marker is
+    absent or nothing reliable remains.  Never adds quantities or rewrites the words."""
+    stem = Path(filename).stem if filename else ""
+    m = None
+    for m in _DEFECT_MARKER_RE.finditer(stem):      # the LAST 'LỖI' marker starts the defect list
+        pass
+    if m is None:
+        return ""
+    tail = stem[m.end():]
+    # cut at the first date token, then drop trailing parentheticals / metadata words
+    dm = _TRAILING_DATE_RE.search(tail)
+    if dm:
+        tail = tail[:dm.start()]
+    tail = re.sub(r"\([^)]*\)\s*$", "", tail.strip())
+    tail = re.sub(r"\([^)]*\)", " ", tail)
+    words = tail.replace("_", " ").split()
+    def _meta(w: str) -> bool:
+        k = norm_key(w)
+        return (k in _TRAILING_META_WORDS or re.fullmatch(r"[\W_]+", w) is not None
+                or MODEL_SM_RE.fullmatch(w.upper()) is not None or MODEL_PLAIN_RE.fullmatch(w.upper()) is not None
+                or re.fullmatch(r"SM-[A-Z]\d{3}[A-Z0-9]{0,3}", w.upper()) is not None
+                or k in {i.lower() for i in DEFAULT_ITEMS} or k in ("model", "item"))
+    while words and _meta(words[-1]):          # trailing item / model / metadata words
+        words.pop()
+    text = " ".join(words).strip(" ,;:-–_")
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"\s+", " ", text)
+    if len(text) < 2 or not re.search(r"[A-Za-zÀ-ỹ]", text):
+        return ""
+    return text
+
+
 def extract_defect_content(report: ReportData, cls: Classification) -> str:
+    """Nội dung lỗi: (1) defect names from the file name; (2) defect text on the QPN/defect slide."""
+    from_name = defect_content_from_filename(report.filename)
+    if from_name:
+        return from_name
+    return extract_defect_content_from_slides(report, cls)
+
+
+def extract_defect_content_from_slides(report: ReportData, cls: Classification) -> str:
     # only the defect / QPN slides are sources; the cover, titles and the file name never are
     slides: List[SlideData] = []
     for n in [cls.defect_slide, cls.qpn_slide]:

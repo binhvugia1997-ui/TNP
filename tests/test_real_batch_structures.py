@@ -149,18 +149,27 @@ def test_explicit_evidence_outranks_structure(tmp_path):
 
 # ---------------------------------------------------------------- 4. Nội dung lỗi vs QPN image
 @pytest.mark.parametrize("key", ["260601030-VOC", "260601037-VOC"])
-def test_defect_only_in_image_gets_explicit_reason_not_fabricated(real_like, key):
+def test_defect_from_filename_when_qpn_is_only_an_image(real_like, key):
+    # file name "... Đối sách lỗi xước Rear A185 05.06.2026" -> defect names from the name, not OCR / not Qwen
     r = parse_pptx(real_like[key])
+    rec = extract_record(r, heuristic_classify(r))
+    assert rec.defect_content == "xước"
+    assert not any("Nội dung lỗi" in x for x in rec.review_reasons)
+    # cause text under the QPN picture is cause, never defect text
+    assert "Khay chứa Rear" in rec.root_cause and "Khay" not in rec.defect_content
+
+
+def test_defect_only_in_image_and_no_marker_in_filename(tmp_path):
+    p = build_real_like(tmp_path / "(CTMS)_1_260601030-VOC_ Bao cao A185 Rear 05.06.2026.pptx", improvement_vendor_text="- x")
+    r = parse_pptx(p)
     rec = extract_record(r, heuristic_classify(r))
     assert rec.defect_content == ""
     assert "Nội dung lỗi chỉ có trong hình ảnh QPN, không có text để sao chép – cần bổ sung thủ công" in rec.review_reasons
     assert "Không tìm thấy Nội dung lỗi trong báo cáo" not in rec.review_reasons
-    # cause text under the QPN picture is cause, never defect text; cover text never defect text
-    assert "Khay chứa Rear" in rec.root_cause and "A185" not in rec.defect_content
 
 
 def test_defect_text_copied_when_recoverable(tmp_path):
-    p = build_real_like(tmp_path / "(CTMS)_1_260601030-VOC_txt.pptx", improvement_vendor_text="- x")
+    p = build_real_like(tmp_path / "(CTMS)_1_260601030-VOC_ Bao cao A185 txt.pptx", improvement_vendor_text="- x")
     prs = Presentation(p)
     _textbox(prs.slides[1], "HIỆN TRẠNG\nXước mặt sau Rear: 12ea\nMẻ cạnh: 3ea", Inches(0.3), Inches(3.7), Inches(6), Inches(0.6), 12, True)
     prs.save(p)
@@ -248,8 +257,8 @@ def test_five_report_batch_expectations(real_like, template, tmp_path, monkeypat
         assert "ĐỐI SÁCH LÂU DÀI" in ws.cell(row=row, column=10).value
         assert "Sorting 100%" not in ws.cell(row=row, column=10).value
         assert all(ws.cell(row=row, column=k).value == "OK" for k in range(12, 20))
-        assert ws.cell(row=row, column=7).value in (None, "")                       # defect only in image
-        assert "Nội dung lỗi chỉ có trong hình ảnh QPN, không có text để sao chép – cần bổ sung thủ công" in fr.review_reasons
+        assert ws.cell(row=row, column=7).value == "xước"                            # from the file name
+        assert not any("Nội dung lỗi" in x for x in fr.review_reasons)
         assert not any("chỉ do AI" in x for x in fr.review_reasons)
     # vendor expectations
     r030, r037, r038, r039, r017 = (by_key[k] for k in REAL)

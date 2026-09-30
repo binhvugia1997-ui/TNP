@@ -593,3 +593,59 @@ def test_genuine_difference_still_conflicts_despite_aliases(template, tmp_path):
 def test_blank_excel_vendor_gets_canonical_names(template, tmp_path):
     notes, cell = _upd(template, tmp_path, None, ["Mtech", "Tesung", "Assy IT"])
     assert notes == [] and cell == "Mtech\nTesung\nAssy IT"
+
+
+# ---------------------------------------------------------------- Nội dung lỗi from the file name
+from app.extractor import defect_content_from_filename  # noqa: E402
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("(CTMS)_260923045_ĐỐI SÁCH CẢI TIẾN MODEL A185 REAR LỖI BONG ATN, MỤN 22.9.2026 SEV.pptx", "BONG ATN, MỤN"),
+    ("(CTMS)_260924036_ĐỐI SÁCH CẢI TIẾN MODEL A185 REAR LỖI SƠN, MẺ, LỆCH TAPE 24.9.2026.pptx", "SƠN, MẺ, LỆCH TAPE"),
+    ("(CTMS)_20506_260918080-VOC_ĐỐI SÁCH CẢI TIẾN MODEL A185 REAR LỖI XƯỚC, LỆCH ANT, MẺ 16.9.2026.pptx", "XƯỚC, LỆCH ANT, MẺ"),
+    ("(CTMS)_260925011_ĐỐI SÁCH CẢI TIẾN MODEL A185 REAR LỖI BẨN KEO 25.9.2026 (Dreamtech).pptx", "BẨN KEO"),
+    ("(CTMS)_260926002-VOC_ĐỐI SÁCH CẢI TIẾN MODEL A185 REAR LỖI NỨT (Dreamtech) 26.9.2026 SEV.pptx", "NỨT"),
+    # older June pattern: "lỗi <defect> <Item> <Model> <date>"
+    ("(CTMS)_11203_260601038-VOC_ Đối sách lỗi xước Rear A185 05.06.2026.pptx", "xước"),
+    ("(CTMS)_11205_260601017_ Đối sách lỗi xước, mẻ Rear A185 05.06.2026.pptx", "xước, mẻ"),
+    ("(CTMS)_11107_251119092-VOC_ Đối sách lỗi xước Rear A185 (Dreamtech) 17.11.2025.pptx", "xước"),
+    # full Windows path is fine
+    (r"D:\real_data\reports\(CTMS)_260923045_ĐỐI SÁCH CẢI TIẾN MODEL A185 REAR LỖI BONG ATN, MỤN 22.9.2026 SEV.pptx", "BONG ATN, MỤN"),
+])
+def test_defect_content_from_filename(name, expected):
+    assert defect_content_from_filename(name) == expected
+
+
+@pytest.mark.parametrize("name", [
+    "(CTMS)_20506_260918080-VOC_A185_Rear.pptx",          # no marker
+    "(CTMS)_1_260601017_ Đối sách A185.pptx",
+    "LỖI 22.9.2026.pptx",                                  # marker but only a date after it
+    "LỖI SEV.pptx",
+    "report3.pptx",
+    "Bao cao chat luong A185 Rear 05.06.2026.pptx",
+])
+def test_defect_content_from_filename_unreliable_is_blank(name):
+    assert defect_content_from_filename(name) == ""
+
+
+def test_defect_filename_never_adds_quantities():
+    assert "ea" not in defect_content_from_filename("(CTMS)_260923045_ĐỐI SÁCH A185 REAR LỖI BONG ATN, MỤN 22.9.2026.pptx")
+
+
+def test_defect_filename_primary_then_slide_text_fallback(report_factory):
+    # file name has the marker -> file name wins over slide text (slide has "Xước: 15ea" table)
+    p = report_factory("(CTMS)_20506_260918080-VOC_ĐỐI SÁCH CẢI TIẾN MODEL A185 REAR LỖI XƯỚC, LỆCH ANT, MẺ 16.9.2026.pptx")
+    rep = parse_pptx(p)
+    rec = extract_record(rep, heuristic_classify(rep))
+    assert rec.defect_content == "XƯỚC, LỆCH ANT, MẺ"
+    assert rec.management_number == "260918080-VOC" and rec.occurrence_date_text == "18/09/2026"   # not 16.9.2026
+    # no marker -> existing slide-text extraction
+    p2 = report_factory("(CTMS)_20506_260918080-VOC_A185_Rear.pptx")
+    rep2 = parse_pptx(p2)
+    rec2 = extract_record(rep2, heuristic_classify(rep2))
+    assert "Xước: 15ea" in rec2.defect_content
+    # neither -> blank + review
+    p3 = report_factory("(CTMS)_1_260601017_ Bao cao A185.pptx", with_qpn=False)
+    rep3 = parse_pptx(p3)
+    rec3 = extract_record(rep3, heuristic_classify(rep3))
+    assert rec3.defect_content == "" and "Không tìm thấy Nội dung lỗi trong báo cáo" in rec3.review_reasons
