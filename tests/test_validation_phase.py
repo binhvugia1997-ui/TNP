@@ -135,7 +135,7 @@ def test_mapping_sheet_without_header_row(template, tmp_path):
 def test_batch_result_has_diagnostics_and_review_report(sample_tree, tmp_path):
     out = tmp_path / "Output" / "r.xlsx"
     files = [sample_tree["files"][0], sample_tree["files"][3]]
-    opts = BatchOptions(files=files, template=sample_tree["template"], output_file=out, use_ollama=False)
+    opts = BatchOptions(files=files, template=sample_tree["template"], output_file=out, use_ollama=False, row_mode="append")
     proc = BatchProcessor(opts)
     proc.run()
     res = json.loads((out.parent / "logs" / "batch_result.json").read_text(encoding="utf-8"))["results"]

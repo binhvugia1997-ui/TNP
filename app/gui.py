@@ -29,7 +29,7 @@ DEFAULT_OUTPUT_NAME = "Kiem_chung_doi_sach_TONG_HOP.xlsx"
 STATUS_ICON = {
     "waiting": "○", "reading": "⟳", "analyzing": "⟳", "extracting_qpn": "⟳",
     "extracting_images": "⟳", "writing_excel": "⟳", "completed": "✓",
-    "needs_review": "⚠", "error": "✗", "skipped": "•",
+    "needs_review": "⚠", "error": "✗", "skipped": "•", "not_written": "⚠",
 }
 
 
@@ -142,6 +142,7 @@ class ReportExtractorApp:
         self.tree.tag_configure("needs_review", foreground="#b26a00")
         self.tree.tag_configure("error", foreground="#c62828")
         self.tree.tag_configure("skipped", foreground="#666666")
+        self.tree.tag_configure("not_written", foreground="#b26a00")
         self.tree.tag_configure("working", foreground="#0b57d0")
         self.tree.bind("<Double-1>", self._on_row_double_click)
         if _DND_OK:
@@ -348,7 +349,8 @@ class ReportExtractorApp:
         opts = BatchOptions(files=list(self.files), template=Path(template), output_file=Path(output),
                             ollama_server=server, model=model, force_reprocess=bool(self.var_force.get()),
                             request_timeout=self.cfg.request_timeout, use_ollama=use_ai,
-                            fill_temporary_column=bool(self.cfg.fill_temporary_column))
+                            fill_temporary_column=bool(self.cfg.fill_temporary_column),
+                            row_mode=self.cfg.row_mode or "match")
         self.error_details = []
         self.summary = None
         for i in self.file_items:
@@ -385,7 +387,7 @@ class ReportExtractorApp:
                     name = self.files[i].name if i < len(self.files) else ""
                     if stage in ("reading", "analyzing", "extracting_qpn", "extracting_images", "writing_excel"):
                         self.lbl_current.configure(text=f"[{i + 1}/{len(self.files)}] {name} – {STAGE_LABELS_VI[stage]} {detail}")
-                    if stage == "error":
+                    if stage in ("error", "not_written"):
                         self.error_details.append(f"{name}: {detail}")
                     elif stage == "needs_review":
                         self.error_details.append(f"{name} (cần kiểm tra): {detail}")
@@ -413,14 +415,14 @@ class ReportExtractorApp:
         if not iid:
             return
         label = f"{STATUS_ICON.get(stage, '')} {STAGE_LABELS_VI.get(stage, stage)}"
-        tag = stage if stage in ("completed", "needs_review", "error", "skipped") else ("working" if stage != "waiting" else "")
+        tag = stage if stage in ("completed", "needs_review", "error", "skipped", "not_written") else ("working" if stage != "waiting" else "")
         self.tree.item(iid, values=(i + 1, self._display_name(self.files[i]), label, detail), tags=(tag,) if tag else ())
         if stage != "waiting":
             self.tree.see(iid)
 
     def _update_counts(self, s: BatchSummary) -> None:
         self.lbl_counts.configure(text=f"Tổng: {s.total}   Hoàn thành: {s.completed}   Cần kiểm tra: {s.needs_review}"
-                                       f"   Lỗi: {s.failed}   Bỏ qua: {s.skipped}")
+                                       f"   Chưa ghi: {s.not_written}   Lỗi: {s.failed}   Bỏ qua: {s.skipped}")
 
     def _on_done(self, s: BatchSummary) -> None:
         self.summary = s

@@ -163,7 +163,7 @@ def test_a1285_record_contents(tmp_path):
     assert any("chỉ nằm trong hình ảnh (slide 2)" in x for x in rec.review_reasons)
     assert any("Quality Problem Notice" in x for x in rec.review_reasons)
     assert not any(x == "Không tìm thấy trang QPN (Quality Problem Notice)" for x in rec.review_reasons)
-    assert rec.vendor == "" and rec.occurrence_date == "" and all(v == "" for v in rec.weeks.values())
+    assert rec.vendor == "" and rec.occurrence_date is None and all(v == "" for v in rec.weeks.values())
 
 
 def test_a1285_defect_text_when_present(tmp_path):

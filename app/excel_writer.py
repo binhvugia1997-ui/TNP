@@ -16,6 +16,7 @@ import math
 import re
 import shutil
 from copy import copy
+from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -379,9 +380,125 @@ class ExcelWriter:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Management-Number keyed rows
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _norm_mgmt(v: Any) -> str:
+        return str(v).strip().upper() if v not in (None, "") else ""
+
+    def find_rows_by_management_number(self, mgmt: str) -> List[int]:
+        """Exact (trim/case-insensitive) matches in the Management Number column, data rows only."""
+        if "management_number" not in self.columns or not mgmt:
+            return []
+        key = self._norm_mgmt(mgmt)
+        col = self.columns["management_number"]
+        rows: List[int] = []
+        for r in range(self.data_start, self.ws.max_row + 1):
+            cell, rng = self._anchor(r, col)
+            if rng is not None and cell.row != r:
+                continue                         # covered by a vertical merge – counted once at its anchor
+            if self._norm_mgmt(cell.value) == key:
+                rows.append(r)
+        return rows
+
+    @staticmethod
+    def _as_date(value: Any) -> Optional[date]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        txt = str(value).strip()
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d", "%Y/%m/%d", "%d/%m/%y", "%d.%m.%y"):
+            try:
+                return datetime.strptime(txt, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def _write_date(self, row: int, value: Optional[date]) -> None:
+        if "occurrence_date" not in self.columns or value is None:
+            return
+        cell, _ = self._anchor(row, self.columns["occurrence_date"])
+        template_fmt = cell.number_format
+        cell.value = value                      # openpyxl switches 'General' to 'yyyy-mm-dd' here
+        if not template_fmt or template_fmt == "General":
+            cell.number_format = "DD/MM/YYYY"   # template had no date format -> DD/MM/YYYY
+        else:
+            cell.number_format = template_fmt   # keep the template's own date format
+
+    def _remove_images_in_cell(self, row: int, field: str) -> None:
+        if field not in self.columns:
+            return
+        cell, _ = self._anchor(row, self.columns[field])
+        keep = []
+        for img in getattr(self.ws, "_images", []):
+            try:
+                fr = img.anchor._from
+                if fr.row + 1 == cell.row and fr.col + 1 == cell.column:
+                    continue
+            except Exception:
+                pass
+            keep.append(img)
+        self.ws._images = keep
+
+    # ------------------------------------------------------------------
+    # Writing
+    # ------------------------------------------------------------------
+    def _write_content(self, row: int, rec, qpn_png: Optional[Path], improvement_jpg: Optional[Path],
+                       fill_temporary: bool) -> None:
+        """Report content shared by append/update: model, item, defect, cause, improvement, images."""
+        self._set_cell(row, "model", rec.model)
+        self._set_cell(row, "item", rec.item)
+        self._set_cell(row, "defect_content", rec.defect_content)
+        self._set_cell(row, "root_cause", rec.root_cause)
+        self._set_cell(row, "improvement", rec.improvement)
+        # "Xử lý tạm thời" column: kept separate from improvement; blank unless explicitly enabled
+        if fill_temporary:
+            self._set_cell(row, "temporary", rec.temporary_excluded)
+        heights = [self.ws.row_dimensions[row].height or 15.0]
+        heights.append(self._text_height_pt(row, "improvement", rec.improvement))
+        heights.append(self._text_height_pt(row, "root_cause", rec.root_cause))
+        heights.append(self._text_height_pt(row, "defect_content", rec.defect_content))
+        if qpn_png:
+            self._remove_images_in_cell(row, "qpn")
+            heights.append(self._embed_image(row, "qpn", Path(qpn_png)))
+        if improvement_jpg:
+            self._remove_images_in_cell(row, "improvement_image")
+            heights.append(self._embed_image(row, "improvement_image", Path(improvement_jpg)))
+        self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
+        self._dirty = True
+
+    def _write_vendor_and_date(self, row: int, rec, overwrite_blank_only: bool) -> List[str]:
+        """Vendor / Ngày phát sinh: fill when blank, keep when equal, never overwrite a different value."""
+        notes: List[str] = []
+        if "vendor" in self.columns:
+            cell, _ = self._anchor(row, self.columns["vendor"])
+            existing = str(cell.value).strip() if cell.value not in (None, "") else ""
+            if rec.vendor:
+                if not existing:
+                    cell.value = rec.vendor
+                elif existing.lower() != rec.vendor.lower():
+                    notes.append(f"Vendor trong Excel '{existing}' khác Vendor trong báo cáo '{rec.vendor}' (giữ giá trị Excel)")
+        if "occurrence_date" in self.columns:
+            cell, _ = self._anchor(row, self.columns["occurrence_date"])
+            existing = self._as_date(cell.value)
+            if rec.occurrence_date:
+                if cell.value in (None, ""):
+                    self._write_date(row, rec.occurrence_date)
+                elif existing is None:
+                    notes.append(f"Ngày phát sinh trong Excel '{cell.value}' không đọc được, ngày theo Management Number là "
+                                 f"{rec.occurrence_date_text} (giữ giá trị Excel)")
+                elif existing != rec.occurrence_date:
+                    notes.append(f"Ngày phát sinh trong Excel {existing.strftime('%d/%m/%Y')} khác ngày theo Management Number "
+                                 f"{rec.occurrence_date_text} (giữ giá trị Excel)")
+        return notes
+
     def append_record(self, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
                       status_text: str = "", note_text: str = "", fill_temporary: bool = False) -> int:
-        """Write one report as one new row. Returns the Excel row number."""
+        """Write one report as one NEW row (append mode). Returns the Excel row number."""
         row = self.next_row()
         src = row - 1 if row - 1 >= self.data_start else self.data_start
         if src != row:
@@ -389,34 +506,33 @@ class ExcelWriter:
         if "stt" in self.columns:
             self._set_cell(row, "stt", self.used_count() + 1, wrap=False)
         self._set_cell(row, "management_number", rec.management_number)
-        # Business rules: user fills manually -> ALWAYS blank
-        self._set_cell(row, "vendor", "")
-        self._set_cell(row, "occurrence_date", "")
-        self._set_cell(row, "model", rec.model)
-        self._set_cell(row, "item", rec.item)
-        self._set_cell(row, "defect_content", rec.defect_content)
-        self._set_cell(row, "root_cause", rec.root_cause)
-        self._set_cell(row, "improvement", rec.improvement)
-        # "Xử lý tạm thời" column: kept separate from improvement; blank unless explicitly enabled
-        self._set_cell(row, "temporary", rec.temporary_excluded if fill_temporary else "")
+        self._set_cell(row, "vendor", rec.vendor or "")
+        self._write_date(row, rec.occurrence_date)
         for i in range(1, 9):   # WEEK +1..+8: blank unless real source data (none parsed) -> blank
             self._set_cell(row, f"week_{i}", rec.weeks.get(i, "") or "", wrap=False)
+        self._write_content(row, rec, qpn_png, improvement_jpg, fill_temporary)
         if status_text:
             self._set_cell(row, "status", status_text)
         if note_text:
             self._set_cell(row, "note", note_text)
-
-        heights = [self.ws.row_dimensions[row].height or 15.0]
-        heights.append(self._text_height_pt(row, "improvement", rec.improvement))
-        heights.append(self._text_height_pt(row, "root_cause", rec.root_cause))
-        heights.append(self._text_height_pt(row, "defect_content", rec.defect_content))
-        if qpn_png:
-            heights.append(self._embed_image(row, "qpn", Path(qpn_png)))
-        if improvement_jpg:
-            heights.append(self._embed_image(row, "improvement_image", Path(improvement_jpg)))
-        self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
-        self._dirty = True
         return row
+
+    def update_record(self, row: int, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
+                      status_text: str = "", note_text: str = "", fill_temporary: bool = False) -> List[str]:
+        """Write the report into an EXISTING row located by Management Number.
+
+        * the Management Number cell is preserved untouched;
+        * Vendor / Ngày phát sinh: fill if blank, keep if equal, conflict -> keep + note;
+        * WEEK +1..+8 and any other columns are left as they are.
+        Returns conflict notes (to be added to 'Cần kiểm tra').
+        """
+        notes = self._write_vendor_and_date(row, rec, overwrite_blank_only=True)
+        self._write_content(row, rec, qpn_png, improvement_jpg, fill_temporary)
+        if status_text:
+            self._set_cell(row, "status", status_text)
+        if note_text or notes:
+            self._set_cell(row, "note", "; ".join(x for x in [note_text, *notes] if x))
+        return notes
 
     def _refresh_images(self) -> None:
         """Work around openpyxl closing in-memory image buffers after a save.

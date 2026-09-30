@@ -41,6 +41,7 @@ STAGE_LABELS_VI = {
     "needs_review": "Cần kiểm tra",
     "error": "Lỗi",
     "skipped": "Đã xử lý trước đó",
+    "not_written": "Cần kiểm tra (chưa ghi)",
 }
 
 
@@ -56,6 +57,9 @@ class BatchOptions:
     render_width: int = 1920
     use_ollama: bool = True
     fill_temporary_column: bool = False
+    # "match": Management Number from the file name locates the EXISTING Excel row (production);
+    # "append": every report becomes a new row (legacy / empty template)
+    row_mode: str = "match"
 
 
 @dataclass
@@ -65,6 +69,7 @@ class BatchSummary:
     needs_review: int = 0
     failed: int = 0
     skipped: int = 0
+    not_written: int = 0
     stopped: bool = False
     output_file: str = ""
     output_folder: str = ""
@@ -167,8 +172,8 @@ class BatchProcessor:
             except Exception as e:  # noqa: BLE001
                 LOG.warning("review_report.txt failed: %s", e)
             self._log(f"Kết thúc. Tổng: {self.summary.total}  Hoàn thành: {self.summary.completed}  "
-                      f"Cần kiểm tra: {self.summary.needs_review}  Lỗi: {self.summary.failed}  "
-                      f"Bỏ qua: {self.summary.skipped}")
+                      f"Cần kiểm tra: {self.summary.needs_review}  Chưa ghi: {self.summary.not_written}  "
+                      f"Lỗi: {self.summary.failed}  Bỏ qua: {self.summary.skipped}")
             self.on_done(self.summary)
         return self.summary
 
@@ -220,6 +225,8 @@ class BatchProcessor:
             # --- 3. extract original content (program copies WHAT) ----------
             rec = extract_record(report, cls, writer.item_mapping, writer.known_models)
             fr.management_number = rec.management_number
+            fr.vendor = rec.vendor
+            fr.occurrence_date = rec.occurrence_date_text
             fr.model = rec.model
             fr.item = rec.item
 
@@ -248,11 +255,32 @@ class BatchProcessor:
 
             # --- 6. write Excel ------------------------------------------------
             self.on_file(idx, "writing_excel", "")
+            if self.opts.row_mode == "match":
+                # Management Number (from file name) is the key of the destination row
+                if not rec.management_number:
+                    return self._not_written(idx, fr, rec, "Không xác định được Management Number từ tên file")
+                rows = writer.find_rows_by_management_number(rec.management_number)
+                if not rows:
+                    return self._not_written(idx, fr, rec,
+                                             f"Không tìm thấy Management Number {rec.management_number} trong file Kiểm chứng")
+                if len(rows) > 1:
+                    return self._not_written(idx, fr, rec,
+                                             f"Management Number {rec.management_number} xuất hiện nhiều dòng ({rows})")
+                row = rows[0]
+                conflicts = writer.update_record(row, rec, qpn_png, imp_jpg, fill_temporary=self.opts.fill_temporary_column)
+                rec.review_reasons.extend(conflicts)
+                note = "; ".join(rec.review_reasons)
+                if note and "note" in writer.columns:
+                    writer._set_cell(row, "note", note)
+                if rec.review_reasons and "status" in writer.columns:
+                    writer._set_cell(row, "status", "Cần kiểm tra")
+            else:
+                note = "; ".join(rec.review_reasons)
+                row = writer.append_record(rec, qpn_png, imp_jpg,
+                                           status_text="Cần kiểm tra" if rec.review_reasons else "",
+                                           note_text=note, fill_temporary=self.opts.fill_temporary_column)
             status = "needs_review" if rec.review_reasons else "completed"
             note = "; ".join(rec.review_reasons)
-            row = writer.append_record(rec, qpn_png, imp_jpg,
-                                       status_text="Cần kiểm tra" if rec.review_reasons else "",
-                                       note_text=note, fill_temporary=self.opts.fill_temporary_column)
             writer.save()                       # save after every successful record
             fr.excel_row = row
             fr.review_reasons = list(rec.review_reasons)
@@ -275,6 +303,19 @@ class BatchProcessor:
         fr.finished_at = datetime.now().isoformat(timespec="seconds")
         return fr
 
+    def _not_written(self, idx: int, fr: FileResult, rec, reason: str) -> FileResult:
+        """Match mode: destination row cannot be determined -> nothing is written, report it."""
+        fr.status = "not_written"
+        fr.review_reasons = [f"Cần kiểm tra: {reason}", *rec.review_reasons]
+        fr.blank_fields = list(rec.blank_fields)
+        fr.error = f"Cần kiểm tra: {reason}"
+        fr.finished_at = datetime.now().isoformat(timespec="seconds")
+        self.summary.not_written += 1
+        self.summary.errors.append({"file": fr.source_file, "error": fr.error})
+        LOG.warning("%s: not written – %s", Path(fr.source_file).name, reason)
+        self.on_file(idx, "not_written", reason)
+        return fr
+
     def _log(self, msg: str) -> None:
         LOG.info(msg)
         self.on_log(msg)
@@ -286,7 +327,9 @@ def format_file_diagnostics(fr: FileResult) -> str:
         f"Báo cáo            : {fr.source_file}",
         f"Trạng thái         : {fr.status}" + (f"  (dòng Excel {fr.excel_row})" if fr.excel_row else ""),
         f"Bộ phân loại       : {fr.classifier or '-'}" + (f"  (độ tin cậy AI {fr.confidence:.2f})" if fr.confidence is not None else ""),
-        f"Management number  : {fr.management_number or '(trống)'}",
+        f"Management number  : {fr.management_number or '(trống)'}  (từ tên file – khoá dòng Excel)",
+        f"Vendor (từ đối sách): {fr.vendor or '(trống)'}",
+        f"Ngày phát sinh     : {fr.occurrence_date or '(trống)'}  (suy ra từ Management Number YYMMDD)",
         f"Model              : {fr.model or '(trống)'}",
         f"Item               : {fr.item or '(trống)'}",
         f"Slide QPN          : {fr.qpn_slide or '(không thấy)'}",

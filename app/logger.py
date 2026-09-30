@@ -55,6 +55,8 @@ class FileResult:
     source_file: str
     status: str = "waiting"            # completed | needs_review | error | skipped
     management_number: str = ""
+    vendor: str = ""
+    occurrence_date: str = ""
     model: str = ""
     item: str = ""
     qpn_slide: Optional[int] = None

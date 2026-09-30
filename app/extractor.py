@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence
+from datetime import date
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
 
 from .classifier import Classification, is_heading_like, section_kind_of_heading
 from .pptx_parser import ReportData, SlideData, norm_key, clean_text
@@ -52,10 +54,17 @@ class ExtractedRecord:
     improvement_image_slides: List[int] = field(default_factory=list)
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
-    # Business rule: user fills these manually -> always blank
+    # Vendor: detected from the ORIGINAL improvement text ("Tại công đoạn assy <Vendor>")
     vendor: str = ""
-    occurrence_date: str = ""
+    vendor_candidates: List[str] = field(default_factory=list)
+    # Ngày phát sinh: derived from the Management Number (YYMMDD prefix) as a real date
+    occurrence_date: Optional[date] = None
+    # WEEK +1..+8: always blank (never invented)
     weeks: Dict[int, str] = field(default_factory=lambda: {i: "" for i in range(1, 9)})
+
+    @property
+    def occurrence_date_text(self) -> str:
+        return self.occurrence_date.strftime("%d/%m/%Y") if self.occurrence_date else ""
 
 
 # ----------------------------------------------------------------------------
@@ -147,21 +156,84 @@ def join_sections(sections: Iterable[Section]) -> str:
 # ----------------------------------------------------------------------------
 # Field extraction
 # ----------------------------------------------------------------------------
-def extract_management_number(report: ReportData, llm_value: str = "") -> str:
-    m = MGMT_RE.search(report.filename)
-    if m:
-        return m.group(1)
-    text = report.all_text()
-    m = MGMT_RE.search(text)
-    if m:
-        return m.group(1)
-    v = (llm_value or "").strip()
-    if v and (v in text or v in report.filename):
-        return v
-    # "Management No: XXXXX" style label
-    m = re.search(r"(?:management\s*(?:no|number)|mã\s*quản\s*lý|so\s*quan\s*ly)\s*[:：]?\s*([A-Za-z0-9\-/]{5,})",
-                  text, re.IGNORECASE)
+def management_number_from_filename(filename: str) -> str:
+    """Management Number token in a report file name, e.g.
+
+        (CTMS)_11107_251119092-VOC_ Đối sách ... (DRT ) 17.11.2025.pptx  ->  251119092-VOC
+
+    Pattern: digits + '-' + upper-case suffix, delimited by non-alphanumerics.  Other
+    numeric tokens (11107, dates 17.11.2025) never match.  Returns '' when absent.
+    """
+    m = MGMT_RE.search(Path(filename).name if filename else "")
     return m.group(1) if m else ""
+
+
+def extract_management_number(report: ReportData, llm_value: str = "") -> str:
+    """Production rule: the Management Number comes from the PPTX FILE NAME only
+    (it is the key of the existing Excel row).  LLM/text values are never used."""
+    return management_number_from_filename(report.filename)
+
+
+def derive_occurrence_date(mgmt: str) -> Tuple[Optional[date], str]:
+    """First six digits of the Management Number are YYMMDD (2000-based year).
+
+    251119092-VOC -> 19/11/2025.  Strict calendar validation; returns (None, reason)
+    when the prefix is missing or is not a real date.
+    """
+    m = re.match(r"^\s*(\d{6})\d*-", mgmt or "")
+    if not m:
+        return None, "Management Number không có tiền tố ngày YYMMDD"
+    yy, mm, dd = int(m.group(1)[0:2]), int(m.group(1)[2:4]), int(m.group(1)[4:6])
+    try:
+        return date(2000 + yy, mm, dd), ""
+    except ValueError:
+        return None, f"Ngày trong Management Number không hợp lệ (YYMMDD={m.group(1)})"
+
+
+# "Tại công đoạn assy Taewon", "Công đoạn Assy Daoltech", "công đoạn ASSY  ABC Vina):"
+_VENDOR_PHRASE = re.compile(
+    r"(?i:c[oô]ng\s+[dđ]o[aạ]n\s+(?:assy|ass\.?y|assembly))\s*[:\-–]?\s*"
+    # the name itself is matched case-sensitively: Capitalised words / upper-case codes only
+    r"((?:[A-ZÀ-Ỹ][\w&.\-]*|[A-Z0-9&]{2,})(?:[ \t]+(?:[A-ZÀ-Ỹ][\w&.\-]*|[A-Z0-9&]{2,})){0,3})",
+    re.UNICODE)
+_VENDOR_STOP = {"tai", "cong", "doan", "assy", "ngay", "tu", "ap", "dung", "loi", "va", "cua", "trong", "sau",
+                "truoc", "line", "day", "chuyen", "khu", "vuc", "may", "kiem", "tra", "san", "xuat"}
+
+
+def _clean_vendor(token: str) -> str:
+    t = token.strip(" \t.,;:()[]{}–-/\\")
+    t = re.sub(r"\s*\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?.*$", "", t)     # trailing dates
+    words = []
+    for w in t.split():
+        if norm_key(w) in _VENDOR_STOP:
+            break
+        words.append(w)
+    return " ".join(words).strip(" .,;:()–-")
+
+
+def find_vendor_candidates(text: str) -> List[str]:
+    """Vendor names exactly as written in ``text`` (original spelling), de-duplicated case-insensitively."""
+    out: List[str] = []
+    for m in _VENDOR_PHRASE.finditer(text or ""):
+        v = _clean_vendor(m.group(1))
+        if len(v) < 2:
+            continue
+        if not any(v.lower() == o.lower() for o in out):
+            out.append(v)
+    return out
+
+
+def extract_vendor(rec: "ExtractedRecord", report: ReportData) -> None:
+    """Vendor from improvement content first; other structural phrases elsewhere only as fallback."""
+    primary = find_vendor_candidates(rec.improvement)
+    candidates = primary or find_vendor_candidates(report.all_text())
+    rec.vendor_candidates = candidates
+    if len(candidates) == 1:
+        rec.vendor = candidates[0]
+    elif len(candidates) > 1:
+        rec.review_reasons.append("Phát hiện nhiều Vendor khác nhau trong nội dung đối sách: " + ", ".join(candidates))
+    else:
+        rec.review_reasons.append("Không xác định được Vendor từ nội dung đối sách")
 
 
 def normalize_model(model: str) -> str:
@@ -285,6 +357,15 @@ def extract_record(report: ReportData, cls: Classification,
     rec.temporary_excluded = join_sections(tmp_sections)
     rec.improvement_image_slides = list(cls.improvement_image_slides)
 
+    # Vendor (from source text) and Ngày phát sinh (from Management Number)
+    extract_vendor(rec, report)
+    if rec.management_number:
+        rec.occurrence_date, why = derive_occurrence_date(rec.management_number)
+        if why:
+            rec.review_reasons.append(why)
+    else:
+        rec.review_reasons.append("Không xác định được Management Number từ tên file")
+
     # validation -> review reasons (never invent content)
     if not rec.model:
         rec.review_reasons.append("Không tìm thấy Model")
@@ -298,7 +379,8 @@ def extract_record(report: ReportData, cls: Classification,
         rec.review_reasons.append("Không có hình ảnh cải tiến")
     # ambiguous classification -> manual review rather than guessing
     rec.review_reasons.extend(cls.ambiguities)
-    for name, val in (("Management number", rec.management_number), ("Model", rec.model), ("Item", rec.item),
+    for name, val in (("Management number", rec.management_number), ("Tên vendor", rec.vendor),
+                      ("Ngày phát sinh", rec.occurrence_date_text), ("Model", rec.model), ("Item", rec.item),
                       ("Nội dung lỗi", rec.defect_content), ("Nguyên nhân", rec.root_cause),
                       ("Nội dung đối sách cải tiến", rec.improvement)):
         if not val:

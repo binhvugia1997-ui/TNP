@@ -15,7 +15,7 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 
 IMPROVEMENT_TEXT = (
-    "Lỗi xước rear do va chạm với khay chứa\n"
+    "Lỗi xước rear do va chạm với khay chứa ( Áp dụng cải tiến 17/9 – Công đoạn Assy Daoltech):\n"
     "- Tại công đoạn lắp ráp Rear, thao tác đặt sản phẩm vào khay\n"
     "+ Trước: Khay nhựa cứng không có lót xốp, sản phẩm tiếp xúc trực tiếp gây xước\n"
     "+ Sau: Thay khay mới có lót mút EVA 3mm, bổ sung vách ngăn từng ô\n"
@@ -204,9 +204,9 @@ def make_sample_tree(root: Path) -> dict:
     reports = root / "Reports"
     files = [
         make_report(reports / "September" / "A185" / "(CTMS)_20506_260918080-VOC_A185_Rear.pptx"),
-        make_report(reports / "September" / "A185" / "report2.pptx", model="SM-A185", item="Rear", mgmt="260918081-VOC"),
-        make_report(reports / "September" / "A175" / "report3.pptx", model="SM-A175", item="Main", mgmt="260918082-VOC"),
-        make_report(reports / "October" / "report4.pptx", model="SM-A166", item="PBA", mgmt="260918083-VOC", with_qpn=False),
+        make_report(reports / "September" / "A185" / "260918081-VOC_report2.pptx", model="SM-A185", item="Rear", mgmt="260918081-VOC"),
+        make_report(reports / "September" / "A175" / "260918082-VOC_report3.pptx", model="SM-A175", item="Main", mgmt="260918082-VOC"),
+        make_report(reports / "October" / "(CTMS)_20509_260918083-VOC_ Đối sách A166 PBA 21.09.2026.pptx", model="SM-A166", item="PBA", mgmt="260918083-VOC", with_qpn=False),
     ]
     template = make_template(root / "Templates" / "Verification.xlsx")
     return {"reports": reports, "files": files, "template": template}

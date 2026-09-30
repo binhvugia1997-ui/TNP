@@ -18,7 +18,7 @@ def test_recursive_scan_finds_all_reports(sample_tree):
     files = scan_folder(sample_tree["reports"])
     names = sorted(p.name for p in files)
     assert len(files) == 4
-    assert "report4.pptx" in names and "report3.pptx" in names
+    assert any(n.endswith("report3.pptx") for n in names) and any("260918083-VOC" in n for n in names)
     assert any("September/A185" in str(p).replace("\\", "/") for p in files)
 
 
@@ -198,8 +198,9 @@ def test_extraction_preserves_original_text_and_excludes_temporary(a185_report):
     for line in (CAUSE_TEXT_1 + "\n" + CAUSE_TEXT_2).split("\n"):
         assert line in rec.root_cause
     assert len(rec.cause_sections) >= 2
-    # manual fields blank
-    assert rec.vendor == "" and rec.occurrence_date == ""
+    # vendor: no "công đoạn assy <Vendor>" phrase in this deck -> blank + review; date derived from mgmt no.
+    assert rec.vendor == "Daoltech"                      # exactly as written in the source
+    assert rec.occurrence_date_text == "18/09/2026"      # from 260918080-VOC, not from slide text
     assert all(v == "" for v in rec.weeks.values())
     assert rec.review_reasons == []
 

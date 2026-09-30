@@ -48,14 +48,15 @@ def _cli(args) -> int:
     opts = BatchOptions(files=files, template=Path(args.template), output_file=Path(args.output),
                         ollama_server=server, model=model or "", force_reprocess=args.force,
                         use_ollama=bool(model) and not args.no_ai,
-                        fill_temporary_column=bool(cfg.fill_temporary_column))
+                        fill_temporary_column=bool(cfg.fill_temporary_column),
+                        row_mode="append" if args.append else (cfg.row_mode or "match"))
 
     def on_file(i, stage, detail):
         print(f"[{i + 1}/{len(files)}] {files[i].name}: {STAGE_LABELS_VI.get(stage, stage)} {detail}".rstrip(), flush=True)
 
     proc = BatchProcessor(opts, on_file=on_file, on_log=lambda m: print(m, flush=True))
     s = proc.run()
-    print(f"\nTổng: {s.total}\nHoàn thành: {s.completed}\nCần kiểm tra: {s.needs_review}\nLỗi: {s.failed}\nBỏ qua: {s.skipped}")
+    print(f"\nTổng: {s.total}\nHoàn thành: {s.completed}\nCần kiểm tra: {s.needs_review}\nChưa ghi (không tìm thấy dòng): {s.not_written}\nLỗi: {s.failed}\nBỏ qua: {s.skipped}")
     print(f"Kết quả: {s.output_file}")
     return 0 if s.failed == 0 else 1
 
@@ -71,6 +72,7 @@ def main(argv=None) -> int:
     parser.add_argument("--model", help="tên model Ollama (rỗng = không dùng AI)")
     parser.add_argument("--no-ai", action="store_true", help="chỉ dùng nhận diện từ khoá")
     parser.add_argument("--force", action="store_true", help="xử lý lại file đã xử lý")
+    parser.add_argument("--append", action="store_true", help="ghi mỗi báo cáo thành dòng mới (mặc định: tìm dòng theo Management Number)")
     parser.add_argument("--inspect", metavar="PATH", help="in cấu trúc file .pptx hoặc form .xlsx để kiểm tra mapping")
     parser.add_argument("--out", metavar="FILE", help="ghi kết quả --inspect ra file UTF-8 (mặc định inspect_template.txt / inspect_report.txt)")
     parser.add_argument("--version", action="store_true")
