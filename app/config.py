@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
+DEFAULT_MODEL = "qwen3:4b"
 
 
 def app_base_dir() -> Path:
@@ -53,7 +54,7 @@ def normalize_ollama_url(address: str) -> str:
 @dataclass
 class AppConfig:
     ollama_server: str = DEFAULT_OLLAMA
-    model: str = ""
+    model: str = DEFAULT_MODEL
     last_report_folder: str = ""
     last_template: str = ""
     last_output_folder: str = ""

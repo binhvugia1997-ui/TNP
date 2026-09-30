@@ -33,15 +33,17 @@ STAGES = ["waiting", "reading", "analyzing", "extracting_qpn", "extracting_image
 STAGE_LABELS_VI = {
     "waiting": "Đang chờ",
     "reading": "Đang đọc PPTX",
-    "analyzing": "Đang phân tích (AI)",
+    "analyzing": "Đang phân tích Qwen",
+    "analyzing_heuristic": "Đang phân tích (từ khoá, không AI)",
+    "extracting": "Đang trích xuất nguyên nhân / đối sách cải tiến",
     "extracting_qpn": "Đang trích xuất QPN",
-    "extracting_images": "Đang trích xuất hình ảnh",
+    "extracting_images": "Đang trích xuất hình ảnh cải tiến",
     "writing_excel": "Đang ghi Excel",
     "completed": "Hoàn thành",
     "needs_review": "Cần kiểm tra",
     "error": "Lỗi",
     "skipped": "Đã xử lý trước đó",
-    "not_written": "Cần kiểm tra (chưa ghi)",
+    "not_written": "Không tìm thấy Management Number",
 }
 
 
@@ -200,12 +202,14 @@ class BatchProcessor:
 
             # --- 1. read PPTX ------------------------------------------------
             self.on_file(idx, "reading", "")
+            if path.suffix.lower() == ".ppt":
+                raise RuntimeError("Định dạng .ppt cũ không đọc được – hãy mở bằng PowerPoint và lưu lại thành .pptx")
             report = parse_pptx(path)
             if not report.slides:
                 raise RuntimeError("PPTX không có slide nào")
 
             # --- 2. classify (AI decides WHERE) ------------------------------
-            self.on_file(idx, "analyzing", f"{len(report.slides)} slide")
+            self.on_file(idx, "analyzing" if client else "analyzing_heuristic", f"{len(report.slides)} slide")
             cls = classify(report, client, self.opts.model if client else "")
             fr.classifier = cls.source
             fr.qpn_slide = cls.qpn_slide
@@ -228,6 +232,7 @@ class BatchProcessor:
                      cls.improvement_slides, cls.improvement_image_slides, cls.confidence)
 
             # --- 3. extract original content (program copies WHAT) ----------
+            self.on_file(idx, "extracting", "")
             rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None)
             fr.management_number = rec.management_number
             fr.vendor = rec.vendor

@@ -14,7 +14,8 @@ def is_report_file(path: Path) -> bool:
         return False
     if name.startswith("."):
         return False
-    return path.suffix.lower() in (".pptx", ".pptm")
+    # legacy .ppt is listed too so the user sees it (it is reported as an error with a clear message)
+    return path.suffix.lower() in (".pptx", ".pptm", ".ppt")
 
 
 def scan_folder(folder: PathLike) -> List[Path]:

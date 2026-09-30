@@ -93,7 +93,7 @@ def test_config_persistence(tmp_path):
 
 def test_config_load_missing_file_gives_defaults(tmp_path):
     cfg = AppConfig.load(tmp_path / "nope.json")
-    assert cfg.model == "" and cfg.ollama_server.startswith("http://")
+    assert cfg.model == "qwen3:4b" and cfg.ollama_server.startswith("http://")
 
 
 # ---------------------------------------------------------------- pptx / classification
