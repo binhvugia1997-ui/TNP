@@ -1,0 +1,24 @@
+LẦN CHẠY ĐẦU TIÊN – REPORT EXTRACTOR {version}
+=================================================
+
+1. Giải nén TOÀN BỘ thư mục {name} (không chạy exe trực tiếp từ trong file ZIP).
+   Đặt ở nơi có quyền ghi: D:\, Desktop, Documents… Không đặt trong C:\Program Files.
+
+2. Windows SmartScreen có thể hiện "Windows đã bảo vệ PC của bạn" vì bản portable
+   chưa ký số thương mại. Bấm "Thông tin thêm" (More info) → "Vẫn chạy" (Run anyway).
+   Chương trình không chỉnh sửa hệ thống, không cần quyền Administrator,
+   không gửi dữ liệu ra Internet.
+
+3. Lần đầu chạy, chương trình tự tạo các thư mục config\, logs\, Output\ bên cạnh
+   ReportExtractor.exe. Không có gì được ghi vào _internal\.
+
+4. Ollama là TÙY CHỌN:
+   - Không có Ollama: chương trình vẫn xử lý báo cáo (heuristic).
+   - Muốn dùng AI phân loại slide: chạy Install_Ollama_Optional.bat (cài trên máy này)
+     hoặc dùng máy khác trong LAN: tab "Cấu hình & Ollama" → "Tìm Ollama trong mạng LAN".
+   - Máy Ollama dùng chung cần: OLLAMA_HOST=0.0.0.0 và mở cổng 11434 trên firewall.
+
+5. Nếu không khởi động được: mở logs\startup_error.log và gửi nội dung cho người hỗ trợ
+   cùng VERSION.txt.
+
+Prompt {build_id} – build {built}

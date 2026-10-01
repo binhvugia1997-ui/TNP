@@ -47,7 +47,8 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> Path:
         sh.setFormatter(fmt)
         LOG.addHandler(sh)
     from . import VERSION_LINE
-    LOG.info("STARTUP %s", VERSION_LINE)
+    from .runtime_paths import describe
+    LOG.info("STARTUP %s %s", VERSION_LINE, describe())
     return log_dir / "errors.log"
 
 

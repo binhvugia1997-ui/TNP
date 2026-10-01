@@ -1,11 +1,10 @@
-"""Configuration persistence (config.json next to the executable) and helpers."""
+"""Configuration persistence (<portable>/config/config.json) and helpers."""
 from __future__ import annotations
 
 import re
 
 import json
 import os
-import sys
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,14 +15,9 @@ DEFAULT_MODEL = "qwen3:4b"
 
 
 def app_base_dir() -> Path:
-    """Directory that holds config.json.
-
-    - Frozen (PyInstaller onedir): folder containing ReportExtractor.exe.
-    - Development: project root (parent of the ``app`` package).
-    """
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
+    """Writable portable application directory (see :mod:`app.runtime_paths`)."""
+    from .runtime_paths import portable_root
+    return portable_root()
 
 
 def normalize_ollama_url(address: str) -> str:
@@ -119,7 +113,15 @@ class AppConfig:
     # ------------------------------------------------------------------
     @classmethod
     def path(cls) -> Path:
-        return app_base_dir() / "config.json"
+        """``<portable>/config/config.json``; a pre-1.0.3 ``config.json`` next to the executable is still read
+        (migration) until the new file exists."""
+        from .runtime_paths import config_file, legacy_config_file
+        p = config_file()
+        if not p.exists():
+            legacy = legacy_config_file()
+            if legacy is not None:
+                return legacy
+        return p
 
     @classmethod
     def load(cls, path: Optional[os.PathLike | str] = None) -> "AppConfig":
@@ -140,7 +142,13 @@ class AppConfig:
         return cfg
 
     def save(self, path: Optional[os.PathLike | str] = None) -> Path:
-        p = Path(path) if path else self.path()
+        if path:
+            p = Path(path)
+        else:
+            from .runtime_paths import config_file, legacy_config_file
+            p = self.path()
+            if p == legacy_config_file():
+                p = config_file()                  # migrate: always write the portable config/ folder
         data = asdict(self)
         extra = data.pop("extra", {}) or {}
         data.update(extra)

@@ -168,15 +168,15 @@ def _scan_tree_names(app_):
 
 # ------------------------------------------------------------------ 1 version
 def test_canonical_version_prompt002():
-    assert app.__version__ == "1.0.2" and app.BUILD_ID == "PROMPT-002"
-    assert app.APP_TITLE == "Report Extractor v1.0.2" and app.VERSION_LINE == "version=1.0.2 prompt=PROMPT-002"
-    assert "1.0.2" not in SRC and "PROMPT-002" not in SRC.split('"""', 2)[2]   # header imports the constants
+    assert app.__version__ == "1.0.3" and app.BUILD_ID == "PROMPT-003"
+    assert app.APP_TITLE == "Report Extractor v1.0.3" and app.VERSION_LINE == "version=1.0.3 prompt=PROMPT-003"
+    assert "1.0.3" not in SRC and "PROMPT-003" not in SRC.split('"""', 2)[2]   # header imports the constants
 
 
 def test_window_title_and_header_use_constants(monkeypatch, tmp_path):
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
-    assert a.root.title_.startswith("Report Extractor v1.0.2")
-    assert a.lbl_version.cfg["text"] == "v1.0.2" and a.lbl_build.cfg["text"] == "PROMPT-002"
+    assert a.root.title_.startswith("Report Extractor v1.0.3")
+    assert a.lbl_version.cfg["text"] == "v1.0.3" and a.lbl_build.cfg["text"] == "PROMPT-003"
     assert a.root.geometry_ == "1400x850" and a.root.minsize_ == (1100, 700)
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 def force_utf8_stdio() -> None:
@@ -151,12 +152,79 @@ def main(argv=None) -> int:
             parser.error("--cli cần --template và --output")
         return _cli(args)
 
+    return launch_gui()
+
+
+STARTUP_ERROR_LOG = "startup_error.log"
+STARTUP_ERROR_VI = "Không thể khởi động Report Extractor.\n\nChi tiết đã được ghi tại:\nlogs\\" + STARTUP_ERROR_LOG
+
+
+def _startup_logging() -> None:
+    """Portable dirs + STARTUP line (version/prompt/packaged/executable/portable_root, no secrets)."""
+    from . import runtime_paths
+    from .logger import LOG, setup_logging
+    runtime_paths.ensure_portable_dirs()
     try:
+        setup_logging(runtime_paths.logs_dir())
+    except OSError as e:                      # read-only location: keep going, the GUI still works
+        LOG.warning("Không ghi được log khởi động: %s", e)
+    LOG.info("STARTUP_MODE gui %s", runtime_paths.describe())
+
+
+def record_startup_error(exc: BaseException, log_dir: Optional[Path] = None) -> Optional[Path]:
+    """Write the traceback of a fatal pre-GUI failure to ``logs/startup_error.log`` (never silent)."""
+    import traceback
+    from datetime import datetime
+    try:
+        if log_dir is None:
+            from . import runtime_paths
+            log_dir = runtime_paths.logs_dir()
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        from . import VERSION_LINE
+        target = log_dir / STARTUP_ERROR_LOG
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {VERSION_LINE} python={sys.version.split()[0]} "
+                     f"executable={sys.executable}\n")
+            fh.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        return target
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _show_startup_error_dialog() -> None:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Report Extractor", STARTUP_ERROR_VI)
+        root.destroy()
+    except Exception:  # noqa: BLE001
+        print(STARTUP_ERROR_VI, file=sys.stderr)
+
+
+def launch_gui() -> int:
+    try:
+        _startup_logging()
         from .gui import launch
     except ImportError as e:
+        record_startup_error(e)
         print(f"Không khởi động được giao diện (tkinter): {e}", file=sys.stderr)
+        _show_startup_error_dialog()
         return 3
-    launch()
+    except Exception as e:  # noqa: BLE001
+        record_startup_error(e)
+        _show_startup_error_dialog()
+        return 4
+    try:
+        launch()
+    except Exception as e:  # noqa: BLE001 – failure before/while creating the main window
+        from .logger import LOG
+        LOG.exception("GUI_FATAL %s", e)
+        record_startup_error(e)
+        _show_startup_error_dialog()
+        return 4
     return 0
 
 

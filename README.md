@@ -16,33 +16,46 @@ management number returned by the LLM are only used when found verbatim in the P
 
 ---
 
-## 1. Portable build (Windows)
+## 1. Portable build (Windows) – v1.0.3 / PROMPT-003
 
-On the **development PC** (Python 3.9+ installed):
-
-```
-BUILD_PORTABLE.bat
-```
-
-This creates a venv, installs the build dependencies, runs the tests, runs
-PyInstaller (onedir) and produces:
+On the **development PC** (Python 3.10 – 3.13, 64-bit; the build refuses other versions):
 
 ```
-dist\ReportExtractor_Portable\
+build_portable.bat
+```
+
+`tools/build_portable.py` creates `.venv-build` from `requirements-build.txt`, runs pyflakes + pytest, runs
+PyInstaller with the committed `ReportExtractor.spec` (**onedir, windowed, no console, no UPX, no onefile**),
+assembles the portable folder, validates it (no tests / .venv / .git / sample PPTX-XLSX / developer
+`config.json` inside, no Ollama or model files), zips it and writes SHA256 sums:
+
+```
+dist\ReportExtractor_v1.0.3_Portable\
 ├── ReportExtractor.exe
-├── _internal\
-├── config.json
-└── README.md
+├── _internal\                 (read-only bundle – never written to)
+├── Output\  logs\  config\    (writable state, created next to the exe)
+├── README.txt  FIRST_RUN.txt  VERSION.txt  SHA256SUMS.txt
+└── Install_Ollama_Optional.bat
+release\ReportExtractor_v1.0.3_Portable.zip + release\SHA256SUMS.txt
 ```
 
-Copy the whole `ReportExtractor_Portable` folder to any Windows 10/11 PC and
-double-click `ReportExtractor.exe`. No Python, pip, or tools required there.
+Runtime paths come from `app/runtime_paths.py`: *resource root* = `sys._MEIPASS` (`_internal`) when packaged,
+*portable root* = folder of `ReportExtractor.exe` (never the current working directory). Config is
+`config\config.json` (a pre-1.0.3 `config.json` next to the exe is still read once and migrated), start-up log
+`logs\app.log` (`STARTUP version=1.0.3 prompt=PROMPT-003 packaged=… executable=… portable_root=…`), fatal start-up
+errors → `logs\startup_error.log` + dialog. Defaults shipped: `http://127.0.0.1:11434`, `qwen3:4b`; Ollama and
+models are **not** bundled (the app starts and works in heuristic mode without Ollama).
 
-> The build must be run on Windows – PyInstaller does not cross-compile.
-> Recommended: Microsoft PowerPoint installed on the *target* PC gives the best
-> QPN rendering; otherwise LibreOffice, otherwise the built-in renderer is used.
+Copy the whole folder to any Windows 10/11 PC (paths with spaces / Vietnamese are fine; avoid `Program Files`)
+and double-click `ReportExtractor.exe`. The build must run on Windows – PyInstaller does not cross-compile.
+PowerPoint / LibreOffice on the target PC are optional accelerators for QPN rendering; the built-in renderer is used otherwise.
 
-Development run: `RUN_DEV.bat` – tests: `RUN_TESTS.bat`.
+**Ollama in the LAN:** tab *Cấu hình & Ollama* → **Tìm Ollama trong mạng LAN** (user-initiated only; scans port
+11434 on the PC's private subnet with bounded concurrency; *Dừng tìm* cancels). Found servers are verified via
+`/api/tags`; choose one and confirm **Sử dụng server này** – the app never switches server or model
+automatically. The Ollama PC needs `OLLAMA_HOST=0.0.0.0` and port 11434 open.
+
+Development run: `run.bat` / `RUN_DEV.bat` – tests: `RUN_TESTS.bat` – CLI: `run_cli.bat --cli …`.
 
 Headless mode (same pipeline, also works from the exe):
 
@@ -302,7 +315,7 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 * Kiểm tra cuối: import thư viện, module ứng dụng, tkinter, thư mục config – không xử lý báo cáo nào.
 * Chạy lại `setup.bat` an toàn (idempotent). `run.bat` = `.venv\Scripts\python.exe run.py` (GUI); `run_cli.bat` chuyển
   tiếp tham số cho CLI (`--cli …`). Cửa sổ dừng lại khi lỗi (`Nhấn phím bất kỳ để thoát...`).
-* Đây là cài đặt từ source; bản Portable sẽ là luồng riêng sau này.
+* Đây là cài đặt từ source; bản Portable xem mục 1 (`build_portable.bat`).
 
 Checklist smoke test Windows: (A) máy sạch không Python/Ollama → winget cài Python → .venv → bỏ qua Ollama → run.bat;
 (B) có Python, không Ollama; (C) Python + Ollama, chưa model → chọn [4]; (D) đã có qwen3:4b → "đã tồn tại — bỏ qua tải xuống";

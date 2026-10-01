@@ -13,9 +13,9 @@
 - Phase 6  Improvement contact sheet + original picture dump ..................... done
 - Phase 7  Batch processor, stop-after-current, errors.log, batch_result.json,
            history.json duplicate protection, CLI mode, diagnostics .............. done
-- Phase 8  PyInstaller spec + BUILD_PORTABLE.bat / RUN_DEV.bat ................... written
+- Phase 8  PyInstaller spec + build_portable.bat / RUN_DEV.bat ................... written
            Sandbox is Linux without libpython/tkinter and GitHub assets blocked →
-           the .exe could not be produced here; run BUILD_PORTABLE.bat on Windows.
+           the .exe could not be produced here; run build_portable.bat on Windows.
 - Fixes    openpyxl closed-image-buffer on 2nd save; header mis-detection on reopen;
            cover title mis-classified as improvement; defect cell extraction.
 - Tests    40 passed (pytest).

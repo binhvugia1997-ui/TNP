@@ -22,6 +22,8 @@ from .excel_writer import validate_template
 from .extractor import management_number_from_filename
 from .logger import FileResult
 from .ollama_client import OllamaClient, OllamaError, preferred_model
+from .ollama_discovery import (OllamaDiscovery, OllamaDiscoveryResult, discovery_summary_vi, missing_model_message,
+                               model_available)
 from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS,
                       ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
                       CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, MasterLookup, PreScanItem,
@@ -217,7 +219,7 @@ class ScanRow:
 
 @dataclass
 class UiEvent:
-    kind: str                      # row | progress | log | done | ollama
+    kind: str                      # row | progress | log | done | ollama | models | discovery_*
     payload: Any = None
 
 
@@ -274,6 +276,15 @@ class GuiController:
         self.worker_failure: str = ""                # set by reconcile() when the worker died without "done"
         self._today: Callable[[], Any] = __import__("datetime").date.today   # overridable for tests
         self._queue: "queue.Queue[UiEvent]" = queue.Queue()
+        # LAN discovery (user-initiated only; completely separate from the batch progress)
+        self._discovery_factory: Callable[..., OllamaDiscovery] = OllamaDiscovery
+        self.discovery: Optional[OllamaDiscovery] = None
+        self.discovery_state: str = "idle"           # idle | running
+        self.discovery_checked = 0
+        self.discovery_total = 0
+        self.discovery_results: List[OllamaDiscoveryResult] = []
+        self.discovery_message: str = ""
+        self.discovery_runs = 0
 
     # ------------------------------------------------------------------ Ollama endpoint
     @property
@@ -699,6 +710,80 @@ class GuiController:
         self.save_settings()
         return ""
 
+    # ------------------------------------------------------------------ LAN discovery (PROMPT-003)
+    @property
+    def discovery_running(self) -> bool:
+        return self.discovery_state == "running"
+
+    def can_discover(self) -> bool:
+        """Only while no batch is running / stopping and no scan is already in flight."""
+        return self.state == "idle" and not self.discovery_running
+
+    def discovery_progress_text(self) -> str:
+        if self.discovery_running:
+            return (f"Đang tìm Ollama trong mạng LAN... Đã kiểm tra {self.discovery_checked} / "
+                    f"{self.discovery_total} địa chỉ")
+        return self.discovery_message
+
+    def discover_ollama(self) -> List[OllamaDiscoveryResult]:
+        """Synchronous scan (worker thread body). Never touches the configured server."""
+        disc = self._discovery_factory()
+        self.discovery = disc
+        self.discovery_results = []
+        self.discovery_runs += 1
+        LOG.info("DISCOVERY_START port=%s", disc.port)
+
+        def progress(checked: int, total: int) -> None:
+            self._queue.put(UiEvent("discovery_progress", (checked, total)))
+
+        def found(res: OllamaDiscoveryResult) -> None:
+            self._queue.put(UiEvent("discovery_found", res))
+
+        try:
+            results = disc.run(progress=progress, found=found)
+        except Exception as e:  # noqa: BLE001 – the scan must never crash the GUI
+            LOG.exception("DISCOVERY_ERROR %s", e)
+            results = list(disc.results)
+        LOG.info("DISCOVERY_DONE checked=%s total=%s found=%s cancelled=%s networks=%s", disc.checked, disc.total,
+                 len(results), disc.cancelled, [str(n) for n in disc.networks])
+        self._queue.put(UiEvent("discovery_done", (results, disc.checked, disc.total, disc.cancelled)))
+        return results
+
+    def discover_ollama_async(self) -> bool:
+        if not self.can_discover():
+            return False
+        self.discovery_state = "running"
+        self.discovery_checked, self.discovery_total = 0, 0
+        self.discovery_message = ""
+        threading.Thread(target=self.discover_ollama, daemon=True, name="ollama-discovery").start()
+        return True
+
+    def cancel_discovery(self) -> bool:
+        if not self.discovery_running or self.discovery is None:
+            return False
+        self.discovery.cancel()
+        return True
+
+    def apply_discovered_server(self, result: OllamaDiscoveryResult, timeout: Optional[int] = None) -> Tuple[bool, str]:
+        """User confirmed "Sử dụng server này": set + persist the endpoint through the normal config path, refresh
+        the model list and keep the configured model if the server has it (otherwise warn – never auto-switch,
+        never download).  Returns (model_available, message)."""
+        problem = self.set_endpoint(result.host, result.port)
+        if problem:
+            return False, problem
+        self.ollama_ok, self.ollama_status = None, ""
+        self.save_ollama_settings()
+        ok, msg, models = self.refresh_models(timeout=timeout)
+        if not ok and result.models:
+            models = list(result.models)
+            self.available_models = models
+        LOG.info("DISCOVERY_APPLY server=%s models=%s", self.server, len(models))
+        if not self.model.strip():
+            return False, missing_model_message(DEFAULT_MODEL)
+        if model_available(self.model, models):
+            return True, f"Đã chuyển sang server {self.endpoint_label}. Model {self.model} có sẵn."
+        return False, missing_model_message(self.model)
+
     # ------------------------------------------------------------------ run control
     def can_start(self) -> bool:
         return self.state == "idle"
@@ -896,6 +981,17 @@ class GuiController:
             self.ollama_ok, self.ollama_status = ev.payload
         elif ev.kind == "models":
             pass                                     # payload (ok, msg, models) is rendered by the view
+        elif ev.kind == "discovery_progress":
+            self.discovery_checked, self.discovery_total = ev.payload
+        elif ev.kind == "discovery_found":
+            if all(r.endpoint != ev.payload.endpoint for r in self.discovery_results):
+                self.discovery_results.append(ev.payload)
+        elif ev.kind == "discovery_done":
+            results, checked, total, cancelled = ev.payload
+            self.discovery_results = list(results)
+            self.discovery_checked, self.discovery_total = checked, total
+            self.discovery_state = "idle"
+            self.discovery_message = discovery_summary_vi(results, checked, total, cancelled)
 
     def _fill_row_from_result(self, row: RowState) -> None:
         fr = self.result_for(row.index)

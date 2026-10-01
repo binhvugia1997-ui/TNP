@@ -84,8 +84,8 @@ _FONT_CACHE: Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
 
 def _font_candidates() -> List[str]:
     c: List[str] = []
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
-    c.append(str(base / "assets" / "DejaVuSans.ttf"))
+    from .runtime_paths import resource_root
+    c.append(str(resource_root() / "assets" / "DejaVuSans.ttf"))
     if sys.platform == "win32":
         win = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
         c += [str(win / n) for n in ("arial.ttf", "segoeui.ttf", "tahoma.ttf", "calibri.ttf", "times.ttf")]

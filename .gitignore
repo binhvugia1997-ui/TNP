@@ -16,3 +16,6 @@ logs/
 *.egg-info/
 .mypy_cache/
 .ruff_cache/
+release/
+*.zip
+config/

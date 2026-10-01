@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import platform
-import sys
 import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -37,7 +36,9 @@ def run_diagnostics(cfg: AppConfig, template: Optional[str] = None,
                     output_folder: Optional[str] = None, check_ollama: bool = True,
                     smoke: bool = False) -> List[Tuple[str, str]]:
     rows: List[Tuple[str, str]] = []
-    rows.append((APP_TITLE, f"{VERSION_LINE} ({'portable' if getattr(sys, 'frozen', False) else 'dev'})"))
+    from .runtime_paths import is_packaged, portable_root
+    rows.append((APP_TITLE, f"{VERSION_LINE} ({'portable' if is_packaged() else 'dev'})"))
+    rows.append(("Thư mục chương trình", f"{portable_root()} (config\\config.json, logs\\, Output\\)"))
     rows.append(("Python/runtime", f"OK – {platform.python_version()} / {platform.system()} {platform.release()}"))
     try:
         import pptx, openpyxl, PIL, requests  # noqa: F401

@@ -23,7 +23,7 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import APP_NAME, APP_TITLE, BUILD_ID, __version__
 from .config import AppConfig
@@ -252,6 +252,9 @@ class ReportExtractorApp:
         self.row_items: Dict[int, str] = {}
         self._config_widgets: List = []
         self._done_handled = True                    # no batch yet; start() arms it
+        self.discovery_window = None
+        self.discovery_tree = None
+        self._discovery_items: Dict[str, Any] = {}
         self._search_placeholder = True
         self._build()
         self._bind_shortcuts()
@@ -618,6 +621,19 @@ class ReportExtractorApp:
         self.lbl_conn.grid(row=4, column=0, columnspan=3, sticky="w", pady=(XS, 0))
         self.lbl_ai = ttk.Label(of, text=self.ctl.ai_status_text(), style="Secondary.TLabel")
         self.lbl_ai.grid(row=5, column=0, columnspan=3, sticky="w")
+        # ---- LAN discovery: user-initiated only, same card, same visual system ----------
+        dbtns = ttk.Frame(of, style="Card.TFrame")
+        dbtns.grid(row=6, column=0, columnspan=3, sticky="w", pady=(S, XS))
+        self.btn_discover = ttk.Button(dbtns, text="Tìm Ollama trong mạng LAN", command=self.discover_ollama)
+        self.btn_discover.pack(side="left", padx=(0, XS))
+        self.btn_discover_stop = ttk.Button(dbtns, text="Dừng tìm", command=self.cancel_discovery, state="disabled")
+        self.btn_discover_stop.pack(side="left", padx=(0, XS))
+        self.btn_discover_results = ttk.Button(dbtns, text="Xem kết quả", command=self.show_discovery_results,
+                                               state="disabled")
+        self.btn_discover_results.pack(side="left")
+        self.lbl_discovery = ttk.Label(of, text="Chỉ quét cổng 11434 trong mạng LAN nội bộ khi bạn bấm nút; "
+                                                "không tự động đổi server.", style="Secondary.TLabel", wraplength=900)
+        self.lbl_discovery.grid(row=7, column=0, columnspan=3, sticky="w")
         for var in (self.var_host, self.var_port, self.var_model):
             var.trace_add("write", lambda *_: self._on_endpoint_edited())
 
@@ -649,7 +665,7 @@ class ReportExtractorApp:
         log_vsb.grid(row=0, column=1, sticky="ns")
         self.txt_log.configure(yscrollcommand=log_vsb.set)
 
-        self._config_widgets.extend([e4, e5, b5, b6, b7, self.cb_model, c2])
+        self._config_widgets.extend([e4, e5, b5, b6, b7, self.cb_model, c2, self.btn_discover])
 
     def _bind_shortcuts(self) -> None:
         """Safe conveniences: Ctrl+F focuses the search box, F5 rescans only while idle."""
@@ -1004,6 +1020,118 @@ class ReportExtractorApp:
         self.log(f"Đã lưu cấu hình Ollama: {self.ctl.model} @ {self.ctl.endpoint_label}")
         self._render_ai_status()
 
+    # ------------------------------------------------------------------ LAN discovery
+    def discover_ollama(self) -> None:
+        """User clicked "Tìm Ollama trong mạng LAN" – never called automatically."""
+        if self.ctl.is_running():
+            messagebox.showinfo(APP_NAME, "Đang xử lý báo cáo – vui lòng đợi xong rồi mới tìm Ollama trong mạng LAN.")
+            return
+        if not self.ctl.discover_ollama_async():
+            return
+        self.discovery_window = None
+        self.btn_discover.configure(state="disabled")
+        self.btn_discover_stop.configure(state="normal")
+        self.btn_discover_results.configure(state="disabled")
+        self.lbl_discovery.configure(text=self.ctl.discovery_progress_text(), style="Secondary.TLabel")
+        self.log("Bắt đầu tìm Ollama trong mạng LAN (cổng 11434)…")
+
+    def cancel_discovery(self) -> None:
+        if self.ctl.cancel_discovery():
+            self.btn_discover_stop.configure(state="disabled")
+            self.lbl_discovery.configure(text="Đang dừng tìm Ollama…", style="Secondary.TLabel")
+
+    def _render_discovery_progress(self) -> None:
+        self.lbl_discovery.configure(text=self.ctl.discovery_progress_text(), style="Secondary.TLabel")
+
+    def _on_discovery_done(self) -> None:
+        results = self.ctl.discovery_results
+        self.btn_discover.configure(state="normal" if not self.ctl.is_running() else "disabled")
+        self.btn_discover_stop.configure(state="disabled")
+        self.btn_discover_results.configure(state="normal" if results else "disabled")
+        first = self.ctl.discovery_message.splitlines()[0] if self.ctl.discovery_message else ""
+        if results:
+            self.lbl_discovery.configure(text=f"{first} – tìm thấy {len(results)} server Ollama.", style="Success.TLabel")
+            self.log(f"Tìm thấy {len(results)} server Ollama: " + ", ".join(r.endpoint for r in results))
+            self.show_discovery_results()
+        else:
+            self.lbl_discovery.configure(text=f"{first} – không tìm thấy Ollama trong mạng LAN.", style="Warning.TLabel")
+            self.log("Không tìm thấy Ollama trong mạng LAN.")
+            messagebox.showinfo(APP_NAME, self.ctl.discovery_message)
+
+    def show_discovery_results(self) -> None:
+        """Result list: the user must pick a row and confirm "Sử dụng server này" – even for a single result."""
+        results = list(self.ctl.discovery_results)
+        if not results:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Ollama trong mạng LAN")
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
+        self.discovery_window = win
+        ttk.Label(win, text=f"Tìm thấy {len(results)} server Ollama. Chọn một server rồi bấm “Sử dụng server này”.",
+                  style="Secondary.TLabel", wraplength=700).grid(row=0, column=0, sticky="w", padx=M, pady=(M, XS))
+        cols = ("server", "models", "status")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=min(10, max(3, len(results))), selectmode="browse")
+        for key, title, width in (("server", "Server", 180), ("models", "Models", 420), ("status", "Trạng thái", 160)):
+            tree.heading(key, text=title)
+            tree.column(key, width=width, anchor="w")
+        tree.grid(row=1, column=0, sticky="nsew", padx=M)
+        self.discovery_tree = tree
+        self._discovery_items = {}
+        for r in results:
+            iid = tree.insert("", "end", values=(r.endpoint, ", ".join(r.models) or "(chưa có model)",
+                                                 f"Sẵn sàng ({r.latency_ms} ms)"))
+            self._discovery_items[iid] = r
+        btns = ttk.Frame(win)
+        btns.grid(row=2, column=0, sticky="e", padx=M, pady=M)
+        ttk.Button(btns, text="Quét lại", command=lambda: (win.destroy(), self.discover_ollama())).pack(side="left", padx=(0, XS))
+        ttk.Button(btns, text="Sử dụng server này", style="TButton",
+                   command=lambda: self.use_discovered_server(win)).pack(side="left", padx=(0, XS))
+        ttk.Button(btns, text="Đóng", command=win.destroy).pack(side="left")
+        tree.bind("<Double-1>", lambda _e: self.use_discovered_server(win))
+
+    def _selected_discovery_result(self):
+        tree = getattr(self, "discovery_tree", None)
+        if tree is None:
+            return None
+        sel = tree.selection()
+        if not sel:
+            return None
+        return self._discovery_items.get(sel[0])
+
+    def use_discovered_server(self, win=None) -> None:
+        res = self._selected_discovery_result()
+        if res is None:
+            messagebox.showinfo(APP_NAME, "Vui lòng chọn một server trong danh sách.")
+            return
+        if self.ctl.is_running():
+            messagebox.showinfo(APP_NAME, "Đang xử lý báo cáo – không thể đổi server lúc này.")
+            return
+        if not messagebox.askyesno(APP_NAME, f"Sử dụng server Ollama {res.endpoint} cho chương trình?"):
+            return
+        ok, msg = self.ctl.apply_discovered_server(res)
+        self._loading = True
+        try:
+            self.var_host.set(self.ctl.host)
+            self.var_port.set(str(self.ctl.port))
+            self.var_model.set(self.ctl.model)
+        finally:
+            self._loading = False
+        if self.ctl.available_models:
+            self.cb_model["values"] = self.ctl.available_models
+        self._render_ai_status()
+        self.lbl_conn.configure(text=f"● Đã chọn server {self.ctl.endpoint_label} (đã lưu cấu hình)",
+                                style="Success.TLabel" if ok else "Warning.TLabel")
+        self.log(msg)
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        if not ok:
+            messagebox.showwarning(APP_NAME, msg)
+
     # ------------------------------------------------------------------ run
     def start(self) -> None:
         if not self.ctl.can_start():
@@ -1080,6 +1208,10 @@ class ReportExtractorApp:
                 w.configure(state="disabled" if running else "normal")
             except tk.TclError:
                 pass
+        if running and self.ctl.discovery_running:          # a batch never runs with a LAN scan in flight
+            self.ctl.cancel_discovery()
+        if not running and self.ctl.discovery_running:
+            self.btn_discover.configure(state="disabled")
 
     # ------------------------------------------------------------------ rendering
     def _render_rows(self) -> None:
@@ -1179,6 +1311,12 @@ class ReportExtractorApp:
                     self.log(f"Model '{self.var_model.get().strip()}' không có trên máy chủ; "
                              f"có: {', '.join(models)}")
             self.log(msg)
+        elif ev.kind == "discovery_progress":
+            self._render_discovery_progress()
+        elif ev.kind == "discovery_found":
+            self._render_discovery_progress()
+        elif ev.kind == "discovery_done":
+            self._on_discovery_done()
         elif ev.kind == "done":
             pass                                            # handled by _poll -> _on_done (idempotent)
 
