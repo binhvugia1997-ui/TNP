@@ -182,14 +182,19 @@ def test_extraction_preserves_original_text_and_excludes_temporary(a185_report):
     assert rec.model == "A185"
     assert rec.item == "Rear"
     assert rec.defect_content == "Xước: 15ea\nLệch ANT: 5ea\nMẻ: 13ea"
-    # full original improvement text, in source order
-    for line in IMPROVEMENT_TEXT.split("\n") + IMPROVEMENT_TEXT_2.split("\n") + LONG_TERM_TEXT.split("\n"):
+    # full original PRODUCTION improvement text + long-term production actions, in source order
+    for line in IMPROVEMENT_TEXT.split("\n") + LONG_TERM_TEXT.split("\n"):
         if line.strip():
             assert line in rec.improvement, line
+    # PROMPT-001: inspection/control improvement contributes ZERO text to "Nội dung đối sách cải tiến"
+    for line in IMPROVEMENT_TEXT_2.split("\n"):
+        if line.strip():
+            assert line not in rec.improvement, line
+    assert any(x.startswith("S6 inspection:") for x in rec.excluded_sections)
     # slide titles are page structure (content-region rule) – content blocks keep their source order
     for t in ("3. CẢI TIẾN TRONG SẢN XUẤT", "4. CẢI TIẾN TRONG KIỂM TRA", "5. ĐỐI SÁCH LÂU DÀI", "2. NGUYÊN NHÂN"):
         assert t not in rec.improvement and t not in rec.root_cause
-    assert rec.improvement.index("Lỗi xước rear do va chạm") < rec.improvement.index("Cải tiến trong kiểm tra") \
+    assert rec.improvement.index("Lỗi xước rear do va chạm") \
         < rec.improvement.index("Đưa hạng mục kiểm tra khay/jig vào checklist")
     # temporary handling excluded from improvement
     for line in TEMP_TEXT.split("\n"):

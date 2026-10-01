@@ -46,6 +46,8 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> Path:
         sh.setLevel(level)
         sh.setFormatter(fmt)
         LOG.addHandler(sh)
+    from . import VERSION_LINE
+    LOG.info("STARTUP %s", VERSION_LINE)
     return log_dir / "errors.log"
 
 
@@ -83,6 +85,10 @@ class FileResult:
     image_slides_structural: List[int] = field(default_factory=list)
     image_slides_llm: List[int] = field(default_factory=list)
     qpn_renderer: str = ""
+    qpn_image: str = ""                                        # PROMPT-001: PNG of the isolated QPN panel ("" when omitted)
+    qpn_region: str = ""                                       # PROMPT-001: how the QPN panel was isolated (or why not)
+    qpn_excluded: List[str] = field(default_factory=list)      # title / sidebar / footer objects left out of the QPN
+    excluded_sections: List[str] = field(default_factory=list)  # inspection / follow-up / verify / temporary blocks
     fingerprint: str = ""
     started_at: str = ""
     finished_at: str = ""

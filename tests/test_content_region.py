@@ -191,15 +191,16 @@ def test_root_cause_is_main_content_only(real_deck):
 def test_improvement_text_is_main_content_only(real_deck):
     _, cls, rec = real_deck
     imp = rec.improvement
-    for line in (IMP_ITEM_1 + "\n" + IMP_ITEM_2 + "\n" + INSPECTION_TEXT + "\n" + LONG_TERM_TEXT).split("\n"):
+    for line in (IMP_ITEM_1 + "\n" + IMP_ITEM_2 + "\n" + LONG_TERM_TEXT).split("\n"):
         assert line in imp, line
-    assert imp.index("Cải tiến lỗi Mẻ xước") < imp.index("Cải tiến lỗi bong sơn") < imp.index("Cải tiến trong kiểm tra:") \
-        < imp.index("checklist đầu ca")
+    for line in INSPECTION_TEXT.split("\n"):                       # PROMPT-001: inspection block -> zero text
+        assert line not in imp, line
+    assert imp.index("Cải tiến lỗi Mẻ xước") < imp.index("Cải tiến lỗi bong sơn") < imp.index("checklist đầu ca")
     assert "+ Trước: Jig nén bằng nhôm" in imp and "+ Sau: Bọc silicon 2mm" in imp     # textual Trước/Sau retained
     assert "Trước cải tiến" not in imp and "Sau cải tiến" not in imp                     # caption buttons excluded
     for junk in ("3. CẢI TIẾN TRONG SẢN XUẤT", "4. CẢI TIẾN TRONG KIỂM TRA", "5. ĐỐI SÁCH LÂU DÀI", "CTMS", "▶"):
         assert junk not in imp
-    assert imp.count("Cải tiến trong kiểm tra") == 1                     # content heading once, sidebar circles never
+    assert imp.count("Cải tiến trong kiểm tra") == 0                     # PROMPT-001: inspection block never enters the field
     assert "Sorting 100%" not in imp and "XỬ LÝ TẠM THỜI" not in imp     # temporary handling still excluded
     assert "Sorting 100%" in rec.temporary_excluded
     assert "BÁO CÁO ĐỐI SÁCH" not in imp

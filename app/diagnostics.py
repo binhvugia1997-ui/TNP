@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from . import __version__
+from . import APP_TITLE, VERSION_LINE
 from .config import AppConfig
 from .excel_writer import validate_template
 from .ollama_client import OllamaClient, OllamaError
@@ -37,7 +37,7 @@ def run_diagnostics(cfg: AppConfig, template: Optional[str] = None,
                     output_folder: Optional[str] = None, check_ollama: bool = True,
                     smoke: bool = False) -> List[Tuple[str, str]]:
     rows: List[Tuple[str, str]] = []
-    rows.append(("Report Extractor", f"v{__version__} ({'portable' if getattr(sys, 'frozen', False) else 'dev'})"))
+    rows.append((APP_TITLE, f"{VERSION_LINE} ({'portable' if getattr(sys, 'frozen', False) else 'dev'})"))
     rows.append(("Python/runtime", f"OK – {platform.python_version()} / {platform.system()} {platform.release()}"))
     try:
         import pptx, openpyxl, PIL, requests  # noqa: F401

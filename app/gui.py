@@ -19,7 +19,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Optional
 
-from . import APP_NAME, __version__
+from . import APP_NAME, APP_TITLE
 from .config import AppConfig
 from .diagnostics import format_diagnostics, run_diagnostics
 from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, SCAN_FILTERS_VI, GuiController,
@@ -74,7 +74,7 @@ class ReportExtractorApp:
     def __init__(self, cfg: Optional[AppConfig] = None):
         self.ctl = GuiController(cfg or AppConfig.load())
         self.root = TkinterDnD.Tk() if _DND_OK else tk.Tk()
-        self.root.title(f"{APP_NAME} v{__version__} – Báo cáo → Kiểm chứng đối sách")
+        self.root.title(f"{APP_TITLE} – Báo cáo → Kiểm chứng đối sách")
         self.root.geometry("1180x800")
         self.root.minsize(960, 640)
         self.row_items: Dict[int, str] = {}

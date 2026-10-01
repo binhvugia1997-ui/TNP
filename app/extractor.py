@@ -16,7 +16,8 @@ from datetime import date
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from pathlib import Path
 
-from .classifier import Classification, is_heading_like, section_kind_of_heading
+from .classifier import (FOLLOWUP_LINE_RE, Classification, improvement_subkind, is_heading_like, is_long_term_heading,
+                         section_kind_of_heading)
 from .pptx_parser import ReportData, SlideData, norm_key, clean_text
 from .improvement_pictures import PictureRef, select_after_pictures
 from .content_region import ROLE_CONTENT, ROLE_TITLE, classify_blocks, is_slide_level_heading
@@ -34,9 +35,10 @@ DEFAULT_ITEMS = ["Rear", "Main", "Sub", "PBA", "Front", "Deco", "Bracket", "Wind
 
 @dataclass
 class Section:
-    kind: str                 # cause | temporary | improvement | verify | standard | defect | qpn | other
+    kind: str                 # cause | temporary | improvement | inspection | followup | verify | standard | defect | qpn | other
     slide: int
     lines: List[str] = field(default_factory=list)
+    heading: str = ""         # heading that opened the section (slide title or mid-slide heading), diagnostics/rules only
 
     @property
     def text(self) -> str:
@@ -54,6 +56,7 @@ class ExtractedRecord:
     temporary_excluded: str = ""      # kept for audit only, never written to improvement cell
     cause_sections: List[Section] = field(default_factory=list)
     improvement_sections: List[Section] = field(default_factory=list)
+    excluded_sections: List[str] = field(default_factory=list)     # "S5 inspection: Cải tiến tại công đoạn kiểm tra:" (audit)
     qpn_slide: Optional[int] = None
     improvement_image_slides: List[int] = field(default_factory=list)     # classified improvement slides with pictures
     after_pictures: List["PictureRef"] = field(default_factory=list)      # ONLY "Sau cải tiến" pictures (source order)
@@ -86,12 +89,47 @@ def _is_noise(line: str) -> bool:
     return bool(_NOISE_LINE.match(line)) or not line.strip()
 
 
+def _semantic_kind(heading: str) -> Optional[str]:
+    """Section kind of a heading with the improvement sub-type resolved (PROMPT-001):
+    production improvement -> 'improvement', inspection/control -> 'inspection', follow-up -> 'followup'."""
+    kind = section_kind_of_heading(heading)
+    if kind == "improvement":
+        sub = improvement_subkind(heading)
+        if sub in ("inspection", "followup"):
+            return sub
+    return kind
+
+
+def _resolve_long_term(sections: List[Section]) -> None:
+    """'Đối sách lâu dài' is a production block when its body holds actions (SOP update, jig, checklist …) and a
+    follow-up block when its body is monitoring/sustain/audit text (or it has no body and a verify/follow-up
+    section follows).  Decided per whole block – never by deleting single sentences."""
+    for i, sec in enumerate(sections):
+        if sec.kind != "improvement" or not sec.lines:
+            continue
+        head = sec.heading or sec.lines[0]
+        if not is_long_term_heading(head):
+            continue
+        body = [ln for ln in (sec.lines[1:] if sec.lines[0].strip() == head.strip() else sec.lines) if ln.strip()]
+        if not body:
+            nxt = sections[i + 1].kind if i + 1 < len(sections) else ""
+            if nxt in ("verify", "followup"):
+                sec.kind = "followup"
+            continue
+        hits = sum(1 for ln in body if FOLLOWUP_LINE_RE.search(norm_key(ln)))
+        if hits * 2 >= len(body):
+            sec.kind = "followup"
+
+
 def split_sections(slide: SlideData, default_kind: str = "other") -> List[Section]:
     """Walk the slide's MAIN CONTENT REGION in reading order and split it into heading-delimited sections.
 
     Title/header, sidebar labels, caption buttons and page furniture (see :mod:`content_region`) are
     never copied; the slide title still decides the section kind.  Sub-headings that live inside the
     content ("Nguyên nhân trong kiểm tra:") are business text and stay, in source order, verbatim.
+    A mid-slide heading that starts a NEW semantic block ("Cải tiến tại công đoạn kiểm tra:",
+    "Đối sách lâu dài:", "Hiệu quả cải tiến:", "Duy trì và áp dụng cải tiến") terminates the previous
+    section, so excluded blocks (inspection / follow-up / verify) never leak into the production text.
     """
     sections: List[Section] = []
     cur = Section(kind=default_kind, slide=slide.number)
@@ -99,11 +137,11 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
     for role in classify_blocks(slide):
         b = role.block
         if role.role == ROLE_TITLE:
-            kind = section_kind_of_heading(_first_line_of(b))
+            kind = _semantic_kind(_first_line_of(b))
             if kind:
                 if cur.lines:
                     sections.append(cur)
-                cur = Section(kind=kind, slide=slide.number)
+                cur = Section(kind=kind, slide=slide.number, heading=_first_line_of(b).strip())
             continue
         if role.role != ROLE_CONTENT:
             continue
@@ -114,7 +152,7 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
                     cur.lines.append("")
                 continue
             heading = is_heading_like(ln, b.bold if i == 0 else False, b.size_pt if i == 0 else None)
-            kind = section_kind_of_heading(ln) if heading else None
+            kind = _semantic_kind(ln) if heading else None
             if kind:
                 # every heading starts a new section (even of the same kind) so
                 # sub-sections such as "Nguyên nhân trong kiểm tra" stay separate
@@ -122,9 +160,9 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
                     sections.append(cur)
                 if i == 0 and first_content and is_slide_level_heading(ln):
                     # "2. NGUYÊN NHÂN" typed into the first content frame = slide header, not content
-                    cur = Section(kind=kind, slide=slide.number)
+                    cur = Section(kind=kind, slide=slide.number, heading=ln.strip())
                 else:
-                    cur = Section(kind=kind, slide=slide.number, lines=[ln.strip()])
+                    cur = Section(kind=kind, slide=slide.number, lines=[ln.strip()], heading=ln.strip())
                 continue
             cur.lines.append(ln.rstrip())
         first_content = False
@@ -137,7 +175,58 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
     for s in sections:
         while s.lines and s.lines[-1] == "":
             s.lines.pop()
-    return [s for s in sections if s.lines]
+    sections = [s for s in sections if s.lines]
+    _resolve_long_term(sections)
+    return sections
+
+
+EXCLUDED_SECTION_KINDS = ("inspection", "followup", "verify", "temporary")
+
+
+def excluded_bands(slide: SlideData, H: int) -> List[Tuple[int, int, str]]:
+    """Vertical bands (top, bottom, kind) of the slide occupied by EXCLUDED sections (inspection / follow-up /
+    verify / temporary) – the same segmentation as :func:`split_sections`, expressed in geometry so that the
+    picture selector drops every picture that belongs to such a block (zero text AND zero pictures)."""
+    bands: List[Tuple[int, int, str]] = []
+    open_kind: Optional[str] = None
+    open_y = 0
+    first_content = True
+    roles = classify_blocks(slide)
+    for role in roles:
+        b = role.block
+        if role.role == ROLE_TITLE:
+            kind = _semantic_kind(_first_line_of(b))
+            if kind in EXCLUDED_SECTION_KINDS and open_kind is None:
+                open_kind, open_y = kind, b.bottom
+            elif kind and kind not in EXCLUDED_SECTION_KINDS and open_kind:
+                bands.append((open_y, b.top, open_kind))
+                open_kind = None
+            continue
+        if role.role != ROLE_CONTENT or not b.is_text:
+            continue
+        lines = b.text.split("\n")
+        line_h = b.height / max(1, len(lines)) if b.height else 0
+        for i, ln in enumerate(lines):
+            if _is_noise(ln):
+                continue
+            heading = is_heading_like(ln, b.bold if i == 0 else False, b.size_pt if i == 0 else None)
+            kind = _semantic_kind(ln) if heading else None
+            if not kind:
+                continue
+            if i == 0 and first_content and is_slide_level_heading(ln):
+                y = b.bottom if len(lines) == 1 else int(b.top + line_h)
+            else:
+                y = int(b.top + i * line_h)
+            if kind in EXCLUDED_SECTION_KINDS:
+                if open_kind is None:
+                    open_kind, open_y = kind, y
+            elif open_kind:
+                bands.append((open_y, y, open_kind))
+                open_kind = None
+        first_content = False
+    if open_kind:
+        bands.append((open_y, H, open_kind))
+    return [bd for bd in bands if bd[1] > bd[0]]
 
 
 def _first_line_of(b) -> str:
@@ -602,6 +691,8 @@ def extract_record(report: ReportData, cls: Classification,
     sections = collect_sections(report, cls)
     rec.cause_sections = [s for s in sections if s.kind == "cause"]
     rec.improvement_sections = [s for s in sections if s.kind in ("improvement", "standard")]
+    rec.excluded_sections = [f"S{s.slide} {s.kind}: {(s.heading or s.lines[0]).strip()[:70]}" for s in sections
+                             if s.kind in ("inspection", "followup", "verify", "temporary") and s.lines]
     tmp_sections = [s for s in sections if s.kind == "temporary"]
     rec.root_cause = join_sections(rec.cause_sections)
     rec.improvement = join_sections(rec.improvement_sections)

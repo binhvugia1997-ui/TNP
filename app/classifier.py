@@ -48,6 +48,44 @@ STANDARD_MARKERS = ["tieu chuan hoa", "standardization", "ngan ngua tai phat",
                     "horizontal deployment", "trien khai ngang"]
 
 
+# Improvement sub-types (PROMPT-001).  The classifier keeps treating every one of them as an *improvement
+# slide* (slide selection is unchanged); the section splitter uses the sub-type to decide what may enter
+# "Nội dung đối sách cải tiến": only PRODUCTION/process improvements.  Inspection/control improvements and
+# follow-up / effectiveness blocks contribute ZERO text.
+INSPECTION_WORDS_RE = re.compile(r"\b(?:kiem tra|kiem soat|kiem hang|inspection|inspect|control|oqc|iqc|pqc|fqc|qc)\b")
+PRODUCTION_WORDS_RE = re.compile(r"\b(?:san xuat|production|lap rap|assy|assembly|gia cong|cnc|son|ep|may|"
+                                 r"nhua|khuon|jig|tool|thiet bi|may moc|process)\b")
+FOLLOWUP_MARKERS = ["duy tri", "theo doi hieu qua", "theo doi", "audit", "ap dung cai tien", "giam sat",
+                    "monitoring", "follow up", "follow-up", "sustain", "kiem tra thuong xuyen"]
+LONG_TERM_MARKERS = ["doi sach lau dai", "giai phap lau dai", "bien phap lau dai", "long term", "long-term",
+                     "permanent action"]
+FOLLOWUP_LINE_RE = re.compile(r"theo doi|duy tri|audit|hieu qua|ap dung cai tien|kiem tra thuong xuyen|giam sat|"
+                              r"monitor|follow[- ]?up|sustain")
+
+
+def is_long_term_heading(text: str) -> bool:
+    k = re.sub(r"^(?:[ivx]+|\d+(?: \d+)*|[a-z])\s+", "", norm_key(text))
+    return any(m in k for m in LONG_TERM_MARKERS)
+
+
+def improvement_subkind(text: str) -> str:
+    """'inspection' | 'followup' | 'production' for an improvement-type heading.
+
+    * inspection: improvement heading naming inspection/control ("CẢI TIẾN TRONG KIỂM TRA",
+      "Cải tiến tại công đoạn kiểm tra:") without any production/process word;
+    * followup: "Duy trì và áp dụng cải tiến", "Theo dõi hiệu quả ...", audit / sustain headings;
+    * production: everything else (incl. "Đối sách lâu dài" – its BODY decides later, see extractor).
+    """
+    k = re.sub(r"^(?:[ivx]+|\d+(?: \d+)*|[a-z])\s+", "", norm_key(text))
+    if not k:
+        return "production"
+    if any(m in k for m in FOLLOWUP_MARKERS):
+        return "followup"
+    if INSPECTION_WORDS_RE.search(k) and not PRODUCTION_WORDS_RE.search(k):
+        return "inspection"
+    return "production"
+
+
 def section_kind_of_heading(text: str) -> Optional[str]:
     """Return section kind for a *heading-like* line, or None.
 

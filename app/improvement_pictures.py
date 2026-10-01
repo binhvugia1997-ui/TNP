@@ -242,6 +242,8 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
             continue
         captions = _caption_anchors(roles)
         inlines, inspection_ranges = _inline_anchors(roles)
+        from .extractor import excluded_bands                      # lazy: extractor imports this module
+        bands = excluded_bands(s, H)
         content_pics = [p for p in s.pictures if not is_decorative_picture(p, W, H)]
         claims = _claims(content_pics, captions, W, H)
         ambiguous = False
@@ -251,6 +253,10 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
                 sel.rejected.append(PictureRef(n, p, "excluded", why))
                 continue
             cy = p.top + p.height / 2
+            band = next((k for y0, y1, k in bands if y0 <= cy < y1), None)
+            if band:                                                # PROMPT-001: excluded section block -> zero pictures
+                sel.rejected.append(PictureRef(n, p, "excluded", f"{band} section block (mid-slide heading)"))
+                continue
             if any(y0 <= cy < y1 for y0, y1 in inspection_ranges) and not captions:
                 sel.rejected.append(PictureRef(n, p, "excluded", "inspection/control item"))
                 continue

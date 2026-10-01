@@ -111,6 +111,15 @@ def inspect_report(path: Path, template: Path | None = None, server: str = "", m
     out.append(f"Item                : {rec.item!r}")
     out.append(f"Nội dung lỗi        :\n{rec.defect_content}")
     out.append(f"QPN slide           : {rec.qpn_slide}")
+    if rec.qpn_slide and r.slide(rec.qpn_slide):
+        from app.qpn_region import locate_qpn_region
+        loc = locate_qpn_region(r.slide(rec.qpn_slide), r.slide_width, r.slide_height)
+        if loc.region:
+            out.append(f"Vùng QPN            : {loc.region.describe(r.slide_width, r.slide_height)}")
+            out.append("Loại khỏi QPN       : " + "; ".join(loc.region.excluded))
+        else:
+            out.append(f"Vùng QPN            : KHÔNG TÁCH ĐƯỢC – {loc.reason} (không chèn ảnh)")
+    out.append("Mục loại khỏi cải tiến: " + "; ".join(rec.excluded_sections))
     out.append(f"Nguyên nhân ({len(rec.root_cause)} chars):\n{rec.root_cause}")
     out.append(f"Nội dung đối sách cải tiến ({len(rec.improvement)} chars):\n{rec.improvement}")
     out.append(f"[EXCLUDED] Xử lý tạm thời ({len(rec.temporary_excluded)} chars):\n{rec.temporary_excluded}")

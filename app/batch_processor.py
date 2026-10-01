@@ -27,7 +27,7 @@ from .pptx_parser import parse_pptx
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, PROCESS_ACTIONS,
                       CACHE_FILE_NAME,
                       FastScanCache, MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, prescan)
-from .qpn_renderer import SlideRenderer, render_qpn
+from .qpn_renderer import SlideRenderer, render_qpn_panel
 
 LOG = logging.getLogger("report_extractor.batch")
 
@@ -414,13 +414,22 @@ class BatchProcessor:
             fr.model = rec.model
             fr.item = rec.item
 
-            # --- 4. QPN full slide render -----------------------------------
+            # --- 4. QPN = the Quality Problem Notice PANEL only (object/region based, fail-closed) ---------
             qpn_png: Optional[Path] = None
             if rec.qpn_slide:
                 self.on_file(idx, "extracting_qpn", f"slide {rec.qpn_slide}")
                 try:
-                    qpn_png, backend = render_qpn(report, rec.qpn_slide, assets / f"{prefix}_QPN.png", renderer)
-                    fr.qpn_renderer = backend
+                    qr = render_qpn_panel(report, rec.qpn_slide, assets / f"{prefix}_QPN.png", renderer)
+                    if qr.ok:
+                        qpn_png = qr.path
+                        fr.qpn_image = str(qr.path)
+                        fr.qpn_renderer = qr.backend
+                        fr.qpn_region = qr.region.describe(report.slide_width, report.slide_height)
+                        fr.qpn_excluded = list(qr.region.excluded)
+                    else:
+                        fr.qpn_region = f"không tách được: {qr.reason}"
+                        rec.review_reasons.append(f"Cần kiểm tra: Không tách được QPN khỏi slide {rec.qpn_slide} "
+                                                  f"({qr.reason}) – không chèn ảnh cả slide")
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("%s: QPN render failed: %s", path.name, e)
                     rec.review_reasons.append(f"Không render được QPN: {e}")
@@ -429,6 +438,7 @@ class BatchProcessor:
             imp_jpg: List[Path] = []           # one PNG per After picture -> independent Excel images
             fr.after_pictures = [r.label for r in rec.after_pictures]
             fr.picture_notes = list(rec.picture_notes)
+            fr.excluded_sections = list(rec.excluded_sections)
             if rec.after_pictures:
                 self.on_file(idx, "extracting_images", f"{len(rec.after_pictures)} ảnh Sau cải tiến")
                 try:
@@ -575,6 +585,9 @@ def format_file_diagnostics(fr: FileResult) -> str:
         f"Nguồn QPN          : {fr.qpn_source or '-'}" + (f"  – {fr.qpn_override}" if fr.qpn_override else ""),
         f"Slide kiểm chứng   : {fr.verify_slides or '-'}  (WEEK +1..+8 luôn để trống)",
         f"Renderer QPN       : {fr.qpn_renderer or '-'}",
+        f"Vùng QPN           : {fr.qpn_region or '-'}",
+        f"Loại khỏi QPN      : {'; '.join(fr.qpn_excluded) if fr.qpn_excluded else '-'}",
+        f"Mục loại khỏi cải tiến: {'; '.join(fr.excluded_sections) if fr.excluded_sections else '-'}",
         f"Trường để trống    : {', '.join(fr.blank_fields) if fr.blank_fields else '(không)'}",
         f"Trường đã điền     : {', '.join(fr.filled_fields) if fr.filled_fields else '(không)'}",
         f"Ảnh Sau cải tiến   : {', '.join(fr.after_pictures) if fr.after_pictures else '(không)'} "

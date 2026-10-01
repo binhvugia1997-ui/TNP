@@ -155,9 +155,10 @@ def test_a1285_record_contents(tmp_path):
     assert rec.model == "A185" and rec.item == "Rear"
     assert rec.qpn_slide == 2
     assert "Khay chứa không có lót" in rec.root_cause
-    for n in (5, 6, 7):
+    for n in (5, 7):
         assert f"- Sau: mới ({n})" in rec.improvement
-    assert "ĐỐI SÁCH LÂU DÀI" in rec.improvement and "Cập nhật SOP Rev.03" in rec.improvement
+    assert "- Sau: mới (6)" not in rec.improvement            # PROMPT-001: "5. CẢI TIẾN TRONG KIỂM TRA" -> zero text
+    assert "ĐỐI SÁCH LÂU DÀI" in rec.improvement and "Cập nhật SOP Rev.03" in rec.improvement   # production action body
     assert "Sorting 100%" not in rec.improvement and "chưa có dữ liệu" not in rec.improvement
     assert "BÁO CÁO CẢI TIẾN" not in rec.improvement        # cover text not copied
     # defect text exists only inside the picture -> blank + explicit review reason (no fabrication)

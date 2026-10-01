@@ -112,8 +112,8 @@ def main(argv=None) -> int:
     force_utf8_stdio()
 
     if args.version:
-        from . import __version__
-        print(f"Report Extractor {__version__}")
+        from . import APP_TITLE, VERSION_LINE
+        print(f"{APP_TITLE} ({VERSION_LINE})")
         return 0
     if args.inspect:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))

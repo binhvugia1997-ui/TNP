@@ -18,10 +18,12 @@ import sys
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
+from .qpn_region import QpnRegion, crop_box_px, locate_qpn_region
 from .pptx_parser import Block, ReportData, SlideData
 
 LOG = logging.getLogger("report_extractor.renderer")
@@ -335,17 +337,60 @@ class SlideRenderer:
         raise RuntimeError("Không render được slide: " + "; ".join(errors))
 
 
-def render_qpn(report: ReportData, qpn_slide: int, target_png: Path,
-               renderer: Optional[SlideRenderer] = None) -> Tuple[Path, str]:
-    """Render the COMPLETE QPN slide to ``target_png`` (uniform white margins trimmed so the QPN content
-    fills the Excel area instead of slide whitespace); returns (path, backend)."""
+@dataclass
+class QpnRender:
+    path: Optional[Path]            # None when the QPN panel could not be isolated (fail-closed)
+    backend: str = ""
+    region: Optional[QpnRegion] = None
+    reason: str = ""                # why no image was produced
+    crop_px: Tuple[int, int, int, int] = (0, 0, 0, 0)
+
+    @property
+    def ok(self) -> bool:
+        return self.path is not None
+
+
+def render_qpn_panel(report: ReportData, qpn_slide: int, target_png: Path,
+                     renderer: Optional[SlideRenderer] = None) -> QpnRender:
+    """PRODUCTION QPN image = the QPN panel ONLY (PROMPT-001).
+
+    The panel is located from the PPTX objects (:func:`locate_qpn_region`).  A direct picture object is
+    exported as-is; otherwise the slide is rendered and CROPPED to the panel's bounds.  Whole-slide output
+    (even white-trimmed) is never produced: without a confident panel the result is ``path=None`` + reason.
+    """
+    slide = report.slide(qpn_slide)
+    if slide is None:
+        return QpnRender(None, reason=f"slide {qpn_slide} không tồn tại")
+    W, H = report.slide_width or slide.width, report.slide_height or slide.height
+    loc = locate_qpn_region(slide, W, H)
+    if loc.region is None:
+        return QpnRender(None, reason=loc.reason)
+    region = loc.region
+    target_png.parent.mkdir(parents=True, exist_ok=True)
+    if region.picture is not None and region.picture.image_blob:
+        try:
+            with Image.open(BytesIO(region.picture.image_blob)) as im:
+                im.convert("RGB").save(target_png, "PNG", optimize=True)
+            return QpnRender(target_png, "picture", region)
+        except Exception as e:  # noqa: BLE001 – EMF/WMF previews: fall through to render + crop
+            LOG.debug("QPN picture blob not decodable (%s) – cropping rendered slide instead", e)
     renderer = renderer or SlideRenderer()
     with tempfile.TemporaryDirectory(prefix="re_qpn_") as tmp:
         res = renderer.render(report, [qpn_slide], Path(tmp))
-        src = res[qpn_slide]
-        target_png.parent.mkdir(parents=True, exist_ok=True)
-        trim_white_margins(Image.open(src).convert("RGB")).save(target_png, "PNG", optimize=True)
-    return target_png, renderer.last_backend
+        with Image.open(res[qpn_slide]) as im:
+            im = im.convert("RGB")
+            box = crop_box_px(region, W, H, im.width, im.height)
+            im.crop(box).save(target_png, "PNG", optimize=True)
+    return QpnRender(target_png, renderer.last_backend, region, crop_px=box)
+
+
+def render_qpn(report: ReportData, qpn_slide: int, target_png: Path,
+               renderer: Optional[SlideRenderer] = None) -> Tuple[Path, str]:
+    """Compatibility wrapper: QPN panel image or ``RuntimeError`` (never a whole-slide fallback)."""
+    res = render_qpn_panel(report, qpn_slide, target_png, renderer)
+    if not res.ok:
+        raise RuntimeError(f"Không tách được QPN khỏi slide {qpn_slide}: {res.reason}")
+    return res.path, res.backend
 
 
 def trim_white_margins(im: "Image.Image", threshold: int = 245, pad: int = 8) -> "Image.Image":
