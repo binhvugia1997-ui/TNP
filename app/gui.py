@@ -77,6 +77,14 @@ class ReportExtractorApp:
         style.configure("Start.TButton", font=("Segoe UI", 10, "bold"))
         pad = {"padx": 8, "pady": 3}
         ttk.Label(r, text="BÁO CÁO PPTX  →  BẢNG KIỂM CHỨNG ĐỐI SÁCH", style="Title.TLabel").pack(anchor="w", padx=10, pady=(10, 4))
+        # two tabs: processing (inputs, period, results, progress) | configuration & Ollama
+        self.nb = ttk.Notebook(r)
+        self.nb.pack(fill="both", expand=True)
+        self.tab_run = ttk.Frame(self.nb)
+        self.tab_cfg = ttk.Frame(self.nb)
+        self.nb.add(self.tab_run, text="Xử lý báo cáo")
+        self.nb.add(self.tab_cfg, text="Cấu hình & Ollama")
+        r = self.tab_run
 
         f = ttk.LabelFrame(r, text="Cấu hình")
         f.pack(fill="x", padx=10, pady=4)
@@ -154,7 +162,7 @@ class ReportExtractorApp:
             var.trace_add("write", lambda *_: self._on_period_changed())
 
         # ---- Kết nối Ollama -------------------------------------------------------
-        of = ttk.LabelFrame(r, text="Kết nối Ollama")
+        of = ttk.LabelFrame(self.tab_cfg, text="Kết nối Ollama")
         of.pack(fill="x", padx=10, pady=4)
         ttk.Label(of, text="IP / Server:").grid(row=0, column=0, sticky="w", **pad)
         self.var_host = tk.StringVar()
@@ -233,7 +241,9 @@ class ReportExtractorApp:
 
         bf = ttk.Frame(r)
         bf.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(bf, text="Chẩn đoán hệ thống", command=self.show_system_diagnostics).pack(side="left", padx=2)
+        cf = ttk.Frame(self.tab_cfg)
+        cf.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(cf, text="Chẩn đoán hệ thống", command=self.show_system_diagnostics).pack(side="left", padx=2)
         ttk.Button(bf, text="Xem log", command=self.open_log).pack(side="left", padx=2)
         ttk.Button(bf, text="Mở file kết quả", command=self.open_output_file).pack(side="left", padx=2)
         ttk.Button(bf, text="Mở thư mục kết quả", command=self.open_output_folder).pack(side="left", padx=2)

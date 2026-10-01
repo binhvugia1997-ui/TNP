@@ -54,6 +54,7 @@ class FileResult:
     """One entry of batch_result.json."""
     source_file: str
     status: str = "waiting"            # completed | needs_review | error | skipped
+    new_row: bool = False              # the destination row was created by this run (Management Number was absent)
     management_number: str = ""
     vendor: str = ""
     occurrence_date: str = ""

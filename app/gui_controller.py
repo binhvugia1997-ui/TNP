@@ -733,6 +733,7 @@ class GuiController:
             "Tên file": Path(fr.source_file).name,
             "Trạng thái": status_label(fr.status) + (f" (dòng Excel {fr.excel_row})" if fr.excel_row else ""),
             "Management Number": fr.management_number or "(trống)",
+            "Dòng Excel": ("Tạo mới" if fr.new_row else "Có sẵn") + (f" (dòng {fr.excel_row})" if fr.excel_row else ""),
             "Ngày phát sinh": fr.occurrence_date or "(trống)",
             "Vendor": fr.vendor.replace("\n", " / ") if fr.vendor else "(trống)",
             "Model": fr.model or "(trống)",

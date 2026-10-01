@@ -679,6 +679,33 @@ class ExcelWriter:
                                  f"{rec.occurrence_date_text} (giữ giá trị Excel)")
         return notes
 
+    def create_row(self, mgmt: str) -> int:
+        """Create ONE blank report row for a Management Number that is absent from the master.
+
+        * destination = ``next_row()``: the first unused report row of the table (a blank form row the template
+          intentionally contains is reused; otherwise the row directly after the last report row) – never header /
+          summary rows, never another sheet;
+        * FORMAT only is cloned from the nearest report row above (styles, borders, fills, fonts, number formats,
+          alignment/wrap, single-row merges, row height); values and pictures are never copied;
+        * the Management Number (and STT) is written immediately so a later lookup finds the row.
+        Returns the row number.
+        """
+        mgmt = (mgmt or "").strip()
+        if not mgmt or "management_number" not in self.columns:
+            raise ValueError("Management Number trống – không tạo dòng mới")
+        existing = self.find_rows_by_management_number(mgmt)
+        if existing:
+            return existing[0]                                   # never a second row for the same key
+        row = self.next_row()
+        src = row - 1
+        if src >= self.data_start and self._row_used(src):
+            self._copy_row_style(src, row)
+        if "stt" in self.columns:
+            self._set_cell(row, "stt", self.used_count() + 1, wrap=False)
+        self._set_cell(row, "management_number", mgmt)
+        self._dirty = True
+        return row
+
     def append_record(self, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
                       status_text: str = "", note_text: str = "", fill_temporary: bool = False) -> int:
         """Write one report as one NEW row (append mode). Returns the Excel row number."""

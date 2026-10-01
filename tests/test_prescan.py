@@ -18,7 +18,7 @@ from app.config import AppConfig
 from app.excel_writer import MANAGED_FIELDS
 from app.extractor import derive_occurrence_date, management_number_from_filename
 from app.gui_controller import FINAL_STATUSES, GuiController, UiEvent
-from app.prescan import (ACTION_FAST_SKIP, ACTION_OUTSIDE_PERIOD,
+from app.prescan import (ACTION_FAST_SKIP, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS_NEW_ROW,
                          ACTION_PROCESS, ACTION_SOURCE_DUPLICATE, AUTO_PERIOD_FAIL_VI, CACHE_FILE_NAME,
                          PERIOD_DIFFERS_VI, FastScanCache, MasterLookup, ProcessingPeriod, auto_period_from_excel,
                          cache_cutoff, detect_month_from_excel_name, month_period, prescan, range_period)
@@ -362,24 +362,25 @@ def test_cleanup_only_touches_cache_file(sample_tree, tmp_path):                
 
 
 # ================================================================ 41. master Excel pre-check
-def test_master_not_found_and_complete_no_pptx_open(sample_tree, tmp_path, monkeypatch):   # 42-44
+def test_master_complete_no_pptx_open_and_absent_key_is_new_row_candidate(sample_tree, tmp_path, monkeypatch):   # 42-44
     spies = Spies(monkeypatch)
     tpl = tmp_path / "Kiem_chung_09_2026.xlsx"
     shutil.copy(sample_tree["template"], tpl)
     _prefill(tpl, ["260915001-VOC"], complete=["260915001-VOC"])
     complete = _fake_pptx(tmp_path / "in", "260915001-VOC_done.pptx")
-    absent = _fake_pptx(tmp_path / "in", "260916002-VOC_new.pptx")
     out = tmp_path / "Output" / "Kiem_chung_09_2026.xlsx"
-    summary, events, proc = _run([complete, absent], tpl, out, period=SEP,
+    summary, events, proc = _run([complete], tpl, out, period=SEP,
                                  ollama_server="http://127.0.0.1:1", model="qwen3:4b")
     assert spies.parse == spies.classify == 0
     assert _final(events, 0) == "skipped" and "Bỏ qua — đã cập nhật" in proc.results[0].error
-    assert _final(events, 1) == "not_written" and "Không tìm thấy Management Number 260916002-VOC" in proc.results[1].error
-    assert summary.skipped == 1 and summary.not_written == 1 and summary.candidates == 0
-    assert summary.prescan["master_complete"] == 1 and summary.prescan["master_not_found"] == 1
-    # the complete-row skip is a safe outcome -> cached for the next run
+    assert summary.skipped == 1 and summary.candidates == 0 and summary.prescan["master_complete"] == 1
     data = json.loads((out.parent / "logs" / CACHE_FILE_NAME).read_text(encoding="utf-8"))
-    assert data["entries"]["260915001-VOC"]["status"] == "skipped" and "260916002-VOC" not in data["entries"]
+    assert data["entries"]["260915001-VOC"]["status"] == "skipped"
+    # absent key: pre-scan marks it PROCESS_NEW_ROW (a real candidate), never a rejection
+    absent = _fake_pptx(tmp_path / "in", "260916002-VOC_new.pptx")
+    res = prescan([absent], SEP, None, MasterLookup(lambda m: [], lambda r: []), today=RUN_TODAY)
+    assert res.items[0].action == ACTION_PROCESS_NEW_ROW and len(res.candidates) == 1
+    assert res.counts()["new_rows"] == 1 and "Mã mới sẽ thêm vào Excel: 1" in res.summary_lines_vi()
 
 
 def test_incomplete_master_row_proceeds(sample_tree, tmp_path, monkeypatch):          # 45
@@ -516,21 +517,25 @@ def test_gui_counters_progress_denominator_and_eta(sample_tree, tmp_path, monkey
     assert kinds.index("prescan") < kinds.index("row")                                 # counters first
     c = ctl.prescan.counts()
     assert c == {"discovered": 7, "outside_period": 2, "source_duplicates": 1, "fast_skipped": 1,
-                 "master_complete": 1, "master_not_found": 1, "invalid_management_number": 0, "candidates": 1}
-    assert ctl.progress.total == 1 and ctl.progress.done == 1 and ctl.progress.percent == 100.0   # 61
-    assert ctl.progress.text == "Đã xử lý: 1 / 1 — 100%"
-    assert len(ctl.report_durations) == 1                                              # 62: skips not measured
+                 "master_complete": 1, "new_rows": 1, "incomplete": 1, "invalid_management_number": 0, "candidates": 2}
+    assert ctl.progress.total == 2 and ctl.progress.done == 2 and ctl.progress.percent == 100.0   # 61 (new row counts)
+    assert ctl.progress.text == "Đã xử lý: 2 / 2 — 100%"
+    assert len(ctl.report_durations) == 2                                              # 62: skips not measured
     assert all(r.is_final for r in ctl.rows)
     stages = {r.path.name: r.stage for r in ctl.rows}
     assert stages["260820001-VOC_aug.pptx"] == stages["261002002-VOC_oct.pptx"] == "outside_period"
     assert stages["260917005-VOC_a.pptx"] == "source_duplicate" and stages["260917005-VOC_b.pptx"] == "fast_skip"
-    assert stages["260915003-VOC_done.pptx"] == "skipped" and stages["260916004-VOC_absent.pptx"] == "not_written"
+    assert stages["260915003-VOC_done.pptx"] == "skipped"
+    assert stages["260916004-VOC_absent.pptx"] == "error"                             # new row created, fake PPTX fails
     assert stages["260918080-VOC_real.pptx"] == "completed"
     lines = ctl.summary_lines()
     assert "Tổng file phát hiện: 7" in lines and "Ngoài thời gian xử lý: 2" in lines
     assert "Trùng Management Number trong folder: 1" in lines and "Bỏ qua nhanh — đã xử lý gần đây: 1" in lines
-    assert "Bỏ qua — Excel đã đầy đủ: 1" in lines and "Không tìm thấy Management Number trong Excel: 1" in lines
-    assert "Cần xử lý thực tế: 1" in lines
+    assert "Bỏ qua — Excel đã đầy đủ: 1" in lines and "Mã mới sẽ thêm vào Excel: 1" in lines
+    assert "Cần bổ sung dữ liệu: 1" in lines and "Cần xử lý thực tế: 2" in lines
+    ws = load_workbook(out)["Kiểm chứng"]
+    keys = [ws.cell(row=r, column=2).value for r in range(4, 9)]
+    assert keys == ["260918080-VOC", "260915003-VOC", "260917005-VOC", "260916004-VOC", None]   # one new row, key kept
     assert set(FINAL_STATUSES) >= {"outside_period", "source_duplicate", "fast_skip"}
 
 

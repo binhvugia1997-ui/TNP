@@ -145,12 +145,12 @@ def test_match_mode_updates_existing_row_and_preserves_key(sample_tree, template
 def test_match_mode_not_found_duplicate_and_missing_key(sample_tree, template, tmp_path, report_factory):
     _prefill(template, [("260918081-VOC", None, None), ("260918081-VOC", None, None)])
     nokey = report_factory("bao_cao.pptx")
-    files = [sample_tree["files"][0], sample_tree["files"][1], nokey]      # not found / duplicate / no key
+    files = [sample_tree["files"][0], sample_tree["files"][1], nokey]      # absent (-> new row) / duplicate / no key
     out = tmp_path / "out" / "k.xlsx"
     summary, events, proc = _run(files, template, out)
-    assert summary.not_written == 2 and summary.completed == 0 and summary.needs_review == 1
+    assert summary.not_written == 1 and summary.completed == 1 and summary.needs_review == 1 and summary.new_rows == 1
     msgs = [r.error for r in proc.results]
-    assert "Không tìm thấy Management Number 260918080-VOC trong file Kiểm chứng" in msgs[0]
+    assert proc.results[0].new_row and proc.results[0].excel_row == 6                 # appended after the table
     assert "Không xác định được Management Number từ tên file" in msgs[2]
     # duplicate key: topmost row is the canonical destination, the other row stays untouched but is marked red
     dup = proc.results[1]
@@ -159,12 +159,9 @@ def test_match_mode_not_found_duplicate_and_missing_key(sample_tree, template, t
     ws = load_workbook(out)["Kiểm chứng"]
     assert ws.cell(row=4, column=5).value == "A185" and ws.cell(row=5, column=5).value is None
     assert ws.cell(row=5, column=2).fill.fgColor.rgb.endswith("FFC7CE") and not str(ws.cell(row=4, column=2).fill.fgColor.rgb).endswith("FFC7CE")
-    for r in (6, 7):                                                       # nothing written anywhere else
-        assert ws.cell(row=r, column=5).value is None and ws.cell(row=r, column=10).value is None
-    # not_written results are not recorded as processed -> a re-run after fixing the template works
-    _prefill(template, [("260918080-VOC", None, None)])
-    summary2, _, _ = _run([sample_tree["files"][0]], template, tmp_path / "out2" / "k.xlsx")
-    assert summary2.completed == 1 and summary2.skipped == 0
+    assert ws.cell(row=6, column=2).value == "260918080-VOC" and ws.cell(row=6, column=5).value == "A185"
+    for r in (7, 8):                                                       # nothing written anywhere else
+        assert ws.cell(row=r, column=2).value is None and ws.cell(row=r, column=10).value is None
 
 
 def test_vendor_and_date_conflicts_keep_existing_value(sample_tree, template, tmp_path):

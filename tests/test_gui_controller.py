@@ -141,12 +141,12 @@ def test_missing_management_number_row_is_separate_status(sample_tree, tmp_path,
     by_key = {r.management_number: r for r in ctl.rows}
     assert by_key["260918080-VOC"].stage == "completed"
     other = by_key["260918081-VOC"]
-    assert other.stage == "not_written" and other.status_vi == "Không tìm thấy Management Number"
-    assert "Không tìm thấy Management Number 260918081-VOC" in other.note
+    assert other.stage == "completed"                              # absent key -> new row created + processed
     s = ctl.summary
-    assert s.not_written >= 1 and s.failed == 0                  # not a generic program error
-    assert f"Không tìm thấy Management Number: {s.not_written}" in ctl.summary_lines()
+    assert s.not_written == 0 and s.failed == 0 and s.new_rows >= 1
     assert "Lỗi: 0" in ctl.summary_lines()
+    fr = next(ctl.result_for(i) for i in range(len(ctl.files)) if ctl.result_for(i).management_number == "260918081-VOC")
+    assert fr.new_row and ctl.diagnostics_for(fr and ctl.files.index(Path(fr.source_file)))["Dòng Excel"].startswith("Tạo mới")
 
 
 def test_start_stop_state_transitions(sample_tree, tmp_path):
@@ -297,7 +297,7 @@ def test_gui_view_builds_with_mocked_tkinter(monkeypatch, sample_tree, tmp_path)
         setattr(tkmod, n, Var if n.endswith("Var") else (Exception if n == "TclError" else Widget))
     ttkmod = types.ModuleType("tkinter.ttk")
     for n in ("Style", "Label", "LabelFrame", "Frame", "Entry", "Button", "Combobox", "Checkbutton", "Treeview",
-              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox"):
+              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox", "Notebook"):
         setattr(ttkmod, n, Widget)
     fd = types.ModuleType("tkinter.filedialog"); mb = types.ModuleType("tkinter.messagebox")
     for m in (fd, mb):

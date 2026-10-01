@@ -8,7 +8,7 @@ Decision order (one report file):
 
     file name -> Management Number -> occurrence date (existing parser) -> processing period
     -> source duplicates (same Management Number) -> 7-day recent-success cache
-    -> master Excel row lookup -> master row completeness -> PROCESS
+    -> master Excel row lookup (absent -> PROCESS_NEW_ROW) -> master row completeness -> PROCESS
 
 Business strings (Vietnamese) are kept in ``ACTION_LABELS_VI``; code uses the ``ACTION_*`` constants.
 """
@@ -41,16 +41,17 @@ ACTION_OUTSIDE_PERIOD = "OUTSIDE_PERIOD"
 ACTION_SOURCE_DUPLICATE = "SOURCE_DUPLICATE"
 ACTION_FAST_SKIP = "FAST_SKIP"
 ACTION_MASTER_COMPLETE = "MASTER_COMPLETE"
-ACTION_MASTER_NOT_FOUND = "MASTER_NOT_FOUND"
+ACTION_PROCESS_NEW_ROW = "PROCESS_NEW_ROW"       # valid key absent from the master -> a new report row is created
+PROCESS_ACTIONS = (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW)
 ACTION_INVALID_MGMT = "INVALID_MANAGEMENT_NUMBER"
 
 ACTION_LABELS_VI = {
-    ACTION_PROCESS: "Cần xử lý",
+    ACTION_PROCESS: "Cần bổ sung dữ liệu",
+    ACTION_PROCESS_NEW_ROW: "Mã mới sẽ thêm vào Excel",
     ACTION_OUTSIDE_PERIOD: "Bỏ qua ngoài thời gian xử lý",
     ACTION_SOURCE_DUPLICATE: "Trùng Management Number trong folder",
     ACTION_FAST_SKIP: "Bỏ qua nhanh — đã xử lý gần đây",
     ACTION_MASTER_COMPLETE: "Bỏ qua — đã cập nhật",
-    ACTION_MASTER_NOT_FOUND: "Không tìm thấy Management Number",
     ACTION_INVALID_MGMT: "Không xác định được Management Number từ tên file",
 }
 
@@ -60,7 +61,6 @@ ACTION_STATUS = {
     ACTION_SOURCE_DUPLICATE: "source_duplicate",
     ACTION_FAST_SKIP: "fast_skip",
     ACTION_MASTER_COMPLETE: "skipped",
-    ACTION_MASTER_NOT_FOUND: "not_written",
     ACTION_INVALID_MGMT: "not_written",
 }
 
@@ -350,7 +350,7 @@ class PreScanItem:
     period_decision: str = ""          # inside | outside | no_date | n/a
     duplicate_decision: str = ""       # selected | ignored | unique
     cache_decision: str = ""           # hit | miss:<reason> | bypassed_force | n/a
-    master_decision: str = ""          # found_complete | found_incomplete | not_found | n/a
+    master_decision: str = ""          # found_complete | found_incomplete | not_found (-> new row) | n/a
     excel_row: Optional[int] = None
     action: str = ACTION_PROCESS
     reason: str = ""
@@ -380,7 +380,8 @@ class PreScanResult:
 
     @property
     def candidates(self) -> List[PreScanItem]:
-        return [it for it in self.items if it.action == ACTION_PROCESS]
+        """Reports that really enter PPT processing: incomplete existing rows + new rows."""
+        return [it for it in self.items if it.action in PROCESS_ACTIONS]
 
     def counts(self) -> Dict[str, int]:
         return {
@@ -389,7 +390,8 @@ class PreScanResult:
             "source_duplicates": self.count(ACTION_SOURCE_DUPLICATE),
             "fast_skipped": self.count(ACTION_FAST_SKIP),
             "master_complete": self.count(ACTION_MASTER_COMPLETE),
-            "master_not_found": self.count(ACTION_MASTER_NOT_FOUND),
+            "new_rows": self.count(ACTION_PROCESS_NEW_ROW),
+            "incomplete": self.count(ACTION_PROCESS),
             "invalid_management_number": self.count(ACTION_INVALID_MGMT),
             "candidates": len(self.candidates),
         }
@@ -403,7 +405,8 @@ class PreScanResult:
             f"Trùng Management Number trong folder: {c['source_duplicates']}",
             f"Bỏ qua nhanh — đã xử lý gần đây: {c['fast_skipped']}",
             f"Bỏ qua — Excel đã đầy đủ: {c['master_complete']}",
-            f"Không tìm thấy Management Number trong Excel: {c['master_not_found']}",
+            f"Mã mới sẽ thêm vào Excel: {c['new_rows']}",
+            f"Cần bổ sung dữ liệu: {c['incomplete']}",
             f"Không xác định được Management Number từ tên file: {c['invalid_management_number']}",
             f"Cần xử lý thực tế: {c['candidates']}",
         ]
@@ -518,10 +521,15 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
 
         rows = master.rows(mgmt)
         if not rows:
+            # valid key, inside the period, survived duplicate filtering -> a new report row will be created.
+            # The CURRENT workbook is authoritative: a cache hit from another/previous workbook never hides it.
             it.master_decision = "not_found"
-            it.action = ACTION_MASTER_NOT_FOUND
-            it.reason = f"Không tìm thấy Management Number {mgmt} trong file Kiểm chứng"
-            LOG.info("MASTER_MISS management_number=%s reason=not_found", mgmt)
+            if cache_hit:
+                it.cache_decision = "miss:master_row_missing"
+                LOG.info("CACHE_MISS management_number=%s reason=master_row_missing", mgmt)
+            it.action = ACTION_PROCESS_NEW_ROW
+            it.reason = "Mã mới sẽ thêm vào Excel"
+            LOG.info("MASTER_MISS management_number=%s reason=not_found action=PROCESS_NEW_ROW", mgmt)
             continue
         it.excel_row = rows[0]
         missing = master.missing(rows[0])

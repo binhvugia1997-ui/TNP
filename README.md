@@ -204,9 +204,9 @@ Trước khi mở bất kỳ PPTX nào, mỗi file được quyết định ch�
 Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có) → Thời gian xử lý
 → Trùng Management Number trong folder (chọn file mới nhất, hoà → thứ tự đường dẫn)
 → Cache 7 ngày (đã xử lý thành công gần đây, cùng path/size/mtime)
-→ Tra dòng Excel (không có → "Không tìm thấy Management Number")
-→ Dòng đã đầy đủ → "Bỏ qua — đã cập nhật"
-→ chỉ các báo cáo còn thiếu dữ liệu mới mở PPTX / Qwen / trích xuất
+→ Tra dòng Excel (không có → PROCESS_NEW_ROW: tự tạo MỘT dòng báo cáo mới, ghi Management Number trước)
+→ Dòng đã đầy đủ → "Bỏ qua — đã cập nhật"; dòng thiếu → PROCESS (bổ sung trường trống)
+→ chỉ các báo cáo mới / còn thiếu dữ liệu mới mở PPTX / Qwen / trích xuất
 ```
 
 * **Thời gian xử lý** (GUI, nhóm `Thời gian xử lý`): `Tự động theo file Excel` (mặc định – nhận diện tháng từ tên file kết quả,
@@ -223,3 +223,20 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 * Tiến độ `Đang xử lý: x / N` chỉ đếm N = báo cáo thực sự vào pipeline; file bị loại ở pre-scan không ảnh hưởng % và ETA.
 * Log máy đọc được: `PERIOD_AUTO/PERIOD_MANUAL`, `PERIOD_SKIP`, `SOURCE_DUPLICATE`, `FAST_SKIP`, `CACHE_MISS reason=…`,
   `CACHE_EXPIRE`, `MASTER_SKIP`, `MASTER_MISS`.
+
+### Management Number chưa có trong Excel → tự thêm dòng mới
+
+* Điều kiện: mã hợp lệ theo parser hiện có (có ngày YYMMDD thật), trong thời gian xử lý, không phải bản trùng bị bỏ.
+  Tên file không có mã / ngày sai / ngoài kỳ / bản trùng → **không** tạo dòng.
+* Vị trí: `ExcelWriter.create_row` dùng `next_row()` – dòng báo cáo trống đầu tiên của bảng (tận dụng dòng form trống
+  có sẵn), nếu không thì ngay sau dòng báo cáo cuối; không bao giờ là header/tiêu đề/sheet khác.
+* Chỉ sao chép **định dạng** từ dòng báo cáo gần nhất phía trên (`_copy_row_style`: style/border/fill/font/number format/
+  alignment/wrap, merge một dòng, chiều cao dòng). Không sao chép giá trị, ảnh QPN/ảnh cải tiến, WEEK đã nhập tay.
+* Ghi Management Number (+ STT) rồi `save()` ngay, sau đó xử lý PPT bằng pipeline chuẩn vào đúng dòng đó; lần chạy sau tìm
+  lại được dòng này (kể cả khi trích xuất lỗi) và điền tiếp theo cơ chế incremental – không bao giờ tạo dòng thứ hai.
+* Dòng Excel trùng mã đã có sẵn → giữ nguyên rule cũ (dòng trên cùng là đích, các dòng kia tô đỏ), không thêm dòng.
+* Cache: cache hit nhưng mã không có trong file Excel hiện tại → `CACHE_MISS reason=master_row_missing` → tạo dòng mới
+  (mỗi tháng một file Excel khác nhau).
+* Log: `MASTER_NEW management_number=… row=…`, `MASTER_NEW_RETRY …existing_partial_row=…`, `MASTER_NEW_FAILED …`.
+  Chẩn đoán GUI: `Dòng Excel: Tạo mới (dòng N)`.
+* GUI gồm 2 tab: `Xử lý báo cáo` (thư mục, file, thời gian xử lý, kết quả, tiến độ) và `Cấu hình & Ollama`.
