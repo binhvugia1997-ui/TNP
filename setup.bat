@@ -212,8 +212,8 @@ exit /b 1
 
 REM ---------- helpers -------------------------------------------
 :find_python
-REM Uu tien: py -3.12, py -3.13, py -3.11, py -3.10, py -3, python ; phai qua check-python
-for %%V in (-3.12 -3.13 -3.11 -3.10 -3) do (
+REM Uu tien: py -3.12, py -3.13, py -3.14, py -3.11, py -3.10, py -3, python ; phai qua check-python
+for %%V in (-3.12 -3.13 -3.14 -3.11 -3.10 -3) do (
     if not defined SYS_PY (
         py %%V "%SUPPORT%" check-python >nul 2>nul
         if not errorlevel 1 set "SYS_PY=py %%V"

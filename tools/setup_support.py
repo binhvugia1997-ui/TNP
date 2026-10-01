@@ -22,7 +22,7 @@ from typing import Iterable, List, Sequence, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 
 PYTHON_MIN = (3, 10)                 # `X | Y` annotations, dataclass features, current wheels (PyMuPDF, pywin32)
-PYTHON_MAX_EXCLUSIVE = (3, 14)       # 3.14 has no verified wheels for every runtime dependency yet
+PYTHON_MAX_EXCLUSIVE = (3, 15)       # 3.14 verified: PyMuPDF (cp310-abi3), pywin32 312, Pillow 12 ship win_amd64 wheels
 PYTHON_RECOMMENDED = "3.12"
 WINGET_PYTHON_ID = "Python.Python.3.12"
 

@@ -16,9 +16,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_supported_python_range_is_consistent():                                   # 1
     assert ss.PYTHON_MIN < ss.PYTHON_MAX_EXCLUSIVE
-    assert ss.python_version_ok((3, 10)) and ss.python_version_ok((3, 12)) and ss.python_version_ok((3, 13))
-    assert not ss.python_version_ok((3, 9)) and not ss.python_version_ok((3, 14))
-    assert ss.python_version_ok(sys.version_info)                                   # the suite itself runs on it
+    assert ss.PYTHON_MIN == (3, 10) and ss.PYTHON_MAX_EXCLUSIVE == (3, 15)         # canonical production range
+    assert ss.python_version_ok(ss.PYTHON_MIN)                                       # minimum -> True
+    for inside in ((3, 11), (3, 12), (3, 13), (3, 14), (3, 14, 7)):                  # inside range -> True
+        assert ss.python_version_ok(inside), inside
+    assert not ss.python_version_ok((3, 9)) and not ss.python_version_ok((3, 9, 18))  # below minimum -> False
+    assert not ss.python_version_ok(ss.PYTHON_MAX_EXCLUSIVE) and not ss.python_version_ok((4, 0))  # above max -> False
+    # NOTE: deliberately no assertion on sys.version_info - the interpreter running the dev suite
+    # does not have to be inside the production setup range.
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert f"{ss.PYTHON_MIN[0]}.{ss.PYTHON_MIN[1]}" in readme and ss.PYTHON_RECOMMENDED in readme
     setup = (ROOT / "setup.bat").read_text(encoding="utf-8")

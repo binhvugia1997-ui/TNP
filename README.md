@@ -265,8 +265,8 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 4. Nháy đúp run.bat.
 ```
 
-* **Python hỗ trợ: >= 3.10 và < 3.14 (khuyến nghị 3.12)** – định nghĩa duy nhất trong `tools/setup_support.py`.
-  `setup.bat` thử `py -3.12 / -3.13 / -3.11 / -3.10 / -3` rồi `python`, kiểm tra phiên bản thật; nếu không có sẽ đề nghị
+* **Python hỗ trợ: >= 3.10 và < 3.15, tức 3.10 – 3.14 (khuyến nghị 3.12)** – định nghĩa duy nhất trong `tools/setup_support.py`.
+  `setup.bat` thử `py -3.12 / -3.13 / -3.14 / -3.11 / -3.10 / -3` rồi `python`, kiểm tra phiên bản thật; nếu không có sẽ đề nghị
   cài `Python.Python.3.12` qua **winget** (gói chính thức), không tải từ nguồn lạ. Không cần quyền Admin cho `.venv`/pip.
 * Môi trường ảo cục bộ `.venv` (đã có trong `.gitignore`): tạo nếu chưa có, dùng lại nếu lành, tạo lại nếu hỏng/sai phiên bản.
   Thư viện runtime từ `requirements.txt`; công cụ test/dev (`pytest`, …) trong `requirements-dev.txt` – hỏi `Cài thêm công cụ
