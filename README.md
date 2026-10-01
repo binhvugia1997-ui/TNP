@@ -53,6 +53,14 @@ ReportExtractor.exe --cli D:\Reports --template D:\Templates\Verification.xlsx -
 
 ## 2. Hướng dẫn sử dụng (GUI)
 
+> **v1.0.2 / PROMPT-002 – giao diện mới.** Tab **Xử lý báo cáo** đi theo đúng thứ tự làm việc: *Nguồn dữ liệu* →
+> *Thời gian xử lý* → *Danh sách báo cáo* (ô tìm kiếm `Ctrl+F`, bộ lọc hiển thị, Quét lại `F5`, Khôi phục, Xóa khỏi danh
+> sách – chỉ xóa khỏi danh sách xử lý, không xóa file gốc) → **▶ BẮT ĐẦU XỬ LÝ / ■ DỪNG SAU FILE HIỆN TẠI** → tiến trình
+> (phần trăm, giai đoạn, file hiện tại, đã chạy / còn khoảng, thẻ Hoàn thành / Cần kiểm tra / Lỗi / Bỏ qua) → *Kết quả xử lý*
+> (nháy đúp xem chi tiết). Trạng thái Ollama hiển thị gọn ở đầu danh sách; mọi cấu hình Ollama, tùy chọn xử lý và
+> **Nhật ký xử lý** (Mở file log / Mở thư mục log / Xóa phần hiển thị – không xóa `app.log`) nằm ở tab **Cấu hình & Ollama**.
+> Kích thước cửa sổ / trạng thái phóng to được ghi nhớ trong `config.json`. Logic trích xuất không thay đổi so với v1.0.1.
+
 1. **Máy AI (Ollama)**: nhập `192.168.1.50:11434` hoặc `http://192.168.1.50:11434`
    → bấm **Kiểm tra kết nối**. Danh sách model được đọc từ `GET /api/tags`;
    model chứa `qwen` + `4b` được chọn sẵn (có thể đổi trong combobox).
