@@ -17,8 +17,8 @@ from pptx.util import Inches
 
 import app
 from app.batch_processor import BatchOptions, BatchProcessor, format_file_diagnostics
-from app.classifier import Classification, heuristic_classify, improvement_subkind
-from app.extractor import extract_record, split_sections
+from app.classifier import Classification, heuristic_classify, improvement_subkind, section_kind_of_heading
+from app.extractor import _semantic_kind, extract_record, split_sections
 from app.improvement_pictures import select_after_pictures
 from app.pptx_parser import parse_pptx
 from app.qpn_region import locate_qpn_region
@@ -283,3 +283,120 @@ def test_rerun_and_force_are_stable(template, tmp_path):
         assert im.size == (960, 540)
     _, p3 = _run([deck], template, out)                                        # plain rerun: complete -> skipped
     assert p3.results[0].status == "skipped"
+
+
+# ------------------------------------------------------------------ HOTFIX: real data 260918080-VOC
+REAL_PROD_1 = "Lỗi xước rear ( Áp dụng cải tiến 17/9 – Công đoạn Assy Daoltech):"
+REAL_PROD_2 = "Cải tiến tại công đoạn lắp ráp lỗi lệch ant (Áp dụng cải tiến từ ngày 22.9.2026):"
+REAL_PROD_3 = "Cải tiến lỗi mẻ rear (Áp dụng cải tiến 17/9 – Công đoạn Assy Daoltech):"
+REAL_BODY_1 = ("- Tại công đoạn nén tape sealing\n"
+               "+ Trước: Jig nén cạnh sắc, không có đệm silicon\n"
+               "+ Sau: Bọc silicon toàn bộ cạnh jig, bo tròn R1.0")
+REAL_BODY_2 = ("- Tại công đoạn lắp ANT\n"
+               "+ Trước: Lắp ANT bằng tay, không có cữ định vị\n"
+               "+ Sau: Bổ sung jig định vị ANT, kiểm tra vị trí bằng gauge")
+
+
+@pytest.mark.parametrize("heading", [REAL_PROD_1, REAL_PROD_2, REAL_PROD_3])
+def test_ap_dung_cai_tien_date_is_production(heading):
+    assert improvement_subkind(heading) == "production"
+    assert section_kind_of_heading(heading) == "improvement"
+
+
+@pytest.mark.parametrize("heading,kinds", [
+    ("Áp dụng cải tiến và theo dõi hiệu quả cải tiến", ("followup", "verify")),
+    ("Theo dõi hiệu quả cải tiến trên data kiểm tra OQC", ("followup", "verify")),
+    ("Duy trì và áp dụng cải tiến", ("followup",)),
+    ("Audit kiểm tra thường xuyên", ("followup",)),
+    ("Theo dõi data OQC", ("followup", "verify")),
+])
+def test_positive_followup_evidence_still_followup(heading, kinds):
+    assert improvement_subkind(heading) == "followup"
+    assert _semantic_kind(heading) in kinds                       # the kind the segmentation actually uses
+
+
+def make_real_production_deck(path: Path) -> Path:
+    """S2 QPN, S3 cause, S4 '3. CẢI TIẾN TRONG SẢN XUẤT' with the two REAL child headings (+ Before/After
+    pictures), S5 inspection slide, S6 'Hiệu quả cải tiến' / 'Duy trì và áp dụng cải tiến'."""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    W = prs.slide_width
+    blank = prs.slide_layouts[6]
+    s = prs.slides.add_slide(blank)
+    _tb(s, "BÁO CÁO ĐỐI SÁCH LỖI XƯỚC, LỆCH ANT REAR A185", 0.5, 1, 12, 1, 28, True)
+    _tb(s, "Model: A185\nItem: Rear\nManagement No: 260918080-VOC", 0.5, 2.5, 6, 2, 16)
+    _qpn_slide(prs, "picture")
+    s = prs.slides.add_slide(blank)
+    _tb(s, "2. NGUYÊN NHÂN", 0.5, 0.3, 8, 0.7, 24, True)
+    _tb(s, "- Jig nén cạnh sắc gây xước rear", 1.7, 1.1, 11, 2.2, 13)
+    _furniture(s, W)
+    s = prs.slides.add_slide(blank)                                                          # 4 production
+    _tb(s, "3. CẢI TIẾN TRONG SẢN XUẤT", 0.5, 0.3, 8, 0.7, 24, True)
+    _shape(s, MSO_SHAPE.OVAL, "Cải tiến", 0.15, 3.0, 1.3, 1.3)
+    _tb(s, REAL_PROD_1, 1.7, 1.0, 5.6, 0.4, 12, True)                                       # bold child heading
+    _tb(s, REAL_BODY_1, 1.7, 1.4, 5.6, 1.9, 12)
+    _shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, "Trước cải tiến", 7.5, 1.0, 1.5, 0.35)
+    s.shapes.add_picture(_pic("#ffe0b2", "b1"), Inches(7.5), Inches(1.4), Inches(1.6), Inches(1.2))
+    _shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, "Sau cải tiến", 9.4, 1.0, 1.5, 0.35)
+    s.shapes.add_picture(_pic("#c8e6c9", "a1"), Inches(9.4), Inches(1.4), Inches(1.6), Inches(1.2))
+    _tb(s, REAL_PROD_2, 1.7, 3.6, 5.6, 0.4, 12, True)
+    _tb(s, REAL_BODY_2, 1.7, 4.0, 5.6, 1.9, 12)
+    _shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, "Trước cải tiến", 7.5, 3.6, 1.5, 0.35)
+    s.shapes.add_picture(_pic("#ffe0b2", "b2"), Inches(7.5), Inches(4.0), Inches(1.6), Inches(1.2))
+    _shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, "Sau cải tiến", 9.4, 3.6, 1.5, 0.35)
+    s.shapes.add_picture(_pic("#c8e6c9", "a2"), Inches(9.4), Inches(4.0), Inches(1.6), Inches(1.2))
+    _furniture(s, W)
+    s = prs.slides.add_slide(blank)                                                          # 5 inspection
+    _tb(s, "4. CẢI TIẾN TRONG KIỂM TRA", 0.5, 0.3, 8, 0.7, 24, True)
+    _tb(s, INSPECTION_TEXT, 1.7, 1.0, 5.6, 2.5, 12)
+    _shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, "Sau cải tiến", 7.5, 1.0, 1.5, 0.35)
+    s.shapes.add_picture(_pic("#b3e5fc", "insp"), Inches(7.5), Inches(1.4), Inches(4), Inches(2.5))
+    _furniture(s, W)
+    s = prs.slides.add_slide(blank)                                                          # 6 verify / follow-up
+    _tb(s, "5. HIỆU QUẢ CẢI TIẾN", 0.5, 0.3, 8, 0.7, 24, True)
+    _tb(s, "- Tỷ lệ lỗi xước giảm từ 1.2% xuống 0%", 1.7, 1.0, 11, 1.5, 13)
+    _tb(s, "Duy trì và áp dụng cải tiến", 1.7, 3.0, 5.6, 0.4, 13, True)
+    _tb(s, "- Theo dõi data OQC hàng tuần", 1.7, 3.4, 11, 1.2, 12)
+    _furniture(s, W)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(path))
+    return path
+
+
+@pytest.fixture
+def real_prod_deck(tmp_path):
+    p = make_real_production_deck(tmp_path / "(CTMS)_1_260918080-VOC_ Đối sách LỖI XƯỚC 24.9.2026.pptx")
+    return parse_pptx(p)
+
+
+def test_parent_production_context_keeps_child_headings(real_prod_deck):
+    r = real_prod_deck
+    secs = split_sections(r.slide(4), "improvement")
+    assert [s.kind for s in secs] == ["improvement", "improvement"], [(s.kind, s.heading) for s in secs]
+    cls = Classification(management_number="260918080-VOC", qpn_slide=2, cause_slides=[3],
+                         improvement_slides=[4, 5, 6], improvement_image_slides=[4, 5], verify_slides=[6],
+                         source="qwen", confidence=0.9)
+    rec = extract_record(r, cls, {"rear": "Rear"}, ["A185"])
+    imp = rec.improvement
+    for part in (REAL_PROD_1, REAL_BODY_1, REAL_PROD_2, REAL_BODY_2):
+        for line in part.split("\n"):
+            assert line.strip() in imp, line
+    assert not any(e.startswith(("S4 followup", "S4 verify", "S4 inspection")) for e in rec.excluded_sections)
+    assert any(e.startswith("S5 inspection") for e in rec.excluded_sections)
+    assert any(e.startswith("S6 verify") for e in rec.excluded_sections)
+    assert any(e.startswith("S6 followup") for e in rec.excluded_sections)
+    assert "Duy trì" not in imp and "Tỷ lệ lỗi" not in imp and "Đào tạo" not in imp
+    assert not any("Không tìm thấy Nội dung đối sách" in m for m in rec.review_reasons)
+    assert not any("Không tìm thấy ảnh Sau cải tiến" in m for m in rec.review_reasons)
+
+
+def test_production_pictures_follow_the_same_segmentation(real_prod_deck):
+    sel = select_after_pictures(real_prod_deck, [4, 5, 6])
+    after = sorted((p.slide, p.block.left) for p in sel.after)
+    assert after == [(4, Inches(9.4)), (4, Inches(9.4))]                      # both After pictures of S4
+    before = [p for p in sel.rejected if p.slide == 4 and p.kind == "before"]
+    assert len(before) == 2 and all(p.block.left == Inches(7.5) for p in before)
+    assert not any("followup section block" in (p.reason or "") for p in sel.rejected if p.slide == 4)
+    insp = [p for p in sel.rejected if p.slide == 5]
+    assert insp and all(p.reason == "inspection/control improvement slide" for p in insp)
+    assert not sel.reasons

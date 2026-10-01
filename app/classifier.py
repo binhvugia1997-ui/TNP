@@ -55,11 +55,16 @@ STANDARD_MARKERS = ["tieu chuan hoa", "standardization", "ngan ngua tai phat",
 INSPECTION_WORDS_RE = re.compile(r"\b(?:kiem tra|kiem soat|kiem hang|inspection|inspect|control|oqc|iqc|pqc|fqc|qc)\b")
 PRODUCTION_WORDS_RE = re.compile(r"\b(?:san xuat|production|lap rap|assy|assembly|gia cong|cnc|son|ep|may|"
                                  r"nhua|khuon|jig|tool|thiet bi|may moc|process)\b")
-FOLLOWUP_MARKERS = ["duy tri", "theo doi hieu qua", "theo doi", "audit", "ap dung cai tien", "giam sat",
-                    "monitoring", "follow up", "follow-up", "sustain", "kiem tra thuong xuyen"]
+# Follow-up / effectiveness headings need POSITIVE monitoring / sustain / audit semantics.  "Áp dụng cải tiến
+# <date>" alone is the implementation date of a PRODUCTION corrective action ("Lỗi xước rear (Áp dụng cải tiến
+# 17/9 – Công đoạn Assy Daoltech):") and must never trigger follow-up (PROMPT-001 hotfix, real data 260918080-VOC).
+FOLLOWUP_MARKERS = ["duy tri", "theo doi", "audit", "giam sat", "monitoring", "monitor", "follow up", "follow-up",
+                    "sustain", "kiem tra thuong xuyen", "hieu qua cai tien", "hieu qua doi sach"]
+FOLLOWUP_HEADING_MARKERS = ["audit", "duy tri", "giam sat", "kiem tra thuong xuyen", "monitoring", "follow up",
+                            "follow-up", "sustain"]
 LONG_TERM_MARKERS = ["doi sach lau dai", "giai phap lau dai", "bien phap lau dai", "long term", "long-term",
                      "permanent action"]
-FOLLOWUP_LINE_RE = re.compile(r"theo doi|duy tri|audit|hieu qua|ap dung cai tien|kiem tra thuong xuyen|giam sat|"
+FOLLOWUP_LINE_RE = re.compile(r"theo doi|duy tri|audit|hieu qua|kiem tra thuong xuyen|giam sat|"
                               r"monitor|follow[- ]?up|sustain")
 
 
@@ -73,7 +78,8 @@ def improvement_subkind(text: str) -> str:
 
     * inspection: improvement heading naming inspection/control ("CẢI TIẾN TRONG KIỂM TRA",
       "Cải tiến tại công đoạn kiểm tra:") without any production/process word;
-    * followup: "Duy trì và áp dụng cải tiến", "Theo dõi hiệu quả ...", audit / sustain headings;
+    * followup: "Duy trì và áp dụng cải tiến", "Theo dõi hiệu quả ...", audit / sustain headings – positive
+      monitoring evidence only; "Áp dụng cải tiến 17/9 – Công đoạn Assy" is production (implementation date);
     * production: everything else (incl. "Đối sách lâu dài" – its BODY decides later, see extractor).
     """
     k = re.sub(r"^(?:[ivx]+|\d+(?: \d+)*|[a-z])\s+", "", norm_key(text))
@@ -111,6 +117,8 @@ def section_kind_of_heading(text: str) -> Optional[str]:
         return "standard"
     if any(m in k for m in IMPROVE_MARKERS):
         return "improvement"
+    if any(m in k for m in FOLLOWUP_HEADING_MARKERS):           # "Audit kiểm tra thường xuyên", "Duy trì ..."
+        return "followup"
     if any(m in k for m in DEFECT_MARKERS):
         return "defect"
     return None
