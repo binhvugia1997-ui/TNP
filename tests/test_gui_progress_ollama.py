@@ -25,7 +25,7 @@ class FakeClock:
 
 
 def _ctl_with_rows(tmp_path, n=5):
-    ctl = GuiController(AppConfig(), config_path=tmp_path / "c.json")
+    ctl = GuiController(AppConfig(period_mode="all"), config_path=tmp_path / "c.json")
     folder = tmp_path / "reports"
     folder.mkdir(exist_ok=True)
     for i in range(n):
@@ -51,7 +51,7 @@ def _finish_report(ctl, i, status="completed"):
 
 # ------------------------------------------------------------------ progress
 def test_progress_zero_reports_is_safe(tmp_path):
-    ctl = GuiController(AppConfig(), config_path=tmp_path / "c.json")
+    ctl = GuiController(AppConfig(period_mode="all"), config_path=tmp_path / "c.json")
     assert ctl.progress.percent == 0.0 and ctl.progress.text == "" and ctl.eta_text() == ""
     assert progress_bar_text(0) == "░" * 20 + " 0%"
 
@@ -199,7 +199,7 @@ def test_endpoint_normalisation_accepts_all_spellings():
 
 
 def test_controller_endpoint_fields(tmp_path):
-    ctl = GuiController(AppConfig(), config_path=tmp_path / "c.json")
+    ctl = GuiController(AppConfig(period_mode="all"), config_path=tmp_path / "c.json")
     assert (ctl.host, ctl.port, ctl.model) == ("127.0.0.1", 11434, "qwen3:4b")       # defaults
     assert ctl.set_endpoint("192.168.1.50", "11434") == ""
     assert ctl.server == "http://192.168.1.50:11434" and ctl.endpoint_label == "192.168.1.50:11434"
@@ -256,7 +256,7 @@ class _Crash(_Client):
 
 
 def test_check_ollama_messages_and_model_presence(tmp_path):
-    ctl = GuiController(AppConfig(), config_path=tmp_path / "c.json")
+    ctl = GuiController(AppConfig(period_mode="all"), config_path=tmp_path / "c.json")
     ctl.set_endpoint("192.168.1.50", 11434, "qwen3:4b")
     ctl._client_factory = _Client
     assert ctl.check_ollama() == (True, "● Đã kết nối — qwen3:4b")
@@ -282,7 +282,7 @@ def test_check_ollama_messages_and_model_presence(tmp_path):
 
 
 def test_check_ollama_async_does_not_block(tmp_path):
-    ctl = GuiController(AppConfig(), config_path=tmp_path / "c.json")
+    ctl = GuiController(AppConfig(period_mode="all"), config_path=tmp_path / "c.json")
     gate = threading.Event()
 
     class Slow(_Client):
@@ -303,7 +303,7 @@ def test_check_ollama_async_does_not_block(tmp_path):
 
 
 def test_model_discovery_and_failure_keeps_selection(tmp_path):
-    ctl = GuiController(AppConfig(model="my-custom:latest"), config_path=tmp_path / "c.json")
+    ctl = GuiController(AppConfig(model="my-custom:latest", period_mode="all"), config_path=tmp_path / "c.json")
     ctl._client_factory = _Client
     ok, msg, models = ctl.refresh_models()
     assert ok and models == ["qwen3:1.7b", "qwen3:4b", "llama3.2:3b"] and "3 model" in msg
@@ -327,7 +327,7 @@ def test_model_discovery_and_failure_keeps_selection(tmp_path):
 
 def test_settings_save_and_reload_and_immediate_effect(sample_tree, tmp_path):
     cfg_path = tmp_path / "config.json"
-    ctl = GuiController(AppConfig(), config_path=cfg_path)
+    ctl = GuiController(AppConfig(period_mode="all"), config_path=cfg_path)
     ctl.set_report_folder(str(sample_tree["reports"]))
     ctl.set_template(str(sample_tree["template"]))
     assert ctl.set_endpoint("192.168.1.50", "11500", "qwen3:1.7b") == ""
@@ -367,7 +367,7 @@ def test_ollama_lost_during_batch_falls_back_without_marking_everything_review(s
             raise OllamaError("Không kết nối được Ollama tại " + self.base + ": connection lost")
 
     monkeypatch.setattr(bp, "OllamaClient", FlakyClient)
-    ctl = GuiController(AppConfig(row_mode="append"), config_path=tmp_path / "c.json")
+    ctl = GuiController(AppConfig(row_mode="append", period_mode="all"), config_path=tmp_path / "c.json")
     ctl.set_report_folder(str(sample_tree["reports"]))
     ctl.set_template(str(sample_tree["template"]))
     ctl.set_output(str(tmp_path / "out" / "k.xlsx"))
@@ -386,7 +386,7 @@ def test_ollama_lost_during_batch_falls_back_without_marking_everything_review(s
         assert not any("Ollama" in r for r in fr.review_reasons)   # unavailability itself is never a review reason
     assert (tmp_path / "out" / "k.xlsx").exists()
     # same inputs without AI give the same statuses (no extraction regression from the AI path)
-    ctl2 = GuiController(AppConfig(row_mode="append"), config_path=tmp_path / "c2.json")
+    ctl2 = GuiController(AppConfig(row_mode="append", period_mode="all"), config_path=tmp_path / "c2.json")
     ctl2.set_report_folder(str(sample_tree["reports"]))
     ctl2.set_template(str(sample_tree["template"]))
     ctl2.set_output(str(tmp_path / "out2" / "k.xlsx"))
@@ -420,7 +420,7 @@ def test_mocked_view_renders_progress_and_ollama_widgets(monkeypatch, sample_tre
     tkmod.Tk, tkmod.StringVar, tkmod.BooleanVar, tkmod.TclError = Root, Var, Var, Exception
     ttkmod = types.ModuleType("tkinter.ttk")
     for n in ("Style", "Label", "LabelFrame", "Frame", "Entry", "Button", "Combobox", "Checkbutton", "Treeview",
-              "Scrollbar", "Progressbar"):
+              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox"):
         setattr(ttkmod, n, Widget)
     fd, mb = types.ModuleType("tkinter.filedialog"), types.ModuleType("tkinter.messagebox")
     for m in (fd, mb):

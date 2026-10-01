@@ -15,7 +15,7 @@ from app.ollama_client import OllamaError
 
 
 def _ctl(tmp_path, sample_tree=None, **cfg):
-    c = AppConfig(**cfg)
+    c = AppConfig(**{"period_mode": "all", **cfg})
     ctl = GuiController(c, config_path=tmp_path / "config.json")
     if sample_tree is not None:
         ctl.set_report_folder(str(sample_tree["reports"]))
@@ -248,7 +248,7 @@ def test_diagnostics_mapping(sample_tree, tmp_path):
 
 def test_settings_persistence(sample_tree, tmp_path):
     cfg_path = tmp_path / "config.json"
-    ctl = GuiController(AppConfig(), config_path=cfg_path)
+    ctl = GuiController(AppConfig(period_mode="all"), config_path=cfg_path)
     ctl.set_report_folder(str(sample_tree["reports"]))
     ctl.set_template(str(sample_tree["template"]))
     ctl.set_output(str(tmp_path / "o" / "k.xlsx"))
@@ -264,7 +264,7 @@ def test_settings_persistence(sample_tree, tmp_path):
     assert ctl2.report_folder == str(sample_tree["reports"]) and ctl2.template == str(sample_tree["template"])
     assert ctl2.server == "http://192.168.1.50:11434" and ctl2.model == "qwen3:4b"
     # defaults for a fresh install
-    fresh = GuiController(AppConfig(), config_path=tmp_path / "none.json")
+    fresh = GuiController(AppConfig(period_mode="all"), config_path=tmp_path / "none.json")
     assert fresh.server == "http://127.0.0.1:11434" and fresh.model == "qwen3:4b"
 
 
@@ -297,7 +297,7 @@ def test_gui_view_builds_with_mocked_tkinter(monkeypatch, sample_tree, tmp_path)
         setattr(tkmod, n, Var if n.endswith("Var") else (Exception if n == "TclError" else Widget))
     ttkmod = types.ModuleType("tkinter.ttk")
     for n in ("Style", "Label", "LabelFrame", "Frame", "Entry", "Button", "Combobox", "Checkbutton", "Treeview",
-              "Scrollbar", "Progressbar"):
+              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox"):
         setattr(ttkmod, n, Widget)
     fd = types.ModuleType("tkinter.filedialog"); mb = types.ModuleType("tkinter.messagebox")
     for m in (fd, mb):

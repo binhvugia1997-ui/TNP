@@ -195,3 +195,31 @@ tests/                 40 pytest tests
 * QPN: ảnh slide được cắt bỏ viền trắng đồng nhất (`trim_white_margins`) rồi vừa bề rộng cột QPN; hình học độc lập với cột Hình ảnh cải tiến.
 * Chạy lại: dòng đã đủ ảnh → `Bỏ qua — đã cập nhật`, ảnh giữ nguyên (không nhân đôi, không phóng to dần, không đổi chiều cao dòng).
 * Thay đổi độ rộng cột trong template → kích thước ảnh tự thích ứng ở lần chạy sau (không có pixel cứng).
+
+## Quét nhanh thư mục lớn (pre-scan) & Thời gian xử lý
+
+Trước khi mở bất kỳ PPTX nào, mỗi file được quyết định chỉ bằng **tên file + kích thước + mtime + file Excel đang mở + cache JSON**:
+
+```
+Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có) → Thời gian xử lý
+→ Trùng Management Number trong folder (chọn file mới nhất, hoà → thứ tự đường dẫn)
+→ Cache 7 ngày (đã xử lý thành công gần đây, cùng path/size/mtime)
+→ Tra dòng Excel (không có → "Không tìm thấy Management Number")
+→ Dòng đã đầy đủ → "Bỏ qua — đã cập nhật"
+→ chỉ các báo cáo còn thiếu dữ liệu mới mở PPTX / Qwen / trích xuất
+```
+
+* **Thời gian xử lý** (GUI, nhóm `Thời gian xử lý`): `Tự động theo file Excel` (mặc định – nhận diện tháng từ tên file kết quả,
+  rồi tên file Kiểm chứng: `09_2026`, `2026-09`, `Tháng 9-2026`, `T09_2026`…; tên mơ hồ như `Kiem_chung_v2_09.xlsx` → báo
+  `Không xác định được tháng từ tên file Excel…` và không cho bắt đầu), `Chọn tháng`, `Khoảng thời gian` (dd/mm/yyyy, bao gồm hai
+  đầu, không tự đảo), `Tất cả`. Chọn tay luôn thắng tên file (có cảnh báo không chặn). CLI: `--month MM/YYYY`, `--from/--to`, `--all`.
+* Ngày để lọc **chỉ** là ngày phát sinh suy ra từ Management Number (không dùng ngày trong tên file/PPT/thư mục/mtime).
+* Cache: `Output/logs/fast_scan_cache.json` `{version, entries{mgmt: {path,size,mtime,occurrence_date,processed_at,status}}}`,
+  ghi atomic (tmp + replace). Chỉ `Hoàn thành` / `Bỏ qua — đã cập nhật` được cache; `Cần kiểm tra`/`Lỗi`/không tìm thấy/bị dừng
+  thì không. Hết hạn khi `ngày phát sinh <= hôm nay − 7 ngày` (hôm nay 14/10 → cutoff 07/10: 07/10 hết hạn, 08/10 còn), dọn
+  lúc bắt đầu mỗi batch; cache hỏng/không ghi được → vẫn xử lý bình thường. Dòng Excel luôn là nguồn sự thật: cache hit nhưng
+  dòng thiếu trường → `CACHE_MISS reason=master_row_incomplete` và xử lý lại. `--force / Xử lý lại` bỏ qua cache + dòng đầy đủ
+  nhưng **vẫn** lọc theo thời gian.
+* Tiến độ `Đang xử lý: x / N` chỉ đếm N = báo cáo thực sự vào pipeline; file bị loại ở pre-scan không ảnh hưởng % và ETA.
+* Log máy đọc được: `PERIOD_AUTO/PERIOD_MANUAL`, `PERIOD_SKIP`, `SOURCE_DUPLICATE`, `FAST_SKIP`, `CACHE_MISS reason=…`,
+  `CACHE_EXPIRE`, `MASTER_SKIP`, `MASTER_MISS`.

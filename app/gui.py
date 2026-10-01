@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Optional
@@ -20,7 +21,8 @@ from typing import Dict, Optional
 from . import APP_NAME, __version__
 from .config import AppConfig
 from .diagnostics import format_diagnostics, run_diagnostics
-from .gui_controller import DEFAULT_OUTPUT_NAME, FINAL_STATUSES, GuiController, default_output_path
+from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, GuiController,
+                             default_output_path)
 from .scanner import parse_dnd_paths
 
 try:  # optional drag & drop support
@@ -29,7 +31,8 @@ try:  # optional drag & drop support
 except Exception:  # noqa: BLE001
     _DND_OK = False
 
-STATUS_ICON = {"waiting": "○", "completed": "✓", "needs_review": "⚠", "error": "✗", "skipped": "•", "not_written": "⚠"}
+STATUS_ICON = {"waiting": "○", "completed": "✓", "needs_review": "⚠", "error": "✗", "skipped": "•", "not_written": "⚠",
+               "outside_period": "–", "source_duplicate": "•", "fast_skip": "•"}
 COLUMNS = (("stt", "STT", 45), ("mgmt", "Management Number", 140), ("file", "Tên file", 330), ("vendor", "Vendor", 110),
            ("model", "Model", 70), ("item", "Item", 70), ("status", "Trạng thái", 210), ("note", "Ghi chú", 320))
 
@@ -111,6 +114,45 @@ class ReportExtractorApp:
         c1 = ttk.Checkbutton(f, text="Xử lý lại báo cáo đã xử lý (ghi đè các trường tự động)", variable=self.var_force)
         c1.grid(row=3, column=1, sticky="w", **pad)
 
+        # ---- Thời gian xử lý (lọc theo ngày phát sinh từ Management Number, trước khi mở PPTX) -----
+        tf = ttk.LabelFrame(r, text="Thời gian xử lý")
+        tf.pack(fill="x", padx=10, pady=4)
+        self.var_period_mode = tk.StringVar(value="auto")
+        self._period_radios = []
+        for col, (mode, label) in enumerate(PERIOD_MODE_VI.items()):
+            rb = ttk.Radiobutton(tf, text=label, value=mode, variable=self.var_period_mode,
+                                 command=self._on_period_changed)
+            rb.grid(row=0, column=col, sticky="w", **pad)
+            self._period_radios.append(rb)
+        self.frm_month = ttk.Frame(tf)
+        ttk.Label(self.frm_month, text="Tháng:").pack(side="left", padx=(0, 4))
+        self.var_period_month = tk.StringVar()
+        self.sb_month = ttk.Spinbox(self.frm_month, from_=1, to=12, width=4, format="%02.0f",
+                                    textvariable=self.var_period_month, command=self._on_period_changed)
+        self.sb_month.pack(side="left", padx=(0, 10))
+        ttk.Label(self.frm_month, text="Năm:").pack(side="left", padx=(0, 4))
+        self.var_period_year = tk.StringVar()
+        self.sb_year = ttk.Spinbox(self.frm_month, from_=2020, to=2099, width=6,
+                                   textvariable=self.var_period_year, command=self._on_period_changed)
+        self.sb_year.pack(side="left")
+        self.frm_range = ttk.Frame(tf)
+        ttk.Label(self.frm_range, text="Từ ngày:").pack(side="left", padx=(0, 4))
+        self.var_period_from = tk.StringVar()
+        self.e_from = ttk.Entry(self.frm_range, textvariable=self.var_period_from, width=12)
+        self.e_from.pack(side="left", padx=(0, 10))
+        ttk.Label(self.frm_range, text="Đến ngày:").pack(side="left", padx=(0, 4))
+        self.var_period_to = tk.StringVar()
+        self.e_to = ttk.Entry(self.frm_range, textvariable=self.var_period_to, width=12)
+        self.e_to.pack(side="left")
+        ttk.Label(self.frm_range, text="(dd/mm/yyyy, bao gồm cả hai đầu)").pack(side="left", padx=(8, 0))
+        self.lbl_period = ttk.Label(tf, text="")
+        self.lbl_period.grid(row=2, column=0, columnspan=6, sticky="w", **pad)
+        self.lbl_period_warn = ttk.Label(tf, text="", style="Bad.TLabel")
+        self.lbl_period_warn.grid(row=3, column=0, columnspan=6, sticky="w", **pad)
+        for var in (self.var_period_month, self.var_period_year, self.var_period_from, self.var_period_to,
+                    self.var_output, self.var_template):
+            var.trace_add("write", lambda *_: self._on_period_changed())
+
         # ---- Kết nối Ollama -------------------------------------------------------
         of = ttk.LabelFrame(r, text="Kết nối Ollama")
         of.pack(fill="x", padx=10, pady=4)
@@ -138,7 +180,8 @@ class ReportExtractorApp:
         self.lbl_ai.grid(row=1, column=5, columnspan=4, sticky="w", **pad)
         for var in (self.var_host, self.var_port, self.var_model):
             var.trace_add("write", lambda *_: self._on_endpoint_edited())
-        self._config_widgets = [e1, e2, e3, e4, e5, b1, b2, b3, b4, b5, b6, b7, self.cb_model, c1]
+        self._config_widgets = [e1, e2, e3, e4, e5, b1, b2, b3, b4, b5, b6, b7, self.cb_model, c1,
+                                self.sb_month, self.sb_year, self.e_from, self.e_to, *self._period_radios]
 
         lf = ttk.LabelFrame(r, text="Kết quả từng báo cáo  (nháy đúp để xem chi tiết)" + ("  – có thể kéo thả thư mục/file vào đây" if _DND_OK else ""))
         lf.pack(fill="both", expand=True, padx=10, pady=4)
@@ -152,7 +195,8 @@ class ReportExtractorApp:
         self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         vsb.pack(side="left", fill="y", pady=6)
         for tag, color in (("completed", "#1a7f37"), ("needs_review", "#b26a00"), ("error", "#c62828"),
-                           ("skipped", "#666666"), ("not_written", "#8e24aa"), ("working", "#0b57d0")):
+                           ("skipped", "#666666"), ("not_written", "#8e24aa"), ("working", "#0b57d0"),
+                           ("outside_period", "#9e9e9e"), ("source_duplicate", "#9e9e9e"), ("fast_skip", "#666666")):
             self.tree.tag_configure(tag, foreground=color)
         self.tree.bind("<Double-1>", self._on_row_double_click)
         if _DND_OK:
@@ -212,6 +256,14 @@ class ReportExtractorApp:
         self._loading = False
         self.lbl_ai.configure(text=c.ai_status_text())
         self.var_force.set(c.force_reprocess)
+        self._loading = True
+        self.var_period_mode.set(c.period_mode)
+        self.var_period_month.set(c.period_month or f"{datetime.now():%m}")
+        self.var_period_year.set(c.period_year or f"{datetime.now():%Y}")
+        self.var_period_from.set(c.period_from)
+        self.var_period_to.set(c.period_to)
+        self._loading = False
+        self._on_period_changed()
         if c.report_folder and Path(c.report_folder).is_dir():
             self.scan_reports()
 
@@ -222,6 +274,29 @@ class ReportExtractorApp:
         c.set_output(self.var_output.get())
         self._push_endpoint()
         c.force_reprocess = bool(self.var_force.get())
+        self._push_period()
+
+    def _push_period(self) -> str:
+        return self.ctl.set_period(self.var_period_mode.get(), self.var_period_month.get(), self.var_period_year.get(),
+                                   self.var_period_from.get(), self.var_period_to.get())
+
+    def _on_period_changed(self) -> None:
+        """Show the ACTIVE period (or the Vietnamese problem) before the batch starts; manual values win over
+        the Excel file name; the auto month is recomputed from the CURRENT Excel path."""
+        if getattr(self, "_loading", False) or not hasattr(self, "lbl_period"):
+            return
+        self.ctl.set_template(self.var_template.get())
+        self.ctl.set_output(self.var_output.get())
+        mode = self.var_period_mode.get()
+        self.frm_month.grid_forget()
+        self.frm_range.grid_forget()
+        if mode == "month":
+            self.frm_month.grid(row=1, column=0, columnspan=6, sticky="w", padx=6, pady=2)
+        elif mode == "range":
+            self.frm_range.grid(row=1, column=0, columnspan=6, sticky="w", padx=6, pady=2)
+        err = self._push_period()
+        self.lbl_period.configure(text=self.ctl.period_label(), style="Bad.TLabel" if err else "TLabel")
+        self.lbl_period_warn.configure(text=self.ctl.period_warning())
 
     def _push_endpoint(self) -> str:
         """Host/port/model from the widgets into the controller (takes effect immediately)."""
@@ -349,6 +424,7 @@ class ReportExtractorApp:
         self._render_rows()
         self._set_running(True)
         self._render_progress()
+        self.lbl_stage.configure(text="Đang quét thư mục...")
         self.root.after(1000, self._tick)
 
     def _tick(self) -> None:
@@ -428,6 +504,16 @@ class ReportExtractorApp:
                 self.lbl_counts.configure(text=self.ctl.counts_text())
             elif ev.kind == "log":
                 self.log(str(ev.payload))
+            elif ev.kind == "prescan":
+                self._render_progress()
+                self.lbl_counts.configure(text=self.ctl.counts_text())
+                for i in self.row_items:
+                    self._render_row(i)
+                c = ev.payload.counts()
+                self.lbl_stage.configure(text=f"Quét nhanh: {c['discovered']} file, cần xử lý thực tế {c['candidates']} "
+                                              f"(ngoài thời gian {c['outside_period']}, trùng {c['source_duplicates']}, "
+                                              f"đã xử lý gần đây {c['fast_skipped']}, Excel đầy đủ {c['master_complete']}, "
+                                              f"không có trong Excel {c['master_not_found']})")
             elif ev.kind == "ollama":
                 ok, msg = ev.payload
                 self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")

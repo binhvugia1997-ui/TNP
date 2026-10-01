@@ -10,7 +10,7 @@ import logging
 import threading
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -24,6 +24,9 @@ from .image_extractor import export_after_pictures
 from .logger import BatchResultLog, FileResult, setup_logging
 from .ollama_client import OllamaClient
 from .pptx_parser import parse_pptx
+from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_MASTER_NOT_FOUND,  # noqa: F401
+                      ACTION_PROCESS, CACHE_FILE_NAME,
+                      FastScanCache, MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, prescan)
 from .qpn_renderer import SlideRenderer, render_qpn
 
 LOG = logging.getLogger("report_extractor.batch")
@@ -46,7 +49,12 @@ STAGE_LABELS_VI = {
     "error": "Lỗi",
     "skipped": "Bỏ qua — đã cập nhật",
     "not_written": "Không tìm thấy Management Number",
+    # pre-scan outcomes (decided from file name / cache / master workbook – PPTX never opened)
+    "outside_period": "Bỏ qua ngoài thời gian xử lý",
+    "source_duplicate": "Trùng Management Number trong folder",
+    "fast_skip": "Bỏ qua nhanh — đã xử lý gần đây",
 }
+PRESCAN_STATUSES = ("outside_period", "source_duplicate", "fast_skip")
 
 
 @dataclass
@@ -65,6 +73,10 @@ class BatchOptions:
     # "append": every report becomes a new row (legacy / empty template)
     row_mode: str = "match"
     vendors: List[str] = field(default_factory=list)   # controlled Vendor list override (empty -> built-in)
+    # fast pre-scan: processing period (None = all), recent-success cache switch, fixed "today" for tests
+    period: Optional[ProcessingPeriod] = None
+    use_fast_cache: bool = True
+    today: Optional[date] = None
 
 
 @dataclass
@@ -79,6 +91,14 @@ class BatchSummary:
     output_file: str = ""
     output_folder: str = ""
     errors: List[Dict[str, str]] = field(default_factory=list)
+    # pre-scan counters (discovered, outside_period, source_duplicates, fast_skipped, master_complete,
+    # master_not_found, invalid_management_number, candidates) + the period actually used
+    prescan: Dict[str, int] = field(default_factory=dict)
+    candidates: int = 0
+    period: str = ""
+    outside_period: int = 0
+    source_duplicates: int = 0
+    fast_skipped: int = 0
 
     def as_dict(self) -> Dict:
         return self.__dict__.copy()
@@ -87,6 +107,7 @@ class BatchSummary:
 ProgressCB = Callable[[int, str, str], None]           # (file_index, stage, detail)
 BatchCB = Callable[[int, int], None]                    # (done, total)
 DoneCB = Callable[[BatchSummary], None]
+PreScanCB = Callable[[PreScanResult], None]
 
 
 class BatchProcessor:
@@ -94,12 +115,16 @@ class BatchProcessor:
                  on_file: Optional[ProgressCB] = None,
                  on_batch: Optional[BatchCB] = None,
                  on_done: Optional[DoneCB] = None,
-                 on_log: Optional[Callable[[str], None]] = None):
+                 on_log: Optional[Callable[[str], None]] = None,
+                 on_prescan: Optional[PreScanCB] = None):
         self.opts = opts
         self.on_file = on_file or (lambda i, s, d: None)
         self.on_batch = on_batch or (lambda d, t: None)
         self.on_done = on_done or (lambda s: None)
         self.on_log = on_log or (lambda m: None)
+        self.on_prescan = on_prescan or (lambda r: None)
+        self.prescan_result: Optional[PreScanResult] = None
+        self.cache: Optional[FastScanCache] = None
         self.stop_event = threading.Event()
         self.summary = BatchSummary(total=len(opts.files))
         self.results: List[FileResult] = []
@@ -154,7 +179,13 @@ class BatchProcessor:
         seq = writer.used_count()
         done = 0
         try:
-            for idx, path in enumerate(opts.files):
+            # --- fast pre-scan: file name / period / duplicates / 7-day cache / master row (no PPTX) ---
+            queue = self._prescan(writer, logs, result_log)
+            total = len(queue)
+            self.summary.candidates = total
+            self.on_batch(0, total)
+            for item in queue:
+                idx, path = item.index, item.path
                 if self.stop_event.is_set():
                     self.summary.stopped = True
                     self._log("Đã dừng theo yêu cầu (trước file tiếp theo).")
@@ -164,13 +195,15 @@ class BatchProcessor:
                 self.results.append(fr)
                 result_log.add(fr)
                 done += 1
-                self.on_batch(done, len(opts.files))
+                self.on_batch(done, total)
         finally:
             try:
                 writer.save()
             except Exception as e:  # noqa: BLE001
                 LOG.error("Final save failed: %s", e)
             writer.close()
+            order = {str(p): i for i, p in enumerate(opts.files)}
+            self.results.sort(key=lambda r: order.get(r.source_file, len(order)))   # file order, like the GUI table
             result_log.finish(self.summary.as_dict())
             try:
                 write_review_report(self.results, logs / "review_report.txt", self.summary)
@@ -181,6 +214,90 @@ class BatchProcessor:
                       f"Lỗi: {self.summary.failed}  Bỏ qua: {self.summary.skipped}")
             self.on_done(self.summary)
         return self.summary
+
+    # ------------------------------------------------------------------
+    def _prescan(self, writer: ExcelWriter, logs: Path, result_log: BatchResultLog) -> List[PreScanItem]:
+        """Run the cheap pre-scan, report every rejected file immediately, return the real queue."""
+        opts = self.opts
+        today = opts.today or date.today()
+        period = opts.period
+        if period is not None:
+            LOG.info("%s period=%s%s", "PERIOD_AUTO" if period.mode == "auto" else "PERIOD_MANUAL", period.iso(),
+                     f" excel={period.source}" if period.source else "")
+        self.cache = None
+        if opts.use_fast_cache:
+            try:
+                self.cache = FastScanCache(logs / CACHE_FILE_NAME)
+                self.cache.cleanup(today)
+            except Exception as e:  # noqa: BLE001 – cache is optional performance state
+                LOG.warning("CACHE_PROBLEM reason=%s", e)
+                self.cache = None
+        if self.cache is not None and self.cache.problem:
+            self._log(f"Cache quét nhanh không dùng được ({self.cache.problem}) – xử lý bình thường")
+        master = MasterLookup.from_writer(writer) if opts.row_mode == "match" else None
+        self._log("Đang quét thư mục...")
+        res = prescan(opts.files, period, self.cache, master, force=opts.force_reprocess, today=today,
+                      on_stage=self._log)
+        self.prescan_result = res
+        c = res.counts()
+        self.summary.prescan = c
+        self.summary.period = period.label_vi() if period else "Thời gian xử lý: Tất cả"
+        self.summary.outside_period = c["outside_period"]
+        self.summary.source_duplicates = c["source_duplicates"]
+        self.summary.fast_skipped = c["fast_skipped"]
+        self.on_prescan(res)
+        for line in res.summary_lines_vi():
+            self._log(line)
+        # report the rejected files right away (they never enter the processing queue)
+        for it in res.items:
+            if it.action == ACTION_PROCESS:
+                continue
+            fr = FileResult(source_file=str(it.path), started_at=datetime.now().isoformat(timespec="seconds"),
+                            management_number=it.management_number)
+            fr.occurrence_date = f"{it.occurrence_date:%d/%m/%Y}" if it.occurrence_date else ""
+            if it.action == ACTION_MASTER_NOT_FOUND or it.action == ACTION_INVALID_MGMT:
+                self._not_written(it.index, fr, None, it.reason.replace("Cần kiểm tra: ", ""))
+            elif it.action == ACTION_MASTER_COMPLETE:
+                self._skip_complete(it.index, fr, writer, it.management_number, it.path)
+            else:
+                fr.status = it.status                    # outside_period | source_duplicate | fast_skip
+                fr.error = it.reason or it.label_vi
+                fr.excel_row = it.excel_row
+                fr.finished_at = datetime.now().isoformat(timespec="seconds")
+                if it.action == ACTION_FAST_SKIP:
+                    self.summary.skipped += 1
+                self.on_file(it.index, it.status, it.label_vi)
+            self.results.append(fr)
+            result_log.add(fr)
+        return res.candidates
+
+    def _skip_complete(self, idx: int, fr: FileResult, writer: ExcelWriter, mgmt: str, path: Path) -> FileResult:
+        """Complete master row -> `Bỏ qua — đã cập nhật` (no parse, no Qwen, no rewrite); duplicate Excel rows
+        are still highlighted red; the outcome is safe for the 7-day cache."""
+        rows = writer.find_rows_by_management_number(mgmt)
+        row = rows[0] if rows else None
+        if len(rows) > 1:
+            writer.mark_rows_red(rows[1:])
+            LOG.warning("%s: Management Number %s xuất hiện %s dòng %s; dòng %s là dòng chính",
+                        path.name, mgmt, len(rows), rows, row)
+        fr.status = "skipped"
+        fr.excel_row = row
+        fr.error = f"Bỏ qua — đã cập nhật (dòng {row})"
+        fr.finished_at = datetime.now().isoformat(timespec="seconds")
+        self.summary.skipped += 1
+        LOG.info("%s: row %s already complete – skipped (no Qwen, no extraction)", path.name, row)
+        self._remember(mgmt, path, "skipped")
+        self.on_file(idx, "skipped", fr.error)
+        return fr
+
+    def _remember(self, mgmt: str, path: Path, status: str) -> None:
+        """Feed the recent-success cache; any failure is logged and ignored (never blocks the batch)."""
+        if self.cache is None:
+            return
+        try:
+            self.cache.record(mgmt, path, status)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("CACHE_PROBLEM management_number=%s reason=%s", mgmt, e)
 
     # ------------------------------------------------------------------
     def _process_one(self, idx: int, path: Path, seq: int, writer: ExcelWriter, renderer: SlideRenderer,
@@ -222,6 +339,7 @@ class BatchProcessor:
                     fr.error = f"Bỏ qua — đã cập nhật (dòng {row})"
                     self.summary.skipped += 1
                     LOG.info("%s: row %s already complete – skipped (no Qwen, no extraction)", path.name, row)
+                    self._remember(mgmt, path, "skipped")
                     self.on_file(idx, "skipped", fr.error)
                     return fr
                 if missing and len(missing) < len([f for f in MANAGED_FIELDS if f in writer.columns]) \
@@ -344,6 +462,7 @@ class BatchProcessor:
             fr.status = status
             history.record(fr.fingerprint, path, Path(self.opts.output_file), row, status)
             if status == "completed":
+                self._remember(fr.management_number, path, "completed")   # needs_review is never safe-cached
                 self.summary.completed += 1
             else:
                 self.summary.needs_review += 1

@@ -22,6 +22,8 @@ from .excel_writer import validate_template
 from .extractor import management_number_from_filename
 from .logger import FileResult
 from .ollama_client import OllamaClient, OllamaError, preferred_model
+from .prescan import (AUTO_PERIOD_FAIL_VI, PERIOD_DIFFERS_VI, ALL_PERIOD, PreScanResult, ProcessingPeriod,
+                      auto_period_from_excel, month_period, range_period)
 from .scanner import scan_inputs
 
 LOG = logging.getLogger("report_extractor.gui")
@@ -35,8 +37,14 @@ STATUS_VI: Dict[str, str] = {
     "not_written": "Không tìm thấy Management Number",
     "error": "Lỗi",
     "skipped": "Bỏ qua — đã cập nhật",
+    "outside_period": "Bỏ qua ngoài thời gian xử lý",
+    "source_duplicate": "Trùng Management Number trong folder",
+    "fast_skip": "Bỏ qua nhanh — đã xử lý gần đây",
 }
-FINAL_STATUSES = ("completed", "needs_review", "not_written", "error", "skipped")
+PRESCAN_STATUSES = ("outside_period", "source_duplicate", "fast_skip")
+FINAL_STATUSES = ("completed", "needs_review", "not_written", "error", "skipped") + PRESCAN_STATUSES
+PERIOD_MODES = ("auto", "month", "range", "all")
+PERIOD_MODE_VI = {"auto": "Tự động theo file Excel", "month": "Chọn tháng", "range": "Khoảng thời gian", "all": "Tất cả"}
 WORKING_STAGES = ("reading", "analyzing", "analyzing_heuristic", "extracting", "extracting_qpn",
                   "extracting_images", "writing_excel")
 
@@ -175,6 +183,14 @@ class GuiController:
         self.model: str = self.cfg.model or DEFAULT_MODEL
         self.available_models: List[str] = []
         self.force_reprocess: bool = bool(self.cfg.force_reprocess)
+        # processing period (fast pre-scan)
+        self.period_mode: str = self.cfg.period_mode if self.cfg.period_mode in PERIOD_MODES else "auto"
+        self.period_month: str = str(self.cfg.period_month or "")
+        self.period_year: str = str(self.cfg.period_year or "")
+        self.period_from: str = self.cfg.period_from or ""
+        self.period_to: str = self.cfg.period_to or ""
+        self.prescan: Optional[PreScanResult] = None
+        self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # runtime state
         self.state: str = "idle"                 # idle | running | stopping
         self.files: List[Path] = []
@@ -252,10 +268,76 @@ class GuiController:
         self.server = server
         self.model = model.strip()
 
+    # ------------------------------------------------------------------ processing period
+    def set_period(self, mode: str, month: Any = None, year: Any = None, start: Optional[str] = None,
+                   end: Optional[str] = None) -> str:
+        """Change the period mode/values; returns a Vietnamese problem text ('' when fine)."""
+        if mode not in PERIOD_MODES:
+            return f"Chế độ thời gian không hợp lệ: {mode}"
+        self.period_mode = mode
+        if month is not None:
+            self.period_month = str(month).strip()
+        if year is not None:
+            self.period_year = str(year).strip()
+        if start is not None:
+            self.period_from = start.strip()
+        if end is not None:
+            self.period_to = end.strip()
+        _, err = self.effective_period()
+        return err
+
+    def detected_period(self) -> Optional[ProcessingPeriod]:
+        """Month detected from the CURRENT destination / master Excel file name (recomputed every call, so a
+        newly selected workbook is never mixed up with the previous one)."""
+        for candidate in (self.output, self.template):
+            if candidate:
+                per = auto_period_from_excel(candidate)
+                if per:
+                    return per
+        return None
+
+    def effective_period(self) -> Tuple[Optional[ProcessingPeriod], str]:
+        """(period, error).  Manual month/range always wins over the Excel file name."""
+        mode = self.period_mode
+        if mode == "all":
+            return ALL_PERIOD, ""
+        if mode == "auto":
+            per = self.detected_period()
+            return (per, "") if per else (None, AUTO_PERIOD_FAIL_VI)
+        if mode == "month":
+            try:
+                m, y = int(self.period_month), int(self.period_year)
+                if not 1 <= m <= 12:
+                    raise ValueError
+                if not 2000 <= y <= 2099:
+                    return None, f"Năm không hợp lệ: {self.period_year!r}"
+                return month_period(y, m), ""
+            except (TypeError, ValueError):
+                return None, f"Tháng/Năm không hợp lệ: {self.period_month!r}/{self.period_year!r}"
+        per, err = range_period(self.period_from, self.period_to)
+        return (per, "") if per else (None, err)
+
+    def period_label(self) -> str:
+        per, err = self.effective_period()
+        return per.label_vi() if per else f"Thời gian xử lý: {err}"
+
+    def period_warning(self) -> str:
+        """Non-blocking notice when a manual period differs from the month in the Excel file name."""
+        if self.period_mode not in ("month", "range"):
+            return ""
+        per, _ = self.effective_period()
+        det = self.detected_period()
+        if per and det and (per.start, per.end) != (det.start, det.end):
+            return PERIOD_DIFFERS_VI
+        return ""
+
     # ------------------------------------------------------------------ validation
     def validate(self) -> List[str]:
         """Vietnamese problems that prevent a run (empty list = OK). Ollama is NOT required."""
         errs: List[str] = []
+        _, perr = self.effective_period()
+        if perr:
+            errs.append(perr)
         if not self.report_folder or not Path(self.report_folder).is_dir():
             errs.append("Thư mục báo cáo không tồn tại.")
         elif not self.files:
@@ -408,7 +490,8 @@ class GuiController:
                             force_reprocess=self.force_reprocess, request_timeout=int(self.cfg.request_timeout or 180),
                             use_ollama=use_ollama and bool(self.model),
                             fill_temporary_column=bool(self.cfg.fill_temporary_column),
-                            vendors=list(self.cfg.vendors or []), row_mode=self.cfg.row_mode or "match")
+                            vendors=list(self.cfg.vendors or []), row_mode=self.cfg.row_mode or "match",
+                            period=self.effective_period()[0])
 
     def start(self, use_ollama: bool = True, in_thread: bool = True) -> bool:
         """Start the production batch; returns False when validation fails or already running."""
@@ -421,11 +504,16 @@ class GuiController:
             r.stage, r.note, r.vendor, r.model, r.item = "waiting", "", "", "", ""
         self.progress = Progress(total=len(self.files))
         self.summary = None
+        self.prescan, self.queue_indexes = None, None
         self.report_durations = []
         self._report_started_at = None
         self.started_at, self.finished_at = self._clock(), None
+        self.log_lines.append(self.period_label())
+        if self.period_warning():
+            self.log_lines.append(self.period_warning())
         self.processor = self._processor_factory(
             self.build_options(use_ollama),
+            on_prescan=lambda r: self._queue.put(UiEvent("prescan", r)),
             on_file=lambda i, s, d: self._queue.put(UiEvent("row", (i, s, d))),
             on_batch=lambda d, t: self._queue.put(UiEvent("progress", (d, t))),
             on_done=lambda s: self._queue.put(UiEvent("done", s)),
@@ -467,14 +555,32 @@ class GuiController:
             applied.append(ev)
         return applied
 
+    def _in_queue(self, index: int) -> bool:
+        return self.queue_indexes is None or index in self.queue_indexes
+
+    def _count_done(self) -> int:
+        return sum(1 for r in self.rows if r.is_final and self._in_queue(r.index))
+
     def apply_event(self, ev: UiEvent) -> None:
-        if ev.kind == "row":
+        if ev.kind == "prescan":
+            res: PreScanResult = ev.payload
+            self.prescan = res
+            self.queue_indexes = {it.index for it in res.candidates}
+            self.progress = Progress(total=len(self.queue_indexes))     # denominator = real candidates only
+            self._report_started_at = self._clock()                      # pre-scan time never enters the ETA
+            for line in res.summary_lines_vi():
+                self.log_lines.append(line)
+        elif ev.kind == "row":
             i, stage, detail = ev.payload
             if 0 <= i < len(self.rows):
                 row = self.rows[i]
                 was_final = row.is_final
                 row.stage = stage
                 now = self._clock()
+                if not self._in_queue(i):
+                    row.note = detail or ""                              # pre-scan rejection: no progress / ETA
+                    self._fill_row_from_result(row)
+                    return
                 if stage in FINAL_STATUSES:
                     row.note = detail or ""
                     self._fill_row_from_result(row)
@@ -485,7 +591,7 @@ class GuiController:
                             del self.report_durations[:-ETA_WINDOW]
                         self._report_started_at = now          # next report starts right away
                     self.progress.finish_report(i)
-                    self.progress.done = sum(1 for r in self.rows if r.is_final)
+                    self.progress.done = self._count_done()
                 else:
                     if self.progress.current_index != i or self._report_started_at is None:
                         self._report_started_at = now if self._report_started_at is None else self._report_started_at
@@ -493,7 +599,7 @@ class GuiController:
         elif ev.kind == "progress":
             done, total = ev.payload
             self.progress.total = total
-            self.progress.done = max(done, sum(1 for r in self.rows if r.is_final))
+            self.progress.done = max(done, self._count_done())
             if self.processor:
                 self.summary = self.processor.summary
         elif ev.kind == "log":
@@ -506,7 +612,7 @@ class GuiController:
                 if not r.is_final and r.stage != "waiting":
                     r.stage = "error"
             self.progress.current_index, self.progress.current_stage, self.progress.current_fraction = None, "", 0.0
-            self.progress.done = sum(1 for r in self.rows if r.is_final)
+            self.progress.done = self._count_done()
             self.progress.finished = True
         elif ev.kind == "ollama":
             self.ollama_ok, self.ollama_status = ev.payload
@@ -575,10 +681,16 @@ class GuiController:
         parts = [self.progress.text, self.progress.bar_text, self.elapsed_text(), self.eta_text()]
         return "   ".join(x for x in parts if x)
 
+    def prescan_lines(self) -> List[str]:
+        """Pre-scan counters (Vietnamese) – empty before the pre-scan ran."""
+        return self.prescan.summary_lines_vi() if self.prescan else []
+
     def summary_lines(self) -> List[str]:
         s = self.summary or BatchSummary(total=len(self.files))
         lines = [f"Tổng: {s.total}", f"Hoàn thành: {s.completed}", f"Cần kiểm tra: {s.needs_review}",
                  f"Không tìm thấy Management Number: {s.not_written}", f"Lỗi: {s.failed}", f"Bỏ qua: {s.skipped}"]
+        if self.prescan:
+            lines.extend(self.prescan_lines())
         if self.started_at is not None:
             lines.append(f"Tổng thời gian xử lý: {format_elapsed(self.elapsed_seconds())}")
         if s.stopped:
@@ -653,6 +765,13 @@ class GuiController:
         c.ollama_server = normalize_ollama_url(self.server) if self.server else DEFAULT_OLLAMA
         c.model = self.model
         c.force_reprocess = bool(self.force_reprocess)
+        c.period_mode = self.period_mode
+        try:
+            c.period_month = int(self.period_month) if str(self.period_month).strip() else 0
+            c.period_year = int(self.period_year) if str(self.period_year).strip() else 0
+        except ValueError:
+            c.period_month, c.period_year = 0, 0
+        c.period_from, c.period_to = self.period_from, self.period_to
         try:
             c.save(self._config_path)
         except OSError as e:

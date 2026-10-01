@@ -108,6 +108,12 @@ class AppConfig:
     fill_temporary_column: bool = False
     row_mode: str = "match"               # "match" (Management Number -> existing row) | "append"
     vendors: List[str] = field(default_factory=list)   # controlled Vendor list; empty -> built-in CANONICAL_VENDORS
+    # processing period (fast pre-scan): auto (from the Excel file name) | month | range | all
+    period_mode: str = "auto"
+    period_month: int = 0                 # last manual month/year (convenience only)
+    period_year: int = 0
+    period_from: str = ""                 # last manual range dd/mm/yyyy
+    period_to: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------

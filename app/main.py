@@ -33,6 +33,24 @@ def write_utf8_report(text: str, path: Path) -> Path:
     return path
 
 
+def _cli_period(args):
+    """--all | --month MM/YYYY | --from dd/mm/yyyy --to dd/mm/yyyy | default: month from the Excel file name."""
+    from .prescan import (ALL_PERIOD, AUTO_PERIOD_FAIL_VI, auto_period_from_excel, month_period, range_period)
+    if getattr(args, "all_periods", False):
+        return ALL_PERIOD, ""
+    if getattr(args, "month", None):
+        try:
+            mm, yy = args.month.split("/")
+            return month_period(int(yy), int(mm)), ""
+        except (ValueError, TypeError):
+            return None, f"--month không hợp lệ: {args.month!r} (định dạng MM/YYYY)"
+    if getattr(args, "date_from", None) or getattr(args, "date_to", None):
+        per, err = range_period(args.date_from or "", args.date_to or "")
+        return per, err
+    per = auto_period_from_excel(args.output) or auto_period_from_excel(args.template)
+    return (per, "") if per else (None, AUTO_PERIOD_FAIL_VI + " (--month MM/YYYY, --from/--to dd/mm/yyyy hoặc --all)")
+
+
 def _cli(args) -> int:
     from .batch_processor import STAGE_LABELS_VI, BatchOptions, BatchProcessor
     from .config import AppConfig, normalize_ollama_url
@@ -45,7 +63,12 @@ def _cli(args) -> int:
         return 2
     server = normalize_ollama_url(args.server or cfg.ollama_server)
     model = args.model if args.model is not None else cfg.model
-    opts = BatchOptions(files=files, template=Path(args.template), output_file=Path(args.output),
+    period, perr = _cli_period(args)
+    if perr:
+        print(perr)
+        return 2
+    print(period.label_vi())
+    opts = BatchOptions(period=period, files=files, template=Path(args.template), output_file=Path(args.output),
                         ollama_server=server, model=model or "", force_reprocess=args.force,
                         use_ollama=bool(model) and not args.no_ai,
                         fill_temporary_column=bool(cfg.fill_temporary_column),
@@ -57,7 +80,9 @@ def _cli(args) -> int:
 
     proc = BatchProcessor(opts, on_file=on_file, on_log=lambda m: print(m, flush=True))
     s = proc.run()
-    print(f"\nTổng: {s.total}\nHoàn thành: {s.completed}\nCần kiểm tra: {s.needs_review}\nChưa ghi (không tìm thấy dòng): {s.not_written}\nLỗi: {s.failed}\nBỏ qua: {s.skipped}")
+    print(f"\nTổng: {s.total}\nHoàn thành: {s.completed}\nCần kiểm tra: {s.needs_review}\nChưa ghi (không tìm thấy dòng): {s.not_written}\nLỗi: {s.failed}\nBỏ qua: {s.skipped}\n"
+          f"Ngoài thời gian xử lý: {s.outside_period}\nTrùng Management Number trong folder: {s.source_duplicates}\n"
+          f"Bỏ qua nhanh — đã xử lý gần đây: {s.fast_skipped}\nCần xử lý thực tế: {s.candidates}")
     print(f"Kết quả: {s.output_file}")
     return 0 if s.failed == 0 else 1
 
@@ -75,6 +100,10 @@ def main(argv=None) -> int:
     parser.add_argument("--model", help="tên model Ollama (rỗng = không dùng AI)")
     parser.add_argument("--no-ai", action="store_true", help="chỉ dùng nhận diện từ khoá")
     parser.add_argument("--force", action="store_true", help="xử lý lại file đã xử lý")
+    parser.add_argument("--month", help="thời gian xử lý: tháng MM/YYYY (mặc định: nhận diện từ tên file Excel)")
+    parser.add_argument("--from", dest="date_from", help="thời gian xử lý từ ngày dd/mm/yyyy")
+    parser.add_argument("--to", dest="date_to", help="thời gian xử lý đến ngày dd/mm/yyyy")
+    parser.add_argument("--all", dest="all_periods", action="store_true", help="không lọc theo thời gian")
     parser.add_argument("--append", action="store_true", help="ghi mỗi báo cáo thành dòng mới (mặc định: tìm dòng theo Management Number)")
     parser.add_argument("--inspect", metavar="PATH", help="in cấu trúc file .pptx hoặc form .xlsx để kiểm tra mapping")
     parser.add_argument("--out", metavar="FILE", help="ghi kết quả --inspect ra file UTF-8 (mặc định inspect_template.txt / inspect_report.txt)")
