@@ -50,7 +50,8 @@ def _images_in(ws, row, col):
 
 # ---------------------------------------------------------------- pure layout engine
 def test_col_width_to_px_follows_excel_formula():
-    assert col_width_to_px(8.43) == round(8.43 * 7 + 5)
+    # openpyxl exposes the STORED width (padding already included): default column 9.140625 -> 64 px (ECMA-376)
+    assert col_width_to_px(9.140625) == 64 and col_width_to_px(30) == 210 and col_width_to_px(None) == 64
     assert col_width_to_px(40) > col_width_to_px(20)
 
 

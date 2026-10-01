@@ -185,8 +185,17 @@ tests/                 40 pytest tests
 
 * Mỗi ảnh **Sau cải tiến** hợp lệ là **một đối tượng ảnh riêng** trong Excel (không ghép), theo thứ tự xuất hiện trong báo cáo;
   file nguồn lưu tại `Output/assets/<prefix>_IMPROVEMENT_pics/afterNN_slideSS.png`.
-* Bề rộng hiển thị = bề rộng vùng đích thực tế (độ rộng cột / vùng merge, quy đổi `px = width*7 + 5`) trừ lề 4 px mỗi bên;
-  chiều cao theo đúng tỉ lệ gốc – không méo, không cắt. Ảnh nguồn nhỏ/hẹp vẫn được phóng vừa bề rộng.
+* Bề rộng hiển thị = bề rộng vùng đích thực tế (độ rộng cột / vùng merge – cộng **mọi** cột trong vùng merge, tôn trọng
+  `<col min max>`, cột ẩn, độ rộng mặc định của sheet) trừ lề 4 px mỗi bên; quy đổi theo ECMA-376
+  `px = trunc(((256*W + trunc(128/7))/256)*7)` (openpyxl trả về độ rộng *đã gồm* 5 px đệm – công thức cũ `W*7+5` làm ảnh
+  rộng hơn cột 5 px và tràn sang cột bên). Chiều cao theo đúng tỉ lệ gốc – không méo, không cắt. Ảnh nguồn nhỏ/hẹp vẫn
+  được phóng vừa bề rộng.
+* **Quy tắc chứa cứng**: mọi ảnh (QPN và từng ảnh Sau cải tiến) nằm hoàn toàn trong vùng đích
+  (`x >= lề, y >= lề, x+w <= rộng−lề, y+h <= cao−lề`, dung sai 1 px làm tròn EMU), không chồng nhau, không tràn sang
+  cột/dòng kế. Trình tự ghi: đọc bề rộng thật → tính bố cục → chốt chiều cao dòng (≤ 409 pt) → **vừa lại ảnh theo cả
+  bề rộng lẫn chiều cao thật của dòng** → kiểm tra `assert_image_inside_area` → mới tạo anchor. `save()` kiểm tra lại
+  `image_bounds_report()` và từ chối ghi nếu còn ảnh vượt ô (lỗi rõ ràng thay vì file sai). Đơn vị quy đổi tập trung:
+  `col_width_to_px`, `pt_to_px`, `px_to_pt`, `px_to_emu`, `emu_to_px`.
 * Giới hạn chiều cao tập trung: `MAX_IMAGE_HEIGHT_PT = 300` (app/excel_writer.py). Ảnh quá cao được thu nhỏ đồng tỉ lệ.
 * Nhiều ảnh: xếp **một cột** (ảnh sau nằm dưới ảnh trước, cách 6 px). Vì Excel giới hạn chiều cao dòng 409 pt, nếu xếp một cột
   không đủ, hệ thống thu nhỏ đồng tỉ lệ hoặc chuyển sang lưới 2–3 cột – chọn phương án cho **bề rộng ảnh lớn nhất**

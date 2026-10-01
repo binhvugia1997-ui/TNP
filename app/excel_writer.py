@@ -87,7 +87,10 @@ WEEK_PARENT_KEYS = ("kiem chung", "theo doi", "week", "tuan", "verification", "x
                     "followup", "hieu qua", "monitoring", "giam sat")
 
 MAX_ROW_HEIGHT_PT = 409.0          # hard Excel limit for a row
-EXCEL_DEFAULT_COL_WIDTH = 8.43
+EXCEL_DEFAULT_COL_WIDTH = 9.140625  # stored (XML) width of Excel's default column = 64 px with Calibri 11
+EXCEL_DEFAULT_ROW_HEIGHT_PT = 15.0
+MAX_DIGIT_WIDTH_PX = 7             # Calibri 11 @ 96 dpi (Excel "MDW")
+CONTAINMENT_TOL_PX = 1             # only EMU/pixel rounding may differ by this much
 # ---- image layout (all derived from the real column widths of the workbook, never from a screenshot) ----
 IMAGE_MARGIN_PX = 4                # left/right/top/bottom margin inside the destination area
 IMAGE_GAP_PX = 6                   # gap between two independent images
@@ -97,22 +100,78 @@ PX_PER_PT = 4.0 / 3.0
 EMU_PER_PX = 9525
 
 
-def col_width_to_px(width_chars: float) -> int:
-    """Excel column width (characters of the default font) -> pixels (Calibri 11: 7 px per char + 5 px padding)."""
-    w = float(width_chars or EXCEL_DEFAULT_COL_WIDTH)
-    return int(round(w * 7 + 5))
+def col_width_to_px(width_chars: float, mdw: int = MAX_DIGIT_WIDTH_PX) -> int:
+    """Stored Excel column width -> pixels, ECMA-376 §18.3.1.13.
+
+    openpyxl exposes the width *as stored in the XML*, which ALREADY contains the 5 px cell padding
+    (default column: stored 9.140625 -> 64 px).  ``trunc(((256*W + trunc(128/MDW)) / 256) * MDW)``.
+    Adding another "+5 px" (the old formula) over-estimated every column by 5 px and let images spill
+    into the next column.
+    """
+    if width_chars is None:
+        width_chars = EXCEL_DEFAULT_COL_WIDTH
+    w = float(width_chars)
+    if w <= 0:                      # hidden column
+        return 0
+    return int(((256 * w + int(128 / mdw)) / 256) * mdw)
+
+
+def pt_to_px(pt: float) -> int:
+    """Points -> whole pixels at 96 dpi (Excel row heights)."""
+    return int(math.floor(float(pt) * PX_PER_PT + 1e-6))
+
+
+def px_to_pt(px: float) -> float:
+    return float(px) / PX_PER_PT
+
+
+def px_to_emu(px: float) -> int:
+    return int(round(float(px) * EMU_PER_PX))
+
+
+def emu_to_px(emu: float) -> int:
+    return int(round(float(emu) / EMU_PER_PX))
+
+
+def assert_image_inside_area(items: List[Tuple[int, int, int, int]], area_w_px: int, area_h_px: int,
+                             margin_px: int = IMAGE_MARGIN_PX, tol_px: int = CONTAINMENT_TOL_PX) -> None:
+    """Hard containment rule (#32/#41): every (x, y, w, h) stays inside the margins of the destination area
+    and no two pictures overlap.  Raises ``ValueError`` describing the first violation."""
+    for i, (x, y, w, h) in enumerate(items):
+        if w <= 0 or h <= 0:
+            raise ValueError(f"image {i}: empty size {w}x{h}")
+        if x + tol_px < margin_px or y + tol_px < margin_px:
+            raise ValueError(f"image {i}: top-left ({x},{y}) inside the {margin_px}px margin")
+        if x + w - tol_px > area_w_px - margin_px:
+            raise ValueError(f"image {i}: right edge {x + w} > {area_w_px - margin_px} (area {area_w_px}px)")
+        if y + h - tol_px > area_h_px - margin_px:
+            raise ValueError(f"image {i}: bottom edge {y + h} > {area_h_px - margin_px} (area {area_h_px}px)")
+        for j, (x2, y2, w2, h2) in enumerate(items[:i]):
+            if x < x2 + w2 - tol_px and x2 < x + w - tol_px and y < y2 + h2 - tol_px and y2 < y + h - tol_px:
+                raise ValueError(f"image {i} overlaps image {j}")
+
+
+def images_inside_area(items, area_w_px: int, area_h_px: int, margin_px: int = IMAGE_MARGIN_PX) -> bool:
+    try:
+        assert_image_inside_area(items, area_w_px, area_h_px, margin_px)
+        return True
+    except ValueError:
+        return False
 
 
 def plan_image_grid(sizes: List[Tuple[int, int]], area_px: int, max_row_pt: float = MAX_ROW_HEIGHT_PT,
                     max_image_pt: float = MAX_IMAGE_HEIGHT_PT, margin_px: int = IMAGE_MARGIN_PX,
-                    gap_px: int = IMAGE_GAP_PX, max_columns: int = MAX_IMAGE_COLUMNS) -> Dict[str, Any]:
+                    gap_px: int = IMAGE_GAP_PX, max_columns: int = MAX_IMAGE_COLUMNS,
+                    area_h_px: Optional[int] = None) -> Dict[str, Any]:
     """Deterministic layout of independent pictures inside one destination area.
 
     Every picture is scaled to the FULL usable slot width (aspect ratio preserved, height follows).
-    Preferred = one column (pictures stacked, source order).  Because an Excel row cannot exceed
-    ``max_row_pt`` (409 pt), a layout that would not fit is scaled down uniformly; among 1..max_columns
-    columns the plan giving the LARGEST displayed picture width wins (ties -> fewer columns), so five
-    pictures are never squeezed into thumbnails when a 2-column grid shows them bigger.
+    Preferred = one column (pictures stacked, source order).  The vertical budget is the smaller of the
+    Excel row cap (``max_row_pt`` = 409 pt) and, when given, the REAL area height ``area_h_px`` (final row
+    height); a layout that would not fit is scaled down uniformly (never cropped / distorted).  Among
+    1..max_columns columns the plan giving the LARGEST displayed picture width wins (ties -> fewer columns),
+    so five pictures are never squeezed into thumbnails when a 2-column grid shows them bigger.
+    Sizes are floored and positions clamped so ``assert_image_inside_area`` holds for every returned plan.
     Returns {"columns", "scale", "slot_px", "items": [(x_px, y_px, w_px, h_px)], "height_pt"}.
     """
     n = len(sizes)
@@ -120,6 +179,9 @@ def plan_image_grid(sizes: List[Tuple[int, int]], area_px: int, max_row_pt: floa
         return {"columns": 1, "scale": 1.0, "slot_px": 0, "items": [], "height_pt": 0.0}
     usable = max(20, area_px - 2 * margin_px)
     budget_px = (max_row_pt * PX_PER_PT) - 2 * margin_px
+    if area_h_px is not None:
+        budget_px = min(budget_px, area_h_px - 2 * margin_px)
+    budget_px = max(1.0, budget_px)
     best = None
     for cols in range(1, min(max_columns, n) + 1):
         slot = (usable - gap_px * (cols - 1)) / cols
@@ -134,29 +196,32 @@ def plan_image_grid(sizes: List[Tuple[int, int]], area_px: int, max_row_pt: floa
             dims.append((ww, hh))
         rows = [dims[i:i + cols] for i in range(0, n, cols)]
         row_h = [max(d[1] for d in r) for r in rows]
-        total = sum(row_h) + gap_px * (len(rows) - 1)
-        scale = min(1.0, budget_px / total) if total > 0 else 1.0
+        # gaps are NOT scaled when placing, so only the picture heights share the remaining budget
+        pic_budget = budget_px - gap_px * (len(rows) - 1)
+        total = sum(row_h)
+        scale = min(1.0, max(0.01, pic_budget) / total) if total > 0 else 1.0
         eff_w = min(d[0] for d in dims) * scale
         key = (round(eff_w, 1), -cols)
         if best is None or key > best[0]:
             best = (key, cols, scale, slot, dims, rows, row_h)
     _, cols, scale, slot, dims, rows, row_h = best
     items: List[Tuple[int, int, int, int]] = []
-    y = margin_px
-    i = 0
+    y = float(margin_px)
     for r_idx, r in enumerate(rows):
         rh = row_h[r_idx] * scale
         for c_idx, (ww, hh) in enumerate(r):
-            w_px, h_px = int(round(ww * scale)), int(round(hh * scale))
-            slot_x = margin_px + c_idx * (slot * scale if scale < 1 else slot) + c_idx * gap_px
+            w_px, h_px = max(1, int(math.floor(ww * scale))), max(1, int(math.floor(hh * scale)))
             slot_w = slot * scale if scale < 1 else slot
+            slot_x = margin_px + c_idx * slot_w + c_idx * gap_px
             x_px = int(round(slot_x + (slot_w - w_px) / 2))          # centre inside the slot
-            items.append((x_px, int(round(y)), w_px, h_px))
-            i += 1
+            x_px = max(margin_px, min(x_px, area_px - margin_px - w_px))
+            y_px = int(math.floor(y))
+            items.append((x_px, y_px, w_px, h_px))
         y += rh + gap_px
-    height_px = y - gap_px + margin_px
+    bottom = max((it[1] + it[3] for it in items), default=margin_px)
+    height_px = bottom + margin_px
     return {"columns": cols, "scale": scale, "slot_px": int(slot * scale), "items": items,
-            "height_pt": min(max_row_pt, height_px / PX_PER_PT)}
+            "height_pt": min(max_row_pt, px_to_pt(height_px))}
 
 
 def _as_paths(value) -> List[Path]:
@@ -223,6 +288,7 @@ class ExcelWriter:
         self.ws = self._find_target_sheet()          # also sets columns / header_row / data_start
         self.item_mapping, self.known_models = self._read_mapping_sheet()
         self._dirty = False
+        self._placed: List[Tuple[Any, int, str]] = []   # (image, row, field) written by THIS writer
 
     # ------------------------------------------------------------------
     # Template analysis
@@ -464,13 +530,53 @@ class ExcelWriter:
         if ws.row_dimensions[src_row].height:
             ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
 
+    def _col_width_chars(self, col: int) -> float:
+        """Stored width of ONE column, honouring <col min=.. max=..> ranges, hidden columns and the sheet default
+        (``column_dimensions[letter]`` alone silently returns a *default* dimension for columns inside a range)."""
+        for dim in list(self.ws.column_dimensions.values()):
+            lo, hi = dim.min or 0, dim.max or 0
+            if lo and hi and lo <= col <= hi:
+                if dim.hidden:
+                    return 0.0
+                if dim.width:
+                    return float(dim.width)
+        dim = self.ws.column_dimensions.get(get_column_letter(col))
+        if dim is not None:
+            if dim.hidden:
+                return 0.0
+            if dim.width:
+                return float(dim.width)
+        fmt = self.ws.sheet_format
+        if fmt is not None and fmt.defaultColWidth:
+            return float(fmt.defaultColWidth)
+        if fmt is not None and fmt.baseColWidth:
+            return float(fmt.baseColWidth) + 5.0 / MAX_DIGIT_WIDTH_PX
+        return EXCEL_DEFAULT_COL_WIDTH
+
     def _col_width_px(self, col: int, rng=None) -> int:
         cols = range(rng.min_col, rng.max_col + 1) if rng is not None else [col]
-        total = 0.0
-        for c in cols:
-            w = self.ws.column_dimensions[get_column_letter(c)].width or EXCEL_DEFAULT_COL_WIDTH
-            total += col_width_to_px(w)
-        return int(total)
+        return int(sum(col_width_to_px(self._col_width_chars(c)) for c in cols))
+
+    def _row_height_pt(self, row: int) -> float:
+        h = self.ws.row_dimensions[row].height
+        if h:
+            return float(h)
+        fmt = self.ws.sheet_format
+        if fmt is not None and fmt.defaultRowHeight:
+            return float(fmt.defaultRowHeight)
+        return EXCEL_DEFAULT_ROW_HEIGHT_PT
+
+    def _area_height_px(self, row: int, rng=None) -> int:
+        rows = range(rng.min_row, rng.max_row + 1) if rng is not None else [row]
+        return int(sum(pt_to_px(self._row_height_pt(r)) for r in rows))
+
+    def image_area_height_px(self, row: int, field: str) -> int:
+        """Pixel height of the destination image area as it is NOW (merged rows included)."""
+        if field not in self.columns:
+            return 0
+        col = self.columns[field]
+        _, rng = self._anchor(row, col)
+        return self._area_height_px(row, rng)
 
     def _set_cell(self, row: int, field: str, value: Any, wrap: bool = True) -> Optional[Any]:
         if field not in self.columns:
@@ -491,28 +597,93 @@ class ExcelWriter:
         _, rng = self._anchor(row, col)
         return self._col_width_px(col, rng)
 
-    def place_images(self, row: int, field: str, paths: List[Path]) -> float:
-        """Insert INDEPENDENT pictures into the field's area, each fitted to its slot width (aspect kept),
-        stacked/gridded deterministically (``plan_image_grid``).  Returns the required row height (pt)."""
+    def plan_field_images(self, row: int, field: str, paths: List[Path]) -> Optional[Dict[str, Any]]:
+        """Step 1 (#35): read the real destination width and compute the candidate layout + required height.
+        Returns {"paths", "sizes", "plan", "height_pt"} or None when there is nothing to place."""
         paths = [Path(p) for p in (paths or []) if p and Path(p).exists()]
         if field not in self.columns or not paths:
-            return 0.0
-        col = self.columns[field]
-        cell, _ = self._anchor(row, col)
+            return None
         sizes = []
         for p in paths:
             with PILImage.open(p) as im:
                 sizes.append(im.size)
         plan = plan_image_grid(sizes, self.image_area_px(row, field))
-        for p, (x, y, w, h) in zip(paths, plan["items"]):
+        return {"paths": paths, "sizes": sizes, "plan": plan, "height_pt": float(plan["height_pt"]) + 2}
+
+    def insert_planned_images(self, row: int, field: str, planned: Optional[Dict[str, Any]]) -> None:
+        """Steps 2-4 (#35): with the FINAL row height applied, re-fit the pictures to the final rectangle,
+        validate containment (#39) and only then create the anchors.  Never writes an overflowing geometry."""
+        if not planned:
+            return
+        col = self.columns[field]
+        cell, rng = self._anchor(row, col)
+        area_w = self._col_width_px(col, rng)
+        area_h = self._area_height_px(row, rng)
+        plan = plan_image_grid(planned["sizes"], area_w, area_h_px=area_h)
+        items = plan["items"]
+        shrink = 1.0
+        while not images_inside_area(items, area_w, area_h) and shrink > 0.05:
+            shrink -= 0.02                                    # defensive: uniform proportional shrink only
+            items = [(x, y, max(1, int(w * shrink)), max(1, int(h * shrink))) for (x, y, w, h) in plan["items"]]
+        assert_image_inside_area(items, area_w, area_h)      # raises on a genuine layout bug instead of writing it
+        for p, (x, y, w, h) in zip(planned["paths"], items):
             img = XLImage(str(p))
             img.width, img.height = max(1, w), max(1, h)
-            marker = AnchorMarker(col=cell.column - 1, colOff=x * EMU_PER_PX, row=cell.row - 1, rowOff=y * EMU_PER_PX)
-            img.anchor = OneCellAnchor(_from=marker, ext=XDRPositiveSize2D(cx=img.width * EMU_PER_PX,
-                                                                            cy=img.height * EMU_PER_PX))
+            marker = AnchorMarker(col=cell.column - 1, colOff=px_to_emu(x), row=cell.row - 1, rowOff=px_to_emu(y))
+            img.anchor = OneCellAnchor(_from=marker, ext=XDRPositiveSize2D(cx=px_to_emu(img.width), cy=px_to_emu(img.height)))
             self.ws.add_image(img)
+            self._placed.append((img, row, field))
         self._dirty = True
-        return float(plan["height_pt"]) + 2
+
+    def place_images(self, row: int, field: str, paths: List[Path]) -> float:
+        """Convenience for a single field: plan -> raise the row height if needed -> fit -> insert.
+        Returns the row height (pt) the pictures required."""
+        planned = self.plan_field_images(row, field, paths)
+        if not planned:
+            return 0.0
+        self._remove_images_in_cell(row, field)
+        need = min(MAX_ROW_HEIGHT_PT, max(self._row_height_pt(row), planned["height_pt"]))
+        self.ws.row_dimensions[row].height = need
+        self.insert_planned_images(row, field, planned)
+        return planned["height_pt"]
+
+    def _write_images_with_row_height(self, row: int, heights: List[float], qpn_png, improvement_jpg,
+                                      want_qpn: bool, want_imp: bool) -> None:
+        """Shared #35 sequence: candidate plans -> final row height -> fit to final rectangle -> anchors."""
+        plans = {}
+        if want_qpn and qpn_png:
+            self._remove_images_in_cell(row, "qpn")
+            plans["qpn"] = self.plan_field_images(row, "qpn", [Path(qpn_png)])
+        if want_imp and improvement_jpg:
+            self._remove_images_in_cell(row, "improvement_image")
+            plans["improvement_image"] = self.plan_field_images(row, "improvement_image", _as_paths(improvement_jpg))
+        heights.extend(pl["height_pt"] for pl in plans.values() if pl)
+        self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
+        for field, pl in plans.items():
+            self.insert_planned_images(row, field, pl)
+        self._dirty = True
+
+    def image_bounds_report(self, row: Optional[int] = None) -> List[str]:
+        """#39/#42: compare every picture placed by this writer with its destination rectangle as the workbook
+        stands now (row heights converted back to pixels).  Returns human-readable violations (empty = OK)."""
+        problems: List[str] = []
+        by_cell: Dict[Tuple[int, str], List[Tuple[int, int, int, int]]] = {}
+        for img, r, field in self._placed:
+            if row is not None and r != row:
+                continue
+            if img not in getattr(self.ws, "_images", []):
+                continue
+            a = img.anchor
+            by_cell.setdefault((r, field), []).append((emu_to_px(a._from.colOff), emu_to_px(a._from.rowOff),
+                                                       emu_to_px(a.ext.cx), emu_to_px(a.ext.cy)))
+        for (r, field), items in by_cell.items():
+            col = self.columns[field]
+            _, rng = self._anchor(r, col)
+            try:
+                assert_image_inside_area(items, self._col_width_px(col, rng), self._area_height_px(r, rng))
+            except ValueError as e:
+                problems.append(f"row {r} {field}: {e}")
+        return problems
 
     def _text_height_pt(self, row: int, field: str, text: str) -> float:
         if field not in self.columns or not text:
@@ -643,14 +814,7 @@ class ExcelWriter:
         heights.append(self._text_height_pt(row, "improvement", rec.improvement))
         heights.append(self._text_height_pt(row, "root_cause", rec.root_cause))
         heights.append(self._text_height_pt(row, "defect_content", rec.defect_content))
-        if qpn_png:
-            self._remove_images_in_cell(row, "qpn")
-            heights.append(self.place_images(row, "qpn", [Path(qpn_png)]))
-        if improvement_jpg:
-            self._remove_images_in_cell(row, "improvement_image")
-            heights.append(self.place_images(row, "improvement_image", _as_paths(improvement_jpg)))
-        self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
-        self._dirty = True
+        self._write_images_with_row_height(row, heights, qpn_png, improvement_jpg, want_qpn=True, want_imp=True)
 
     def _write_vendor_and_date(self, row: int, rec, overwrite_blank_only: bool) -> List[str]:
         """Vendor / Ngày phát sinh: fill when blank, keep when equal, never overwrite a different value."""
@@ -778,12 +942,8 @@ class ExcelWriter:
                 if val:
                     self._set_cell(row, f, val)
                     heights.append(self._text_height_pt(row, f, val))
-        if "qpn" in missing and qpn_png:
-            heights.append(self.place_images(row, "qpn", [Path(qpn_png)]))
-        if "improvement_image" in missing and improvement_jpg:
-            heights.append(self.place_images(row, "improvement_image", _as_paths(improvement_jpg)))
-        self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
-        self._dirty = True
+        self._write_images_with_row_height(row, heights, qpn_png, improvement_jpg,
+                                           want_qpn="qpn" in missing, want_imp="improvement_image" in missing)
         return notes
 
     def _refresh_images(self) -> None:
@@ -816,6 +976,9 @@ class ExcelWriter:
         if self.probe:
             raise TemplateError("Workbook mở ở chế độ quét (probe) – không ghi")
         tmp = self.output.with_name(self.output.stem + ".saving.xlsx")
+        problems = self.image_bounds_report()
+        if problems:                                   # never persist an overflowing picture (#39)
+            raise TemplateError("Ảnh vượt ra ngoài ô đích: " + "; ".join(problems))
         self._refresh_images()
         self.wb.save(tmp)
         shutil.move(str(tmp), str(self.output))
