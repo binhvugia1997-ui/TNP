@@ -83,7 +83,7 @@ def test_excel_row_insertion_rules(template, tmp_path):
 def test_images_embedded_and_scaled(template, tmp_path, a185_report):
     r = parse_pptx(a185_report)
     qpn, backend = render_qpn(r, 2, tmp_path / "qpn.png", SlideRenderer(prefer=("builtin",)))
-    assert backend == "builtin" and Image.open(qpn).width == 1920
+    assert backend == "builtin" and 1500 <= Image.open(qpn).width <= 1920    # white slide margins trimmed
     imp, _ = build_improvement_image(r, [5, 6], tmp_path / "imp.jpg", SlideRenderer(prefer=("builtin",)))
     with Image.open(imp) as im:
         assert im.height > im.width          # vertically combined
@@ -159,7 +159,7 @@ def test_batch_continues_after_failed_report(sample_tree, tmp_path):
     assert res["meta"]["summary"]["failed"] == 1
     # assets
     assert (out.parent / "assets" / "0001_QPN.png").exists()
-    assert (out.parent / "assets" / "0001_IMPROVEMENT.jpg").exists()
+    assert list((out.parent / "assets" / "0001_IMPROVEMENT_pics").glob("after*.png"))   # independent After pictures
     ws = load_workbook(out)["Kiểm chứng"]
     assert ws.cell(row=4, column=5).value == "A185" and ws.cell(row=5, column=5).value == "A175"
     assert ws.cell(row=6, column=5).value is None

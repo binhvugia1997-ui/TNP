@@ -152,3 +152,35 @@ def build_after_pictures_image(report: ReportData, refs: Sequence["PictureRef"],
     target_jpg.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(target_jpg, "JPEG", quality=90, optimize=True)
     return target_jpg, problems
+
+
+def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_dir: Path
+                          ) -> Tuple[List[Path], List[str]]:
+    """Save every selected "Sau cải tiến" picture as its OWN PNG (source order) – each becomes an
+    independent Excel image object.  Returns (paths, problems for 'Cần kiểm tra')."""
+    problems: List[str] = []
+    paths: List[Path] = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, ref in enumerate(refs, start=1):
+        blob = ref.block.image_blob
+        ext = (ref.block.image_ext or "").lower()
+        if not blob:
+            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không đọc được dữ liệu – cần bổ sung thủ công")
+            continue
+        if ext in ("emf", "wmf"):
+            (out_dir / f"after{i:02d}_slide{ref.slide:02d}.{ext}").write_bytes(blob)
+            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} ở định dạng {ext.upper()} không chèn được – "
+                            f"cần bổ sung thủ công")
+            continue
+        try:
+            im = Image.open(BytesIO(blob))
+            im.load()
+            im = im.convert("RGB")
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không giải mã được ({type(e).__name__}) – "
+                            f"cần bổ sung thủ công")
+            continue
+        target = out_dir / f"after{i:02d}_slide{ref.slide:02d}.png"
+        im.save(target, "PNG", optimize=True)
+        paths.append(target)
+    return paths, problems

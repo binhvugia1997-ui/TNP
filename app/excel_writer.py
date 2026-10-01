@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as XLImage
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.styles import Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
@@ -84,8 +86,86 @@ WEEK_RE = re.compile(r"^(?:week|wk|w|tuan|t)?\s*\+?\s*([1-8])\s*(?:w|wk|week|tua
 WEEK_PARENT_KEYS = ("kiem chung", "theo doi", "week", "tuan", "verification", "xac nhan", "follow up",
                     "followup", "hieu qua", "monitoring", "giam sat")
 
-MAX_ROW_HEIGHT_PT = 409.0
+MAX_ROW_HEIGHT_PT = 409.0          # hard Excel limit for a row
 EXCEL_DEFAULT_COL_WIDTH = 8.43
+# ---- image layout (all derived from the real column widths of the workbook, never from a screenshot) ----
+IMAGE_MARGIN_PX = 4                # left/right/top/bottom margin inside the destination area
+IMAGE_GAP_PX = 6                   # gap between two independent images
+MAX_IMAGE_HEIGHT_PT = 300.0        # one width-fitted picture is never taller than this (readable, < Excel row cap)
+MAX_IMAGE_COLUMNS = 3              # grid fallback when stacking would exceed the Excel row limit
+PX_PER_PT = 4.0 / 3.0
+EMU_PER_PX = 9525
+
+
+def col_width_to_px(width_chars: float) -> int:
+    """Excel column width (characters of the default font) -> pixels (Calibri 11: 7 px per char + 5 px padding)."""
+    w = float(width_chars or EXCEL_DEFAULT_COL_WIDTH)
+    return int(round(w * 7 + 5))
+
+
+def plan_image_grid(sizes: List[Tuple[int, int]], area_px: int, max_row_pt: float = MAX_ROW_HEIGHT_PT,
+                    max_image_pt: float = MAX_IMAGE_HEIGHT_PT, margin_px: int = IMAGE_MARGIN_PX,
+                    gap_px: int = IMAGE_GAP_PX, max_columns: int = MAX_IMAGE_COLUMNS) -> Dict[str, Any]:
+    """Deterministic layout of independent pictures inside one destination area.
+
+    Every picture is scaled to the FULL usable slot width (aspect ratio preserved, height follows).
+    Preferred = one column (pictures stacked, source order).  Because an Excel row cannot exceed
+    ``max_row_pt`` (409 pt), a layout that would not fit is scaled down uniformly; among 1..max_columns
+    columns the plan giving the LARGEST displayed picture width wins (ties -> fewer columns), so five
+    pictures are never squeezed into thumbnails when a 2-column grid shows them bigger.
+    Returns {"columns", "scale", "slot_px", "items": [(x_px, y_px, w_px, h_px)], "height_pt"}.
+    """
+    n = len(sizes)
+    if n == 0 or area_px <= 0:
+        return {"columns": 1, "scale": 1.0, "slot_px": 0, "items": [], "height_pt": 0.0}
+    usable = max(20, area_px - 2 * margin_px)
+    budget_px = (max_row_pt * PX_PER_PT) - 2 * margin_px
+    best = None
+    for cols in range(1, min(max_columns, n) + 1):
+        slot = (usable - gap_px * (cols - 1)) / cols
+        # per picture: width = slot, height from aspect ratio, capped at MAX_IMAGE_HEIGHT_PT (aspect kept)
+        dims = []
+        for (w, h) in sizes:
+            ww = slot
+            hh = slot * h / max(1, w)
+            cap = max_image_pt * PX_PER_PT
+            if hh > cap:
+                ww, hh = cap * w / max(1, h), cap
+            dims.append((ww, hh))
+        rows = [dims[i:i + cols] for i in range(0, n, cols)]
+        row_h = [max(d[1] for d in r) for r in rows]
+        total = sum(row_h) + gap_px * (len(rows) - 1)
+        scale = min(1.0, budget_px / total) if total > 0 else 1.0
+        eff_w = min(d[0] for d in dims) * scale
+        key = (round(eff_w, 1), -cols)
+        if best is None or key > best[0]:
+            best = (key, cols, scale, slot, dims, rows, row_h)
+    _, cols, scale, slot, dims, rows, row_h = best
+    items: List[Tuple[int, int, int, int]] = []
+    y = margin_px
+    i = 0
+    for r_idx, r in enumerate(rows):
+        rh = row_h[r_idx] * scale
+        for c_idx, (ww, hh) in enumerate(r):
+            w_px, h_px = int(round(ww * scale)), int(round(hh * scale))
+            slot_x = margin_px + c_idx * (slot * scale if scale < 1 else slot) + c_idx * gap_px
+            slot_w = slot * scale if scale < 1 else slot
+            x_px = int(round(slot_x + (slot_w - w_px) / 2))          # centre inside the slot
+            items.append((x_px, int(round(y)), w_px, h_px))
+            i += 1
+        y += rh + gap_px
+    height_px = y - gap_px + margin_px
+    return {"columns": cols, "scale": scale, "slot_px": int(slot * scale), "items": items,
+            "height_pt": min(max_row_pt, height_px / PX_PER_PT)}
+
+
+def _as_paths(value) -> List[Path]:
+    """One path or a list of paths -> list (independent pictures stay independent)."""
+    if not value:
+        return []
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    return [Path(v) for v in value if v]
 
 
 def week_index(cell_key: str) -> Optional[int]:
@@ -383,8 +463,8 @@ class ExcelWriter:
         total = 0.0
         for c in cols:
             w = self.ws.column_dimensions[get_column_letter(c)].width or EXCEL_DEFAULT_COL_WIDTH
-            total += w
-        return int(total * 7 + 5)
+            total += col_width_to_px(w)
+        return int(total)
 
     def _set_cell(self, row: int, field: str, value: Any, wrap: bool = True) -> Optional[Any]:
         if field not in self.columns:
@@ -413,6 +493,37 @@ class ExcelWriter:
         img.anchor = f"{get_column_letter(cell.column)}{cell.row}"
         self.ws.add_image(img)
         return img.height * 0.75 + 6
+
+    def image_area_px(self, row: int, field: str) -> int:
+        """Pixel width of the destination image area (merged span included)."""
+        if field not in self.columns:
+            return 0
+        col = self.columns[field]
+        _, rng = self._anchor(row, col)
+        return self._col_width_px(col, rng)
+
+    def place_images(self, row: int, field: str, paths: List[Path]) -> float:
+        """Insert INDEPENDENT pictures into the field's area, each fitted to its slot width (aspect kept),
+        stacked/gridded deterministically (``plan_image_grid``).  Returns the required row height (pt)."""
+        paths = [Path(p) for p in (paths or []) if p and Path(p).exists()]
+        if field not in self.columns or not paths:
+            return 0.0
+        col = self.columns[field]
+        cell, _ = self._anchor(row, col)
+        sizes = []
+        for p in paths:
+            with PILImage.open(p) as im:
+                sizes.append(im.size)
+        plan = plan_image_grid(sizes, self.image_area_px(row, field))
+        for p, (x, y, w, h) in zip(paths, plan["items"]):
+            img = XLImage(str(p))
+            img.width, img.height = max(1, w), max(1, h)
+            marker = AnchorMarker(col=cell.column - 1, colOff=x * EMU_PER_PX, row=cell.row - 1, rowOff=y * EMU_PER_PX)
+            img.anchor = OneCellAnchor(_from=marker, ext=XDRPositiveSize2D(cx=img.width * EMU_PER_PX,
+                                                                            cy=img.height * EMU_PER_PX))
+            self.ws.add_image(img)
+        self._dirty = True
+        return float(plan["height_pt"]) + 2
 
     def _text_height_pt(self, row: int, field: str, text: str) -> float:
         if field not in self.columns or not text:
@@ -528,7 +639,7 @@ class ExcelWriter:
     # ------------------------------------------------------------------
     # Writing
     # ------------------------------------------------------------------
-    def _write_content(self, row: int, rec, qpn_png: Optional[Path], improvement_jpg: Optional[Path],
+    def _write_content(self, row: int, rec, qpn_png: Optional[Path], improvement_jpg,
                        fill_temporary: bool) -> None:
         """Report content shared by append/update: model, item, defect, cause, improvement, images."""
         self._set_cell(row, "model", rec.model)
@@ -545,10 +656,10 @@ class ExcelWriter:
         heights.append(self._text_height_pt(row, "defect_content", rec.defect_content))
         if qpn_png:
             self._remove_images_in_cell(row, "qpn")
-            heights.append(self._embed_image(row, "qpn", Path(qpn_png)))
+            heights.append(self.place_images(row, "qpn", [Path(qpn_png)]))
         if improvement_jpg:
             self._remove_images_in_cell(row, "improvement_image")
-            heights.append(self._embed_image(row, "improvement_image", Path(improvement_jpg)))
+            heights.append(self.place_images(row, "improvement_image", _as_paths(improvement_jpg)))
         self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
         self._dirty = True
 
@@ -637,7 +748,7 @@ class ExcelWriter:
         self._dirty = True
 
     def fill_missing_fields(self, row: int, rec, missing: List[str], qpn_png: Optional[Path] = None,
-                            improvement_jpg: Optional[Path] = None) -> List[str]:
+                            improvement_jpg=None) -> List[str]:
         """Partial update of an EXISTING row: write ONLY the fields listed in ``missing``.
 
         Populated cells are preserved even when the report holds another value (Vendor / Ngày phát sinh keep
@@ -652,9 +763,9 @@ class ExcelWriter:
                     self._set_cell(row, f, val)
                     heights.append(self._text_height_pt(row, f, val))
         if "qpn" in missing and qpn_png:
-            heights.append(self._embed_image(row, "qpn", Path(qpn_png)))
+            heights.append(self.place_images(row, "qpn", [Path(qpn_png)]))
         if "improvement_image" in missing and improvement_jpg:
-            heights.append(self._embed_image(row, "improvement_image", Path(improvement_jpg)))
+            heights.append(self.place_images(row, "improvement_image", _as_paths(improvement_jpg)))
         self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
         self._dirty = True
         return notes

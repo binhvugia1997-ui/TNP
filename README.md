@@ -180,3 +180,18 @@ tests/                 40 pytest tests
   image can be enlarged in Excel.
 * openpyxl preserves formatting, formulas, merges, widths and existing images;
   charts/VBA in the template are not preserved (use a plain `.xlsx` template).
+
+## Kích thước ảnh trong Excel (QPN & Hình ảnh cải tiến)
+
+* Mỗi ảnh **Sau cải tiến** hợp lệ là **một đối tượng ảnh riêng** trong Excel (không ghép), theo thứ tự xuất hiện trong báo cáo;
+  file nguồn lưu tại `Output/assets/<prefix>_IMPROVEMENT_pics/afterNN_slideSS.png`.
+* Bề rộng hiển thị = bề rộng vùng đích thực tế (độ rộng cột / vùng merge, quy đổi `px = width*7 + 5`) trừ lề 4 px mỗi bên;
+  chiều cao theo đúng tỉ lệ gốc – không méo, không cắt. Ảnh nguồn nhỏ/hẹp vẫn được phóng vừa bề rộng.
+* Giới hạn chiều cao tập trung: `MAX_IMAGE_HEIGHT_PT = 300` (app/excel_writer.py). Ảnh quá cao được thu nhỏ đồng tỉ lệ.
+* Nhiều ảnh: xếp **một cột** (ảnh sau nằm dưới ảnh trước, cách 6 px). Vì Excel giới hạn chiều cao dòng 409 pt, nếu xếp một cột
+  không đủ, hệ thống thu nhỏ đồng tỉ lệ hoặc chuyển sang lưới 2–3 cột – chọn phương án cho **bề rộng ảnh lớn nhất**
+  (ưu tiên dễ đọc hơn dòng thấp). Không bao giờ có 5 ảnh thumbnail nằm ngang.
+* Chiều cao dòng được nâng theo nhu cầu, **không bao giờ giảm** chiều cao đã có, không đụng dòng khác.
+* QPN: ảnh slide được cắt bỏ viền trắng đồng nhất (`trim_white_margins`) rồi vừa bề rộng cột QPN; hình học độc lập với cột Hình ảnh cải tiến.
+* Chạy lại: dòng đã đủ ảnh → `Bỏ qua — đã cập nhật`, ảnh giữ nguyên (không nhân đôi, không phóng to dần, không đổi chiều cao dòng).
+* Thay đổi độ rộng cột trong template → kích thước ảnh tự thích ứng ở lần chạy sau (không có pixel cứng).

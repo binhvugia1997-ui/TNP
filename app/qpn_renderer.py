@@ -337,11 +337,31 @@ class SlideRenderer:
 
 def render_qpn(report: ReportData, qpn_slide: int, target_png: Path,
                renderer: Optional[SlideRenderer] = None) -> Tuple[Path, str]:
-    """Render the COMPLETE QPN slide to ``target_png``; returns (path, backend)."""
+    """Render the COMPLETE QPN slide to ``target_png`` (uniform white margins trimmed so the QPN content
+    fills the Excel area instead of slide whitespace); returns (path, backend)."""
     renderer = renderer or SlideRenderer()
     with tempfile.TemporaryDirectory(prefix="re_qpn_") as tmp:
         res = renderer.render(report, [qpn_slide], Path(tmp))
         src = res[qpn_slide]
         target_png.parent.mkdir(parents=True, exist_ok=True)
-        Image.open(src).convert("RGB").save(target_png, "PNG", optimize=True)
+        trim_white_margins(Image.open(src).convert("RGB")).save(target_png, "PNG", optimize=True)
     return target_png, renderer.last_backend
+
+
+def trim_white_margins(im: "Image.Image", threshold: int = 245, pad: int = 8) -> "Image.Image":
+    """Crop uniform (near-)white borders around the content; keeps a small padding, never crops content."""
+    try:
+        from PIL import ImageChops, ImageOps
+        gray = ImageOps.grayscale(im)
+        mask = gray.point(lambda v: 255 if v < threshold else 0)
+        bbox = mask.getbbox()
+        if not bbox:
+            return im
+        l, t, r, b = bbox
+        l, t = max(0, l - pad), max(0, t - pad)
+        r, b = min(im.width, r + pad), min(im.height, b + pad)
+        if (r - l) < im.width * 0.2 or (b - t) < im.height * 0.2:
+            return im
+        return im.crop((l, t, r, b))
+    except Exception:  # noqa: BLE001
+        return im

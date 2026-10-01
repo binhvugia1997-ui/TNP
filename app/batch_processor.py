@@ -20,7 +20,7 @@ from .extractor import extract_record
 from .history import History, fingerprint
 from .extractor import management_number_from_filename
 from .excel_writer import MANAGED_FIELDS
-from .image_extractor import build_after_pictures_image
+from .image_extractor import export_after_pictures
 from .logger import BatchResultLog, FileResult, setup_logging
 from .ollama_client import OllamaClient
 from .pptx_parser import parse_pptx
@@ -290,15 +290,14 @@ class BatchProcessor:
                     rec.review_reasons.append(f"Không render được QPN: {e}")
 
             # --- 5. improvement images: ONLY "Sau cải tiến" pictures -----------
-            imp_jpg: Optional[Path] = None
+            imp_jpg: List[Path] = []           # one PNG per After picture -> independent Excel images
             fr.after_pictures = [r.label for r in rec.after_pictures]
             fr.picture_notes = list(rec.picture_notes)
             if rec.after_pictures:
                 self.on_file(idx, "extracting_images", f"{len(rec.after_pictures)} ảnh Sau cải tiến")
                 try:
-                    imp_jpg, problems = build_after_pictures_image(
-                        report, rec.after_pictures, assets / f"{prefix}_IMPROVEMENT.jpg",
-                        pictures_dir=assets / f"{prefix}_IMPROVEMENT_pics")
+                    imp_jpg, problems = export_after_pictures(report, rec.after_pictures,
+                                                              assets / f"{prefix}_IMPROVEMENT_pics")
                     rec.review_reasons.extend(problems)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("%s: improvement image failed: %s", path.name, e)
