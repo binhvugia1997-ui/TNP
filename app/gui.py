@@ -24,6 +24,8 @@ from .diagnostics import format_diagnostics, run_diagnostics
 from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, SCAN_FILTERS_VI, GuiController,
                              default_output_path)
 
+SCAN_TREE_ROWS = 12      # visible rows of "Danh sách file"; more rows scroll inside the table (rule #66)
+RESULT_TREE_ROWS = 10    # visible rows of "Kết quả xử lý" (rule #69)
 SCAN_COLUMNS = (("stt", "STT", 45), ("mgmt", "Management Number", 150), ("date", "Ngày phát sinh", 100),
                 ("file", "Tên file", 320), ("vendor", "Vendor", 90), ("scan", "Trạng thái quét", 220),
                 ("path", "Đường dẫn", 260))
@@ -88,9 +90,23 @@ class ReportExtractorApp:
         self.tab_cfg = ttk.Frame(self.nb)
         self.nb.add(self.tab_run, text="Xử lý báo cáo")
         self.nb.add(self.tab_cfg, text="Cấu hình & Ollama")
-        r = self.tab_run
+        # ---- whole-page vertical scroll layer for tab 1 (rule #70): sections scroll, tables scroll internally
+        self.page_canvas = tk.Canvas(self.tab_run, highlightthickness=0, borderwidth=0)
+        self.page_vsb = ttk.Scrollbar(self.tab_run, orient="vertical", command=self.page_canvas.yview)
+        self.page_canvas.configure(yscrollcommand=self.page_vsb.set)
+        self.page_vsb.pack(side="right", fill="y")
+        self.page_canvas.pack(side="left", fill="both", expand=True)
+        self.page = ttk.Frame(self.page_canvas)
+        self._page_win = self.page_canvas.create_window((0, 0), window=self.page, anchor="nw")
+        self.page.bind("<Configure>", self._on_page_configure)
+        self.page_canvas.bind("<Configure>", self._on_canvas_configure)
+        self.page_canvas.bind_all("<MouseWheel>", self._on_page_wheel, add="+")
+        self.page_canvas.bind_all("<Button-4>", self._on_page_wheel, add="+")
+        self.page_canvas.bind_all("<Button-5>", self._on_page_wheel, add="+")
+        r = self.page
 
-        f = ttk.LabelFrame(r, text="Cấu hình")
+        # ---- 1. Nguồn dữ liệu ------------------------------------------------------------------------
+        f = ttk.LabelFrame(r, text="1. Nguồn dữ liệu")
         f.pack(fill="x", padx=10, pady=4)
         f.columnconfigure(1, weight=1)
 
@@ -98,12 +114,8 @@ class ReportExtractorApp:
         self.var_folder = tk.StringVar()
         e1 = ttk.Entry(f, textvariable=self.var_folder)
         e1.grid(row=0, column=1, sticky="ew", **pad)
-        fb = ttk.Frame(f)
-        fb.grid(row=0, column=2, sticky="w")
-        b1 = ttk.Button(fb, text="Chọn thư mục…", command=self.browse_folder)
-        b1.pack(side="left", padx=(8, 2), pady=3)
-        b2 = ttk.Button(fb, text="Quét lại", command=self.scan_reports)
-        b2.pack(side="left", padx=2, pady=3)
+        b1 = ttk.Button(f, text="Chọn thư mục…", command=self.browse_folder)
+        b1.grid(row=0, column=2, sticky="w", **pad)
         self.lbl_found = ttk.Label(f, text="Chưa chọn thư mục")
         self.lbl_found.grid(row=0, column=3, sticky="w", **pad)
 
@@ -122,12 +134,8 @@ class ReportExtractorApp:
         b4.grid(row=2, column=2, sticky="w", **pad)
         ttk.Label(f, text="(không bao giờ ghi đè file Kiểm chứng gốc)").grid(row=2, column=3, sticky="w", **pad)
 
-        self.var_force = tk.BooleanVar(value=False)
-        c1 = ttk.Checkbutton(f, text="Xử lý lại báo cáo đã xử lý (ghi đè các trường tự động)", variable=self.var_force)
-        c1.grid(row=3, column=1, sticky="w", **pad)
-
-        # ---- Thời gian xử lý (lọc theo ngày phát sinh từ Management Number, trước khi mở PPTX) -----
-        tf = ttk.LabelFrame(r, text="Thời gian xử lý")
+        # ---- 2. Thời gian xử lý (lọc theo ngày phát sinh từ Management Number, trước khi mở PPTX) ------
+        tf = ttk.LabelFrame(r, text="2. Thời gian xử lý")
         tf.pack(fill="x", padx=10, pady=4)
         self.var_period_mode = tk.StringVar(value="auto")
         self._period_radios = []
@@ -165,7 +173,118 @@ class ReportExtractorApp:
                     self.var_output, self.var_template):
             var.trace_add("write", lambda *_: self._on_period_changed())
 
-        # ---- Kết nối Ollama -------------------------------------------------------
+        # ---- 3. AI (status only; editable Ollama settings live on tab 2) ------------------------------
+        af = ttk.LabelFrame(r, text="3. AI")
+        af.pack(fill="x", padx=10, pady=4)
+        self.lbl_ai_run = ttk.Label(af, text=self.ctl.ai_status_text())
+        self.lbl_ai_run.pack(side="left", padx=8, pady=3)
+        ttk.Button(af, text="Cấu hình Ollama…", command=lambda: self.nb.select(self.tab_cfg)).pack(side="right", padx=8, pady=3)
+
+        # ---- 4. Các nút chức năng (always above the file list – rules #63–#65) --------------------------
+        xf = ttk.LabelFrame(r, text="4. Các nút chức năng")
+        xf.pack(fill="x", padx=10, pady=4)
+        row_list = ttk.Frame(xf)
+        row_list.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(row_list, text="Danh sách:", width=10).pack(side="left")
+        self.btn_scan = ttk.Button(row_list, text="Quét file", command=self.scan_reports)
+        self.btn_scan.pack(side="left", padx=2)
+        self.btn_rescan = ttk.Button(row_list, text="Quét lại", command=self.scan_reports)
+        self.btn_rescan.pack(side="left", padx=2)
+        self.btn_exclude = ttk.Button(row_list, text="Xóa khỏi danh sách", command=self.exclude_selected)
+        self.btn_exclude.pack(side="left", padx=(12, 2))
+        self.btn_restore = ttk.Button(row_list, text="Khôi phục", command=self.restore_selected)
+        self.btn_restore.pack(side="left", padx=2)
+        ttk.Label(row_list, text="Hiển thị:").pack(side="left", padx=(16, 2))
+        self.var_scan_filter = tk.StringVar(value=SCAN_FILTERS_VI[0])
+        self.cb_scan_filter = ttk.Combobox(row_list, textvariable=self.var_scan_filter, values=list(SCAN_FILTERS_VI),
+                                           state="readonly", width=20)
+        self.cb_scan_filter.pack(side="left")
+        self.cb_scan_filter.bind("<<ComboboxSelected>>", lambda _e: self._render_scan())
+        ttk.Separator(xf, orient="horizontal").pack(fill="x", padx=6, pady=2)
+        row_proc = ttk.Frame(xf)
+        row_proc.pack(fill="x", padx=6, pady=(2, 4))
+        ttk.Label(row_proc, text="Xử lý:", width=10).pack(side="left")
+        self.var_force = tk.BooleanVar(value=False)
+        c1 = ttk.Checkbutton(row_proc, text="Xử lý lại báo cáo đã xử lý (ghi đè các trường tự động)", variable=self.var_force)
+        c1.pack(side="left", padx=2)
+        self.btn_start = ttk.Button(row_proc, text="Bắt đầu xử lý", style="Start.TButton", command=self.start)
+        self.btn_start.pack(side="left", padx=(16, 2))
+        self.btn_stop = ttk.Button(row_proc, text="Dừng sau báo cáo hiện tại", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=2)
+
+        # ---- 5. Thống kê quét ------------------------------------------------------------------------
+        kf = ttk.LabelFrame(r, text="5. Thống kê quét")
+        kf.pack(fill="x", padx=10, pady=4)
+        self.lbl_scan = ttk.Label(kf, text="")
+        self.lbl_scan.pack(anchor="w", padx=8)
+        self.lbl_queue = ttk.Label(kf, text="")
+        self.lbl_queue.pack(anchor="w", padx=8, pady=(0, 3))
+
+        # ---- 6. Danh sách file (own vertical + horizontal scrollbars – rules #66–#68) ----------------
+        sf = ttk.LabelFrame(r, text="6. Danh sách file  (kiểm tra / loại file trước khi xử lý – không xoá file gốc; nháy đúp để xem đường dẫn)")
+        sf.pack(fill="x", padx=10, pady=4)
+        self.scan_tree, _svsb, _shsb = self._make_table(sf, SCAN_COLUMNS, height=SCAN_TREE_ROWS, selectmode="extended",
+                                                      center=("stt", "date"))
+        for tag, color in (("candidate", "#0b57d0"), ("excluded", "#9e9e9e"), ("skip", "#777777")):
+            self.scan_tree.tag_configure(tag, foreground=color)
+        self.scan_tree.bind("<Delete>", lambda _e: self.exclude_selected())
+        self.scan_tree.bind("<Double-1>", self._on_scan_double_click)
+        self.scan_menu = tk.Menu(self.root, tearoff=0)
+        self.scan_menu.add_command(label="Xóa khỏi danh sách xử lý", command=self.exclude_selected)
+        self.scan_menu.add_command(label="Khôi phục", command=self.restore_selected)
+        self.scan_tree.bind("<Button-3>", self._on_scan_right_click)
+        self.scan_items: Dict[str, int] = {}
+
+        # ---- 7. Tiến trình ---------------------------------------------------------------------------
+        pf = ttk.LabelFrame(r, text="7. Tiến trình")
+        pf.pack(fill="x", padx=10, pady=4)
+        top = ttk.Frame(pf)
+        top.pack(fill="x", padx=6)
+        self.lbl_progress = ttk.Label(top, text="Sẵn sàng.", font=("Segoe UI", 10, "bold"))
+        self.lbl_progress.pack(side="left")
+        self.lbl_eta = ttk.Label(top, text="")
+        self.lbl_eta.pack(side="right", padx=(12, 0))
+        self.lbl_elapsed = ttk.Label(top, text="")
+        self.lbl_elapsed.pack(side="right")
+        self.lbl_stage = ttk.Label(pf, text="")
+        self.lbl_stage.pack(anchor="w", padx=6)
+        bar = ttk.Frame(pf)
+        bar.pack(fill="x", padx=6, pady=2)
+        self.pb = ttk.Progressbar(bar, mode="determinate", maximum=100)
+        self.pb.pack(side="left", fill="x", expand=True)
+        self.lbl_percent = ttk.Label(bar, text="0%", width=5, anchor="e")
+        self.lbl_percent.pack(side="left", padx=(6, 0))
+        self.lbl_counts = ttk.Label(pf, text=self.ctl.counts_text())
+        self.lbl_counts.pack(anchor="w", padx=6, pady=(0, 3))
+
+        # ---- 8. Kết quả xử lý (own vertical + horizontal scrollbars – rule #69) ---------------------
+        lf = ttk.LabelFrame(r, text="8. Kết quả xử lý  (nháy đúp để xem chi tiết)" + ("  – có thể kéo thả thư mục/file vào đây" if _DND_OK else ""))
+        lf.pack(fill="x", padx=10, pady=4)
+        self.tree, _vsb, _hsb = self._make_table(lf, COLUMNS, height=RESULT_TREE_ROWS, selectmode="browse",
+                                               center=("stt", "model", "item"))
+        for tag, color in (("completed", "#1a7f37"), ("needs_review", "#b26a00"), ("error", "#c62828"),
+                           ("skipped", "#666666"), ("not_written", "#8e24aa"), ("working", "#0b57d0"),
+                           ("outside_period", "#9e9e9e"), ("source_duplicate", "#9e9e9e"), ("fast_skip", "#666666")):
+            self.tree.tag_configure(tag, foreground=color)
+        self.tree.bind("<Double-1>", self._on_row_double_click)
+        if _DND_OK:
+            for w in (self.tree, lf, r):
+                try:
+                    w.drop_target_register(DND_FILES)
+                    w.dnd_bind("<<Drop>>", self._on_drop)
+                except Exception:
+                    pass
+
+        self.txt_log = tk.Text(r, height=4, wrap="word", state="disabled", font=("Consolas", 9))
+        self.txt_log.pack(fill="x", padx=10, pady=(2, 4))
+
+        bf = ttk.Frame(r)
+        bf.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bf, text="Xem log", command=self.open_log).pack(side="left", padx=2)
+        ttk.Button(bf, text="Mở file kết quả", command=self.open_output_file).pack(side="left", padx=2)
+        ttk.Button(bf, text="Mở thư mục kết quả", command=self.open_output_folder).pack(side="left", padx=2)
+
+        # ---- tab 2: Ollama settings (editable config must stay here) ----------------------------------
         of = ttk.LabelFrame(self.tab_cfg, text="Kết nối Ollama")
         of.pack(fill="x", padx=10, pady=4)
         ttk.Label(of, text="IP / Server:").grid(row=0, column=0, sticky="w", **pad)
@@ -192,115 +311,63 @@ class ReportExtractorApp:
         self.lbl_ai.grid(row=1, column=5, columnspan=4, sticky="w", **pad)
         for var in (self.var_host, self.var_port, self.var_model):
             var.trace_add("write", lambda *_: self._on_endpoint_edited())
-        self._config_widgets = [e1, e2, e3, e4, e5, b1, b2, b3, b4, b5, b6, b7, self.cb_model, c1,
-                                self.sb_month, self.sb_year, self.e_from, self.e_to, *self._period_radios]
-
-        # ---- Danh sách file đã quét (review before Start) + Kết quả share the space -----------------
-        self.lbl_ai_run = ttk.Label(r, text=self.ctl.ai_status_text())
-        self.lbl_ai_run.pack(anchor="w", padx=14)
-        paned = ttk.PanedWindow(r, orient="vertical")
-        paned.pack(fill="both", expand=True, padx=10, pady=4)
-        sf = ttk.LabelFrame(paned, text="Danh sách file đã quét  (kiểm tra / loại file trước khi xử lý – không xoá file gốc)")
-        paned.add(sf, weight=3)
-        sbar = ttk.Frame(sf)
-        sbar.pack(fill="x", padx=6, pady=(4, 0))
-        self.btn_rescan = ttk.Button(sbar, text="Quét lại", command=self.scan_reports)
-        self.btn_rescan.pack(side="left", padx=2)
-        self.btn_exclude = ttk.Button(sbar, text="Xóa khỏi danh sách", command=self.exclude_selected)
-        self.btn_exclude.pack(side="left", padx=2)
-        self.btn_restore = ttk.Button(sbar, text="Khôi phục", command=self.restore_selected)
-        self.btn_restore.pack(side="left", padx=2)
-        ttk.Label(sbar, text="Hiển thị:").pack(side="left", padx=(12, 2))
-        self.var_scan_filter = tk.StringVar(value=SCAN_FILTERS_VI[0])
-        self.cb_scan_filter = ttk.Combobox(sbar, textvariable=self.var_scan_filter, values=list(SCAN_FILTERS_VI),
-                                           state="readonly", width=20)
-        self.cb_scan_filter.pack(side="left")
-        self.cb_scan_filter.bind("<<ComboboxSelected>>", lambda _e: self._render_scan())
-        self.lbl_scan = ttk.Label(sbar, text="")
-        self.lbl_scan.pack(side="left", padx=(12, 0))
-        self.lbl_queue = ttk.Label(sf, text="")
-        self.lbl_queue.pack(anchor="w", padx=8)
-        self.scan_tree = ttk.Treeview(sf, columns=[c[0] for c in SCAN_COLUMNS], show="headings", selectmode="extended",
-                                      height=8)
-        for key, title, width in SCAN_COLUMNS:
-            self.scan_tree.heading(key, text=title)
-            self.scan_tree.column(key, width=width, anchor="center" if key in ("stt", "date") else "w",
-                                  stretch=key in ("file", "path"))
-        svsb = ttk.Scrollbar(sf, orient="vertical", command=self.scan_tree.yview)
-        self.scan_tree.configure(yscrollcommand=svsb.set)
-        self.scan_tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        svsb.pack(side="left", fill="y", pady=6)
-        for tag, color in (("candidate", "#0b57d0"), ("excluded", "#9e9e9e"), ("skip", "#777777")):
-            self.scan_tree.tag_configure(tag, foreground=color)
-        self.scan_tree.bind("<Delete>", lambda _e: self.exclude_selected())
-        self.scan_tree.bind("<Double-1>", self._on_scan_double_click)
-        self.scan_menu = tk.Menu(self.root, tearoff=0)
-        self.scan_menu.add_command(label="Xóa khỏi danh sách xử lý", command=self.exclude_selected)
-        self.scan_menu.add_command(label="Khôi phục", command=self.restore_selected)
-        self.scan_tree.bind("<Button-3>", self._on_scan_right_click)
-        self.scan_items: Dict[str, int] = {}
-        self._config_widgets.extend([self.btn_rescan, self.btn_exclude, self.btn_restore, self.cb_scan_filter])
-
-        lf = ttk.LabelFrame(paned, text="Kết quả từng báo cáo  (nháy đúp để xem chi tiết)" + ("  – có thể kéo thả thư mục/file vào đây" if _DND_OK else ""))
-        paned.add(lf, weight=2)
-        self.tree = ttk.Treeview(lf, columns=[c[0] for c in COLUMNS], show="headings", selectmode="browse")
-        for key, title, width in COLUMNS:
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor="center" if key in ("stt", "model", "item") else "w",
-                             stretch=key in ("file", "note"))
-        vsb = ttk.Scrollbar(lf, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        vsb.pack(side="left", fill="y", pady=6)
-        for tag, color in (("completed", "#1a7f37"), ("needs_review", "#b26a00"), ("error", "#c62828"),
-                           ("skipped", "#666666"), ("not_written", "#8e24aa"), ("working", "#0b57d0"),
-                           ("outside_period", "#9e9e9e"), ("source_duplicate", "#9e9e9e"), ("fast_skip", "#666666")):
-            self.tree.tag_configure(tag, foreground=color)
-        self.tree.bind("<Double-1>", self._on_row_double_click)
-        if _DND_OK:
-            for w in (self.tree, lf, r):
-                try:
-                    w.drop_target_register(DND_FILES)
-                    w.dnd_bind("<<Drop>>", self._on_drop)
-                except Exception:
-                    pass
-
-        pf = ttk.Frame(r)
-        pf.pack(fill="x", padx=10, pady=2)
-        top = ttk.Frame(pf)
-        top.pack(fill="x")
-        self.lbl_progress = ttk.Label(top, text="Sẵn sàng.", font=("Segoe UI", 10, "bold"))
-        self.lbl_progress.pack(side="left")
-        self.lbl_eta = ttk.Label(top, text="")
-        self.lbl_eta.pack(side="right", padx=(12, 0))
-        self.lbl_elapsed = ttk.Label(top, text="")
-        self.lbl_elapsed.pack(side="right")
-        self.lbl_stage = ttk.Label(pf, text="")
-        self.lbl_stage.pack(anchor="w")
-        bar = ttk.Frame(pf)
-        bar.pack(fill="x", pady=2)
-        self.pb = ttk.Progressbar(bar, mode="determinate", maximum=100)
-        self.pb.pack(side="left", fill="x", expand=True)
-        self.lbl_percent = ttk.Label(bar, text="0%", width=5, anchor="e")
-        self.lbl_percent.pack(side="left", padx=(6, 0))
-        self.lbl_counts = ttk.Label(pf, text=self.ctl.counts_text())
-        self.lbl_counts.pack(anchor="w")
-
-        self.txt_log = tk.Text(r, height=4, wrap="word", state="disabled", font=("Consolas", 9))
-        self.txt_log.pack(fill="x", padx=10, pady=(2, 4))
-
-        bf = ttk.Frame(r)
-        bf.pack(fill="x", padx=10, pady=(0, 10))
         cf = ttk.Frame(self.tab_cfg)
         cf.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(cf, text="Chẩn đoán hệ thống", command=self.show_system_diagnostics).pack(side="left", padx=2)
-        ttk.Button(bf, text="Xem log", command=self.open_log).pack(side="left", padx=2)
-        ttk.Button(bf, text="Mở file kết quả", command=self.open_output_file).pack(side="left", padx=2)
-        ttk.Button(bf, text="Mở thư mục kết quả", command=self.open_output_folder).pack(side="left", padx=2)
-        self.btn_start = ttk.Button(bf, text="Bắt đầu xử lý", style="Start.TButton", command=self.start)
-        self.btn_start.pack(side="right", padx=2)
-        self.btn_stop = ttk.Button(bf, text="Dừng sau báo cáo hiện tại", command=self.stop, state="disabled")
-        self.btn_stop.pack(side="right", padx=2)
+
+        self._config_widgets = [e1, e2, e3, e4, e5, b1, b3, b4, b5, b6, b7, self.cb_model, c1,
+                                self.sb_month, self.sb_year, self.e_from, self.e_to, *self._period_radios,
+                                self.btn_scan, self.btn_rescan, self.btn_exclude, self.btn_restore, self.cb_scan_filter]
+
+    # ------------------------------------------------------------------ scroll helpers (layout only)
+    @staticmethod
+    def _make_table(parent, columns, *, height: int, selectmode: str, center=()):
+        """Treeview with its OWN vertical + horizontal scrollbars (grid: tree / vsb / hsb).
+
+        Columns do not stretch, so long file names / paths scroll horizontally instead of being squeezed.
+        """
+        tree = ttk.Treeview(parent, columns=[c[0] for c in columns], show="headings", selectmode=selectmode, height=height)
+        for key, title, width in columns:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=min(width, 60), anchor="center" if key in center else "w", stretch=False)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(6, 0))
+        vsb.grid(row=0, column=1, sticky="ns", pady=(6, 0))
+        hsb.grid(row=1, column=0, sticky="ew", padx=(6, 0), pady=(0, 6))
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        return tree, vsb, hsb
+
+    def _on_page_configure(self, _event=None) -> None:
+        bbox = self.page_canvas.bbox("all")
+        if bbox:
+            self.page_canvas.configure(scrollregion=bbox)
+
+    def _on_canvas_configure(self, event) -> None:
+        # inner frame always as wide as the canvas -> sections stretch horizontally, only vertical page scroll
+        try:
+            self.page_canvas.itemconfigure(self._page_win, width=event.width)
+        except tk.TclError:
+            pass
+
+    def _on_page_wheel(self, event) -> None:
+        """Page scroll only when the pointer is NOT over a table/log (those scroll themselves)."""
+        try:
+            w = event.widget if not isinstance(event.widget, str) else self.root.nametowidget(event.widget)
+        except Exception:  # noqa: BLE001
+            return
+        while w is not None:
+            if isinstance(w, (ttk.Treeview, tk.Text, ttk.Combobox, ttk.Spinbox)):
+                return
+            if w is self.tab_cfg:
+                return
+            w = getattr(w, "master", None)
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            self.page_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            self.page_canvas.yview_scroll(1, "units")
 
     # ------------------------------------------------------------------ controller <-> widgets
     def _load_from_controller(self) -> None:

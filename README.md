@@ -255,6 +255,13 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 * Đổi thư mục / file Excel / tháng / khoảng / Tất cả / Xử lý lại → danh sách thành cũ: `Danh sách file đã thay đổi điều kiện.
   Vui lòng quét lại.` và không thể Bắt đầu. `Quét lại` xoá các loại thủ công và tính lại (kể cả file trùng chuẩn).
   Khi đang xử lý, các nút loại/khôi phục bị khoá (dùng `Dừng sau báo cáo hiện tại`).
+* **Bố cục tab `Xử lý báo cáo`** (từ trên xuống): 1. Nguồn dữ liệu → 2. Thời gian xử lý → 3. AI (trạng thái + nút
+  `Cấu hình Ollama…` mở tab 2) → 4. Các nút chức năng (`Danh sách: Quét file · Quét lại · Xóa khỏi danh sách · Khôi phục · Hiển thị`
+  / `Xử lý: [ ] Xử lý lại · Bắt đầu xử lý · Dừng sau báo cáo hiện tại`) → 5. Thống kê quét → 6. Danh sách file →
+  7. Tiến trình → 8. Kết quả xử lý. Mọi nút thao tác nằm **phía trên** danh sách file.
+  Ba lớp cuộn riêng: thanh cuộn dọc của cả tab (cuộn giữa các mục); bảng `Danh sách file` và bảng `Kết quả xử lý`
+  mỗi bảng có thanh cuộn dọc + ngang riêng, số dòng hiển thị cố định (12 / 10) nên hàng nghìn file không làm cửa sổ cao lên;
+  cột `Tên file`, `Đường dẫn` giữ độ rộng đọc được và xem bằng cuộn ngang. Con lăn chuột trên bảng cuộn bảng, ngoài bảng cuộn trang.
 
 ## Cài đặt từ source trên Windows
 

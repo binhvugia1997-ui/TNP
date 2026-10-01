@@ -293,11 +293,11 @@ def test_gui_view_builds_with_mocked_tkinter(monkeypatch, sample_tree, tmp_path)
         def set(self, v): self.v = v
         def get(self): return self.v
     tkmod = types.ModuleType("tkinter")
-    for n in ("Tk", "Text", "Toplevel", "Menu", "StringVar", "BooleanVar", "TclError"):
+    for n in ("Tk", "Text", "Toplevel", "Menu", "Canvas", "StringVar", "BooleanVar", "TclError"):
         setattr(tkmod, n, Var if n.endswith("Var") else (Exception if n == "TclError" else Widget))
     ttkmod = types.ModuleType("tkinter.ttk")
     for n in ("Style", "Label", "LabelFrame", "Frame", "Entry", "Button", "Combobox", "Checkbutton", "Treeview",
-              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox", "Notebook", "PanedWindow"):
+              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox", "Notebook", "PanedWindow", "Separator"):
         setattr(ttkmod, n, Widget)
     fd = types.ModuleType("tkinter.filedialog"); mb = types.ModuleType("tkinter.messagebox")
     for m in (fd, mb):
