@@ -101,7 +101,7 @@ def test_status_mapping_vietnamese():
     assert status_label("extracting") == "Đang trích xuất nguyên nhân / đối sách cải tiến"
     assert status_label("extracting_qpn") == "Đang trích xuất QPN"
     assert status_label("writing_excel") == "Đang ghi Excel"
-    assert format_elapsed(65) == "1:05" and format_elapsed(3725) == "1:02:05"
+    assert format_elapsed(65) == "01:05" and format_elapsed(3725) == "01:02:05"
 
 
 # ------------------------------------------------------------------ worker events / rows / summary
@@ -126,7 +126,7 @@ def test_worker_events_update_rows_and_summary(sample_tree, tmp_path):
     lines = ctl.summary_lines()
     assert lines[0] == f"Tổng: {s.total}" and f"Hoàn thành: {s.completed}" in lines
     assert any(ln.startswith("Không tìm thấy Management Number:") for ln in lines)
-    assert any(ln.startswith("Thời gian:") for ln in lines)
+    assert any(ln.startswith("Tổng thời gian xử lý:") for ln in lines)
     assert ctl.output_file() and ctl.output_folder() and ctl.log_file()
     assert ctl.progress.percent == 100.0
 
@@ -185,7 +185,7 @@ def test_qwen_unavailable_falls_back_to_heuristic(sample_tree, tmp_path):
     ctl.cfg.row_mode = "append"
     ctl.set_output(str(tmp_path / "out" / "k.xlsx"))
     ok, msg = ctl.check_ollama()
-    assert not ok and msg.startswith("Ollama: không kết nối được")
+    assert not ok and msg.startswith("● Không kết nối được Ollama tại 127.0.0.1:1")
     _run_to_end(ctl, use_ollama=True)                              # user chose to continue anyway
     assert ctl.summary.failed == 0
     d = ctl.diagnostics_for(0)
@@ -206,13 +206,13 @@ def test_check_ollama_messages(tmp_path, monkeypatch):
         def test_connection(self): raise OllamaError("Không kết nối được Ollama tại http://127.0.0.1:11434")
 
     ctl._client_factory = Good
-    assert ctl.check_ollama() == (True, "Ollama: Sẵn sàng — qwen3:4b") and ctl.available_models == ["qwen3:4b", "llama3"]
+    assert ctl.check_ollama() == (True, "● Đã kết nối — qwen3:4b") and ctl.available_models == ["qwen3:4b", "llama3"]
     ctl._client_factory = NoModel
     ok, msg = ctl.check_ollama()
-    assert not ok and "không có trên máy chủ" in msg and "llama3" in msg
+    assert not ok and msg == "● Đã kết nối Ollama nhưng không tìm thấy model qwen3:4b"
     ctl._client_factory = Down
     ok, msg = ctl.check_ollama()
-    assert not ok and "không kết nối được" in msg
+    assert not ok and msg == "● Không kết nối được Ollama tại 127.0.0.1:11434"
     ctl.model = ""
     ctl._client_factory = Good
     assert "chưa chọn model" in ctl.check_ollama()[1]
@@ -224,7 +224,7 @@ def test_check_ollama_messages(tmp_path, monkeypatch):
         if evs:
             break
         threading.Event().wait(0.05)
-    assert ctl.ollama_ok and ctl.ollama_status == "Ollama: Sẵn sàng — qwen3:4b"
+    assert ctl.ollama_ok and ctl.ollama_status == "● Đã kết nối — qwen3:4b"
 
 
 def test_diagnostics_mapping(sample_tree, tmp_path):

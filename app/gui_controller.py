@@ -8,6 +8,7 @@ SAME production pipeline as the CLI (``BatchProcessor``); no second implementati
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -16,13 +17,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .batch_processor import STAGE_LABELS_VI, BatchOptions, BatchProcessor, BatchSummary, format_file_diagnostics
-from .config import DEFAULT_MODEL, DEFAULT_OLLAMA, AppConfig, normalize_ollama_url
+from .config import DEFAULT_MODEL, DEFAULT_OLLAMA, AppConfig, endpoint_problem, normalize_ollama_url, split_endpoint
 from .excel_writer import validate_template
 from .extractor import management_number_from_filename
 from .logger import FileResult
-from .ollama_client import OllamaClient, OllamaError
+from .ollama_client import OllamaClient, OllamaError, preferred_model
 from .scanner import scan_inputs
 
+LOG = logging.getLogger("report_extractor.gui")
 DEFAULT_OUTPUT_NAME = "Kiem_chung_Ket_qua.xlsx"
 
 # final statuses shown in the result table (Vietnamese)
@@ -38,6 +40,21 @@ FINAL_STATUSES = ("completed", "needs_review", "not_written", "error", "skipped"
 WORKING_STAGES = ("reading", "analyzing", "analyzing_heuristic", "extracting", "extracting_qpn",
                   "extracting_images", "writing_excel")
 
+# Deterministic share of ONE report that is considered done when a REAL pipeline stage is reached
+# (order = order in which BatchProcessor emits them).  Nothing is interpolated while a stage runs:
+# during a long Qwen call the value stays at the "analyzing" boundary until the next real event.
+STAGE_WEIGHTS: Dict[str, float] = {
+    "reading": 0.05,
+    "analyzing": 0.15,
+    "analyzing_heuristic": 0.15,
+    "extracting": 0.45,
+    "extracting_qpn": 0.55,
+    "extracting_images": 0.70,
+    "writing_excel": 0.85,
+}
+MIN_ETA_SAMPLES = 1          # ETA is shown once at least this many reports finished with measured durations
+ETA_WINDOW = 10              # rolling window of report durations
+
 
 def status_label(stage: str) -> str:
     """Vietnamese label for a final status or an in-progress pipeline stage."""
@@ -49,10 +66,18 @@ def default_output_path(report_folder: str) -> str:
 
 
 def format_elapsed(seconds: float) -> str:
-    seconds = int(round(seconds))
+    """MM:SS under one hour, HH:MM:SS from one hour on."""
+    seconds = max(0, int(seconds))
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def progress_bar_text(percent: float, width: int = 20) -> str:
+    """Text rendering of the bar ("████████░░░░ 36%") – same value as the ttk bar."""
+    pct = max(0.0, min(100.0, percent))
+    filled = int(round(pct / 100.0 * width))
+    return "█" * filled + "░" * (width - filled) + f" {int(pct)}%"
 
 
 @dataclass
@@ -81,22 +106,48 @@ class RowState:
 
 @dataclass
 class Progress:
-    done: int = 0
+    """Single source of truth for the progress display (text, bar, percentage)."""
+    done: int = 0                       # reports in a terminal state
     total: int = 0
     current_index: Optional[int] = None
     current_stage: str = ""
     current_detail: str = ""
+    current_fraction: float = 0.0       # share of the current report reached (STAGE_WEIGHTS, monotonic)
+    finished: bool = False              # batch ended (completed or stopped)
 
     @property
     def percent(self) -> float:
-        return (self.done / self.total * 100.0) if self.total else 0.0
+        if self.total <= 0:
+            return 0.0
+        value = (self.done + (self.current_fraction if self.current_index is not None else 0.0)) / self.total * 100.0
+        return max(0.0, min(100.0, value))
+
+    @property
+    def percent_int(self) -> int:
+        return int(self.percent)
 
     @property
     def text(self) -> str:
         if self.total == 0:
             return ""
-        cur = min(self.total, (self.current_index or 0) + 1) if self.current_index is not None else self.done
-        return f"Đang xử lý: {cur} / {self.total}"
+        if self.finished:
+            return f"Đã xử lý: {self.done} / {self.total} — {self.percent_int}%"
+        cur = min(self.total, self.current_index + 1) if self.current_index is not None else min(self.total, self.done + 1)
+        return f"Đang xử lý: {cur} / {self.total} — {self.percent_int}%"
+
+    @property
+    def bar_text(self) -> str:
+        return progress_bar_text(self.percent)
+
+    def reach_stage(self, index: int, stage: str, detail: str = "") -> None:
+        if self.current_index != index:
+            self.current_index, self.current_fraction = index, 0.0
+        self.current_stage, self.current_detail = stage, detail or ""
+        self.current_fraction = max(self.current_fraction, STAGE_WEIGHTS.get(stage, 0.0))
+
+    def finish_report(self, index: int) -> None:
+        if self.current_index == index:
+            self.current_index, self.current_fraction, self.current_stage = None, 0.0, ""
 
 
 @dataclass
@@ -120,8 +171,9 @@ class GuiController:
         self.report_folder: str = self.cfg.last_report_folder or ""
         self.template: str = self.cfg.last_template or ""
         self.output: str = self.cfg.last_output_file or ""
-        self.server: str = normalize_ollama_url(self.cfg.ollama_server or DEFAULT_OLLAMA)
+        self.host, self.port = split_endpoint(self.cfg.ollama_server or DEFAULT_OLLAMA)
         self.model: str = self.cfg.model or DEFAULT_MODEL
+        self.available_models: List[str] = []
         self.force_reprocess: bool = bool(self.cfg.force_reprocess)
         # runtime state
         self.state: str = "idle"                 # idle | running | stopping
@@ -133,9 +185,45 @@ class GuiController:
         self.ollama_status: str = ""
         self.ollama_ok: Optional[bool] = None
         self.log_lines: List[str] = []
-        self.started_at: Optional[float] = None
+        self.started_at: Optional[float] = None      # time.monotonic() when the batch really started
         self.finished_at: Optional[float] = None
+        self.report_durations: List[float] = []      # measured seconds per finished report (rolling window)
+        self._report_started_at: Optional[float] = None
+        self._clock: Callable[[], float] = time.monotonic
         self._queue: "queue.Queue[UiEvent]" = queue.Queue()
+
+    # ------------------------------------------------------------------ Ollama endpoint
+    @property
+    def server(self) -> str:
+        """Normalized endpoint used by BOTH the connection test and the production batch."""
+        return normalize_ollama_url(f"{self.host}:{self.port}") if str(self.host).strip() else ""
+
+    @server.setter
+    def server(self, value: str) -> None:
+        self.host, self.port = split_endpoint(value) if (value or "").strip() else ("", 11434)
+
+    @property
+    def endpoint_label(self) -> str:
+        return f"{self.host}:{self.port}" if str(self.host).strip() else "(chưa nhập)"
+
+    def set_endpoint(self, host: str, port: Any, model: Optional[str] = None) -> str:
+        """Accept '127.0.0.1', '192.168.1.50:11434', 'http://192.168.1.50:11434' (host field may carry the
+        port / scheme); returns a Vietnamese problem text or '' – takes effect immediately."""
+        host = (host or "").strip()
+        port_s = str(port or "").strip()
+        if "://" in host or "/" in host or ":" in host:
+            h, p = split_endpoint(host)
+            if ":" in host.split("://", 1)[-1].split("/", 1)[0]:
+                port_s = str(p)
+            host = h
+        problem = endpoint_problem(host, port_s or 11434)
+        if problem:
+            return problem
+        self.host, self.port = host, int(port_s or 11434)
+        if model is not None:
+            self.model = model.strip()
+        self.ollama_ok, self.ollama_status = None, ""        # endpoint changed -> status unknown
+        return ""
 
     # ------------------------------------------------------------------ inputs
     def set_report_folder(self, folder: str) -> int:
@@ -161,7 +249,7 @@ class GuiController:
         self.output = path.strip()
 
     def set_ollama(self, server: str, model: str) -> None:
-        self.server = normalize_ollama_url(server) if server.strip() else ""
+        self.server = server
         self.model = model.strip()
 
     # ------------------------------------------------------------------ validation
@@ -211,35 +299,104 @@ class GuiController:
             return False
 
     # ------------------------------------------------------------------ Ollama
-    def check_ollama(self) -> Tuple[bool, str]:
-        """Same production client; returns (ok, Vietnamese message)."""
-        server = normalize_ollama_url(self.server) if self.server else ""
+    def _classify_ollama_error(self, e: Exception) -> str:
+        cause = getattr(e, "__cause__", None)
+        name = type(cause).__name__ if cause is not None else type(e).__name__
+        text = f"{name} {e}".lower()
+        if "timeout" in text or "timed out" in text:
+            return "timeout"
+        return "unreachable"
+
+    def check_ollama(self, timeout: Optional[int] = None) -> Tuple[bool, str]:
+        """Same production client (server reachable → API answers → model present). (ok, message)."""
+        server = self.server
         model = self.model.strip()
+        where = self.endpoint_label
         if not server:
-            self.ollama_ok, self.ollama_status = False, "Ollama: chưa nhập địa chỉ máy chủ"
+            self.ollama_ok, self.ollama_status = False, "● Chưa nhập IP / Server của Ollama"
+            return False, self.ollama_status
+        problem = endpoint_problem(self.host, self.port)
+        if problem:
+            self.ollama_ok, self.ollama_status = False, f"● {problem}"
             return False, self.ollama_status
         try:
-            info = self._client_factory(server, timeout=int(self.cfg.request_timeout or 180)).test_connection()
+            client = self._client_factory(server, timeout=int(timeout or self.cfg.request_timeout or 180))
+            info = client.test_connection()
         except OllamaError as e:
-            self.ollama_ok, self.ollama_status = False, f"Ollama: không kết nối được – {e}"
+            LOG.warning("Ollama check failed (%s): %s", server, e)
+            kind = self._classify_ollama_error(e)
+            self.ollama_ok = False
+            self.ollama_status = ("● Kết nối Ollama quá thời gian" if kind == "timeout"
+                                  else f"● Không kết nối được Ollama tại {where}")
             return False, self.ollama_status
-        models = info.get("models", [])
+        except Exception as e:  # noqa: BLE001  – never show a traceback to the user
+            LOG.exception("Ollama check crashed (%s)", server)
+            self.ollama_ok, self.ollama_status = False, f"● Không kết nối được Ollama tại {where} ({type(e).__name__})"
+            return False, self.ollama_status
+        models = list(info.get("models", []) or [])
+        if models:
+            self.available_models = models
         if not model:
-            self.ollama_ok, self.ollama_status = False, "Ollama: chưa chọn model (ví dụ qwen3:4b)"
+            self.ollama_ok, self.ollama_status = False, "● Đã kết nối Ollama nhưng chưa chọn model (ví dụ qwen3:4b)"
         elif model not in models:
             self.ollama_ok = False
-            self.ollama_status = (f"Ollama: model '{model}' không có trên máy chủ"
-                                  + (f" (có: {', '.join(models)})" if models else " (chưa có model nào, chạy: ollama pull qwen3:4b)"))
+            self.ollama_status = f"● Đã kết nối Ollama nhưng không tìm thấy model {model}"
         else:
-            self.ollama_ok, self.ollama_status = True, f"Ollama: Sẵn sàng — {model}"
-        self.available_models = models
+            self.ollama_ok, self.ollama_status = True, f"● Đã kết nối — {model}"
         return bool(self.ollama_ok), self.ollama_status
 
     def check_ollama_async(self) -> None:
+        """Run the check on a worker thread; the result arrives as an 'ollama' event in pump()."""
         def work():
             ok, msg = self.check_ollama()
             self._queue.put(UiEvent("ollama", (ok, msg)))
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, daemon=True, name="ollama-check").start()
+
+    def refresh_models(self, timeout: Optional[int] = None) -> Tuple[bool, str, List[str]]:
+        """Query the configured server for its INSTALLED models (no hard-coded list).
+
+        On failure the user's current model is kept untouched. Returns (ok, message, models)."""
+        server = self.server
+        if not server or endpoint_problem(self.host, self.port):
+            return False, f"● {endpoint_problem(self.host, self.port) or 'Chưa nhập IP / Server của Ollama'}", []
+        try:
+            info = self._client_factory(server, timeout=int(timeout or self.cfg.request_timeout or 180)).test_connection()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("Model discovery failed (%s): %s", server, e)
+            kind = self._classify_ollama_error(e) if isinstance(e, OllamaError) else "unreachable"
+            msg = ("● Kết nối Ollama quá thời gian – giữ nguyên model hiện tại" if kind == "timeout"
+                   else f"● Không lấy được danh sách model từ {self.endpoint_label} – giữ nguyên model hiện tại")
+            return False, msg, []
+        models = list(info.get("models", []) or [])
+        if not models:
+            return False, f"● Ollama tại {self.endpoint_label} chưa có model nào (chạy: ollama pull qwen3:4b)", []
+        self.available_models = models
+        if not self.model.strip():
+            self.model = DEFAULT_MODEL if DEFAULT_MODEL in models else (preferred_model(models) or models[0])
+        return True, f"● Đã tìm thấy {len(models)} model trên {self.endpoint_label}", models
+
+    def refresh_models_async(self) -> None:
+        def work():
+            self._queue.put(UiEvent("models", self.refresh_models()))
+        threading.Thread(target=work, daemon=True, name="ollama-models").start()
+
+    def ai_status_text(self) -> str:
+        """What the program is about to use: 'AI: qwen3:4b @ host:port — Đã kết nối' etc."""
+        if not self.server:
+            return "AI: Không kết nối — sẽ sử dụng heuristic fallback"
+        if self.ollama_ok is True:
+            return f"AI: {self.model} @ {self.endpoint_label} — Đã kết nối"
+        if self.ollama_ok is False:
+            return "AI: Không kết nối — sẽ sử dụng heuristic fallback"
+        return f"AI: {self.model or '(chưa chọn model)'} @ {self.endpoint_label} — Chưa kiểm tra"
+
+    def save_ollama_settings(self) -> str:
+        """Persist host/port/model with the existing config mechanism (no registry / env / manual JSON)."""
+        problem = endpoint_problem(self.host, self.port)
+        if problem:
+            return problem
+        self.save_settings()
+        return ""
 
     # ------------------------------------------------------------------ run control
     def can_start(self) -> bool:
@@ -264,7 +421,9 @@ class GuiController:
             r.stage, r.note, r.vendor, r.model, r.item = "waiting", "", "", "", ""
         self.progress = Progress(total=len(self.files))
         self.summary = None
-        self.started_at, self.finished_at = time.perf_counter(), None
+        self.report_durations = []
+        self._report_started_at = None
+        self.started_at, self.finished_at = self._clock(), None
         self.processor = self._processor_factory(
             self.build_options(use_ollama),
             on_file=lambda i, s, d: self._queue.put(UiEvent("row", (i, s, d))),
@@ -313,30 +472,46 @@ class GuiController:
             i, stage, detail = ev.payload
             if 0 <= i < len(self.rows):
                 row = self.rows[i]
+                was_final = row.is_final
                 row.stage = stage
+                now = self._clock()
                 if stage in FINAL_STATUSES:
                     row.note = detail or ""
                     self._fill_row_from_result(row)
+                    if not was_final:
+                        start = self._report_started_at if self._report_started_at is not None else self.started_at
+                        if start is not None:
+                            self.report_durations.append(max(0.0, now - start))
+                            del self.report_durations[:-ETA_WINDOW]
+                        self._report_started_at = now          # next report starts right away
+                    self.progress.finish_report(i)
+                    self.progress.done = sum(1 for r in self.rows if r.is_final)
                 else:
-                    self.progress.current_index, self.progress.current_stage = i, stage
-                    self.progress.current_detail = detail or ""
+                    if self.progress.current_index != i or self._report_started_at is None:
+                        self._report_started_at = now if self._report_started_at is None else self._report_started_at
+                    self.progress.reach_stage(i, stage, detail)
         elif ev.kind == "progress":
             done, total = ev.payload
-            self.progress.done, self.progress.total = done, total
+            self.progress.total = total
+            self.progress.done = max(done, sum(1 for r in self.rows if r.is_final))
             if self.processor:
                 self.summary = self.processor.summary
         elif ev.kind == "log":
             self.log_lines.append(str(ev.payload))
         elif ev.kind == "done":
             self.summary = ev.payload
-            self.finished_at = time.perf_counter()
+            self.finished_at = self._clock()
             self.state = "idle"
-            self.progress.current_index, self.progress.current_stage = None, "done"
             for r in self.rows:                      # rows the batch never reached (stopped early)
                 if not r.is_final and r.stage != "waiting":
                     r.stage = "error"
+            self.progress.current_index, self.progress.current_stage, self.progress.current_fraction = None, "", 0.0
+            self.progress.done = sum(1 for r in self.rows if r.is_final)
+            self.progress.finished = True
         elif ev.kind == "ollama":
             self.ollama_ok, self.ollama_status = ev.payload
+        elif ev.kind == "models":
+            pass                                     # payload (ok, msg, models) is rendered by the view
 
     def _fill_row_from_result(self, row: RowState) -> None:
         fr = self.result_for(row.index)
@@ -357,17 +532,55 @@ class GuiController:
 
     # ------------------------------------------------------------------ summary / diagnostics
     def elapsed_seconds(self) -> float:
+        """Seconds since the batch actually started (monotonic); frozen once the batch ended."""
         if self.started_at is None:
             return 0.0
-        end = self.finished_at if self.finished_at is not None else time.perf_counter()
-        return end - self.started_at
+        end = self.finished_at if self.finished_at is not None else self._clock()
+        return max(0.0, end - self.started_at)
+
+    def elapsed_text(self) -> str:
+        if self.started_at is None:
+            return ""
+        if self.finished_at is not None:
+            stopped = bool(self.summary and self.summary.stopped) or self.progress.done < self.progress.total
+            return (f"Thời gian đã chạy: {format_elapsed(self.elapsed_seconds())}" if stopped
+                    else f"Tổng thời gian: {format_elapsed(self.elapsed_seconds())}")
+        return f"Đã chạy: {format_elapsed(self.elapsed_seconds())}"
+
+    def average_report_seconds(self) -> Optional[float]:
+        if len(self.report_durations) < MIN_ETA_SAMPLES:
+            return None
+        return sum(self.report_durations) / len(self.report_durations)
+
+    def eta_seconds(self) -> Optional[float]:
+        """Approximate remaining seconds from MEASURED report durations; None when unknown / not running."""
+        if not self.is_running() or self.progress.total <= 0:
+            return None
+        avg = self.average_report_seconds()
+        if avg is None:
+            return None
+        p = self.progress
+        remaining_reports = p.total - p.done - (p.current_fraction if p.current_index is not None else 0.0)
+        return max(0.0, remaining_reports * avg)
+
+    def eta_text(self) -> str:
+        """'Còn khoảng: MM:SS' while running, 'Còn khoảng: Đang tính...' before data exists, '' when not running."""
+        if not self.is_running():
+            return ""
+        eta = self.eta_seconds()
+        return "Còn khoảng: Đang tính..." if eta is None else f"Còn khoảng: {format_elapsed(eta)}"
+
+    def status_line(self) -> str:
+        """One-line status for the window: progress text + bar + elapsed + ETA (controller state only)."""
+        parts = [self.progress.text, self.progress.bar_text, self.elapsed_text(), self.eta_text()]
+        return "   ".join(x for x in parts if x)
 
     def summary_lines(self) -> List[str]:
         s = self.summary or BatchSummary(total=len(self.files))
         lines = [f"Tổng: {s.total}", f"Hoàn thành: {s.completed}", f"Cần kiểm tra: {s.needs_review}",
                  f"Không tìm thấy Management Number: {s.not_written}", f"Lỗi: {s.failed}", f"Bỏ qua: {s.skipped}"]
         if self.started_at is not None:
-            lines.append(f"Thời gian: {format_elapsed(self.elapsed_seconds())}")
+            lines.append(f"Tổng thời gian xử lý: {format_elapsed(self.elapsed_seconds())}")
         if s.stopped:
             lines.insert(0, "Đã dừng theo yêu cầu.")
         return lines

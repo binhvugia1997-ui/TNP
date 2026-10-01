@@ -74,6 +74,19 @@ ReportExtractor.exe --cli D:\Reports --template D:\Templates\Verification.xlsx -
    dừng an toàn sau khi ghi xong file đang xử lý.
 6. Kết thúc: **Mở file kết quả**, **Mở thư mục kết quả**, **Xem chi tiết lỗi**, **Chẩn đoán**.
 
+**Kết nối Ollama** (`IP / Server`, `Port`, `Model`): chấp nhận `127.0.0.1`, `192.168.1.50`,
+`192.168.1.50:11434`, `http://192.168.1.50:11434` (tự chuẩn hoá về một endpoint, hỗ trợ port tuỳ ý).
+`Kiểm tra kết nối` dùng đúng client sản xuất (máy chủ → API → model có tồn tại); `Làm mới model` lấy
+danh sách model thật đã cài trên máy chủ; `Lưu cấu hình` ghi IP/port/model vào `config.json` và được khôi phục
+khi mở lại. Đổi IP/model có hiệu lực ngay cho lần kiểm tra/xử lý tiếp theo, không cần khởi động lại.
+Ollama không bắt buộc: không kết nối được → chương trình hỏi và tiếp tục với heuristic fallback; mất kết nối
+giữa chừng → báo cáo đó dùng heuristic, batch vẫn tiếp tục.
+
+**Tiến độ**: `Đang xử lý: 2 / 5 — 36%` + thanh tiến độ cùng giá trị, tính từ số báo cáo đã kết thúc và mốc giai
+đoạn THẬT của báo cáo hiện tại (không ước lượng tiến trình bên trong Qwen); `Đã chạy: MM:SS` (đồng hồ monotonic
+bắt đầu khi batch thật sự chạy), `Còn khoảng: …` từ thời gian đo được của các báo cáo đã xong
+(`Đang tính...` khi chưa có dữ liệu). Dừng sớm → không hiển thị 100%, không hiển thị ETA.
+
 Cấu hình (máy AI, model, các đường dẫn cuối) được lưu vào `config.json` cạnh exe.
 
 ### Trạng thái

@@ -107,23 +107,38 @@ class ReportExtractorApp:
         b4.grid(row=2, column=2, sticky="w", **pad)
         ttk.Label(f, text="(không bao giờ ghi đè file Kiểm chứng gốc)").grid(row=2, column=3, sticky="w", **pad)
 
-        ttk.Label(f, text="Ollama server:").grid(row=3, column=0, sticky="w", **pad)
-        self.var_server = tk.StringVar()
-        e4 = ttk.Entry(f, textvariable=self.var_server)
-        e4.grid(row=3, column=1, sticky="ew", **pad)
-        b5 = ttk.Button(f, text="Kiểm tra Ollama", command=self.check_ollama)
-        b5.grid(row=3, column=2, sticky="w", **pad)
-        self.lbl_conn = ttk.Label(f, text="Ollama: chưa kiểm tra", style="Bad.TLabel")
-        self.lbl_conn.grid(row=3, column=3, rowspan=2, sticky="w", **pad)
-
-        ttk.Label(f, text="Model:").grid(row=4, column=0, sticky="w", **pad)
-        self.var_model = tk.StringVar()
-        self.cb_model = ttk.Combobox(f, textvariable=self.var_model, state="normal")
-        self.cb_model.grid(row=4, column=1, sticky="ew", **pad)
         self.var_force = tk.BooleanVar(value=False)
-        c1 = ttk.Checkbutton(f, text="Xử lý lại báo cáo đã xử lý", variable=self.var_force)
-        c1.grid(row=4, column=2, sticky="w", **pad)
-        self._config_widgets = [e1, e2, e3, e4, b1, b2, b3, b4, b5, self.cb_model, c1]
+        c1 = ttk.Checkbutton(f, text="Xử lý lại báo cáo đã xử lý (ghi đè các trường tự động)", variable=self.var_force)
+        c1.grid(row=3, column=1, sticky="w", **pad)
+
+        # ---- Kết nối Ollama -------------------------------------------------------
+        of = ttk.LabelFrame(r, text="Kết nối Ollama")
+        of.pack(fill="x", padx=10, pady=4)
+        ttk.Label(of, text="IP / Server:").grid(row=0, column=0, sticky="w", **pad)
+        self.var_host = tk.StringVar()
+        e4 = ttk.Entry(of, textvariable=self.var_host, width=26)
+        e4.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(of, text="Port:").grid(row=0, column=2, sticky="w", **pad)
+        self.var_port = tk.StringVar()
+        e5 = ttk.Entry(of, textvariable=self.var_port, width=8)
+        e5.grid(row=0, column=3, sticky="w", **pad)
+        ttk.Label(of, text="Model:").grid(row=0, column=4, sticky="w", **pad)
+        self.var_model = tk.StringVar()
+        self.cb_model = ttk.Combobox(of, textvariable=self.var_model, state="normal", width=22)
+        self.cb_model.grid(row=0, column=5, sticky="w", **pad)
+        b5 = ttk.Button(of, text="Kiểm tra kết nối", command=self.check_ollama)
+        b5.grid(row=0, column=6, sticky="w", **pad)
+        b6 = ttk.Button(of, text="Làm mới model", command=self.refresh_models)
+        b6.grid(row=0, column=7, sticky="w", **pad)
+        b7 = ttk.Button(of, text="Lưu cấu hình", command=self.save_ollama)
+        b7.grid(row=0, column=8, sticky="w", **pad)
+        self.lbl_conn = ttk.Label(of, text="● Chưa kiểm tra kết nối", style="Bad.TLabel")
+        self.lbl_conn.grid(row=1, column=0, columnspan=5, sticky="w", **pad)
+        self.lbl_ai = ttk.Label(of, text=self.ctl.ai_status_text())
+        self.lbl_ai.grid(row=1, column=5, columnspan=4, sticky="w", **pad)
+        for var in (self.var_host, self.var_port, self.var_model):
+            var.trace_add("write", lambda *_: self._on_endpoint_edited())
+        self._config_widgets = [e1, e2, e3, e4, e5, b1, b2, b3, b4, b5, b6, b7, self.cb_model, c1]
 
         lf = ttk.LabelFrame(r, text="Kết quả từng báo cáo  (nháy đúp để xem chi tiết)" + ("  – có thể kéo thả thư mục/file vào đây" if _DND_OK else ""))
         lf.pack(fill="both", expand=True, padx=10, pady=4)
@@ -150,12 +165,22 @@ class ReportExtractorApp:
 
         pf = ttk.Frame(r)
         pf.pack(fill="x", padx=10, pady=2)
-        self.lbl_progress = ttk.Label(pf, text="Sẵn sàng.")
-        self.lbl_progress.pack(anchor="w")
+        top = ttk.Frame(pf)
+        top.pack(fill="x")
+        self.lbl_progress = ttk.Label(top, text="Sẵn sàng.", font=("Segoe UI", 10, "bold"))
+        self.lbl_progress.pack(side="left")
+        self.lbl_eta = ttk.Label(top, text="")
+        self.lbl_eta.pack(side="right", padx=(12, 0))
+        self.lbl_elapsed = ttk.Label(top, text="")
+        self.lbl_elapsed.pack(side="right")
         self.lbl_stage = ttk.Label(pf, text="")
         self.lbl_stage.pack(anchor="w")
-        self.pb = ttk.Progressbar(pf, mode="determinate", maximum=100)
-        self.pb.pack(fill="x", pady=2)
+        bar = ttk.Frame(pf)
+        bar.pack(fill="x", pady=2)
+        self.pb = ttk.Progressbar(bar, mode="determinate", maximum=100)
+        self.pb.pack(side="left", fill="x", expand=True)
+        self.lbl_percent = ttk.Label(bar, text="0%", width=5, anchor="e")
+        self.lbl_percent.pack(side="left", padx=(6, 0))
         self.lbl_counts = ttk.Label(pf, text=self.ctl.counts_text())
         self.lbl_counts.pack(anchor="w")
 
@@ -179,9 +204,13 @@ class ReportExtractorApp:
         self.var_folder.set(c.report_folder)
         self.var_template.set(c.template)
         self.var_output.set(c.output)
-        self.var_server.set(c.server)
+        self._loading = True
+        self.var_host.set(c.host)
+        self.var_port.set(str(c.port))
         self.var_model.set(c.model)
-        self.cb_model["values"] = [c.model] if c.model else []
+        self.cb_model["values"] = c.available_models or ([c.model] if c.model else [])
+        self._loading = False
+        self.lbl_ai.configure(text=c.ai_status_text())
         self.var_force.set(c.force_reprocess)
         if c.report_folder and Path(c.report_folder).is_dir():
             self.scan_reports()
@@ -191,8 +220,28 @@ class ReportExtractorApp:
         c.report_folder = self.var_folder.get().strip()
         c.set_template(self.var_template.get())
         c.set_output(self.var_output.get())
-        c.set_ollama(self.var_server.get(), self.var_model.get())
+        self._push_endpoint()
         c.force_reprocess = bool(self.var_force.get())
+
+    def _push_endpoint(self) -> str:
+        """Host/port/model from the widgets into the controller (takes effect immediately)."""
+        problem = self.ctl.set_endpoint(self.var_host.get(), self.var_port.get(), self.var_model.get())
+        if not problem:
+            # set_endpoint may have split "host:port" / "http://host:port" typed into the IP field
+            if self.var_host.get().strip() != self.ctl.host:
+                self.var_host.set(self.ctl.host)
+            if self.var_port.get().strip() != str(self.ctl.port):
+                self.var_port.set(str(self.ctl.port))
+        self.lbl_ai.configure(text=self.ctl.ai_status_text())
+        return problem
+
+    def _on_endpoint_edited(self) -> None:
+        if getattr(self, "_loading", False):
+            return
+        self.ctl.ollama_ok = None
+        self.lbl_conn.configure(text="● Chưa kiểm tra kết nối (đã thay đổi)", style="Bad.TLabel")
+        self.lbl_ai.configure(text=f"AI: {self.var_model.get().strip() or '(chưa chọn model)'} @ "
+                                   f"{self.var_host.get().strip()}:{self.var_port.get().strip()} — Chưa kiểm tra")
 
     def log(self, msg: str) -> None:
         self.txt_log.configure(state="normal")
@@ -248,9 +297,32 @@ class ReportExtractorApp:
 
     # ------------------------------------------------------------------ Ollama
     def check_ollama(self) -> None:
-        self._push_to_controller()
-        self.lbl_conn.configure(text="Ollama: đang kiểm tra…", style="Bad.TLabel")
-        self.ctl.check_ollama_async()
+        problem = self._push_endpoint()
+        if problem:
+            self.lbl_conn.configure(text=f"● {problem}", style="Bad.TLabel")
+            return
+        self.lbl_conn.configure(text=f"● Đang kiểm tra {self.ctl.endpoint_label}…", style="Bad.TLabel")
+        self.ctl.check_ollama_async()                      # worker thread; result arrives in _poll()
+
+    def refresh_models(self) -> None:
+        problem = self._push_endpoint()
+        if problem:
+            self.lbl_conn.configure(text=f"● {problem}", style="Bad.TLabel")
+            return
+        self.lbl_conn.configure(text=f"● Đang lấy danh sách model từ {self.ctl.endpoint_label}…", style="Bad.TLabel")
+        self.ctl.refresh_models_async()
+
+    def save_ollama(self) -> None:
+        problem = self._push_endpoint()
+        if problem:
+            messagebox.showwarning(APP_NAME, problem)
+            return
+        err = self.ctl.save_ollama_settings()
+        if err:
+            messagebox.showwarning(APP_NAME, err)
+            return
+        self.log(f"Đã lưu cấu hình Ollama: {self.ctl.model} @ {self.ctl.endpoint_label}")
+        self.lbl_ai.configure(text=self.ctl.ai_status_text())
 
     # ------------------------------------------------------------------ run
     def start(self) -> None:
@@ -264,17 +336,39 @@ class ReportExtractorApp:
             messagebox.showwarning(APP_NAME, "Chưa thể bắt đầu:\n\n• " + "\n• ".join(errs))
             return
         use_ai = True
-        ok, msg = self.ctl.check_ollama()
+        ok, msg = self.ctl.check_ollama(timeout=15)
         self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
+        self.lbl_ai.configure(text=self.ctl.ai_status_text())
         if not ok:
-            if not messagebox.askyesno(APP_NAME, f"{msg}\n\nTiếp tục xử lý KHÔNG dùng AI (nhận diện theo từ khoá)?"):
+            if not messagebox.askyesno(APP_NAME, f"{msg}\n\nOllama không khả dụng. Tiếp tục xử lý với heuristic fallback "
+                                                 f"(nhận diện theo cấu trúc/từ khoá, không dùng AI)?"):
                 return
             use_ai = False
         if not self.ctl.start(use_ollama=use_ai):
             return
         self._render_rows()
         self._set_running(True)
-        self.pb["value"] = 0
+        self._render_progress()
+        self.root.after(1000, self._tick)
+
+    def _tick(self) -> None:
+        """Once-a-second refresh of elapsed / ETA from controller state (never blocks the GUI)."""
+        if not self.ctl.is_running():
+            return
+        self.lbl_elapsed.configure(text=self.ctl.elapsed_text())
+        self.lbl_eta.configure(text=self.ctl.eta_text())
+        self.root.after(1000, self._tick)
+
+    def _render_progress(self) -> None:
+        """Bar, percentage and text all come from the SAME controller value."""
+        p = self.ctl.progress
+        pct = p.percent
+        self.pb["value"] = pct
+        self.lbl_percent.configure(text=f"{p.percent_int}%")
+        if p.text:
+            self.lbl_progress.configure(text=p.text)
+        self.lbl_elapsed.configure(text=self.ctl.elapsed_text())
+        self.lbl_eta.configure(text=self.ctl.eta_text())
 
     def stop(self) -> None:
         if self.ctl.request_stop():
@@ -325,19 +419,32 @@ class ReportExtractorApp:
                 i = ev.payload[0]
                 self._render_row(i)
                 p = self.ctl.progress
+                self._render_progress()
                 if p.current_index is not None and not self.ctl.rows[i].is_final:
-                    self.lbl_progress.configure(text=f"{p.text} – {self.ctl.rows[i].path.name}")
-                    self.lbl_stage.configure(text=f"{self.ctl.rows[i].status_vi} {p.current_detail}".strip())
+                    self.lbl_stage.configure(text=f"{self.ctl.rows[i].path.name} — {self.ctl.rows[i].status_vi} "
+                                                  f"{p.current_detail}".strip())
             elif ev.kind == "progress":
-                self.pb["value"] = self.ctl.progress.percent
+                self._render_progress()
                 self.lbl_counts.configure(text=self.ctl.counts_text())
             elif ev.kind == "log":
                 self.log(str(ev.payload))
             elif ev.kind == "ollama":
                 ok, msg = ev.payload
                 self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
-                if ok and getattr(self.ctl, "available_models", None):
+                self.lbl_ai.configure(text=self.ctl.ai_status_text())
+                if self.ctl.available_models:
                     self.cb_model["values"] = self.ctl.available_models
+                self.log(msg)
+            elif ev.kind == "models":
+                ok, msg, models = ev.payload
+                self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
+                if ok and models:
+                    self.cb_model["values"] = models            # real installed models, user's value kept
+                    if not self.var_model.get().strip():
+                        self.var_model.set(self.ctl.model)
+                    if self.var_model.get().strip() not in models:
+                        self.log(f"Model '{self.var_model.get().strip()}' không có trên máy chủ; "
+                                 f"có: {', '.join(models)}")
                 self.log(msg)
             elif ev.kind == "done":
                 self._on_done()
@@ -349,10 +456,8 @@ class ReportExtractorApp:
         for i in self.row_items:
             self._render_row(i)
         self.lbl_counts.configure(text=self.ctl.counts_text())
-        if s and not s.stopped:
-            self.pb["value"] = 100
-        self.lbl_progress.configure(text="Đã dừng." if (s and s.stopped) else "Hoàn thành.")
-        self.lbl_stage.configure(text="")
+        self._render_progress()                      # 100% only when every report reached a terminal state
+        self.lbl_stage.configure(text="Đã dừng theo yêu cầu." if (s and s.stopped) else "Hoàn thành.")
         self._show_summary_dialog()
 
     def _show_summary_dialog(self) -> None:
