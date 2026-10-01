@@ -11,3 +11,8 @@ sample_data/
 Output/
 logs/
 *.saving.xlsx
+*.log
+.re_setup_probe.tmp
+*.egg-info/
+.mypy_cache/
+.ruff_cache/

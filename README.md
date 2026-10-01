@@ -255,3 +255,32 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 * Đổi thư mục / file Excel / tháng / khoảng / Tất cả / Xử lý lại → danh sách thành cũ: `Danh sách file đã thay đổi điều kiện.
   Vui lòng quét lại.` và không thể Bắt đầu. `Quét lại` xoá các loại thủ công và tính lại (kể cả file trùng chuẩn).
   Khi đang xử lý, các nút loại/khôi phục bị khoá (dùng `Dừng sau báo cáo hiện tại`).
+
+## Cài đặt từ source trên Windows
+
+```text
+1. Download/clone source từ GitHub (thư mục bất kỳ, có dấu cách cũng được).
+2. Nháy đúp setup.bat.
+3. Chọn Ollama/model nếu cần (có thể bỏ qua).
+4. Nháy đúp run.bat.
+```
+
+* **Python hỗ trợ: >= 3.10 và < 3.14 (khuyến nghị 3.12)** – định nghĩa duy nhất trong `tools/setup_support.py`.
+  `setup.bat` thử `py -3.12 / -3.13 / -3.11 / -3.10 / -3` rồi `python`, kiểm tra phiên bản thật; nếu không có sẽ đề nghị
+  cài `Python.Python.3.12` qua **winget** (gói chính thức), không tải từ nguồn lạ. Không cần quyền Admin cho `.venv`/pip.
+* Môi trường ảo cục bộ `.venv` (đã có trong `.gitignore`): tạo nếu chưa có, dùng lại nếu lành, tạo lại nếu hỏng/sai phiên bản.
+  Thư viện runtime từ `requirements.txt`; công cụ test/dev (`pytest`, …) trong `requirements-dev.txt` – hỏi `Cài thêm công cụ
+  phát triển/test? [y/N]`, mặc định không.
+* **Ollama local là tuỳ chọn.** Ứng dụng hỗ trợ Ollama trên máy khác qua tab `Cấu hình & Ollama` (IP/port). Nếu chưa cài:
+  `[1] Cài Ollama (winget Ollama.Ollama) / [2] Bỏ qua` (mặc định bỏ qua). Có Ollama → menu model `qwen3:1.7b`,
+  `qwen3:4b (mặc định/khuyến nghị)`, `Cả hai`, `Không tải model` (mặc định); model đã có không tải lại; tiến trình tải là
+  output thật của `ollama pull`; không yêu cầu server Ollama đang chạy khi cài.
+* Kiểm tra cuối: import thư viện, module ứng dụng, tkinter, thư mục config – không xử lý báo cáo nào.
+* Chạy lại `setup.bat` an toàn (idempotent). `run.bat` = `.venv\Scripts\python.exe run.py` (GUI); `run_cli.bat` chuyển
+  tiếp tham số cho CLI (`--cli …`). Cửa sổ dừng lại khi lỗi (`Nhấn phím bất kỳ để thoát...`).
+* Đây là cài đặt từ source; bản Portable sẽ là luồng riêng sau này.
+
+Checklist smoke test Windows: (A) máy sạch không Python/Ollama → winget cài Python → .venv → bỏ qua Ollama → run.bat;
+(B) có Python, không Ollama; (C) Python + Ollama, chưa model → chọn [4]; (D) đã có qwen3:4b → "đã tồn tại — bỏ qua tải xuống";
+(E) bỏ qua Ollama local, cấu hình IP máy khác trong tab Cấu hình; (F) đường dẫn có dấu cách; (G) chạy setup.bat lần 2 →
+".venv: dùng lại", không tải lại model.
