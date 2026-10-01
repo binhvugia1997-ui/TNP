@@ -240,3 +240,18 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 * Log: `MASTER_NEW management_number=… row=…`, `MASTER_NEW_RETRY …existing_partial_row=…`, `MASTER_NEW_FAILED …`.
   Chẩn đoán GUI: `Dòng Excel: Tạo mới (dòng N)`.
 * GUI gồm 2 tab: `Xử lý báo cáo` (thư mục, file, thời gian xử lý, kết quả, tiến độ) và `Cấu hình & Ollama`.
+
+### Danh sách file đã quét (kiểm tra trước khi xử lý)
+
+* Tab `Xử lý báo cáo`: sau `Quét lại` (chạy đúng hàm `prescan` của batch, trong luồng nền, không mở PPTX, không ghi gì)
+  hiện bảng: STT · Management Number · Ngày phát sinh · Tên file · Vendor · Trạng thái quét · Đường dẫn (nháy đúp xem chi tiết).
+  Bộ lọc `Hiển thị: File cần xử lý / Tất cả file đã quét / File bị bỏ qua` chỉ ảnh hưởng hiển thị.
+* `Xóa khỏi danh sách` (nút, phím Delete, chuột phải – cùng một `GuiController.exclude`) chỉ loại file **khỏi hàng đợi hiện tại**
+  (`USER_EXCLUDED` – "Đã loại thủ công"); **không bao giờ** xoá/di chuyển/sửa file gốc, không ghi Excel, không tạo dòng mới,
+  không mở PPTX, không gọi Qwen, không ghi cache. `Khôi phục` chỉ đảo ngược loại thủ công (không vượt qua ngoài kỳ / trùng /
+  mã sai / Excel đầy đủ / cache).
+* Hàng đợi thực tế = danh sách đã duyệt (`final_queue`); tiến độ/ETA dùng số này (20 ứng viên − 3 loại = `0 / 17`).
+  Dòng Excel mới chỉ được tạo khi ứng viên thực sự được xử lý. Nhãn: `Cần xử lý sau khi quét / Đã loại thủ công / Sẽ xử lý`.
+* Đổi thư mục / file Excel / tháng / khoảng / Tất cả / Xử lý lại → danh sách thành cũ: `Danh sách file đã thay đổi điều kiện.
+  Vui lòng quét lại.` và không thể Bắt đầu. `Quét lại` xoá các loại thủ công và tính lại (kể cả file trùng chuẩn).
+  Khi đang xử lý, các nút loại/khôi phục bị khoá (dùng `Dừng sau báo cáo hiện tại`).

@@ -415,12 +415,12 @@ def test_mocked_view_renders_progress_and_ollama_widgets(monkeypatch, sample_tre
         def __init__(self, *a, **k): self.cfg = {}; self.scheduled = []
         def after(self, ms, fn=None): self.scheduled.append((ms, fn))
     tkmod = types.ModuleType("tkinter")
-    for n in ("Text", "Toplevel"):
+    for n in ("Text", "Toplevel", "Menu"):
         setattr(tkmod, n, Widget)
     tkmod.Tk, tkmod.StringVar, tkmod.BooleanVar, tkmod.TclError = Root, Var, Var, Exception
     ttkmod = types.ModuleType("tkinter.ttk")
     for n in ("Style", "Label", "LabelFrame", "Frame", "Entry", "Button", "Combobox", "Checkbutton", "Treeview",
-              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox", "Notebook"):
+              "Scrollbar", "Progressbar", "Radiobutton", "Spinbox", "Notebook", "PanedWindow"):
         setattr(ttkmod, n, Widget)
     fd, mb = types.ModuleType("tkinter.filedialog"), types.ModuleType("tkinter.messagebox")
     for m in (fd, mb):

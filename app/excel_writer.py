@@ -200,17 +200,23 @@ class TemplateError(RuntimeError):
 
 
 class ExcelWriter:
-    def __init__(self, template: Path, output: Path):
+    def __init__(self, template: Path, output: Path, probe: bool = False):
+        """``probe=True`` opens the current master state READ-ONLY for the pre-scan (no copy of the template,
+        nothing is ever written); otherwise the output workbook is created from the template when missing."""
         self.template = Path(template)
         self.output = Path(output)
+        self.probe = probe
         if not self.template.exists():
             raise TemplateError(f"Không tìm thấy form Excel: {self.template}")
         if self.template.resolve() == self.output.resolve():
             raise TemplateError("File kết quả không được trùng với form Excel gốc")
-        self.output.parent.mkdir(parents=True, exist_ok=True)
-        if not self.output.exists():
-            shutil.copyfile(self.template, self.output)
-        self.wb = load_workbook(self.output)
+        if probe:
+            self.wb = load_workbook(self.output if self.output.exists() else self.template)
+        else:
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            if not self.output.exists():
+                shutil.copyfile(self.template, self.output)
+            self.wb = load_workbook(self.output)
         self.columns: Dict[str, int] = {}
         self.header_row = 0
         self.data_start = 0
@@ -807,6 +813,8 @@ class ExcelWriter:
                 img.ref = BytesIO(cached)
 
     def save(self) -> Path:
+        if self.probe:
+            raise TemplateError("Workbook mở ở chế độ quét (probe) – không ghi")
         tmp = self.output.with_name(self.output.stem + ".saving.xlsx")
         self._refresh_images()
         self.wb.save(tmp)

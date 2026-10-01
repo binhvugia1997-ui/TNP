@@ -504,28 +504,32 @@ def test_gui_counters_progress_denominator_and_eta(sample_tree, tmp_path, monkey
 
     ctl = GuiController(AppConfig(), config_path=tmp_path / "c.json")
     monkeypatch.setattr(bp, "date", _FixedDate)                                      # today = 20/09/2026
+    ctl._today = lambda: RUN_TODAY
     ctl.set_report_folder(str(reports))
     ctl.set_template(str(tpl))
     ctl.set_output(str(out))
     assert ctl.period_label() == "Thời gian xử lý: 01/09/2026 → 30/09/2026 (từ tên file Excel)"   # 63
     assert ctl.validate() == []
-    assert len(ctl.files) == 7
-    assert ctl.start(use_ollama=False)
+    assert len(ctl.all_files) == 7
+    assert ctl.start(use_ollama=False)                      # no reviewed list yet -> the real pre-scan runs first
     ctl.processor._thread.join(120)
     events = ctl.pump()
     kinds = [e.kind for e in events]
     assert kinds.index("prescan") < kinds.index("row")                                 # counters first
-    c = ctl.prescan.counts()
+    c = ctl.scan_result.counts()                            # reviewed list = all 7 discovered files
     assert c == {"discovered": 7, "outside_period": 2, "source_duplicates": 1, "fast_skipped": 1,
                  "master_complete": 1, "new_rows": 1, "incomplete": 1, "invalid_management_number": 0, "candidates": 2}
     assert ctl.progress.total == 2 and ctl.progress.done == 2 and ctl.progress.percent == 100.0   # 61 (new row counts)
     assert ctl.progress.text == "Đã xử lý: 2 / 2 — 100%"
     assert len(ctl.report_durations) == 2                                              # 62: skips not measured
-    assert all(r.is_final for r in ctl.rows)
+    assert all(r.is_final for r in ctl.rows) and len(ctl.files) == 2                  # queue = candidates only
+    scan = {r.path.name: r.status_vi for r in ctl.scan_rows()}
+    assert scan["260820001-VOC_aug.pptx"] == scan["261002002-VOC_oct.pptx"] == "Ngoài thời gian xử lý"
+    assert scan["260917005-VOC_a.pptx"] == "Trùng Management Number trong folder"
+    assert scan["260917005-VOC_b.pptx"] == "Bỏ qua — đã xử lý gần đây"
+    assert scan["260915003-VOC_done.pptx"] == "Bỏ qua — Excel đã đầy đủ"
+    assert scan["260916004-VOC_absent.pptx"] == "Sẽ thêm mới vào Excel"
     stages = {r.path.name: r.stage for r in ctl.rows}
-    assert stages["260820001-VOC_aug.pptx"] == stages["261002002-VOC_oct.pptx"] == "outside_period"
-    assert stages["260917005-VOC_a.pptx"] == "source_duplicate" and stages["260917005-VOC_b.pptx"] == "fast_skip"
-    assert stages["260915003-VOC_done.pptx"] == "skipped"
     assert stages["260916004-VOC_absent.pptx"] == "error"                             # new row created, fake PPTX fails
     assert stages["260918080-VOC_real.pptx"] == "completed"
     lines = ctl.summary_lines()

@@ -21,8 +21,12 @@ from typing import Dict, Optional
 from . import APP_NAME, __version__
 from .config import AppConfig
 from .diagnostics import format_diagnostics, run_diagnostics
-from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, GuiController,
+from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, SCAN_FILTERS_VI, GuiController,
                              default_output_path)
+
+SCAN_COLUMNS = (("stt", "STT", 45), ("mgmt", "Management Number", 150), ("date", "Ngày phát sinh", 100),
+                ("file", "Tên file", 320), ("vendor", "Vendor", 90), ("scan", "Trạng thái quét", 220),
+                ("path", "Đường dẫn", 260))
 from .scanner import parse_dnd_paths
 
 try:  # optional drag & drop support
@@ -191,8 +195,54 @@ class ReportExtractorApp:
         self._config_widgets = [e1, e2, e3, e4, e5, b1, b2, b3, b4, b5, b6, b7, self.cb_model, c1,
                                 self.sb_month, self.sb_year, self.e_from, self.e_to, *self._period_radios]
 
-        lf = ttk.LabelFrame(r, text="Kết quả từng báo cáo  (nháy đúp để xem chi tiết)" + ("  – có thể kéo thả thư mục/file vào đây" if _DND_OK else ""))
-        lf.pack(fill="both", expand=True, padx=10, pady=4)
+        # ---- Danh sách file đã quét (review before Start) + Kết quả share the space -----------------
+        self.lbl_ai_run = ttk.Label(r, text=self.ctl.ai_status_text())
+        self.lbl_ai_run.pack(anchor="w", padx=14)
+        paned = ttk.PanedWindow(r, orient="vertical")
+        paned.pack(fill="both", expand=True, padx=10, pady=4)
+        sf = ttk.LabelFrame(paned, text="Danh sách file đã quét  (kiểm tra / loại file trước khi xử lý – không xoá file gốc)")
+        paned.add(sf, weight=3)
+        sbar = ttk.Frame(sf)
+        sbar.pack(fill="x", padx=6, pady=(4, 0))
+        self.btn_rescan = ttk.Button(sbar, text="Quét lại", command=self.scan_reports)
+        self.btn_rescan.pack(side="left", padx=2)
+        self.btn_exclude = ttk.Button(sbar, text="Xóa khỏi danh sách", command=self.exclude_selected)
+        self.btn_exclude.pack(side="left", padx=2)
+        self.btn_restore = ttk.Button(sbar, text="Khôi phục", command=self.restore_selected)
+        self.btn_restore.pack(side="left", padx=2)
+        ttk.Label(sbar, text="Hiển thị:").pack(side="left", padx=(12, 2))
+        self.var_scan_filter = tk.StringVar(value=SCAN_FILTERS_VI[0])
+        self.cb_scan_filter = ttk.Combobox(sbar, textvariable=self.var_scan_filter, values=list(SCAN_FILTERS_VI),
+                                           state="readonly", width=20)
+        self.cb_scan_filter.pack(side="left")
+        self.cb_scan_filter.bind("<<ComboboxSelected>>", lambda _e: self._render_scan())
+        self.lbl_scan = ttk.Label(sbar, text="")
+        self.lbl_scan.pack(side="left", padx=(12, 0))
+        self.lbl_queue = ttk.Label(sf, text="")
+        self.lbl_queue.pack(anchor="w", padx=8)
+        self.scan_tree = ttk.Treeview(sf, columns=[c[0] for c in SCAN_COLUMNS], show="headings", selectmode="extended",
+                                      height=8)
+        for key, title, width in SCAN_COLUMNS:
+            self.scan_tree.heading(key, text=title)
+            self.scan_tree.column(key, width=width, anchor="center" if key in ("stt", "date") else "w",
+                                  stretch=key in ("file", "path"))
+        svsb = ttk.Scrollbar(sf, orient="vertical", command=self.scan_tree.yview)
+        self.scan_tree.configure(yscrollcommand=svsb.set)
+        self.scan_tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        svsb.pack(side="left", fill="y", pady=6)
+        for tag, color in (("candidate", "#0b57d0"), ("excluded", "#9e9e9e"), ("skip", "#777777")):
+            self.scan_tree.tag_configure(tag, foreground=color)
+        self.scan_tree.bind("<Delete>", lambda _e: self.exclude_selected())
+        self.scan_tree.bind("<Double-1>", self._on_scan_double_click)
+        self.scan_menu = tk.Menu(self.root, tearoff=0)
+        self.scan_menu.add_command(label="Xóa khỏi danh sách xử lý", command=self.exclude_selected)
+        self.scan_menu.add_command(label="Khôi phục", command=self.restore_selected)
+        self.scan_tree.bind("<Button-3>", self._on_scan_right_click)
+        self.scan_items: Dict[str, int] = {}
+        self._config_widgets.extend([self.btn_rescan, self.btn_exclude, self.btn_restore, self.cb_scan_filter])
+
+        lf = ttk.LabelFrame(paned, text="Kết quả từng báo cáo  (nháy đúp để xem chi tiết)" + ("  – có thể kéo thả thư mục/file vào đây" if _DND_OK else ""))
+        paned.add(lf, weight=2)
         self.tree = ttk.Treeview(lf, columns=[c[0] for c in COLUMNS], show="headings", selectmode="browse")
         for key, title, width in COLUMNS:
             self.tree.heading(key, text=title)
@@ -283,8 +333,9 @@ class ReportExtractorApp:
         c.set_template(self.var_template.get())
         c.set_output(self.var_output.get())
         self._push_endpoint()
-        c.force_reprocess = bool(self.var_force.get())
+        c.set_force(bool(self.var_force.get()))
         self._push_period()
+        self._render_scan_state()
 
     def _push_period(self) -> str:
         return self.ctl.set_period(self.var_period_mode.get(), self.var_period_month.get(), self.var_period_year.get(),
@@ -318,6 +369,8 @@ class ReportExtractorApp:
             if self.var_port.get().strip() != str(self.ctl.port):
                 self.var_port.set(str(self.ctl.port))
         self.lbl_ai.configure(text=self.ctl.ai_status_text())
+        if hasattr(self, "lbl_ai_run"):
+            self.lbl_ai_run.configure(text=self.ctl.ai_status_text())
         return problem
 
     def _on_endpoint_edited(self) -> None:
@@ -363,13 +416,85 @@ class ReportExtractorApp:
             self.ctl.save_settings()
 
     def scan_reports(self) -> None:
+        """Quét lại: cheap discovery now, the REAL pre-scan in a worker thread (GUI never freezes)."""
         self._push_to_controller()
+        if self.ctl.is_running():
+            return
         n = self.ctl.discover()
         self._render_rows()
         self.lbl_found.configure(text=f"Đã tìm thấy {n} báo cáo")
         self.lbl_progress.configure(text=f"Đã tìm thấy {n} báo cáo .pptx" if n else "Không tìm thấy báo cáo .pptx nào.")
         self.pb["value"] = 0
         self.lbl_counts.configure(text=self.ctl.counts_text())
+        if n and not self.ctl.effective_period()[1]:
+            self.lbl_scan.configure(text="Đang quét thư mục...")
+            self.ctl.scan_async()
+        else:
+            self._render_scan()
+
+    # ------------------------------------------------------------------ scanned-file list
+    def _render_scan(self) -> None:
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        self.scan_items.clear()
+        rows = self.ctl.scan_rows(self.var_scan_filter.get())
+        for n, row in enumerate(rows, start=1):
+            tag = "excluded" if row.excluded else ("candidate" if row.is_candidate else "skip")
+            iid = self.scan_tree.insert("", "end", values=row.as_values(n), tags=(tag,))
+            self.scan_items[iid] = row.index
+        self._render_scan_state()
+
+    def _render_scan_state(self) -> None:
+        if not hasattr(self, "lbl_queue"):
+            return
+        if self.ctl.scan_stale or (self.ctl.scan_result is None and self.ctl.scan_message):
+            self.lbl_scan.configure(text=self.ctl.scan_message, style="Bad.TLabel")
+        elif self.ctl.scan_result is not None:
+            c = self.ctl.scan_result.counts()
+            self.lbl_scan.configure(text=f"Đã quét {c['discovered']} file", style="TLabel")
+        else:
+            self.lbl_scan.configure(text="", style="TLabel")
+        self.lbl_queue.configure(text=self.ctl.queue_text() if self.ctl.scan_result else "")
+        running = self.ctl.is_running()
+        for b in (self.btn_exclude, self.btn_restore):
+            b.configure(state="disabled" if running else "normal")
+
+    def _selected_scan_indexes(self):
+        return [self.scan_items[iid] for iid in self.scan_tree.selection() if iid in self.scan_items]
+
+    def exclude_selected(self) -> None:
+        """Button, Delete key and context menu all end here: remove from the CURRENT queue only."""
+        problem = self.ctl.exclude(self._selected_scan_indexes())
+        if problem:
+            self.log(problem)
+        self._render_scan()
+
+    def restore_selected(self) -> None:
+        problem = self.ctl.restore(self._selected_scan_indexes())
+        if problem:
+            self.log(problem)
+        self._render_scan()
+
+    def _on_scan_right_click(self, event) -> None:
+        try:
+            iid = self.scan_tree.identify_row(event.y)
+            if iid and iid not in self.scan_tree.selection():
+                self.scan_tree.selection_set(iid)
+            self.scan_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.scan_menu.grab_release()
+            except Exception:
+                pass
+
+    def _on_scan_double_click(self, _event=None) -> None:
+        idx = self._selected_scan_indexes()
+        if not idx:
+            return
+        row = next((r for r in self.ctl.scan_rows() if r.index == idx[0]), None)
+        if row:
+            messagebox.showinfo(APP_NAME, f"{row.path.name}\n\nManagement Number: {row.management_number or '(trống)'}\n"
+                                          f"Ngày phát sinh: {row.occurrence_date or '(trống)'}\n"
+                                          f"Trạng thái quét: {row.status_vi}\n{row.reason}\n\nĐường dẫn:\n{row.path}")
 
     def _on_drop(self, event) -> None:
         paths = parse_dnd_paths(event.data)
@@ -419,7 +544,11 @@ class ReportExtractorApp:
         errs = self.ctl.validate()
         if errs:
             messagebox.showwarning(APP_NAME, "Chưa thể bắt đầu:\n\n• " + "\n• ".join(errs))
+            self._render_scan_state()
             return
+        if self.ctl.scan_result is None:
+            self.ctl.scan()                      # synchronous – the list was never scanned (e.g. keyboard-only user)
+            self._render_scan()
         use_ai = True
         ok, msg = self.ctl.check_ollama(timeout=15)
         self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
@@ -433,6 +562,7 @@ class ReportExtractorApp:
             return
         self._render_rows()
         self._set_running(True)
+        self._render_scan_state()
         self._render_progress()
         self.lbl_stage.configure(text="Đang quét thư mục...")
         self.root.after(1000, self._tick)
@@ -514,6 +644,12 @@ class ReportExtractorApp:
                 self.lbl_counts.configure(text=self.ctl.counts_text())
             elif ev.kind == "log":
                 self.log(str(ev.payload))
+            elif ev.kind == "scan":
+                self._render_scan()
+                if self.ctl.scan_result is not None:
+                    self.log(self.ctl.queue_text())
+                elif self.ctl.scan_message:
+                    self.log(self.ctl.scan_message)
             elif ev.kind == "prescan":
                 self._render_progress()
                 self.lbl_counts.configure(text=self.ctl.counts_text())
@@ -549,6 +685,7 @@ class ReportExtractorApp:
     def _on_done(self) -> None:
         s = self.ctl.summary
         self._set_running(False)
+        self._render_scan_state()
         for i in self.row_items:
             self._render_row(i)
         self.lbl_counts.configure(text=self.ctl.counts_text())

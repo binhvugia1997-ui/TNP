@@ -22,8 +22,12 @@ from .excel_writer import validate_template
 from .extractor import management_number_from_filename
 from .logger import FileResult
 from .ollama_client import OllamaClient, OllamaError, preferred_model
-from .prescan import (AUTO_PERIOD_FAIL_VI, PERIOD_DIFFERS_VI, ALL_PERIOD, PreScanResult, ProcessingPeriod,
-                      auto_period_from_excel, month_period, range_period)
+from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS,
+                      ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
+                      CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, MasterLookup, PreScanItem,
+                      PreScanResult, ProcessingPeriod, auto_period_from_excel, month_period, normalize_source_path,
+                      prescan, range_period)
+from .excel_writer import ExcelWriter
 from .scanner import scan_inputs
 
 LOG = logging.getLogger("report_extractor.gui")
@@ -44,6 +48,22 @@ STATUS_VI: Dict[str, str] = {
 PRESCAN_STATUSES = ("outside_period", "source_duplicate", "fast_skip")
 FINAL_STATUSES = ("completed", "needs_review", "not_written", "error", "skipped") + PRESCAN_STATUSES
 PERIOD_MODES = ("auto", "month", "range", "all")
+# scanned-file list: Vietnamese label of each pre-scan decision + the manual exclusion
+USER_EXCLUDED = "USER_EXCLUDED"
+SCAN_LABELS_VI: Dict[str, str] = {
+    ACTION_PROCESS: "Sẽ xử lý — cần bổ sung dữ liệu",
+    ACTION_PROCESS_NEW_ROW: "Sẽ thêm mới vào Excel",
+    ACTION_FAST_SKIP: "Bỏ qua — đã xử lý gần đây",
+    ACTION_MASTER_COMPLETE: "Bỏ qua — Excel đã đầy đủ",
+    ACTION_OUTSIDE_PERIOD: "Ngoài thời gian xử lý",
+    ACTION_SOURCE_DUPLICATE: "Trùng Management Number trong folder",
+    ACTION_INVALID_MGMT: "Không xác định được Management Number từ tên file",
+    USER_EXCLUDED: "Đã loại thủ công",
+}
+SCAN_FILTERS_VI = ("File cần xử lý", "Tất cả file đã quét", "File bị bỏ qua")
+STALE_LIST_VI = "Danh sách file đã thay đổi điều kiện. Vui lòng quét lại."
+NO_SCAN_VI = "Chưa quét thư mục. Vui lòng bấm Quét lại."
+RUNNING_VI = "Đang xử lý – không thể thay đổi danh sách. Dùng 'Dừng sau báo cáo hiện tại'."
 PERIOD_MODE_VI = {"auto": "Tự động theo file Excel", "month": "Chọn tháng", "range": "Khoảng thời gian", "all": "Tất cả"}
 WORKING_STAGES = ("reading", "analyzing", "analyzing_heuristic", "extracting", "extracting_qpn",
                   "extracting_images", "writing_excel")
@@ -159,6 +179,39 @@ class Progress:
 
 
 @dataclass
+class ScanRow:
+    """One line of the scanned-file list (view model built from the real PreScanItem)."""
+    index: int
+    key: str                          # stable identity: normalized path + Management Number
+    path: Path
+    management_number: str
+    occurrence_date: str
+    action: str                       # pre-scan action
+    excluded: bool
+    reason: str
+    excel_row: Optional[int] = None
+
+    @property
+    def is_candidate(self) -> bool:
+        return self.action in (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW)
+
+    @property
+    def state(self) -> str:
+        return USER_EXCLUDED if self.excluded else self.action
+
+    @property
+    def status_vi(self) -> str:
+        return SCAN_LABELS_VI.get(self.state, self.state)
+
+    @property
+    def will_process(self) -> bool:
+        return self.is_candidate and not self.excluded
+
+    def as_values(self, stt: int) -> Tuple[Any, ...]:
+        return (stt, self.management_number, self.occurrence_date, self.path.name, "", self.status_vi, str(self.path))
+
+
+@dataclass
 class UiEvent:
     kind: str                      # row | progress | log | done | ollama
     payload: Any = None
@@ -191,6 +244,12 @@ class GuiController:
         self.period_to: str = self.cfg.period_to or ""
         self.prescan: Optional[PreScanResult] = None
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
+        # reviewed scan list (before Start): real pre-scan result + manual exclusions
+        self.all_files: List[Path] = []                # every discovered PPT/PPTX (recursive)
+        self.scan_result: Optional[PreScanResult] = None
+        self.scan_stale: bool = False
+        self.scan_message: str = ""
+        self.excluded_keys: set = set()
         # runtime state
         self.state: str = "idle"                 # idle | running | stopping
         self.files: List[Path] = []
@@ -206,6 +265,7 @@ class GuiController:
         self.report_durations: List[float] = []      # measured seconds per finished report (rolling window)
         self._report_started_at: Optional[float] = None
         self._clock: Callable[[], float] = time.monotonic
+        self._today: Callable[[], Any] = __import__("datetime").date.today   # overridable for tests
         self._queue: "queue.Queue[UiEvent]" = queue.Queue()
 
     # ------------------------------------------------------------------ Ollama endpoint
@@ -244,25 +304,169 @@ class GuiController:
     # ------------------------------------------------------------------ inputs
     def set_report_folder(self, folder: str) -> int:
         """Select the report folder, discover PPT/PPTX recursively, propose the output path."""
+        changed = folder.strip() != self.report_folder
         self.report_folder = folder.strip()
         if not self.output or Path(self.output).name == DEFAULT_OUTPUT_NAME:
             self.output = default_output_path(self.report_folder)
-        return self.discover()
+        n = self.discover()
+        if changed:
+            self._invalidate_scan()
+        return n
 
     def discover(self) -> int:
+        """Cheap recursive discovery (names only – nothing is opened)."""
         folder = Path(self.report_folder) if self.report_folder else None
-        self.files = scan_inputs([folder]) if folder and folder.is_dir() else []
+        self.all_files = scan_inputs([folder]) if folder and folder.is_dir() else []
+        self._set_files(self.all_files)
+        return len(self.all_files)
+
+    def _set_files(self, files: List[Path]) -> None:
+        self.files = list(files)
         self.rows = [RowState(index=i, path=p, management_number=management_number_from_filename(p.name))
                      for i, p in enumerate(self.files)]
         self.progress = Progress(total=len(self.files))
         self.summary = None
-        return len(self.files)
+
+    def _invalidate_scan(self) -> None:
+        """Any input that changes the candidate set makes the reviewed list stale (never run the old queue)."""
+        if self.scan_result is not None:
+            self.scan_stale = True
+            self.scan_message = STALE_LIST_VI
 
     def set_template(self, path: str) -> None:
-        self.template = path.strip()
+        if path.strip() != self.template:
+            self.template = path.strip()
+            self._invalidate_scan()
 
     def set_output(self, path: str) -> None:
-        self.output = path.strip()
+        if path.strip() != self.output:
+            self.output = path.strip()
+            self._invalidate_scan()
+
+    def set_force(self, value: bool) -> None:
+        if bool(value) != self.force_reprocess:
+            self.force_reprocess = bool(value)
+            self._invalidate_scan()
+
+    # ------------------------------------------------------------------ scanned-file list (review before Start)
+    @staticmethod
+    def candidate_key(path: Path, mgmt: str) -> str:
+        return f"{normalize_source_path(Path(path))}|{(mgmt or '').strip().upper()}"
+
+    def scan(self) -> Optional[PreScanResult]:
+        """Run the REAL pre-scan (same function the batch uses) on the discovered files with the current folder /
+        Excel / period / cache / force settings.  Resets manual exclusions.  Nothing is opened or written."""
+        self.discover()
+        per, err = self.effective_period()
+        self.excluded_keys = set()
+        self.scan_stale, self.scan_message = False, ""
+        if err:
+            self.scan_result, self.scan_message = None, err
+            return None
+        master = None
+        writer = None
+        try:
+            tpl, out = Path(self.template) if self.template else None, Path(self.output) if self.output else None
+            if tpl and tpl.is_file() and out and (self.cfg.row_mode or "match") == "match":
+                writer = ExcelWriter(tpl, out, probe=True)
+                master = MasterLookup.from_writer(writer)
+        except Exception as e:  # noqa: BLE001
+            self.log_lines.append(f"Không đọc được file Excel để quét: {e}")
+        cache = None
+        try:
+            if self.output:
+                cache = FastScanCache(Path(self.output).parent / "logs" / CACHE_FILE_NAME)
+        except Exception:  # noqa: BLE001
+            cache = None
+        try:
+            self.scan_result = prescan(self.all_files, per, cache, master, force=self.force_reprocess,
+                                       today=self._today(), on_stage=lambda m: self.log_lines.append(m))
+        finally:
+            if writer is not None:
+                writer.close()
+        for line in self.scan_result.summary_lines_vi():
+            self.log_lines.append(line)
+        return self.scan_result
+
+    def scan_async(self) -> None:
+        def work():
+            try:
+                res = self.scan()
+                self._queue.put(UiEvent("scan", res))
+            except Exception as e:  # noqa: BLE001
+                self.scan_result, self.scan_message = None, f"Quét thư mục thất bại: {e}"
+                self._queue.put(UiEvent("scan", None))
+        self.log_lines.append("Đang quét thư mục...")
+        threading.Thread(target=work, name="prescan", daemon=True).start()
+
+    def scan_rows(self, filter_name: str = SCAN_FILTERS_VI[1]) -> List[ScanRow]:
+        """View rows of the scanned list.  Filter: 'File cần xử lý' (candidates incl. manually excluded ones),
+        'Tất cả file đã quét', 'File bị bỏ qua' (business skips + manual exclusions)."""
+        if not self.scan_result:
+            return []
+        rows: List[ScanRow] = []
+        for it in self.scan_result.items:
+            key = self.candidate_key(it.path, it.management_number)
+            rows.append(ScanRow(index=it.index, key=key, path=it.path, management_number=it.management_number,
+                                occurrence_date=f"{it.occurrence_date:%d/%m/%Y}" if it.occurrence_date else "",
+                                action=it.action, excluded=key in self.excluded_keys, reason=it.reason,
+                                excel_row=it.excel_row))
+        if filter_name == SCAN_FILTERS_VI[0]:
+            rows = [r for r in rows if r.is_candidate]
+        elif filter_name == SCAN_FILTERS_VI[2]:
+            rows = [r for r in rows if not r.will_process]
+        return rows
+
+    def _scan_row(self, index: int) -> Optional[ScanRow]:
+        return next((r for r in self.scan_rows() if r.index == index), None)
+
+    def exclude(self, indexes) -> str:
+        """Remove processing candidates from the CURRENT queue (never touches the files).  '' or a problem."""
+        if self.is_running():
+            return RUNNING_VI
+        if not self.scan_result:
+            return NO_SCAN_VI
+        n = 0
+        for i in list(indexes):
+            r = self._scan_row(int(i))
+            if r and r.is_candidate and not r.excluded:
+                self.excluded_keys.add(r.key)
+                n += 1
+                LOG.info("USER_EXCLUDED management_number=%s file=%s", r.management_number, r.path)
+        return "" if n else "Không có file cần xử lý nào được chọn."
+
+    def restore(self, indexes) -> str:
+        """Undo a manual exclusion; business exclusions (period, duplicate, invalid key, complete row, cache) stay."""
+        if self.is_running():
+            return RUNNING_VI
+        if not self.scan_result:
+            return NO_SCAN_VI
+        n = 0
+        for i in list(indexes):
+            r = self._scan_row(int(i))
+            if r and r.excluded:
+                self.excluded_keys.discard(r.key)
+                n += 1
+                LOG.info("USER_RESTORED management_number=%s file=%s", r.management_number, r.path)
+        return "" if n else "Chỉ khôi phục được file đã loại thủ công."
+
+    def final_queue(self) -> List[PreScanItem]:
+        """Candidates of the reviewed list minus manual exclusions (source order) = the real processing queue."""
+        if not self.scan_result:
+            return []
+        return [it for it in self.scan_result.candidates
+                if self.candidate_key(it.path, it.management_number) not in self.excluded_keys]
+
+    def queue_counts(self) -> Dict[str, int]:
+        cands = self.scan_result.candidates if self.scan_result else []
+        excluded = sum(1 for it in cands if self.candidate_key(it.path, it.management_number) in self.excluded_keys)
+        return {"candidates": len(cands), "excluded": excluded, "will_process": len(cands) - excluded,
+                "discovered": len(self.all_files)}
+
+    def queue_text(self) -> str:
+        c = self.queue_counts()
+        return (f"Cần xử lý sau khi quét: {c['candidates']}   Đã loại thủ công: {c['excluded']}   "
+                f"Sẽ xử lý: {c['will_process']}")
 
     def set_ollama(self, server: str, model: str) -> None:
         self.server = server
@@ -274,6 +478,7 @@ class GuiController:
         """Change the period mode/values; returns a Vietnamese problem text ('' when fine)."""
         if mode not in PERIOD_MODES:
             return f"Chế độ thời gian không hợp lệ: {mode}"
+        before = (self.period_mode, self.period_month, self.period_year, self.period_from, self.period_to)
         self.period_mode = mode
         if month is not None:
             self.period_month = str(month).strip()
@@ -283,6 +488,8 @@ class GuiController:
             self.period_from = start.strip()
         if end is not None:
             self.period_to = end.strip()
+        if (self.period_mode, self.period_month, self.period_year, self.period_from, self.period_to) != before:
+            self._invalidate_scan()
         _, err = self.effective_period()
         return err
 
@@ -340,8 +547,10 @@ class GuiController:
             errs.append(perr)
         if not self.report_folder or not Path(self.report_folder).is_dir():
             errs.append("Thư mục báo cáo không tồn tại.")
-        elif not self.files:
+        elif not self.all_files and not self.files:
             errs.append("Không tìm thấy file .ppt/.pptx nào trong thư mục báo cáo.")
+        if self.scan_stale:
+            errs.append(STALE_LIST_VI)
         tpl = Path(self.template) if self.template else None
         if tpl is None or not tpl.is_file():
             errs.append("File Kiểm chứng (.xlsx) không tồn tại.")
@@ -499,6 +708,15 @@ class GuiController:
             return False
         if self.validate():
             return False
+        if self.scan_result is None:
+            self.scan()                               # no reviewed list yet -> run the real pre-scan now
+            if self.scan_result is None:
+                return False
+        if self.scan_stale:
+            return False
+        # the processing queue = the FINAL reviewed list (manual exclusions never reach the pipeline; a new
+        # Excel row is created only when its candidate is actually processed)
+        self._set_files([it.path for it in self.final_queue()])
         self.save_settings()
         for r in self.rows:
             r.stage, r.note, r.vendor, r.model, r.item = "waiting", "", "", "", ""
@@ -562,7 +780,9 @@ class GuiController:
         return sum(1 for r in self.rows if r.is_final and self._in_queue(r.index))
 
     def apply_event(self, ev: UiEvent) -> None:
-        if ev.kind == "prescan":
+        if ev.kind == "scan":
+            pass                                     # scan_result already set by scan(); the view re-renders
+        elif ev.kind == "prescan":
             res: PreScanResult = ev.payload
             self.prescan = res
             self.queue_indexes = {it.index for it in res.candidates}
@@ -682,14 +902,20 @@ class GuiController:
         return "   ".join(x for x in parts if x)
 
     def prescan_lines(self) -> List[str]:
-        """Pre-scan counters (Vietnamese) – empty before the pre-scan ran."""
-        return self.prescan.summary_lines_vi() if self.prescan else []
+        """Pre-scan counters (Vietnamese) of the reviewed list (+ manual decisions) – empty before any scan."""
+        res = self.scan_result or self.prescan
+        if not res:
+            return []
+        lines = res.summary_lines_vi()
+        if self.scan_result:
+            lines.append(self.queue_text())
+        return lines
 
     def summary_lines(self) -> List[str]:
         s = self.summary or BatchSummary(total=len(self.files))
         lines = [f"Tổng: {s.total}", f"Hoàn thành: {s.completed}", f"Cần kiểm tra: {s.needs_review}",
                  f"Không tìm thấy Management Number: {s.not_written}", f"Lỗi: {s.failed}", f"Bỏ qua: {s.skipped}"]
-        if self.prescan:
+        if self.scan_result or self.prescan:
             lines.extend(self.prescan_lines())
         if self.started_at is not None:
             lines.append(f"Tổng thời gian xử lý: {format_elapsed(self.elapsed_seconds())}")
