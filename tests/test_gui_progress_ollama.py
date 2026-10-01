@@ -159,7 +159,7 @@ def test_eta_from_measured_durations(tmp_path):
         clock.advance(45)
         _finish_report(ctl, i)
     ctl.apply_event(UiEvent("done", BatchSummary(total=5, completed=5)))
-    assert ctl.eta_text() == ""                            # no ETA after the batch ended
+    assert ctl.eta_text() == "Đã hoàn thành"              # no ETA after the batch ended (#8)
     assert ctl.elapsed_text() == "Tổng thời gian: 03:45"   # 30+60+45*3 = 225 s
     assert "Tổng thời gian xử lý: 03:45" in ctl.summary_lines()
     clock.advance(999)

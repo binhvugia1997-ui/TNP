@@ -36,6 +36,11 @@ CACHE_VERSION = 1
 SAFE_CACHE_STATUSES = ("completed", "skipped")          # Hoàn thành / Hoàn thành — bổ sung / Bỏ qua — đã cập nhật
 
 # final pre-scan actions
+# canonical keys of PreScanResult.counts(): "new_rows" replaced the former "master_not_found" when automatic
+# Management-Number row creation arrived; consumers must use these names (default-safe access in display code)
+PRESCAN_COUNT_KEYS = ("discovered", "outside_period", "source_duplicates", "fast_skipped", "master_complete",
+                      "new_rows", "incomplete", "invalid_management_number", "candidates")
+
 ACTION_PROCESS = "PROCESS"
 ACTION_OUTSIDE_PERIOD = "OUTSIDE_PERIOD"
 ACTION_SOURCE_DUPLICATE = "SOURCE_DUPLICATE"
@@ -384,6 +389,7 @@ class PreScanResult:
         return [it for it in self.items if it.action in PROCESS_ACTIONS]
 
     def counts(self) -> Dict[str, int]:
+        """Canonical pre-scan summary schema (``PRESCAN_COUNT_KEYS``) – every key is always present."""
         return {
             "discovered": self.discovered,
             "outside_period": self.count(ACTION_OUTSIDE_PERIOD),

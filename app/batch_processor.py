@@ -91,8 +91,7 @@ class BatchSummary:
     output_file: str = ""
     output_folder: str = ""
     errors: List[Dict[str, str]] = field(default_factory=list)
-    # pre-scan counters (discovered, outside_period, source_duplicates, fast_skipped, master_complete,
-    # master_not_found, invalid_management_number, candidates) + the period actually used
+    # pre-scan counters = PreScanResult.counts() (schema: prescan.PRESCAN_COUNT_KEYS) + the period actually used
     prescan: Dict[str, int] = field(default_factory=dict)
     candidates: int = 0
     period: str = ""

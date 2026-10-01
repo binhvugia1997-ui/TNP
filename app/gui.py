@@ -8,6 +8,7 @@ GUI thread only drains the controller's event queue every 100 ms.
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -43,6 +44,20 @@ COLUMNS = (("stt", "STT", 45), ("mgmt", "Management Number", 140), ("file", "Tê
            ("model", "Model", 70), ("item", "Item", 70), ("status", "Trạng thái", 210), ("note", "Ghi chú", 320))
 
 
+LOG = logging.getLogger("report_extractor.gui")
+
+
+def prescan_stage_text(counts) -> str:
+    """Stage line after the pre-scan, built from the canonical ``PreScanResult.counts()`` schema with
+    default-safe access (``master_not_found`` was replaced by ``new_rows`` when automatic row creation arrived)."""
+    c = dict(counts or {})
+    g = lambda k: c.get(k, 0)  # noqa: E731
+    return (f"Quét nhanh: {g('discovered')} file, cần xử lý thực tế {g('candidates')} "
+            f"(ngoài thời gian {g('outside_period')}, trùng {g('source_duplicates')}, "
+            f"đã xử lý gần đây {g('fast_skipped')}, Excel đầy đủ {g('master_complete')}, "
+            f"mã mới thêm vào Excel {g('new_rows')}, cần bổ sung {g('incomplete')})")
+
+
 def open_path(path: str) -> None:
     try:
         if sys.platform == "win32":
@@ -64,6 +79,7 @@ class ReportExtractorApp:
         self.root.minsize(960, 640)
         self.row_items: Dict[int, str] = {}
         self._config_widgets = []
+        self._done_handled = True                    # no batch yet; start() arms it
         self._build()
         self._load_from_controller()
         self.root.after(100, self._poll)
@@ -627,6 +643,7 @@ class ReportExtractorApp:
             use_ai = False
         if not self.ctl.start(use_ollama=use_ai):
             return
+        self._done_handled = False
         self._render_rows()
         self._set_running(True)
         self._render_scan_state()
@@ -697,67 +714,92 @@ class ReportExtractorApp:
             self.tree.see(iid)
 
     def _poll(self) -> None:
-        for ev in self.ctl.pump():
-            if ev.kind == "row":
-                i = ev.payload[0]
+        """Drain controller events every 100 ms.  Rendering one malformed/non-critical display event must never
+        kill the loop (the loop is re-armed in ``finally``), lose a later ``done`` or leave the GUI running."""
+        try:
+            for ev in self.ctl.pump():
+                try:
+                    self._render_event(ev)
+                except Exception as e:  # noqa: BLE001 – display-only failure, logged and reported, never fatal
+                    msg = f"GUI_EVENT_ERROR event={ev.kind} error={type(e).__name__}: {e}"
+                    LOG.exception(msg)
+                    self.log(msg)
+                if ev.kind == "done":
+                    self._on_done()                       # authoritative; runs even if rendering above failed
+            if self.ctl.is_running() and not self._done_handled:
+                reason = self.ctl.reconcile()             # safety net: dead worker without "done"
+                if reason:
+                    self.log(reason)
+                    self._on_done()
+        except Exception as e:  # noqa: BLE001
+            LOG.exception("GUI_POLL_ERROR %s", e)
+            self.log(f"GUI_POLL_ERROR {type(e).__name__}: {e}")
+        finally:
+            self.root.after(100, self._poll)              # exactly one polling loop, always re-armed
+
+    def _render_event(self, ev) -> None:
+        if ev.kind == "row":
+            i = ev.payload[0]
+            self._render_row(i)
+            p = self.ctl.progress
+            self._render_progress()
+            if p.current_index is not None and 0 <= i < len(self.ctl.rows) and not self.ctl.rows[i].is_final:
+                self.lbl_stage.configure(text=f"{self.ctl.rows[i].path.name} — {self.ctl.rows[i].status_vi} "
+                                              f"{p.current_detail}".strip())
+        elif ev.kind == "progress":
+            self._render_progress()
+            self.lbl_counts.configure(text=self.ctl.counts_text())
+        elif ev.kind == "log":
+            self.log(str(ev.payload))
+        elif ev.kind == "scan":
+            self._render_scan()
+            if self.ctl.scan_result is not None:
+                self.log(self.ctl.queue_text())
+            elif self.ctl.scan_message:
+                self.log(self.ctl.scan_message)
+        elif ev.kind == "prescan":
+            self._render_progress()
+            self.lbl_counts.configure(text=self.ctl.counts_text())
+            for i in self.row_items:
                 self._render_row(i)
-                p = self.ctl.progress
-                self._render_progress()
-                if p.current_index is not None and not self.ctl.rows[i].is_final:
-                    self.lbl_stage.configure(text=f"{self.ctl.rows[i].path.name} — {self.ctl.rows[i].status_vi} "
-                                                  f"{p.current_detail}".strip())
-            elif ev.kind == "progress":
-                self._render_progress()
-                self.lbl_counts.configure(text=self.ctl.counts_text())
-            elif ev.kind == "log":
-                self.log(str(ev.payload))
-            elif ev.kind == "scan":
-                self._render_scan()
-                if self.ctl.scan_result is not None:
-                    self.log(self.ctl.queue_text())
-                elif self.ctl.scan_message:
-                    self.log(self.ctl.scan_message)
-            elif ev.kind == "prescan":
-                self._render_progress()
-                self.lbl_counts.configure(text=self.ctl.counts_text())
-                for i in self.row_items:
-                    self._render_row(i)
-                c = ev.payload.counts()
-                self.lbl_stage.configure(text=f"Quét nhanh: {c['discovered']} file, cần xử lý thực tế {c['candidates']} "
-                                              f"(ngoài thời gian {c['outside_period']}, trùng {c['source_duplicates']}, "
-                                              f"đã xử lý gần đây {c['fast_skipped']}, Excel đầy đủ {c['master_complete']}, "
-                                              f"không có trong Excel {c['master_not_found']})")
-            elif ev.kind == "ollama":
-                ok, msg = ev.payload
-                self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
-                self.lbl_ai.configure(text=self.ctl.ai_status_text())
-                if self.ctl.available_models:
-                    self.cb_model["values"] = self.ctl.available_models
-                self.log(msg)
-            elif ev.kind == "models":
-                ok, msg, models = ev.payload
-                self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
-                if ok and models:
-                    self.cb_model["values"] = models            # real installed models, user's value kept
-                    if not self.var_model.get().strip():
-                        self.var_model.set(self.ctl.model)
-                    if self.var_model.get().strip() not in models:
-                        self.log(f"Model '{self.var_model.get().strip()}' không có trên máy chủ; "
-                                 f"có: {', '.join(models)}")
-                self.log(msg)
-            elif ev.kind == "done":
-                self._on_done()
-        self.root.after(100, self._poll)
+            self.lbl_stage.configure(text=prescan_stage_text(ev.payload.counts()))
+        elif ev.kind == "ollama":
+            ok, msg = ev.payload
+            self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
+            self.lbl_ai.configure(text=self.ctl.ai_status_text())
+            if self.ctl.available_models:
+                self.cb_model["values"] = self.ctl.available_models
+            self.log(msg)
+        elif ev.kind == "models":
+            ok, msg, models = ev.payload
+            self.lbl_conn.configure(text=msg, style="Ok.TLabel" if ok else "Bad.TLabel")
+            if ok and models:
+                self.cb_model["values"] = models            # real installed models, user's value kept
+                if not self.var_model.get().strip():
+                    self.var_model.set(self.ctl.model)
+                if self.var_model.get().strip() not in models:
+                    self.log(f"Model '{self.var_model.get().strip()}' không có trên máy chủ; "
+                             f"có: {', '.join(models)}")
+            self.log(msg)
+        elif ev.kind == "done":
+            pass                                            # handled by _poll -> _on_done (idempotent)
 
     def _on_done(self) -> None:
+        """Finalize the view ONCE (idempotent): internal state first, modal dialog last (#13)."""
+        if self._done_handled:
+            return
+        self._done_handled = True
         s = self.ctl.summary
-        self._set_running(False)
+        self._set_running(False)                     # Start enabled / Stop disabled / config editable
         self._render_scan_state()
         for i in self.row_items:
-            self._render_row(i)
+            self._render_row(i)                      # transient "Đang ..." statuses replaced by final ones
         self.lbl_counts.configure(text=self.ctl.counts_text())
-        self._render_progress()                      # 100% only when every report reached a terminal state
-        self.lbl_stage.configure(text="Đã dừng theo yêu cầu." if (s and s.stopped) else "Hoàn thành.")
+        self._render_progress()                      # 100% when every report reached a terminal state; timer frozen
+        if self.ctl.worker_failure:
+            self.lbl_stage.configure(text=self.ctl.worker_failure)
+        else:
+            self.lbl_stage.configure(text="Đã dừng theo yêu cầu." if (s and s.stopped) else "Hoàn thành.")
         self._show_summary_dialog()
 
     def _show_summary_dialog(self) -> None:

@@ -142,13 +142,17 @@ class Progress:
     current_detail: str = ""
     current_fraction: float = 0.0       # share of the current report reached (STAGE_WEIGHTS, monotonic)
     finished: bool = False              # batch ended (completed or stopped)
+    high_water: float = 0.0             # monotonic guard: a stale stage event never lowers the overall percentage
 
     @property
     def percent(self) -> float:
         if self.total <= 0:
             return 0.0
         value = (self.done + (self.current_fraction if self.current_index is not None else 0.0)) / self.total * 100.0
-        return max(0.0, min(100.0, value))
+        value = max(0.0, min(100.0, value))
+        if value > self.high_water:
+            self.high_water = value
+        return self.high_water
 
     @property
     def percent_int(self) -> int:
@@ -265,6 +269,9 @@ class GuiController:
         self.report_durations: List[float] = []      # measured seconds per finished report (rolling window)
         self._report_started_at: Optional[float] = None
         self._clock: Callable[[], float] = time.monotonic
+        self.done_events = 0                         # how many "done" events arrived (first one finalizes)
+        self.stale_events = 0                        # worker events ignored after finalization
+        self.worker_failure: str = ""                # set by reconcile() when the worker died without "done"
         self._today: Callable[[], Any] = __import__("datetime").date.today   # overridable for tests
         self._queue: "queue.Queue[UiEvent]" = queue.Queue()
 
@@ -355,7 +362,10 @@ class GuiController:
 
     def scan(self) -> Optional[PreScanResult]:
         """Run the REAL pre-scan (same function the batch uses) on the discovered files with the current folder /
-        Excel / period / cache / force settings.  Resets manual exclusions.  Nothing is opened or written."""
+        Excel / period / cache / force settings.  Resets manual exclusions.  Nothing is opened or written.
+        Never runs while a batch is active: ``discover()`` would replace the live rows/progress from another thread."""
+        if self.is_running():
+            return self.scan_result
         self.discover()
         per, err = self.effective_period()
         self.excluded_keys = set()
@@ -726,6 +736,7 @@ class GuiController:
         self.report_durations = []
         self._report_started_at = None
         self.started_at, self.finished_at = self._clock(), None
+        self.done_events, self.stale_events, self.worker_failure = 0, 0, ""
         self.log_lines.append(self.period_label())
         if self.period_warning():
             self.log_lines.append(self.period_warning())
@@ -756,6 +767,34 @@ class GuiController:
     def is_running(self) -> bool:
         return self.state in ("running", "stopping")
 
+    def worker_alive(self) -> bool:
+        return bool(self.processor and self.processor.is_running())
+
+    def reconcile(self) -> str:
+        """Safety net (#9): the controller thinks a batch is running, the worker thread is dead and the queue is
+        drained, yet no "done" was applied.  Finalize from the worker's own summary when it ended normally,
+        otherwise surface a worker failure.  Returns the reason text ("" when nothing was reconciled)."""
+        if not self.is_running() or self.processor is None or self.processor.is_running() or not self._queue.empty():
+            return ""
+        if getattr(self.processor, "_thread", None) is None:
+            return ""                                 # synchronous run (tests) – no thread to watch
+        summary = getattr(self.processor, "summary", None)
+        total = len(self.files)
+        finished_rows = self._count_done()
+        if summary is not None and (summary.total >= total or finished_rows >= total) and total > 0:
+            reason = "WORKER_RECONCILE: worker ended without a done event – finalized from its summary"
+            self.log_lines.append(reason)
+            self.apply_event(UiEvent("done", summary))
+            return reason
+        self.worker_failure = "Lỗi tiến trình xử lý: luồng xử lý đã dừng bất thường (không có kết quả kết thúc)."
+        reason = f"WORKER_DIED: {self.worker_failure}"
+        self.log_lines.append(reason)
+        for r in self.rows:
+            if not r.is_final and r.stage != "waiting":
+                r.stage, r.note = "error", self.worker_failure
+        self.apply_event(UiEvent("done", summary or BatchSummary(total=total, failed=total - finished_rows)))
+        return reason
+
     def controls_enabled(self) -> bool:
         """Configuration widgets are editable only while idle."""
         return self.state == "idle"
@@ -769,7 +808,11 @@ class GuiController:
                 ev = self._queue.get_nowait()
             except queue.Empty:
                 break
-            self.apply_event(ev)
+            try:
+                self.apply_event(ev)
+            except Exception as e:  # noqa: BLE001 – one malformed event must not stop the stream (#2)
+                self.log_lines.append(f"GUI_EVENT_ERROR event={ev.kind} error={type(e).__name__}: {e}")
+                LOG.exception("GUI_EVENT_ERROR event=%s", ev.kind)
             applied.append(ev)
         return applied
 
@@ -780,6 +823,14 @@ class GuiController:
         return sum(1 for r in self.rows if r.is_final and self._in_queue(r.index))
 
     def apply_event(self, ev: UiEvent) -> None:
+        if self.progress.finished and ev.kind in ("prescan", "row", "progress"):
+            # stale worker event after finalization: must never put the GUI back into "Đang xử lý"
+            if ev.kind == "row" and ev.payload[1] in FINAL_STATUSES and 0 <= ev.payload[0] < len(self.rows):
+                self.rows[ev.payload[0]].stage = ev.payload[1]          # a late final status is still truth
+                self._fill_row_from_result(self.rows[ev.payload[0]])
+            else:
+                self.stale_events += 1
+            return
         if ev.kind == "scan":
             pass                                     # scan_result already set by scan(); the view re-renders
         elif ev.kind == "prescan":
@@ -795,6 +846,9 @@ class GuiController:
             if 0 <= i < len(self.rows):
                 row = self.rows[i]
                 was_final = row.is_final
+                if was_final and stage not in FINAL_STATUSES:
+                    self.stale_events += 1           # late stage event for a finished report: never regress (#6)
+                    return
                 row.stage = stage
                 now = self._clock()
                 if not self._in_queue(i):
@@ -825,6 +879,10 @@ class GuiController:
         elif ev.kind == "log":
             self.log_lines.append(str(ev.payload))
         elif ev.kind == "done":
+            if self.finished_at is not None:         # duplicate done: idempotent (timer/summary/progress untouched)
+                self.done_events += 1
+                return
+            self.done_events += 1
             self.summary = ev.payload
             self.finished_at = self._clock()
             self.state = "idle"
@@ -890,8 +948,10 @@ class GuiController:
         return max(0.0, remaining_reports * avg)
 
     def eta_text(self) -> str:
-        """'Còn khoảng: MM:SS' while running, 'Còn khoảng: Đang tính...' before data exists, '' when not running."""
+        """'Còn khoảng: MM:SS' while running, 'Còn khoảng: Đang tính...' before data exists, 'Đã hoàn thành' after a complete batch, '' otherwise."""
         if not self.is_running():
+            if self.finished_at is not None and self.progress.total > 0 and self.progress.done >= self.progress.total:
+                return "Đã hoàn thành"
             return ""
         eta = self.eta_seconds()
         return "Còn khoảng: Đang tính..." if eta is None else f"Còn khoảng: {format_elapsed(eta)}"
