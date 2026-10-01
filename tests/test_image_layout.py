@@ -214,3 +214,52 @@ def test_qpn_fits_its_own_column_and_whitespace_is_trimmed(template, tmp_path):
     assert qw == qa - 2 * IMAGE_MARGIN_PX and abs(qw / qh - trimmed.width / trimmed.height) < 0.03
     assert qc != ic                                                          # separate geometry
     assert iw == w.image_area_px(4, "improvement_image") - 2 * IMAGE_MARGIN_PX
+
+
+# ---------------------------------------------------------------- explicit regression list (#16)
+def test_horizontal_position_margin_and_centering():
+    # full-width picture: starts exactly at the left margin and ends at the right margin
+    (x, y, w, h), = plan_image_grid([(400, 100)], area_px=300)["items"]
+    assert x == IMAGE_MARGIN_PX and x + w == 300 - IMAGE_MARGIN_PX
+    # height-capped picture is narrower than the slot -> centred (left/right gap differ by <= 1 px)
+    (x, y, w, h), = plan_image_grid([(100, 2000)], area_px=400)["items"]
+    assert abs(x - (400 - x - w)) <= 1 and x > IMAGE_MARGIN_PX
+
+
+def test_portrait_image_scales_to_width_and_increases_required_height():
+    land = plan_image_grid([(400, 200)], area_px=300)
+    port = plan_image_grid([(300, 400)], area_px=300)          # portrait, below the 300 pt cap
+    assert port["items"][0][2] == land["items"][0][2] == 300 - 2 * IMAGE_MARGIN_PX   # both width-fitted
+    assert port["items"][0][3] > land["items"][0][3]
+    assert port["height_pt"] > land["height_pt"]
+    assert abs(port["items"][0][2] / port["items"][0][3] - 300 / 400) < 0.02
+
+
+def test_required_row_height_comes_from_final_resized_heights():
+    sizes = [(400, 200), (400, 300)]
+    plan = plan_image_grid(sizes, area_px=300)
+    items = plan["items"]
+    expected_px = IMAGE_MARGIN_PX + items[0][3] + 6 + items[1][3] + IMAGE_MARGIN_PX
+    assert abs(plan["height_pt"] * PX_PER_PT - expected_px) <= 2
+    assert plan["height_pt"] <= MAX_ROW_HEIGHT_PT
+
+
+def test_row_height_in_workbook_equals_layout_height(template, tmp_path):
+    _prepare(template)
+    out = tmp_path / "o.xlsx"
+    pics = [_png(tmp_path / "a.png", 400, 200), _png(tmp_path / "b.png", 400, 300)]
+    w = ExcelWriter(template, out)
+    plan = plan_image_grid([(400, 200), (400, 300)], w.image_area_px(4, "improvement_image"))
+    w.update_record(4, _record(), improvement_jpg=pics)
+    w.save()
+    ws = load_workbook(out)["Kiểm chứng"]
+    # rec text is short, so the image layout drives the row height (+2 pt breathing space)
+    assert abs(ws.row_dimensions[4].height - (plan["height_pt"] + 2)) < 0.01
+
+
+def test_no_hard_coded_screenshot_width_in_writer():
+    src = Path("app/excel_writer.py").read_text(encoding="utf-8")
+    assert "col_width_to_px(" in src
+    # the legacy fixed pixel widths must not be used anywhere for picture sizing
+    for token in ("= 1116", "1116,", "max(40, ", "_embed_image"):
+        assert token not in src, token

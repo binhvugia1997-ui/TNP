@@ -477,23 +477,6 @@ class ExcelWriter:
                                        indent=al.indent, text_rotation=al.text_rotation)
         return cell
 
-    def _embed_image(self, row: int, field: str, path: Path, max_height_pt: float = 400.0) -> float:
-        """Embed picture in the field cell; returns the required row height (pt)."""
-        if field not in self.columns or not path or not Path(path).exists():
-            return 0.0
-        col = self.columns[field]
-        cell, rng = self._anchor(row, col)
-        col_px = max(40, self._col_width_px(col, rng) - 6)
-        with PILImage.open(path) as im:
-            w, h = im.size
-        scale = min(col_px / w, (max_height_pt / 0.75) / h, 1.0)
-        img = XLImage(str(path))
-        img.width = int(w * scale)
-        img.height = int(h * scale)
-        img.anchor = f"{get_column_letter(cell.column)}{cell.row}"
-        self.ws.add_image(img)
-        return img.height * 0.75 + 6
-
     def image_area_px(self, row: int, field: str) -> int:
         """Pixel width of the destination image area (merged span included)."""
         if field not in self.columns:
