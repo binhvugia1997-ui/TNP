@@ -39,6 +39,11 @@ class Section:
     slide: int
     lines: List[str] = field(default_factory=list)
     heading: str = ""         # heading that opened the section (slide title or mid-slide heading), diagnostics/rules only
+    sources: List[int] = field(default_factory=list)   # shape_id of the block each line came from (-1 = spacer)
+
+    def add(self, line: str, shape_id: int) -> None:
+        self.lines.append(line)
+        self.sources.append(shape_id)
 
     @property
     def text(self) -> str:
@@ -63,6 +68,7 @@ class ExtractedRecord:
     after_picture_slides: List[int] = field(default_factory=list)
     picture_notes: List[str] = field(default_factory=list)                # diagnostics: every picture decision
     image_candidates: list = field(default_factory=list)                   # PROMPT-006 ImageCandidate records
+    content_candidates: list = field(default_factory=list)                 # PROMPT-006B ContentCandidate records
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
     # Vendor: detected from the ORIGINAL improvement text ("Tại công đoạn assy <Vendor>")
@@ -150,7 +156,7 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
         for i, ln in enumerate(lines):
             if _is_noise(ln):
                 if ln.strip() == "" and cur.lines and cur.lines[-1] != "":
-                    cur.lines.append("")
+                    cur.add("", -1)
                 continue
             heading = is_heading_like(ln, b.bold if i == 0 else False, b.size_pt if i == 0 else None)
             kind = _semantic_kind(ln) if heading else None
@@ -163,19 +169,22 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
                     # "2. NGUYÊN NHÂN" typed into the first content frame = slide header, not content
                     cur = Section(kind=kind, slide=slide.number, heading=ln.strip())
                 else:
-                    cur = Section(kind=kind, slide=slide.number, lines=[ln.strip()], heading=ln.strip())
+                    cur = Section(kind=kind, slide=slide.number, lines=[ln.strip()], heading=ln.strip(),
+                                  sources=[b.shape_id])
                 continue
-            cur.lines.append(ln.rstrip())
+            cur.add(ln.rstrip(), b.shape_id)
         first_content = False
         # blank line between separate shapes keeps paragraphs apart
         if cur.lines and cur.lines[-1] != "":
-            cur.lines.append("")
+            cur.add("", -1)
     if cur.lines:
         sections.append(cur)
     # strip trailing blanks
     for s in sections:
         while s.lines and s.lines[-1] == "":
             s.lines.pop()
+            if s.sources:
+                s.sources.pop()
     sections = [s for s in sections if s.lines]
     _resolve_long_term(sections)
     return sections
@@ -706,6 +715,16 @@ def extract_record(report: ReportData, cls: Classification,
     rec.root_cause = join_sections(rec.cause_sections)
     rec.improvement = join_sections(rec.improvement_sections)
     rec.temporary_excluded = join_sections(tmp_sections)
+    if learning is not None:                                   # PROMPT-006B: block-level content corrections
+        from .content_learning import select_content_with_learning
+        content_slides = sorted(set(cls.improvement_slides) | {s.slide for s in rec.improvement_sections})
+        text, ccands, extra = select_content_with_learning(report, sections, content_slides,
+                                                           getattr(learning, "content", None),
+                                                           rec.management_number, str(report.path))
+        rec.content_candidates = ccands
+        if text is not None:
+            rec.improvement = text
+        rec.review_reasons.extend(extra)
     rec.improvement_image_slides = list(cls.improvement_image_slides)
 
     # Vendor (from source text) and Ngày phát sinh (from Management Number)

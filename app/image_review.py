@@ -12,7 +12,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from .classifier import heuristic_classify
+from .content_learning import ContentCandidate, select_content_with_learning
 from .excel_writer import ExcelWriter
+from .extractor import collect_sections, join_sections
 from .image_extractor import export_after_pictures
 from .image_learning import ImageCandidate, ImageLearning, select_with_learning
 from .improvement_pictures import select_after_pictures
@@ -86,6 +89,77 @@ def reapply_labels(template: Path, output: Path, cands: Sequence[ImageCandidate]
             res.messages.append(f"{Path(src).name}: dòng {row} – {n} ảnh Sau cải tiến"
                                 + (f" ({'; '.join(problems)})" if problems else ""))
             # keep the live candidate objects in sync for the GUI
+            by_id = {c.candidate_id: c for c in new_cands}
+            for c in group:
+                nc = by_id.get(c.candidate_id)
+                if nc is not None:
+                    c.decision, c.decision_source, c.user_label = nc.decision, nc.decision_source, nc.user_label
+                    c.evidence = list(nc.evidence)
+        if res.updated_rows:
+            writer.save()
+    except Exception as e:  # noqa: BLE001
+        res.errors.append(f"Lỗi khi lưu Excel: {e}")
+    finally:
+        if own_writer:
+            writer.close()
+    return res
+
+
+# ============================================================================ PROMPT-006B content re-apply
+def group_content_by_file(cands: Sequence[ContentCandidate]) -> Dict[str, List[ContentCandidate]]:
+    out: Dict[str, List[ContentCandidate]] = {}
+    for c in cands:
+        if c.source_file:
+            out.setdefault(c.source_file, []).append(c)
+    return out
+
+
+def reapply_content_labels(template: Path, output: Path, cands: Sequence[ContentCandidate], learning,
+                           writer: Optional[ExcelWriter] = None) -> ReapplyResult:
+    """Rebuild the improvement TEXT of every report represented in ``cands`` from the deterministic sections plus
+    the confirmed block labels, and rewrite only the ``improvement`` cell of the matching Management-Number row.
+    ``learning`` is the :class:`app.image_learning.ImageLearning` facade (``.content``) or a ContentLearning."""
+    res = ReapplyResult()
+    groups = group_content_by_file(cands)
+    if not groups:
+        res.messages.append("Không có khối nội dung nào cần cập nhật.")
+        return res
+    content = getattr(learning, "content", learning)
+    own_writer = writer is None
+    try:
+        if writer is None:
+            writer = ExcelWriter(Path(template), Path(output))
+    except Exception as e:  # noqa: BLE001
+        res.errors.append(f"Không mở được file Excel kết quả: {e}")
+        return res
+    try:
+        for src, group in groups.items():
+            mn = group[0].management_number
+            try:
+                report = parse_pptx(src)
+                cls = heuristic_classify(report)                       # structural only – no Ollama on re-apply
+            except Exception as e:  # noqa: BLE001
+                res.errors.append(f"{Path(src).name}: không đọc lại được PPTX ({e})")
+                continue
+            sections = collect_sections(report, cls)
+            imp_sections = [s for s in sections if s.kind in ("improvement", "standard")]
+            slides = sorted(set(cls.improvement_slides) | {s.slide for s in imp_sections} | {c.slide for c in group})
+            text, new_cands, _ = select_content_with_learning(report, sections, slides, content, mn, src)
+            if text is None:
+                text = join_sections(imp_sections)
+            rows = writer.find_rows_by_management_number(mn) if mn else []
+            if not rows:
+                res.errors.append(f"{Path(src).name}: không tìm thấy dòng Management Number {mn!r} trong Excel")
+                continue
+            row = rows[0]
+            try:
+                changed = writer.replace_improvement_text(row, text)
+            except Exception as e:  # noqa: BLE001
+                res.errors.append(f"{Path(src).name}: không ghi được nội dung vào dòng {row} ({e})")
+                continue
+            res.updated_rows.append(row)
+            res.messages.append(f"{Path(src).name}: dòng {row} – nội dung cải tiến "
+                                + ("đã cập nhật" if changed else "không thay đổi"))
             by_id = {c.candidate_id: c for c in new_cands}
             for c in group:
                 nc = by_id.get(c.candidate_id)

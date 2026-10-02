@@ -787,20 +787,30 @@ class ReportExtractorApp:
 
         # ---- Dữ liệu học ảnh cải tiến (PROMPT-006: local labels + tiny local model; no Ollama) ----------
         lf = self._card(page, "Dữ liệu học ảnh cải tiến", 3)
-        self.lbl_learning = ttk.Label(lf, text=self.ctl.learning_status_text(), style="Card.TLabel", wraplength=900)
+        self.lbl_learning = ttk.Label(lf, text="Ảnh:  " + self.ctl.learning_status_text(), style="Card.TLabel",
+                                      wraplength=900)
         self.lbl_learning.grid(row=0, column=0, sticky="w", pady=(0, XS))
+        self.lbl_learning_content = ttk.Label(lf, text="Nội dung:  " + self.ctl.content_status_text(),
+                                              style="Card.TLabel", wraplength=900)
+        self.lbl_learning_content.grid(row=4, column=0, sticky="w", pady=(0, XS))
         lbtns = ttk.Frame(lf, style="Card.TFrame")
         lbtns.grid(row=1, column=0, sticky="w", pady=(S, XS))
+        self.btn_review_content = ttk.Button(lbtns, text="Kiểm tra nội dung cải tiến", command=self.open_content_review,
+                                             style="Primary.TButton")
+        self.btn_review_content.pack(side="left", padx=(0, XS))
         self.btn_review_images = ttk.Button(lbtns, text="Kiểm tra ảnh cải tiến", command=self.open_image_review,
                                             style="Primary.TButton")
         self.btn_review_images.pack(side="left", padx=(0, XS))
-        self.btn_train_images = ttk.Button(lbtns, text="Cập nhật mô hình ảnh", command=self.train_image_model)
+        self.btn_train_images = ttk.Button(lbtns, text="Cập nhật mô hình học", command=self.train_models)
         self.btn_train_images.pack(side="left", padx=(0, XS))
         ttk.Button(lbtns, text="Mở thư mục dữ liệu học", command=self.open_learning_folder).pack(side="left", padx=(0, XS))
         ttk.Button(lbtns, text="Xuất dữ liệu học", command=self.export_learning_data).pack(side="left")
         self.lbl_review_summary = ttk.Label(lf, text=self.ctl.review_summary_text(), style="Secondary.TLabel",
                                             wraplength=900)
         self.lbl_review_summary.grid(row=2, column=0, sticky="w")
+        self.lbl_review_content_summary = ttk.Label(lf, text=self.ctl.content_review_summary_text(),
+                                                    style="Secondary.TLabel", wraplength=900)
+        self.lbl_review_content_summary.grid(row=5, column=0, sticky="w")
         ttk.Label(lf, text="Nhãn xác nhận được lưu trong learning_data/ cạnh chương trình (giữ nguyên khi cập nhật). "
                            "Mô hình chỉ dùng đặc trưng bố cục slide, không gửi dữ liệu đi đâu; nhãn người dùng luôn "
                            "được ưu tiên.", style="Secondary.TLabel", wraplength=900).grid(row=3, column=0, sticky="w",
@@ -1717,13 +1727,121 @@ class ReportExtractorApp:
     # ------------------------------------------------------------------ PROMPT-006 image review / learning
     def _render_learning(self) -> None:
         if hasattr(self, "lbl_learning"):
-            self.lbl_learning.configure(text=self.ctl.learning_status_text())
+            self.lbl_learning.configure(text="Ảnh:  " + self.ctl.learning_status_text())
             self.lbl_review_summary.configure(text=self.ctl.review_summary_text())
+            self.lbl_learning_content.configure(text="Nội dung:  " + self.ctl.content_status_text())
+            self.lbl_review_content_summary.configure(text=self.ctl.content_review_summary_text())
 
-    def train_image_model(self) -> None:
-        ok, msg = self.ctl.train_image_model()
+    def train_models(self) -> None:
+        ok, msg = self.ctl.train_models()
+        for line in msg.splitlines():
+            self.log(line)
+        self._render_learning()
+        (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
+
+    train_image_model = train_models                 # backwards compatible name
+
+    # ---- PROMPT-006B content review (text + geometry/context; no slide rendering dependency) ------
+    def open_content_review(self) -> None:
+        from .content_learning import CONTENT_LABELS, CONTENT_LABEL_VI
+        cands = self.ctl.review_content_candidates()
+        if not cands:
+            messagebox.showinfo(APP_NAME, "Chưa có khối nội dung để kiểm tra. Hãy chạy xử lý báo cáo trước.")
+            return
+        cands.sort(key=lambda c: (0 if c.decision == "review" else 1, c.source_name, c.slide, c.order))
+        self.ctl.review_content_index = 0
+        win = tk.Toplevel(self.root)
+        win.title("Kiểm tra nội dung cải tiến")
+        win.geometry("900x640")
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
+        self.creview_win, self.creview_cands = win, cands
+        self.creview_head = ttk.Label(win, text="", font=(FONT_FAMILY, 10, "bold"), wraplength=860)
+        self.creview_head.grid(row=0, column=0, sticky="w", padx=M, pady=(M, XS))
+        body = ttk.Frame(win)
+        body.grid(row=1, column=0, sticky="nsew", padx=M)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(1, weight=1)
+        ttk.Label(body, text="Nội dung khối chữ (nguyên văn):").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text="Kết quả / bằng chứng / ngữ cảnh:").grid(row=0, column=1, sticky="w", padx=(M, 0))
+        self.creview_text = tk.Text(body, height=16, wrap="word", font=(FONT_FAMILY, 10))
+        self.creview_text.grid(row=1, column=0, sticky="nsew")
+        self.creview_info = tk.Text(body, height=16, wrap="word", font=(MONO_FAMILY, 9))
+        self.creview_info.grid(row=1, column=1, sticky="nsew", padx=(M, 0))
+        lab = ttk.Frame(win)
+        lab.grid(row=2, column=0, sticky="w", padx=M, pady=(S, 0))
+        self.creview_label_buttons = {}
+        for key in CONTENT_LABELS:
+            b = ttk.Button(lab, text=CONTENT_LABEL_VI[key], command=lambda k=key: self._creview_set_label(k))
+            b.pack(side="left", padx=(0, XS))
+            self.creview_label_buttons[key] = b
+        nav = ttk.Frame(win)
+        nav.grid(row=3, column=0, sticky="ew", padx=M, pady=M)
+        self.btn_creview_prev = ttk.Button(nav, text="Mục trước", command=lambda: self._creview_move(-1))
+        self.btn_creview_prev.pack(side="left", padx=(0, XS))
+        self.btn_creview_next = ttk.Button(nav, text="Mục tiếp", command=lambda: self._creview_move(1))
+        self.btn_creview_next.pack(side="left", padx=(0, XS))
+        self.btn_creview_save = ttk.Button(nav, text="Lưu xác nhận", style="Primary.TButton",
+                                           command=self._creview_save)
+        self.btn_creview_save.pack(side="right")
+        self.lbl_creview_pos = ttk.Label(nav, text="")
+        self.lbl_creview_pos.pack(side="left", padx=(M, 0))
+        self._creview_render()
+
+    def _creview_current(self):
+        cands = getattr(self, "creview_cands", [])
+        if not cands:
+            return None
+        self.ctl.review_content_index = max(0, min(self.ctl.review_content_index, len(cands) - 1))
+        return cands[self.ctl.review_content_index]
+
+    def _creview_render(self) -> None:
+        from .content_learning import CONTENT_LABEL_VI, CONTENT_UNLABELED, explain_content
+        c = self._creview_current()
+        if c is None:
+            return
+        n = len(self.creview_cands)
+        chosen = self.ctl.pending_content_labels.get(c.candidate_id) or c.user_label
+        self.creview_head.configure(text=f"{c.source_name}\nManagement Number: {c.management_number or '—'}   "
+                                         f"Slide {c.slide}   Khối #{c.shape_id}")
+        W, H = c.slide_size
+        x, y, w, h = c.bounds
+        geo = (f"Vị trí trên slide: x {x / W:.0%}  y {y / H:.0%}  rộng {w / W:.0%}  cao {h / H:.0%}"
+               if W and H else "")
+        info = explain_content(c)
+        info += f"\n\nTiêu đề slide: {c.nearest_title or '—'}"
+        info += f"\nMục gần nhất: {c.nearest_heading or '—'}"
+        info += f"\n{geo}"
+        info += f"\n\nNhãn hiện tại: {CONTENT_LABEL_VI.get(chosen, CONTENT_LABEL_VI[CONTENT_UNLABELED])}"
+        if c.candidate_id in self.ctl.pending_content_labels:
+            info += "  (chưa lưu)"
+        for widget, txt in ((self.creview_text, c.text), (self.creview_info, info)):
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("end", txt)
+            widget.configure(state="disabled")
+        self.lbl_creview_pos.configure(text=f"Mục {self.ctl.review_content_index + 1}/{n}")
+        self.btn_creview_prev.configure(state="normal" if self.ctl.review_content_index > 0 else "disabled")
+        self.btn_creview_next.configure(state="normal" if self.ctl.review_content_index < n - 1 else "disabled")
+        self.btn_creview_save.configure(state="normal" if self.ctl.pending_content_labels else "disabled")
+
+    def _creview_set_label(self, label: str) -> None:
+        c = self._creview_current()
+        if c is None:
+            return
+        self.ctl.set_pending_content_label(c, label)
+        self._creview_render()
+
+    def _creview_move(self, step: int) -> None:
+        self.ctl.review_content_index += step
+        self._creview_render()
+
+    def _creview_save(self) -> None:
+        ok, msg = self.ctl.save_content_confirmations(getattr(self, "creview_cands", []))
         self.log(msg)
         self._render_learning()
+        self._creview_render()
         (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
 
     def open_learning_folder(self) -> None:

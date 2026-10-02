@@ -316,6 +316,8 @@ class GuiController:
         self._learning = None
         self.review_index = 0
         self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
+        self.pending_content_labels: Dict[str, str] = {}   # PROMPT-006B content review (separate dataset)
+        self.review_content_index = 0
 
     # ------------------------------------------------------------------ PROMPT-006 image learning
     @property
@@ -335,6 +337,73 @@ class GuiController:
             from .image_learning import MSG_MODEL_UNAVAILABLE
             return MSG_MODEL_UNAVAILABLE
         return lrn.status_text()
+
+    def content_status_text(self) -> str:
+        lrn = self.learning
+        if lrn is None:
+            from .content_learning import MSG_MODEL_UNAVAILABLE
+            return MSG_MODEL_UNAVAILABLE
+        return lrn.content.status_text()
+
+    # ---- PROMPT-006B content review -------------------------------------------------------------
+    def review_content_candidates(self) -> list:
+        """Reviewable text blocks of the LAST finished batch (hard-excluded title/sidebar/footer never offered)."""
+        if self.is_running() or not self.processor:
+            return []
+        out = []
+        for fr in getattr(self.processor, "results", []):
+            out.extend(c for c in getattr(fr, "content_candidates", []) if not c.hard_excluded)
+        return out
+
+    def content_review_summary_text(self) -> str:
+        cands = self.review_content_candidates()
+        if not cands:
+            return "Chưa có khối nội dung để kiểm tra (chạy xử lý trước)."
+        n_rev = sum(1 for c in cands if c.decision == "review")
+        return f"{len(cands)} khối chữ ứng viên, {n_rev} khối chưa chắc chắn"
+
+    def set_pending_content_label(self, cand, label: str) -> None:
+        from .content_learning import CONTENT_LABELS
+        if label not in CONTENT_LABELS:
+            raise ValueError(label)
+        self.pending_content_labels[cand.candidate_id] = label
+
+    def save_content_confirmations(self, cands) -> Tuple[bool, str]:
+        lrn = self.learning
+        if lrn is None:
+            return False, "Không ghi được dữ liệu học (thư mục learning_data không khả dụng)."
+        if not self.pending_content_labels:
+            return False, "Chưa chọn nhãn nào."
+        by_id = {c.candidate_id: c for c in cands}
+        written, touched = 0, []
+        for cid, label in list(self.pending_content_labels.items()):
+            c = by_id.get(cid)
+            if c is None:
+                continue
+            if lrn.content.store.label(c, label) is not None:
+                written += 1
+            touched.append(c)
+        self.pending_content_labels.clear()
+        msg = f"Đã lưu {written} nhãn nội dung."
+        if touched and self.template and self.output and Path(self.output).exists():
+            from .image_review import reapply_content_labels
+            res = reapply_content_labels(Path(self.template), Path(self.output), touched, lrn)
+            if res.updated_rows:
+                msg += f" Đã cập nhật nội dung cải tiến cho {len(res.updated_rows)} dòng Excel."
+            if res.errors:
+                msg += " Lỗi: " + "; ".join(res.errors)
+            self.log_lines.extend(res.messages + res.errors)
+        return True, msg
+
+    def train_models(self) -> Tuple[bool, str]:
+        """'Cập nhật mô hình học': image and content models independently, two result lines."""
+        lrn = self.learning
+        if lrn is None:
+            from .image_learning import MSG_MODEL_UNAVAILABLE
+            return False, MSG_MODEL_UNAVAILABLE
+        ok, msg = lrn.train_all()
+        self.log_lines.extend(msg.splitlines())
+        return ok, msg
 
     def learning_counts(self) -> Dict[str, int]:
         lrn = self.learning

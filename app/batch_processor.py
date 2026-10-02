@@ -426,6 +426,7 @@ class BatchProcessor:
             rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None,
                                  learning=self.learning)
             fr.image_candidates = list(rec.image_candidates)
+            fr.content_candidates = list(rec.content_candidates)
             fr.management_number = rec.management_number
             fr.after_picture_slides = list(rec.after_picture_slides)
             fr.vendor = rec.vendor

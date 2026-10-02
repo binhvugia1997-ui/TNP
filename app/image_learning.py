@@ -340,11 +340,20 @@ def learning_dir(root: Optional[Path] = None, create: bool = True) -> Path:
 
 
 class LabelStore:
-    """Append-only ``image_labels.jsonl``; the LAST record per candidate_id is the current label (audit kept)."""
+    """Append-only JSONL label file; the LAST record per candidate_id is the current label (audit kept).
 
-    def __init__(self, directory: Path):
+    Defaults describe the IMAGE dataset; the content dataset (PROMPT-006B) passes its own file name, label set,
+    feature list and schema so the two record types are never mixed."""
+
+    def __init__(self, directory: Path, filename: str = LABELS_FILE, labels: Sequence[str] = LABELS,
+                 feature_names: Sequence[str] = FEATURE_NAMES, schema: int = IMAGE_FEATURE_SCHEMA,
+                 positive: str = "AFTER"):
         self.dir = Path(directory)
-        self.path = self.dir / LABELS_FILE
+        self.path = self.dir / filename
+        self.labels = tuple(labels)
+        self.feature_names = tuple(feature_names)
+        self.schema = schema
+        self.positive = positive
 
     def records(self) -> List[dict]:
         if not self.path.exists():
@@ -358,7 +367,7 @@ class LabelStore:
                 rec = json.loads(line)
             except Exception:  # noqa: BLE001 – one damaged line never hides the others
                 continue
-            if isinstance(rec, dict) and rec.get("candidate_id") and rec.get("label") in LABELS:
+            if isinstance(rec, dict) and rec.get("candidate_id") and rec.get("label") in self.labels:
                 out.append(rec)
         return out
 
@@ -372,37 +381,44 @@ class LabelStore:
         rec = self.latest().get(candidate_id)
         return rec["label"] if rec else UNLABELED
 
-    def label(self, cand: ImageCandidate, label: str, note: str = "") -> Optional[dict]:
+    def label(self, cand, label: str, note: str = "") -> Optional[dict]:
         """Confirm ``label`` for ``cand``.  Returns the written record, or None when it is a duplicate of the
         current label (duplicate-label protection).  A changed label supersedes the old one (previous_label kept)."""
-        if label not in LABELS:
+        if label not in self.labels:
             raise ValueError(f"Nhãn không hợp lệ: {label}")
         prev = self.latest().get(cand.candidate_id)
-        if prev and prev.get("label") == label and prev.get("schema_version") == IMAGE_FEATURE_SCHEMA:
+        if prev and prev.get("label") == label and prev.get("schema_version") == self.schema:
             return None
         rec = {
-            "schema_version": IMAGE_FEATURE_SCHEMA, "candidate_id": cand.candidate_id, "label": label,
+            "schema_version": self.schema, "candidate_id": cand.candidate_id, "label": label,
             "previous_label": prev.get("label") if prev else None,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "management_number": cand.management_number, "source_name": cand.source_name,
-            "slide": cand.slide, "picture_id": cand.picture_id,
-            "features": {k: cand.features.get(k, 0.0) for k in FEATURE_NAMES},
+            "slide": cand.slide, "shape_id": getattr(cand, "picture_id", getattr(cand, "shape_id", 0)),
+            "features": {k: cand.features.get(k, 0.0) for k in self.feature_names},
             "deterministic_kind": cand.deterministic_kind, "deterministic_confidence": cand.confidence,
             "note": note,
         }
+        if hasattr(cand, "picture_id"):
+            rec["picture_id"] = cand.picture_id
+        if hasattr(cand, "text"):
+            rec["text"] = cand.text[:300]
         self.dir.mkdir(parents=True, exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        LOG.info("IMAGE_LABEL candidate=%s label=%s previous=%s", cand.candidate_id, label, rec["previous_label"])
+        LOG.info("LABEL file=%s candidate=%s label=%s previous=%s", self.path.name, cand.candidate_id, label,
+                 rec["previous_label"])
         return rec
 
     def counts(self) -> Dict[str, int]:
         cur = self.latest()
-        after = sum(1 for r in cur.values() if r["label"] == "AFTER")
-        return {"total": len(cur), "after": after, "non_after": len(cur) - after,
-                "before": sum(1 for r in cur.values() if r["label"] == "BEFORE"),
-                "control": sum(1 for r in cur.values() if r["label"] == "CONTROL"),
-                "ignore": sum(1 for r in cur.values() if r["label"] == "IGNORE")}
+        pos = sum(1 for r in cur.values() if r["label"] == self.positive)
+        out = {"total": len(cur), "positive": pos, "negative": len(cur) - pos}
+        if self.positive == "AFTER":
+            out.update({"after": pos, "non_after": len(cur) - pos})
+        for lb in self.labels:
+            out[lb.lower()] = sum(1 for r in cur.values() if r["label"] == lb)
+        return out
 
     def export(self, target: Path) -> Path:
         target = Path(target)
@@ -452,7 +468,7 @@ class ImageModel:
         return asdict(self)
 
     def probability(self, features: Dict[str, float]) -> float:
-        x = feature_vector(features)
+        x = [float(features.get(k, 0.0)) for k in self.feature_names]
         z = self.bias
         for w, v, m, s in zip(self.weights, x, self.means, self.scales):
             z += w * ((v - m) / s)
@@ -464,33 +480,49 @@ class TrainingError(ValueError):
     """Vietnamese, user-facing: not enough data / single class / incompatible schema."""
 
 
-def training_examples(records: Iterable[dict]) -> Tuple[List[List[float]], List[int]]:
+def training_examples(records: Iterable[dict], schema: int = IMAGE_FEATURE_SCHEMA, labels: Sequence[str] = LABELS,
+                      feature_names: Sequence[str] = FEATURE_NAMES, positive: str = "AFTER"
+                      ) -> Tuple[List[List[float]], List[int]]:
     xs, ys = [], []
     for rec in records:
-        if rec.get("schema_version") != IMAGE_FEATURE_SCHEMA or rec.get("label") not in LABELS:
+        if rec.get("schema_version") != schema or rec.get("label") not in labels:
             continue
-        xs.append(feature_vector(rec.get("features") or {}))
-        ys.append(1 if rec["label"] == "AFTER" else 0)                   # BEFORE/CONTROL/IGNORE -> NON_AFTER
+        f = rec.get("features") or {}
+        xs.append([float(f.get(k, 0.0)) for k in feature_names])
+        ys.append(1 if rec["label"] == positive else 0)                  # every other label -> negative class
     return xs, ys
 
 
-def check_training_data(ys: Sequence[int]) -> Optional[str]:
-    n_after = sum(ys)
-    n_non = len(ys) - n_after
-    if len(ys) < MIN_EXAMPLES or n_after < MIN_PER_CLASS or n_non < MIN_PER_CLASS:
-        return (f"{MSG_NOT_ENOUGH} (cần ≥ {MIN_EXAMPLES} mẫu và ≥ {MIN_PER_CLASS} mẫu mỗi lớp; hiện có "
-                f"{len(ys)} mẫu: Sau cải tiến {n_after}, Không phải Sau {n_non})")
+def check_training_data(ys: Sequence[int], min_examples: int = MIN_EXAMPLES, min_per_class: int = MIN_PER_CLASS,
+                        msg: str = MSG_NOT_ENOUGH, pos_name: str = "Sau cải tiến",
+                        neg_name: str = "Không phải Sau") -> Optional[str]:
+    n_pos = sum(ys)
+    n_neg = len(ys) - n_pos
+    if len(ys) < min_examples or n_pos < min_per_class or n_neg < min_per_class:
+        return (f"{msg} (cần ≥ {min_examples} mẫu và ≥ {min_per_class} mẫu mỗi lớp; hiện có "
+                f"{len(ys)} mẫu: {pos_name} {n_pos}, {neg_name} {n_neg})")
     return None
 
 
-def train_model(store_or_records, epochs: int = 400, lr: float = 0.1, l2: float = 0.01) -> ImageModel:
-    """Batch gradient-descent logistic regression on standardised features.  Deterministic, dependency-free."""
-    records = store_or_records.latest().values() if isinstance(store_or_records, LabelStore) else store_or_records
-    xs, ys = training_examples(records)
-    problem = check_training_data(ys)
+def train_model(store_or_records, epochs: int = 400, lr: float = 0.1, l2: float = 0.01, *,
+                schema: int = IMAGE_FEATURE_SCHEMA, labels: Sequence[str] = LABELS,
+                feature_names: Sequence[str] = FEATURE_NAMES, positive: str = "AFTER",
+                min_examples: int = MIN_EXAMPLES, min_per_class: int = MIN_PER_CLASS, msg: str = MSG_NOT_ENOUGH,
+                pos_name: str = "Sau cải tiến", neg_name: str = "Không phải Sau") -> ImageModel:
+    """Batch gradient-descent logistic regression on standardised features.  Deterministic, dependency-free.
+    Shared by the image and the content classifier (keyword arguments select the dataset)."""
+    if isinstance(store_or_records, LabelStore):
+        st = store_or_records
+        records, schema, labels = st.latest().values(), st.schema, st.labels
+        feature_names, positive = st.feature_names, st.positive
+    else:
+        records = store_or_records
+    feature_names = tuple(feature_names)
+    xs, ys = training_examples(records, schema, labels, feature_names, positive)
+    problem = check_training_data(ys, min_examples, min_per_class, msg, pos_name, neg_name)
     if problem:
         raise TrainingError(problem)
-    n, d = len(xs), len(FEATURE_NAMES)
+    n, d = len(xs), len(feature_names)
     means = [sum(x[j] for x in xs) / n for j in range(d)]
     scales = []
     for j in range(d):
@@ -513,33 +545,34 @@ def train_model(store_or_records, epochs: int = 400, lr: float = 0.1, l2: float 
         for j in range(d):
             w[j] -= lr * (gw[j] / n + l2 * w[j])
     model = ImageModel(weights=[round(v, 6) for v in w], bias=round(b, 6), means=[round(v, 6) for v in means],
-                       scales=[round(v, 6) for v in scales], feature_names=list(FEATURE_NAMES),
-                       schema_version=IMAGE_FEATURE_SCHEMA, trained_at=datetime.now().isoformat(timespec="seconds"),
+                       scales=[round(v, 6) for v in scales], feature_names=list(feature_names),
+                       schema_version=schema, trained_at=datetime.now().isoformat(timespec="seconds"),
                        n_examples=n, n_after=sum(ys), n_non_after=n - sum(ys))
     correct = sum(1 for x, y in zip(xs, ys)
-                  if (model.probability(dict(zip(FEATURE_NAMES, x))) >= 0.5) == bool(y))
+                  if (model.probability(dict(zip(feature_names, x))) >= 0.5) == bool(y))
     model.train_accuracy = round(correct / n, 3)
     return model
 
 
-def model_path(directory: Path) -> Path:
-    return Path(directory) / MODEL_DIR / MODEL_FILE
+def model_path(directory: Path, filename: str = MODEL_FILE) -> Path:
+    return Path(directory) / MODEL_DIR / filename
 
 
-def save_model(model: ImageModel, directory: Path) -> Path:
-    p = model_path(directory)
+def save_model(model: ImageModel, directory: Path, filename: str = MODEL_FILE) -> Path:
+    p = model_path(directory, filename)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(model.to_dict(), ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(p)
-    LOG.info("IMAGE_MODEL saved %s examples=%s after=%s non_after=%s", p, model.n_examples, model.n_after,
+    LOG.info("MODEL saved %s examples=%s positive=%s negative=%s", p, model.n_examples, model.n_after,
              model.n_non_after)
     return p
 
 
-def load_model(directory: Path) -> Tuple[Optional[ImageModel], str]:
+def load_model(directory: Path, filename: str = MODEL_FILE, schema: int = IMAGE_FEATURE_SCHEMA,
+               feature_names: Sequence[str] = FEATURE_NAMES) -> Tuple[Optional[ImageModel], str]:
     """(model, status).  status: 'ok' | 'missing' | 'corrupt' | 'incompatible' – never raises."""
-    p = model_path(directory)
+    p = model_path(directory, filename)
     if not p.exists():
         return None, "missing"
     try:
@@ -548,8 +581,8 @@ def load_model(directory: Path) -> Tuple[Optional[ImageModel], str]:
     except Exception as e:  # noqa: BLE001
         LOG.warning("IMAGE_MODEL corrupt %s: %s", p, e)
         return None, "corrupt"
-    if model.schema_version != IMAGE_FEATURE_SCHEMA or list(model.feature_names) != list(FEATURE_NAMES) \
-            or len(model.weights) != len(FEATURE_NAMES) or len(model.means) != len(FEATURE_NAMES):
+    if model.schema_version != schema or list(model.feature_names) != list(feature_names) \
+            or len(model.weights) != len(feature_names) or len(model.means) != len(feature_names):
         LOG.warning("IMAGE_MODEL incompatible schema=%s features=%s", model.schema_version, len(model.feature_names))
         return None, "incompatible"
     return model, "ok"
@@ -618,12 +651,33 @@ class ImageLearning:
         self.store = LabelStore(self.dir)
         self.model: Optional[ImageModel] = None
         self.model_status = "missing"
+        self._content = None
         if enabled:
             self.reload_model()
 
     def reload_model(self) -> str:
         self.model, self.model_status = load_model(self.dir)
         return self.model_status
+
+    @property
+    def content(self):
+        """PROMPT-006B content-region learning sharing the same learning_data folder (separate files/schema)."""
+        if self._content is None:
+            from .content_learning import ContentLearning
+            self._content = ContentLearning(self.dir, self.enabled)
+        return self._content
+
+    def train_all(self) -> Tuple[bool, str]:
+        """Train the image and the content model independently; report both results separately."""
+        ok_i, msg_i = self.train()
+        ok_c, msg_c = self.content.train()
+        ci, cc = self.store.counts(), self.content.counts()
+        line_i = (f"Ảnh cải tiến: đã cập nhật mô hình — {self.model.n_examples} mẫu." if ok_i else
+                  f"Ảnh cải tiến: chưa đủ dữ liệu — {ci['total']}/{MIN_EXAMPLES} mẫu ({msg_i})")
+        from .content_learning import MIN_EXAMPLES as C_MIN
+        line_c = (f"Nội dung cải tiến: đã cập nhật mô hình — {self.content.model.n_examples} mẫu." if ok_c else
+                  f"Nội dung cải tiến: chưa đủ dữ liệu — {cc['total']}/{C_MIN} mẫu ({msg_c})")
+        return ok_i or ok_c, line_i + "\n" + line_c
 
     def status_text(self) -> str:
         c = self.store.counts()

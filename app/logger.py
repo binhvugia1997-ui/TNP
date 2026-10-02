@@ -79,6 +79,7 @@ class FileResult:
     after_picture_slides: List[int] = field(default_factory=list)
     picture_notes: List[str] = field(default_factory=list)     # every picture decision (before/after/excluded/ambiguous)
     image_candidates: list = field(default_factory=list)       # PROMPT-006 ImageCandidate objects (not serialised)
+    content_candidates: list = field(default_factory=list)     # PROMPT-006B ContentCandidate objects (ids only in JSON)
     classifier_notes: List[str] = field(default_factory=list)
     confidence: Optional[float] = None
     error: str = ""
@@ -99,6 +100,7 @@ class FileResult:
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["image_candidates"] = [c.get("candidate_id", "") for c in d.get("image_candidates", [])]
+        d["content_candidates"] = [c.get("candidate_id", "") for c in d.get("content_candidates", [])]
         return d
 
 

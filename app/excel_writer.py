@@ -718,6 +718,24 @@ class ExcelWriter:
         self.place_images(row, "improvement_image", [Path(x) for x in paths])
         return len(paths)
 
+    def replace_improvement_text(self, row: int, text: str) -> bool:
+        """PROMPT-006B re-apply after content confirmation: rewrite ONLY the ``improvement`` text cell of ``row``
+        (verbatim text supplied by the extractor).  Every other cell, picture, WEEK/manual column, formula and
+        sheet is untouched.  Returns True when the cell changed (backup taken before the first modification)."""
+        if "improvement" not in self.columns:
+            raise TemplateError("Không tìm thấy cột Nội dung đối sách cải tiến trong form Excel")
+        cell, _ = self._anchor(row, self.columns["improvement"])
+        if (cell.value or "") == (text or ""):
+            return False
+        self._ensure_backup()
+        self._set_cell(row, "improvement", text or "")
+        need = self._text_height_pt(row, "improvement", text or "")
+        cur = self.ws.row_dimensions[row].height or 15.0
+        if need > cur:
+            self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, need)
+        self._dirty = True
+        return True
+
     def image_bounds_report(self, row: Optional[int] = None) -> List[str]:
         """#39/#42: compare every picture placed by this writer with its destination rectangle as the workbook
         stands now (row heights converted back to pixels).  Returns human-readable violations (empty = OK)."""

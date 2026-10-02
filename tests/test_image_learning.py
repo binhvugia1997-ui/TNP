@@ -101,7 +101,7 @@ def test_24_stable_backup_exists_and_is_clean():
     assert BACKUP_DIR.is_dir() and msb.verify_backup(BACKUP_DIR) == []
     init = (BACKUP_DIR / "app" / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "1.0.4"' in init and "BUILD_NUMBER = 4" in init       # backup frozen at 1.0.4 / 004
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 6             # dev version moved on
+    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 7             # dev version moved on
     assert not any(p.name in ("sample_data", ".venv", "Output", "logs", "config", "learning_data")
                    for p in BACKUP_DIR.rglob("*") if p.is_dir())
 
@@ -212,7 +212,8 @@ def test_26_label_store_append_supersede_and_duplicate_protection(tmp_path):
     lines = (tmp_path / "learning_data" / "image_labels.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2 and all(json.loads(l)["candidate_id"] == amb.candidate_id for l in lines)
     assert store.current_label(amb.candidate_id) == "BEFORE"
-    assert store.counts() == {"total": 1, "after": 0, "non_after": 1, "before": 1, "control": 0, "ignore": 0}
+    assert store.counts() == {"total": 1, "positive": 0, "negative": 1, "after": 0, "non_after": 1, "before": 1,
+                              "control": 0, "ignore": 0}
     with pytest.raises(ValueError):
         store.label(amb, "MAYBE")
     stored = json.loads(lines[0])
@@ -548,9 +549,10 @@ def test_28_gui_learning_card_and_review_window(monkeypatch, tmp_path):
     a.ctl.learning_dir = tmp_path / "lrn"
     a.ctl._learning = None
     texts = [w.k.get("text") for w in reg["widgets"] if isinstance(w, reg["classes"]["Button"])]
-    for t in ("Kiểm tra ảnh cải tiến", "Cập nhật mô hình ảnh", "Mở thư mục dữ liệu học", "Xuất dữ liệu học"):
+    for t in ("Kiểm tra ảnh cải tiến", "Kiểm tra nội dung cải tiến", "Cập nhật mô hình học", "Mở thư mục dữ liệu học",
+              "Xuất dữ liệu học"):
         assert t in texts
-    assert a.lbl_learning.cfg["text"].startswith("Mẫu đã xác nhận: 0")
+    assert a.lbl_learning.cfg["text"].startswith("Ảnh:  Mẫu đã xác nhận: 0")
     assert "Xóa toàn bộ" not in texts
     # no batch yet -> info box, no window
     a.open_image_review()
@@ -578,6 +580,7 @@ def test_28_gui_learning_card_and_review_window(monkeypatch, tmp_path):
     assert a.lbl_review_pos.cfg["text"].startswith("Ảnh 2/")
     a._review_move(-1)
     a._review_save()
-    assert a.ctl.learning_counts()["after"] == 1 and a.lbl_learning.cfg["text"].startswith("Mẫu đã xác nhận: 1")
-    a.train_image_model()                                          # insufficient data -> message, no crash
-    assert any(MSG_NOT_ENOUGH in l for l in a.ctl.log_lines)
+    assert a.ctl.learning_counts()["after"] == 1 and a.lbl_learning.cfg["text"].startswith("Ảnh:  Mẫu đã xác nhận: 1")
+    a.train_models()                                               # insufficient data -> two messages, no crash
+    assert any(l.startswith("Ảnh cải tiến: chưa đủ dữ liệu — 1/10") for l in a.ctl.log_lines)
+    assert any(l.startswith("Nội dung cải tiến: chưa đủ dữ liệu — 0/20") for l in a.ctl.log_lines)

@@ -435,3 +435,27 @@ Lớp bổ sung **trên** bộ nhận diện ảnh "Sau cải tiến" theo hình
   trong vùng chưa chắc chắn.
 * `learning_data/` nằm cạnh chương trình, là dữ liệu người dùng: bộ cập nhật giữ nguyên, gói phát hành không chứa,
   không có nút xoá toàn bộ.  Bản sao nguồn ổn định: `backup/ReportExtractor_v1.0.4_Build004_STABLE/`.
+
+## Học & sửa NỘI DUNG cải tiến (PROMPT-006B – thử nghiệm, Build 007)
+
+Mở rộng cơ chế học cho ô **Nội dung đối sách cải tiến**: người dùng dạy chương trình khối chữ nào thuộc
+`CẢI TIẾN TRONG SẢN XUẤT`.  Bộ tách nội dung theo cấu trúc hiện tại vẫn là chuẩn; học chỉ quyết định **có lấy khối
+chữ hay không** – không bao giờ viết lại, tóm tắt hay đổi thứ tự (nguyên văn, theo thứ tự đọc của slide).
+
+* Ứng viên = từng khối chữ của các slide cải tiến với đặc trưng chuẩn hoá (`CONTENT_FEATURE_SCHEMA = 1`, tách
+  biệt với schema ảnh): vị trí/kích thước, độ dài, số đoạn, thứ tự đọc, đậm/cỡ chữ/chữ xanh, từ khoá Cải tiến /
+  Trước / Sau / tạm thời / kiểm tra, tiêu đề slide & mục gần nhất, gần ảnh/mũi tên, vai trò khối, kết quả quy tắc.
+  Định danh `MN|S<slide>|SH<shape>|<thứ tự>` (không chứa đường dẫn).
+* Loại trừ cứng (mô hình/nhãn không đảo được): tiêu đề slide, nhãn sidebar, nút chú thích ảnh, footer/logo/trang
+  trí, khu vực XỬ LÝ TẠM THỜI.  Khối thuộc mục kiểm tra/kiểm soát bị loại theo quy tắc nhưng người dùng có thể
+  xác nhận lấy.
+* Nhãn `Nội dung cải tiến` / `Không lấy` → `learning_data/content_labels.jsonl`; mô hình →
+  `learning_data/model/content_model.json` (cần ≥ 20 mẫu, ≥ 5 mỗi lớp; nếu không:
+  *"Chưa đủ dữ liệu học nội dung cải tiến — đang dùng quy tắc hiện tại."*).
+* Thứ tự quyết định: loại trừ cứng → nhãn người dùng → bằng chứng quy tắc mạnh (≥ 0.75 lấy / ≤ 0.35 bỏ) → mô hình
+  cho vùng chưa chắc → giữ kết quả quy tắc hiện tại.
+* GUI (tab Cấu hình & Ollama → Dữ liệu học): **Kiểm tra nội dung cải tiến** (file, Management Number, slide, nguyên
+  văn khối chữ, kết quả, độ tin cậy, bằng chứng, tiêu đề/mục gần nhất, vị trí tương đối; nút Nội dung cải tiến /
+  Không lấy / Mục trước / Mục tiếp / Lưu xác nhận).  Lưu xác nhận ghi nhãn và cập nhật lại **chỉ ô Nội dung đối
+  sách cải tiến** của dòng Management Number tương ứng (sao lưu trước khi sửa).  **Cập nhật mô hình học** huấn
+  luyện mô hình ảnh và mô hình nội dung độc lập, báo cáo hai dòng riêng.

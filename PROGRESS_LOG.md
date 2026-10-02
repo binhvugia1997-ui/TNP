@@ -96,3 +96,17 @@
            dữ liệu học).  Updater preserves learning_data; build validator forbids it in the artefact.
            tests/test_image_learning.py (27 tests) ................................ done, 683 passed
            Real-data labelling / learned-model validation on Windows ............... NOT performed (no labels yet)
+
+- PROMPT-006B Learning / correction for improvement CONTENT regions (v1.1.0-beta, Build 007 – beta).
+           app/content_learning.py: ContentCandidate per text block of the improvement slides
+           (CONTENT_FEATURE_SCHEMA=1, 28 normalised geometry/typography/keyword/section features, identity
+           MN|S<slide>|SH<shape>|<order>), deterministic kind + confidence + VI evidence, hard exclusions (title,
+           sidebar, caption buttons, footer/logo/decoration, XỬ LÝ TẠM THỜI), labels IMPROVEMENT_CONTENT /
+           EXCLUDE_CONTENT → learning_data/content_labels.jsonl, shared logistic regression →
+           learning_data/model/content_model.json (MIN 20 / 5 per class), decision = hard exclusions > user label >
+           strong rule evidence > model (uncertain band) > extractor fallback; verbatim rebuild in reading order
+           (Section.sources traces every line to its shape).  image_review.reapply_content_labels +
+           ExcelWriter.replace_improvement_text (improvement cell only).  GUI card: "Kiểm tra nội dung cải tiến"
+           review window, "Cập nhật mô hình học" trains both models independently with separate counts/results.
+           tests/test_content_learning.py (20 tests) .............................. done, 703 passed
+           Real-data content labelling / learned-model validation on Windows ....... NOT performed (no labels yet)
