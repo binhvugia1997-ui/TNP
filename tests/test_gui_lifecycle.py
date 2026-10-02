@@ -96,7 +96,7 @@ def _row_status(app, i):
 # ------------------------------------------------------------------ #1 / #14 canonical schema + exact KeyError
 def test_prescan_counts_schema_is_canonical(tmp_path):
     res = PreScanResult(period=SimpleNamespace(label_vi=lambda: "all"))
-    assert tuple(res.counts()) == PRESCAN_COUNT_KEYS and "master_not_found" in PRESCAN_COUNT_KEYS
+    assert tuple(res.counts()) == PRESCAN_COUNT_KEYS and "new_rows" in PRESCAN_COUNT_KEYS and "master_not_found" not in PRESCAN_COUNT_KEYS
     import pathlib
     gui_src = pathlib.Path("app/gui.py").read_text(encoding="utf-8")
     assert "c['master_not_found']" not in gui_src and "prescan_stage_text(" in gui_src   # default-safe access only

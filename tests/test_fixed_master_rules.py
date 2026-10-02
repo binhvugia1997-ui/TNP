@@ -45,18 +45,19 @@ def _images_at(ws, row, col):
 
 # ------------------------------------------------------------------ rule 1
 def test_rule1_absent_key_is_reported_never_created(sample_tree, template, tmp_path):
-    """Rule 1 (PROMPT-004): a valid Management Number absent from the master is reported as
-    'Không tìm thấy Management Number' – no row is created, nothing is parsed."""
+    """Rule 1 (PROMPT-004D): a valid Management Number absent from the master gets exactly ONE
+    new production row; a second run finds that row and never appends another."""
     _prefill(template, [{"mgmt": "999999999-VOC"}])
     out = tmp_path / "out" / "k.xlsx"
     summary, events, proc = _run([sample_tree["files"][0]], template, out)
-    assert summary.not_written == 1 and summary.failed == 0 and summary.completed == 0 and summary.new_rows == 0
-    assert proc.results[0].status == "not_written" and proc.results[0].excel_row is None
+    assert summary.not_written == 0 and summary.failed == 0 and summary.completed == 1 and summary.new_rows == 1
+    assert proc.results[0].status == "completed" and proc.results[0].new_row and proc.results[0].excel_row == 5
     ws = load_workbook(out)[SHEET]
-    assert ws.cell(row=4, column=2).value == "999999999-VOC" and ws.cell(row=5, column=2).value is None
+    assert ws.cell(row=4, column=2).value == "999999999-VOC" and ws.cell(row=5, column=2).value == "260918080-VOC"
+    assert ws.cell(row=6, column=2).value is None
     summary2, _, proc2 = _run([sample_tree["files"][0]], template, out)
-    assert summary2.not_written == 1 and summary2.new_rows == 0
-    assert load_workbook(out)[SHEET].cell(row=5, column=2).value is None
+    assert summary2.new_rows == 0 and summary2.not_written == 0
+    assert load_workbook(out)[SHEET].cell(row=6, column=2).value is None
 
 
 # ------------------------------------------------------------------ rule 2 + 3

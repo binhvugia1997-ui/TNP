@@ -8,7 +8,7 @@ import app.gui_controller as gc
 from app.config import AppConfig
 from app.extractor import defect_content_from_filename, derive_occurrence_date, management_number_from_filename
 from app.gui_controller import SCAN_FILTERS_VI, GuiController
-from app.prescan import ACTION_MASTER_NOT_FOUND, ACTION_PROCESS, month_period, prescan
+from app.prescan import ACTION_PROCESS_NEW_ROW, ACTION_PROCESS, month_period, prescan
 from app.scanner import is_report_file, rejection_reason, scan_folder, scan_inputs
 from tests.test_gui_redesign import _make_app
 
@@ -74,7 +74,7 @@ def test_scanner_logs_every_rejected_powerpoint_like_entry(tmp_path, caplog):
     assert sum("SCAN_REJECT" in r.message for r in caplog.records) == 3
 
 
-# 6. absent master row -> visible with MASTER_NOT_FOUND status (no Qwen, no parse)
+# 6. absent master row -> visible as a planned new row (PROMPT-004D; no Qwen, no parse during the scan)
 def test_missing_master_row_keeps_report_visible(tmp_path, template, monkeypatch):
     folder = _folder(tmp_path)
     from openpyxl import load_workbook
@@ -91,15 +91,14 @@ def test_missing_master_row_keeps_report_visible(tmp_path, template, monkeypatch
     ctl.set_output(str(tmp_path / "Output" / "Kiem_chung_09_2026.xlsx"))
     assert len(ctl.all_files) == 6
     res = ctl.scan()
-    assert res is not None and res.counts()["discovered"] == 6 and res.counts()["candidates"] == 5
+    assert res is not None and res.counts()["discovered"] == 6 and res.counts()["candidates"] == 6 and res.counts()["new_rows"] == 1
     rows = {r.path.name: r for r in ctl.scan_rows()}                     # default view = all discovered files
-    assert len(rows) == 6 and rows[NEW].action == ACTION_MASTER_NOT_FOUND
-    assert rows[NEW].status_vi == "Không tìm thấy Management Number trong Excel" and rows[NEW].management_number == "260925015"
+    assert len(rows) == 6 and rows[NEW].action == ACTION_PROCESS_NEW_ROW
+    assert rows[NEW].status_vi == "Sẽ xử lý — Management Number mới" and rows[NEW].will_process and rows[NEW].management_number == "260925015"
     assert NEW in {r.path.name for r in ctl.scan_rows(SCAN_FILTERS_VI[0])}  # even the "cần xử lý" view keeps it
-    assert NEW in {r.path.name for r in ctl.scan_rows(SCAN_FILTERS_VI[2])}
-    assert ctl.queue_text() == ("Tổng file phát hiện: 6   Sẽ xử lý: 5   Bỏ qua/đã cập nhật: 0   "
-                                "Không tìm thấy Management Number: 1   Lỗi/không hợp lệ: 0   Đã loại thủ công: 0")
-    assert "Không tìm thấy Management Number trong Excel: 1" in res.summary_lines_vi()
+    assert ctl.queue_text() == ("Tổng file phát hiện: 6   Sẽ xử lý: 6   Bỏ qua/đã cập nhật: 0   "
+                                "Management Number mới: 1   Lỗi/không hợp lệ: 0   Đã loại thủ công: 0")
+    assert "Management Number mới (sẽ thêm dòng): 1" in res.summary_lines_vi()
 
 
 # 7 + 8. GUI shows 6 immediately, lists all 6, no Ollama call for discovery

@@ -26,7 +26,7 @@ from .ollama_client import OllamaClient, OllamaError, preferred_model
 from .ollama_discovery import (OllamaDiscovery, OllamaDiscoveryResult, discovery_summary_vi, missing_model_message,
                                model_available)
 from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS,
-                      ACTION_MASTER_NOT_FOUND, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
+                      ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
                       CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, MasterLookup, PreScanItem,
                       PreScanResult, ProcessingPeriod, auto_period_from_excel, month_period, normalize_source_path,
                       prescan, range_period)
@@ -41,7 +41,8 @@ STATUS_VI: Dict[str, str] = {
     "waiting": "Đang chờ",
     "completed": "Hoàn thành",
     "needs_review": "Cần kiểm tra",
-    "not_written": "Không tìm thấy Management Number",
+    "completed_new": "Hoàn thành — đã thêm Management Number mới",
+    "not_written": "Cần kiểm tra — Không xác định được Management Number từ tên file",
     "error": "Lỗi",
     "skipped": "Bỏ qua — đã cập nhật",
     "outside_period": "Bỏ qua ngoài thời gian xử lý",
@@ -49,13 +50,13 @@ STATUS_VI: Dict[str, str] = {
     "fast_skip": "Bỏ qua nhanh — đã xử lý gần đây",
 }
 PRESCAN_STATUSES = ("outside_period", "source_duplicate", "fast_skip")
-FINAL_STATUSES = ("completed", "needs_review", "not_written", "error", "skipped") + PRESCAN_STATUSES
+FINAL_STATUSES = ("completed", "completed_new", "needs_review", "not_written", "error", "skipped") + PRESCAN_STATUSES
 PERIOD_MODES = ("auto", "month", "range", "all")
 # scanned-file list: Vietnamese label of each pre-scan decision + the manual exclusion
 USER_EXCLUDED = "USER_EXCLUDED"
 SCAN_LABELS_VI: Dict[str, str] = {
     ACTION_PROCESS: "Sẽ xử lý — cần bổ sung dữ liệu",
-    ACTION_MASTER_NOT_FOUND: "Không tìm thấy Management Number trong Excel",
+    ACTION_PROCESS_NEW_ROW: "Sẽ xử lý — Management Number mới",
     ACTION_FAST_SKIP: "Bỏ qua — đã xử lý gần đây",
     ACTION_MASTER_COMPLETE: "Bỏ qua — Excel đã đầy đủ",
     ACTION_OUTSIDE_PERIOD: "Ngoài thời gian xử lý",
@@ -65,7 +66,7 @@ SCAN_LABELS_VI: Dict[str, str] = {
 }
 SCAN_FILTERS_VI = ("File cần xử lý", "Tất cả file đã quét", "File bị bỏ qua")
 DEFAULT_SCAN_FILTER_VI = SCAN_FILTERS_VI[1]       # every discovered report is visible first; filtering is opt-in
-ATTENTION_ACTIONS = (ACTION_MASTER_NOT_FOUND, ACTION_INVALID_MGMT)
+ATTENTION_ACTIONS = (ACTION_INVALID_MGMT,)
 STALE_LIST_VI = "Danh sách file đã thay đổi điều kiện. Vui lòng quét lại."
 NO_SCAN_VI = "Chưa quét thư mục. Vui lòng bấm Quét lại."
 RUNNING_VI = "Đang xử lý – không thể thay đổi danh sách. Dùng 'Dừng sau báo cáo hiện tại'."
@@ -202,7 +203,11 @@ class ScanRow:
 
     @property
     def is_candidate(self) -> bool:
-        return self.action == ACTION_PROCESS
+        return self.action in (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW)
+
+    @property
+    def is_new_row(self) -> bool:
+        return self.action == ACTION_PROCESS_NEW_ROW
 
     @property
     def needs_attention(self) -> bool:
@@ -502,7 +507,7 @@ class GuiController:
                 "discovered": len(self.all_files),
                 "skipped": pc.get("master_complete", 0) + pc.get("fast_skipped", 0) + pc.get("outside_period", 0)
                 + pc.get("source_duplicates", 0),
-                "master_not_found": pc.get("master_not_found", 0),
+                "new_rows": pc.get("new_rows", 0),
                 "invalid": pc.get("invalid_management_number", 0)}
 
     def queue_text(self) -> str:
@@ -510,7 +515,7 @@ class GuiController:
         (+ manual exclusions), so a report that is not going to be processed is visible, never silently gone."""
         c = self.queue_counts()
         return (f"Tổng file phát hiện: {c['discovered']}   Sẽ xử lý: {c['will_process']}   "
-                f"Bỏ qua/đã cập nhật: {c['skipped']}   Không tìm thấy Management Number: {c['master_not_found']}   "
+                f"Bỏ qua/đã cập nhật: {c['skipped']}   Management Number mới: {c['new_rows']}   "
                 f"Lỗi/không hợp lệ: {c['invalid']}   Đã loại thủ công: {c['excluded']}")
 
     def set_ollama(self, server: str, model: str) -> None:
@@ -1195,7 +1200,8 @@ class GuiController:
     def summary_lines(self) -> List[str]:
         s = self.summary or BatchSummary(total=len(self.files))
         lines = [f"Tổng: {s.total}", f"Hoàn thành: {s.completed}", f"Cần kiểm tra: {s.needs_review}",
-                 f"Không tìm thấy Management Number: {s.not_written}", f"Lỗi: {s.failed}", f"Bỏ qua: {s.skipped}"]
+                 f"Management Number mới: {s.new_rows}", f"Chưa ghi: {s.not_written}", f"Lỗi: {s.failed}",
+                 f"Bỏ qua: {s.skipped}"]
         if self.scan_result or self.prescan:
             lines.extend(self.prescan_lines())
         if self.started_at is not None:
@@ -1210,7 +1216,7 @@ class GuiController:
     def counts_text(self) -> str:
         s = self.summary or (self.processor.summary if self.processor else None) or BatchSummary(total=len(self.files))
         return (f"Tổng: {s.total}   Hoàn thành: {s.completed}   Cần kiểm tra: {s.needs_review}   "
-                f"Không tìm thấy Management Number: {s.not_written}   Lỗi: {s.failed}   Bỏ qua: {s.skipped}")
+                f"Management Number mới: {s.new_rows}   Chưa ghi: {s.not_written}   Lỗi: {s.failed}   Bỏ qua: {s.skipped}")
 
     def output_file(self) -> Optional[Path]:
         p = Path(self.summary.output_file) if self.summary and self.summary.output_file else (Path(self.output) if self.output else None)

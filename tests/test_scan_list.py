@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 import app.batch_processor as bp
 from app.config import AppConfig
 from app.gui_controller import (NO_SCAN_VI, RUNNING_VI, SCAN_FILTERS_VI, STALE_LIST_VI, USER_EXCLUDED, GuiController)
-from app.prescan import (ACTION_OUTSIDE_PERIOD, ACTION_MASTER_NOT_FOUND, ACTION_PROCESS, ACTION_SOURCE_DUPLICATE,
+from app.prescan import (ACTION_OUTSIDE_PERIOD, ACTION_PROCESS_NEW_ROW, ACTION_PROCESS, ACTION_SOURCE_DUPLICATE,
                          CACHE_FILE_NAME)
 
 SHEET = "Kiểm chứng"
@@ -99,9 +99,9 @@ def test_scan_list_shows_candidates_and_skips_without_opening_pptx(world, monkey
     assert len(rows) == 7 and len(ctl.all_files) == 7
     assert rows["260918080-VOC_a.pptx"].action == ACTION_PROCESS and rows["260918080-VOC_a.pptx"].will_process
     assert rows["260918082-VOC_c.pptx"].action == ACTION_PROCESS
-    assert rows["260918083-VOC_absent.pptx"].action == ACTION_MASTER_NOT_FOUND          # PROMPT-004: never a candidate
-    assert rows["260918083-VOC_absent.pptx"].status_vi == "Không tìm thấy Management Number trong Excel"
-    assert not rows["260918083-VOC_absent.pptx"].will_process
+    assert rows["260918083-VOC_absent.pptx"].action == ACTION_PROCESS_NEW_ROW           # PROMPT-004D: new row planned
+    assert rows["260918083-VOC_absent.pptx"].status_vi == "Sẽ xử lý — Management Number mới"
+    assert rows["260918083-VOC_absent.pptx"].will_process and rows["260918083-VOC_absent.pptx"].is_new_row
     assert rows["261002001-VOC_oct.pptx"].status_vi == "Ngoài thời gian xử lý"
     assert rows["khong_ma.pptx"].status_vi.startswith("Không xác định được Management Number")
     dup = [r for r in rows.values() if r.action == ACTION_SOURCE_DUPLICATE]
@@ -113,10 +113,10 @@ def test_scan_list_shows_candidates_and_skips_without_opening_pptx(world, monkey
     assert {r.path.name for r in ctl.scan_rows(SCAN_FILTERS_VI[0])} == {"260918080-VOC_a.pptx", "260918081-VOC_b.pptx",
                                                                         "260918082-VOC_c.pptx",
                                                                         "260918083-VOC_absent.pptx", "khong_ma.pptx"}  # 004C: problems stay visible
-    assert len(ctl.scan_rows(SCAN_FILTERS_VI[2])) == 4                               # skips incl. the absent key
-    assert len(ctl.final_queue()) == 3 and res.counts()["candidates"] == 3
-    assert ctl.queue_text() == ("Tổng file phát hiện: 7   Sẽ xử lý: 3   Bỏ qua/đã cập nhật: 2   "
-                                "Không tìm thấy Management Number: 1   Lỗi/không hợp lệ: 1   Đã loại thủ công: 0")
+    assert len(ctl.scan_rows(SCAN_FILTERS_VI[2])) == 3                               # skips (absent key is now a candidate)
+    assert len(ctl.final_queue()) == 4 and res.counts()["candidates"] == 4
+    assert ctl.queue_text() == ("Tổng file phát hiện: 7   Sẽ xử lý: 4   Bỏ qua/đã cập nhật: 2   "
+                                "Management Number mới: 1   Lỗi/không hợp lệ: 1   Đã loại thủ công: 0")
 
 
 # ---------------------------------------------------------------- 3-13, 29: exclusion
@@ -131,9 +131,10 @@ def test_exclude_one_and_many_never_touches_files_or_excel(world, monkeypatch):
     assert ctl.exclude([rows["261002001-VOC_oct.pptx"].index])                    # not a candidate -> problem text
     assert _by_name(ctl)["260918082-VOC_c.pptx"].state == USER_EXCLUDED
     assert _by_name(ctl)["260918082-VOC_c.pptx"].status_vi == "Đã loại thủ công"
-    assert ctl.queue_text() == ("Tổng file phát hiện: 7   Sẽ xử lý: 2   Bỏ qua/đã cập nhật: 2   "
-                                "Không tìm thấy Management Number: 1   Lỗi/không hợp lệ: 1   Đã loại thủ công: 1")
-    assert ctl.exclude([rows["260918080-VOC_a.pptx"].index, rows["260918081-VOC_b.pptx"].index]) == ""   # 4
+    assert ctl.queue_text() == ("Tổng file phát hiện: 7   Sẽ xử lý: 3   Bỏ qua/đã cập nhật: 2   "
+                                "Management Number mới: 1   Lỗi/không hợp lệ: 1   Đã loại thủ công: 1")
+    assert ctl.exclude([rows["260918080-VOC_a.pptx"].index, rows["260918081-VOC_b.pptx"].index,
+                        rows["260918083-VOC_absent.pptx"].index]) == ""                # 4 (new-row files can be excluded too)
     assert ctl.queue_counts()["will_process"] == 0 and ctl.final_queue() == []
     assert ctl.restore([rows["260918080-VOC_a.pptx"].index]) == ""
     _run(ctl)
@@ -166,7 +167,7 @@ def test_delete_key_and_context_menu_share_the_controller_action(world, monkeypa
 # ---------------------------------------------------------------- 14, 15, 30: queue / progress
 def test_queue_denominator_and_eta_use_final_list(world, tmp_path, monkeypatch):
     ctl = world.ctl
-    # 20 candidates (fake keys pre-registered in the master + 3 real) – exclude 3 -> 17
+    # 21 candidates (fake keys pre-registered in the master + 3 real + 1 new key) – exclude 3 -> 18
     wb = load_workbook(world.template)
     for i in range(17):
         key = f"2609{i + 1:02d}9{i:02d}-VOC"
@@ -174,22 +175,22 @@ def test_queue_denominator_and_eta_use_final_list(world, tmp_path, monkeypatch):
         wb[SHEET].cell(row=7 + i, column=2, value=key)
     wb.save(world.template)
     ctl.scan()
-    assert ctl.queue_counts()["candidates"] == 20
+    assert ctl.queue_counts()["candidates"] == 21
     cands = [r for r in ctl.scan_rows(SCAN_FILTERS_VI[0])][:3]
     assert ctl.exclude([r.index for r in cands]) == ""
-    assert ctl.queue_counts()["will_process"] == 17
+    assert ctl.queue_counts()["will_process"] == 18
     t = [0.0]
     ctl._clock = lambda: t[0]
     assert ctl.start(use_ollama=False, in_thread=False)
     ctl.pump()
-    assert ctl.progress.total == 17 and len(ctl.files) == 17                        # 14
-    assert ctl.progress.text == "Đã xử lý: 17 / 17 — 100%"
-    assert len(ctl.report_durations) <= 10 and ctl.summary.total == 17             # 15: ETA samples from queue only
-    # 30 (PROMPT-004): a key absent from the master is never appended, whatever the manual queue says
+    assert ctl.progress.total == 18 and len(ctl.files) == 18                        # 14
+    assert ctl.progress.text == "Đã xử lý: 18 / 18 — 100%"
+    assert len(ctl.report_durations) <= 10 and ctl.summary.total == 18             # 15: ETA samples from queue only
+    # 30 (PROMPT-004D): exactly one new row for the absent key, nothing else appended
     ws = load_workbook(world.out)[SHEET]
     keys = [ws.cell(row=r, column=2).value for r in range(4, ws.max_row + 1) if ws.cell(row=r, column=2).value]
-    assert len(keys) == 20 and len(set(keys)) == len(keys)                           # pre-existing keys only, no new rows
-    assert ws.cell(row=24, column=2).value is None
+    assert len(keys) == 21 and len(set(keys)) == len(keys) and "260918083-VOC" in keys   # 20 pre-existing + 1 new
+    assert ws.cell(row=25, column=2).value is None
 
 
 # ---------------------------------------------------------------- 16-19: restore
@@ -206,7 +207,7 @@ def test_restore_only_reverses_manual_exclusion(world):
     for j, act in ((oct_i, ACTION_OUTSIDE_PERIOD), (dup_i, ACTION_SOURCE_DUPLICATE), (inv_i, "INVALID_MANAGEMENT_NUMBER")):
         assert ctl.restore([j]) == "Chỉ khôi phục được file đã loại thủ công."                  # 17, 18, 19
         assert next(r for r in ctl.scan_rows() if r.index == j).action == act
-    assert len(ctl.final_queue()) == 3
+    assert len(ctl.final_queue()) == 4
 
 
 # ---------------------------------------------------------------- 20-26: rescan / stale
@@ -271,7 +272,7 @@ def test_removal_disabled_while_processing(world, monkeypatch):
         gate.set()
         ctl.processor._thread.join(120)
         ctl.pump()
-    assert ctl.state == "idle" and len(ctl.files) == 3
+    assert ctl.state == "idle" and len(ctl.files) == 4
     assert ctl.exclude([]) != RUNNING_VI
 
 

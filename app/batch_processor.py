@@ -18,13 +18,13 @@ from .classifier import classify
 from .excel_writer import ExcelWriter
 from .extractor import extract_record
 from .history import History, fingerprint
-from .extractor import management_number_from_filename
+from .extractor import derive_occurrence_date, management_number_from_filename
 from .excel_writer import MANAGED_FIELDS
 from .image_extractor import export_after_pictures
 from .logger import BatchResultLog, FileResult, setup_logging
 from .ollama_client import OllamaClient
 from .pptx_parser import parse_pptx
-from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_MASTER_NOT_FOUND,
+from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE,
                       PROCESS_ACTIONS, CACHE_FILE_NAME,
                       FastScanCache, MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, prescan)
 from .qpn_renderer import SlideRenderer, render_qpn_panel
@@ -45,10 +45,11 @@ STAGE_LABELS_VI = {
     "extracting_images": "Đang trích xuất hình ảnh cải tiến",
     "writing_excel": "Đang ghi Excel",
     "completed": "Hoàn thành",
+    "completed_new": "Hoàn thành — đã thêm Management Number mới",
     "needs_review": "Cần kiểm tra",
     "error": "Lỗi",
     "skipped": "Bỏ qua — đã cập nhật",
-    "not_written": "Không tìm thấy Management Number",
+    "not_written": "Cần kiểm tra — Không xác định được Management Number từ tên file",
     # pre-scan outcomes (decided from file name / cache / master workbook – PPTX never opened)
     "outside_period": "Bỏ qua ngoài thời gian xử lý",
     "source_duplicate": "Trùng Management Number trong folder",
@@ -98,8 +99,8 @@ class BatchSummary:
     outside_period: int = 0
     source_duplicates: int = 0
     fast_skipped: int = 0
-    master_not_found: int = 0            # pre-scan: valid keys absent from the master (reported, never created)
-    new_rows: int = 0                    # always 0 since PROMPT-004 (kept for result-log compatibility)
+    new_rows_planned: int = 0            # pre-scan: valid keys absent from the master (one new row each)
+    new_rows: int = 0                    # production rows created in this run (PROMPT-004D)
     backup_file: str = ""                # safety copy taken before the first real workbook modification
 
     def as_dict(self) -> Dict:
@@ -250,7 +251,7 @@ class BatchProcessor:
         self.summary.outside_period = c["outside_period"]
         self.summary.source_duplicates = c["source_duplicates"]
         self.summary.fast_skipped = c["fast_skipped"]
-        self.summary.master_not_found = c["master_not_found"]
+        self.summary.new_rows_planned = c["new_rows"]
         self.on_prescan(res)
         for line in res.summary_lines_vi():
             self._log(line)
@@ -261,7 +262,7 @@ class BatchProcessor:
             fr = FileResult(source_file=str(it.path), started_at=datetime.now().isoformat(timespec="seconds"),
                             management_number=it.management_number)
             fr.occurrence_date = f"{it.occurrence_date:%d/%m/%Y}" if it.occurrence_date else ""
-            if it.action in (ACTION_INVALID_MGMT, ACTION_MASTER_NOT_FOUND):
+            if it.action == ACTION_INVALID_MGMT:
                 self._not_written(it.index, fr, None, it.reason.replace("Cần kiểm tra: ", ""))
             elif it.action == ACTION_MASTER_COMPLETE:
                 self._skip_complete(it.index, fr, writer, it.management_number, it.path)
@@ -335,9 +336,22 @@ class BatchProcessor:
                     return self._not_written(idx, fr, None, "Không xác định được Management Number từ tên file")
                 rows = writer.find_rows_by_management_number(mgmt)
                 if not rows:
-                    # PROMPT-004: never create a production row automatically – report and leave the file for a rerun
-                    return self._not_written(idx, fr, None,
-                                             f"Không tìm thấy Management Number {mgmt} trong Excel – không tạo dòng mới")
+                    # PROMPT-004D: valid key (parser + real YYMMDD date) absent from the master -> create ONE blank
+                    # production row (format only, no business values), write the key, save, then process into it.
+                    occ, why = derive_occurrence_date(mgmt)
+                    if occ is None:
+                        return self._not_written(idx, fr, None, f"Không tạo dòng mới cho {mgmt}: {why}")
+                    try:
+                        new_row = writer.create_row(mgmt)          # backup is taken inside, BEFORE the first change
+                        writer.save()                              # key is on disk before any parsing can fail
+                    except Exception as e:  # noqa: BLE001
+                        LOG.error("MASTER_NEW_FAILED management_number=%s reason=%s", mgmt, e)
+                        raise RuntimeError(f"Không tạo được dòng mới cho Management Number {mgmt}: {e}") from e
+                    rows = [new_row]
+                    fr.new_row = True
+                    self.summary.new_rows += 1
+                    LOG.info("MASTER_NEW management_number=%s row=%s", mgmt, new_row)
+                    self.on_file(idx, "waiting", f"Đã tạo dòng mới: {new_row} – Management Number mới: {mgmt}")
                 fr.duplicate_rows = self._handle_duplicate_rows(writer, mgmt, rows, path)
                 row = rows[0]
                 missing = writer.missing_managed_fields(row)
@@ -484,8 +498,10 @@ class BatchProcessor:
                 self.summary.completed += 1
             else:
                 self.summary.needs_review += 1
-            self.on_file(idx, status, note or f"dòng {row}")
-            LOG.info("%s -> row %s (%s) %s", path.name, row, status, note)
+            self.on_file(idx, "completed_new" if (status == "completed" and fr.new_row) else status,
+                         note or (f"Đã tạo dòng mới: {row} – Management Number mới: {fr.management_number}"
+                                  if fr.new_row else f"dòng {row}"))
+            LOG.info("%s -> row %s (%s%s) %s", path.name, row, status, " new_row" if fr.new_row else "", note)
         except Exception as e:  # noqa: BLE001
             fr.status = "error"
             fr.error = f"{type(e).__name__}: {e}"
@@ -560,6 +576,8 @@ def format_file_diagnostics(fr: FileResult) -> str:
         f"Báo cáo            : {fr.source_file}",
         f"Trạng thái         : {fr.status}" + (f"  (dòng Excel {fr.excel_row})" if fr.excel_row else ""),
         f"Dòng sử dụng       : {fr.excel_row if fr.excel_row else '(không ghi)'}",
+        f"Dòng Excel         : {'Tạo mới' if fr.new_row else 'Có sẵn'}"
+        + (f"  – Đã tạo dòng mới: {fr.excel_row}  – Management Number mới: {fr.management_number}" if fr.new_row else ""),
         f"Management Number bị trùng tại dòng: {', '.join(map(str, fr.duplicate_rows)) if fr.duplicate_rows else '(không)'}"
         + ("  – Đã đánh dấu đỏ các dòng trùng." if fr.duplicate_rows else ""),
         f"Bộ phân loại       : {fr.classifier or '-'}" + (f"  (độ tin cậy AI {fr.confidence:.2f})" if fr.confidence is not None else ""),

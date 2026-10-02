@@ -95,7 +95,8 @@ def test_validation_messages(sample_tree, tmp_path):
 def test_status_mapping_vietnamese():
     assert STATUS_VI["completed"] == "Hoàn thành"
     assert STATUS_VI["needs_review"] == "Cần kiểm tra"
-    assert STATUS_VI["not_written"] == "Không tìm thấy Management Number"
+    assert STATUS_VI["not_written"] == "Cần kiểm tra — Không xác định được Management Number từ tên file"
+    assert STATUS_VI["completed_new"] == "Hoàn thành — đã thêm Management Number mới"
     assert STATUS_VI["error"] == "Lỗi" and STATUS_VI["skipped"] == "Bỏ qua — đã cập nhật"
     assert status_label("analyzing") == "Đang phân tích Qwen"
     assert status_label("extracting") == "Đang trích xuất nguyên nhân / đối sách cải tiến"
@@ -125,7 +126,7 @@ def test_worker_events_update_rows_and_summary(sample_tree, tmp_path):
     assert s.total == len(ctl.files) and s.completed + s.needs_review + s.failed == s.total
     lines = ctl.summary_lines()
     assert lines[0] == f"Tổng: {s.total}" and f"Hoàn thành: {s.completed}" in lines
-    assert any(ln.startswith("Không tìm thấy Management Number:") for ln in lines)
+    assert any(ln.startswith("Management Number mới:") for ln in lines)
     assert any(ln.startswith("Tổng thời gian xử lý:") for ln in lines)
     assert ctl.output_file() and ctl.output_folder() and ctl.log_file()
     assert ctl.progress.percent == 100.0
@@ -140,12 +141,13 @@ def test_missing_management_number_row_is_separate_status(sample_tree, tmp_path,
     _run_to_end(ctl)
     by_key = {r.management_number: r for r in ctl.rows}
     assert by_key["260918080-VOC"].stage == "completed"
-    assert "260918081-VOC" not in by_key                           # absent key never enters the queue (PROMPT-004)
+    assert by_key["260918081-VOC"].stage == "completed_new"       # absent key -> new row (PROMPT-004D)
+    assert by_key["260918081-VOC"].status_vi == "Hoàn thành — đã thêm Management Number mới"
     s = ctl.summary
-    assert s.completed == 1 and s.failed == 0 and s.new_rows == 0 and s.total == 1
-    assert "Lỗi: 0" in ctl.summary_lines() and "Không tìm thấy Management Number trong Excel: 3" in ctl.summary_lines()
+    assert s.failed == 0 and s.new_rows == 3 and s.completed + s.needs_review == 4 and s.total == 4
+    assert "Lỗi: 0" in ctl.summary_lines() and "Management Number mới: 3" in ctl.summary_lines()
     row = next(r for r in ctl.scan_rows() if r.management_number == "260918081-VOC")
-    assert row.status_vi == "Không tìm thấy Management Number trong Excel" and not row.will_process
+    assert row.status_vi == "Sẽ xử lý — Management Number mới" and row.will_process and row.is_new_row
 
 
 def test_start_stop_state_transitions(sample_tree, tmp_path):

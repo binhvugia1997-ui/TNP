@@ -83,8 +83,10 @@ ReportExtractor.exe --cli D:\Reports --template D:\Templates\Verification.xlsx -
    sách. Toàn bộ thư mục con được quét tự động.
 4. **File kết quả**: file `.xlsx` tổng hợp (không bao giờ ghi đè form gốc). Chạy
    lại với cùng file kết quả sẽ ghi tiếp theo quy tắc master cố định:
-   - Management Number không có trong file → *Không tìm thấy Management Number*
-     (không tạo dòng mới, bổ sung số rồi chạy lại);
+   - Management Number hợp lệ nhưng chưa có trong file → tự động **thêm đúng một
+     dòng mới** (PROMPT-004D) rồi xử lý bình thường → *Hoàn thành — đã thêm
+     Management Number mới*; tên file không có Management Number → *Cần kiểm tra —
+     Không xác định được Management Number từ tên file* (không ghi gì);
    - dòng đã đủ mọi trường tự động → *Bỏ qua — đã cập nhật* (không gọi Qwen,
      không trích xuất lại, không ghi lại QPN/ảnh);
    - dòng còn thiếu trường → tự động **chỉ điền các ô còn trống**, ô đã có dữ liệu
@@ -111,7 +113,7 @@ bắt đầu khi batch thật sự chạy), `Còn khoảng: …` từ thời gia
 Cấu hình (máy AI, model, các đường dẫn cuối) được lưu vào `config.json` cạnh exe.
 
 ### Trạng thái
-`Đang chờ · Đang đọc PPTX · Đang phân tích (AI) · Đang trích xuất QPN · Đang trích xuất hình ảnh · Đang ghi Excel · Hoàn thành · Cần kiểm tra · Không tìm thấy Management Number · Lỗi · Bỏ qua — đã cập nhật`
+`Đang chờ · Đang đọc PPTX · Đang phân tích (AI) · Đang trích xuất QPN · Đang trích xuất hình ảnh · Đang ghi Excel · Hoàn thành · Hoàn thành — đã thêm Management Number mới · Cần kiểm tra · Cần kiểm tra — Không xác định được Management Number từ tên file · Lỗi · Bỏ qua — đã cập nhật`
 
 ## 3. Business rules (fixed)
 
@@ -146,7 +148,7 @@ Dòng trên cùng là đích; các dòng trùng giữ nguyên và được tô �
 
 | Field | Rule |
 |---|---|
-| Management number | From file name only (`260918080-VOC`, `260922134`); must already exist in master – never creates a row |
+| Management number | From file name only (`260918080-VOC`, `260922134`); existing row → updated, valid key absent → exactly one new production row (PROMPT-004D) |
 | Tên vendor | **always blank** (user fills manually) |
 | Ngày phát sinh | derived only from Management Number YYMMDD (`260923045` → 23/09/2026) |
 | Model | `SM-A185` → `A185`; sheet *Phân loại* preferred |
@@ -264,13 +266,27 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 * Log máy đọc được: `PERIOD_AUTO/PERIOD_MANUAL`, `PERIOD_SKIP`, `SOURCE_DUPLICATE`, `FAST_SKIP`, `CACHE_MISS reason=…`,
   `CACHE_EXPIRE`, `MASTER_SKIP`, `MASTER_MISS`.
 
-### Management Number chưa có trong Excel → KHÔNG tạo dòng mới (PROMPT-004)
+### Management Number chưa có trong Excel → tự động thêm MỘT dòng mới (PROMPT-004D, thay thế quy tắc PROMPT-004)
 
 * Management Number chỉ lấy từ tên file (`260918080-VOC`, `260922134`), so khớp chính xác (chuẩn hoá) với cột trong
-  master. Không tìm thấy → trạng thái `Không tìm thấy Management Number trong Excel`, **không ghi gì**, không tạo dòng;
-  lý do: `Không tìm thấy Management Number … trong Excel – không tạo dòng mới`. Người dùng thêm dòng/sửa mã rồi chạy lại.
-* Pre-scan: dòng tổng kết `Không tìm thấy Management Number trong Excel: N`; cache hit nhưng mã không còn trong Excel →
-  `CACHE_MISS reason=master_row_missing` → cũng là *không tìm thấy*.
+  master. Bảng quyết định:
+  | Tên file | Hành động |
+  |---|---|
+  | không có Management Number hợp lệ | không tạo dòng, không sửa Excel → `Cần kiểm tra — Không xác định được Management Number từ tên file` |
+  | có đúng 1 dòng trong Excel | dòng đó: đủ → `Bỏ qua — đã cập nhật`; thiếu → chỉ điền ô trống |
+  | trùng nhiều dòng | dòng trên cùng là đích, các dòng còn lại tô đỏ, batch tiếp tục |
+  | hợp lệ nhưng chưa có | **tạo đúng một dòng mới** (không hỏi xác nhận), ghi Management Number, xử lý bình thường → `Hoàn thành — đã thêm Management Number mới` |
+* Dòng mới = dòng dữ liệu hợp lệ tiếp theo của bảng (không bao giờ là header/WEEK header/dòng cuối bảng), xác định
+  tất định. Chỉ **sao chép định dạng** từ dòng dữ liệu gần nhất (style, viền, căn lề, chiều cao, định dạng số/ngày,
+  merge một dòng); **không** sao chép giá trị nghiệp vụ, ảnh, WEEK, ghi chú. WEEK+1..+8 và các ô thủ công để trống.
+* Bản sao lưu (một lần mỗi batch) được tạo **trước** khi thêm dòng; sao lưu lỗi → không tạo dòng, không sửa gì, báo lỗi
+  rõ (`Không tạo được dòng mới cho Management Number … / Không tạo được bản sao lưu Excel …`). Dòng mới + mã được lưu
+  xuống đĩa ngay, trước khi đọc PPTX; lưu lại sau mỗi báo cáo.
+* Cùng báo cáo hai lần trong một batch → chỉ một dòng; chạy lần hai → tìm thấy dòng, đủ dữ liệu → `Bỏ qua — đã cập nhật`
+  (không gọi Qwen). Chẩn đoán: `Dòng Excel: Tạo mới – Đã tạo dòng mới: <dòng> – Management Number mới: <mã>`.
+* Pre-scan: trạng thái `Sẽ xử lý — Management Number mới` (lý do `Sẽ thêm dòng mới cho Management Number …`), dòng tổng
+  kết `Management Number mới (sẽ thêm dòng): N`; log `MASTER_MISS … action=PROCESS_NEW_ROW`, `MASTER_NEW management_number=… row=…`,
+  `MASTER_NEW_FAILED`. Cache hit nhưng mã không còn trong Excel → `CACHE_MISS reason=master_row_missing` → cũng tạo dòng mới.
 * Ngày phát sinh chỉ suy ra từ YYMMDD của Management Number (`260923045` → 23/09/2026); bỏ qua mọi ngày trong tên
   file/slide. Nội dung lỗi ưu tiên tên file sau `LỖI` (bỏ ngày, `SEV`, ngoặc cuối, đuôi file): `… LỖI BONG ATN, MỤN
   22.9.2026 SEV.pptx` → `BONG ATN, MỤN`.
@@ -313,8 +329,8 @@ của nút `BẮT ĐẦU XỬ LÝ` từng bị "tàng hình"). Với theme nativ
 log `SCAN_REJECT file=… reason=…` cho mọi mục giống PowerPoint bị bỏ; **không bao giờ** loại file theo nội dung tên
 (Management Number, model, FRONT/REAR, ngoặc đơn, thiếu `SEV`/ngày, vendor…). Mọi báo cáo tìm thấy đều hiển thị trong
 danh sách (bộ lọc mặc định `Tất cả file đã quét`; bộ lọc `File cần xử lý` vẫn giữ các dòng cần chú ý
-`Không tìm thấy Management Number trong Excel` / `Không xác định được Management Number`). Dòng tổng kết:
-`Tổng file phát hiện · Sẽ xử lý · Bỏ qua/đã cập nhật · Không tìm thấy Management Number · Lỗi/không hợp lệ · Đã loại thủ công`.
+`Không xác định được Management Number`; dòng `Sẽ xử lý — Management Number mới` là ứng viên bình thường). Dòng tổng kết:
+`Tổng file phát hiện · Sẽ xử lý · Bỏ qua/đã cập nhật · Management Number mới · Lỗi/không hợp lệ · Đã loại thủ công`.
 
 * GUI gồm 2 tab: `Xử lý báo cáo` (thư mục, file, thời gian xử lý, kết quả, tiến độ) và `Cấu hình & Ollama`.
 

@@ -910,6 +910,7 @@ class ExcelWriter:
         existing = self.find_rows_by_management_number(mgmt)
         if existing:
             return existing[0]                                   # never a second row for the same key
+        self._ensure_backup()                                    # one backup per batch, BEFORE the first change
         row = self.next_row()
         src = row - 1
         if src >= self.data_start and self._row_used(src):

@@ -44,3 +44,14 @@
            and directional arrows (auto-shapes/connectors, rotation/flip); selector adds blue-After-text and
            arrow-destination evidence (block-scoped, contiguous groups, conflicts → ambiguous);
            tests/test_after_evidence.py (18 tests) ............................ done, 566 passed
+
+- PROMPT-004D Automatic new Management Number row restored (reverses the PROMPT-004 "never create" rule, keeps 004C):
+           valid key absent from the master → prescan action PROCESS_NEW_ROW ("Sẽ xử lý — Management Number mới"),
+           BatchProcessor creates exactly ONE production row (format-only clone, no business values / WEEK / manual
+           fields), writes the key, saves, then processes normally → stage "completed_new"
+           ("Hoàn thành — đã thêm Management Number mới"); date from the key only; backup before the row,
+           backup failure → no row; no valid key in the filename → no row ("Cần kiểm tra — Không xác định được
+           Management Number từ tên file"); counters "Management Number mới: N"; diagnostics
+           "Đã tạo dòng mới: <row> – Management Number mới: <key>".  tests/test_master_not_found.py removed,
+           tests/test_new_master_row.py restored, tests/test_new_row.py (19 tests) ....... done, 582 passed
+           Real-data validation (September dataset, Windows) ......................... NOT run in sandbox
