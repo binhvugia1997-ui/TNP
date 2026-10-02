@@ -78,6 +78,7 @@ class FileResult:
     after_pictures: List[str] = field(default_factory=list)    # "S5#12" labels of the inserted Sau cải tiến pictures
     after_picture_slides: List[int] = field(default_factory=list)
     picture_notes: List[str] = field(default_factory=list)     # every picture decision (before/after/excluded/ambiguous)
+    image_candidates: list = field(default_factory=list)       # PROMPT-006 ImageCandidate objects (not serialised)
     classifier_notes: List[str] = field(default_factory=list)
     confidence: Optional[float] = None
     error: str = ""
@@ -96,7 +97,9 @@ class FileResult:
     finished_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["image_candidates"] = [c.get("candidate_id", "") for c in d.get("image_candidates", [])]
+        return d
 
 
 class BatchResultLog:

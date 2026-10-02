@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(app.__file__).resolve().parent.parent / "tools"))
 import build_portable as bp  # noqa: E402
 
 V_NEW, B_NEW = "1.0.5", 5
+V_NEWER, B_NEWER = "1.1.0", 7            # newer than the 1.1.0-beta / Build 006 dev app (controller / GUI tests)
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -87,16 +88,16 @@ def _ctl(tmp_path, update_path=""):
 
 # ---------------------------------------------------------------------------- version identity (§21/§23)
 def test_numeric_build_display_and_constants():
-    assert app.__version__ == "1.0.4" and app.BUILD_NUMBER == 4
-    assert app.BUILD_ID == "004" and app.BUILD_LABEL == "Build 004" and app.APP_TITLE == "Report Extractor v1.0.4"
+    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 6
+    assert app.BUILD_ID == "006" and app.BUILD_LABEL == "Build 006" and app.APP_TITLE == "Report Extractor v1.1.0-beta"
     assert app.format_build(4) == "004" and app.format_build(5) == "005" and app.format_build(12) == "012"
     assert app.format_build(1234) == "1234"
-    assert up.version_label() == "1.0.4 — Build 004" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
+    assert up.version_label() == "1.1.0-beta — Build 006" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
     assert "git" not in app.BUILD_ID.lower() and app.BUILD_ID.isdigit()
 
 
 def test_build_script_uses_the_same_constants():
-    assert bp._version() == ("1.0.4", "004") and bp.build_number() == 4
+    assert bp._version() == ("1.1.0-beta", "006") and bp.build_number() == 6
     assert bp.package_name("1.0.5") == "ReportExtractor_1.0.5.zip"
 
 
@@ -450,13 +451,13 @@ def test_update_path_persisted_in_config(tmp_path):
 
 
 def test_controller_check_async_and_status_texts(tmp_path):
-    folder = make_update_folder(tmp_path / "Update")
+    folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     c = _ctl(tmp_path, str(folder))
-    assert c.current_version_text() == "Phiên bản hiện tại: 1.0.4 — Build 004"
+    assert c.current_version_text() == "Phiên bản hiện tại: 1.1.0-beta — Build 006"
     assert c.update_status_text() == "Chưa kiểm tra cập nhật."
     assert c.check_update_async(startup=True)
     c._update_thread.join(10)
-    assert c.update_status_text() == "Có phiên bản mới: 1.0.5 — Build 005" and c.update_available()
+    assert c.update_status_text() == "Có phiên bản mới: 1.1.0 — Build 007" and c.update_available()
     # offline share: a status line, never an exception, processing stays available
     c.set_update_path(str(tmp_path / "offline_share"))
     assert c.update_check is None and c.check_update_async()
@@ -483,7 +484,7 @@ def test_startup_check_is_non_blocking(tmp_path, monkeypatch):
 
 
 def test_install_update_requires_confirmation_and_idle_state(tmp_path, monkeypatch):
-    folder = make_update_folder(tmp_path / "Update")
+    folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     portable = make_portable(tmp_path / "app")
     import app.gui_controller as gc
     monkeypatch.setattr(gc, "portable_root", lambda: portable)
@@ -492,24 +493,24 @@ def test_install_update_requires_confirmation_and_idle_state(tmp_path, monkeypat
     c.check_update()
     spawned = []
     ok, msg = c.install_update(spawn=lambda cmd, **kw: spawned.append(cmd))
-    assert ok and msg.startswith("Đang cài đặt 1.0.5 — Build 005")
+    assert ok and msg.startswith("Đang cài đặt 1.1.0 — Build 007")
     assert spawned and "--apply-update" in spawned[0] and spawned[0][-1].endswith("update.json")
     assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"                    # files untouched until the updater runs
     # downgrade / latest never install
     c2 = _ctl(tmp_path / "x", str(folder))
-    c2.update_check = up.check_for_update(str(folder), current_build=6)
+    c2.update_check = up.check_for_update(str(folder), current_build=B_NEWER + 1)
     assert c2.install_update()[0] is False
 
 
 def test_gui_update_card_controls(monkeypatch, tmp_path):
     from tests.test_gui_redesign import _make_app
-    folder = make_update_folder(tmp_path / "Update")
+    folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
     btn_texts = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Button"}
     assert {"Chọn...", "Kiểm tra cập nhật", "Cập nhật ngay"} <= btn_texts
     labels = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Label"}
-    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.0.4 — Build 004" in labels
-    assert a.lbl_build.cfg["text"] == "Build 004"
+    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.1.0-beta — Build 006" in labels
+    assert a.lbl_build.cfg["text"] == "Build 006"
     assert a.btn_install_update.cfg["state"] == "disabled"
     # startup check scheduled asynchronously (after), not inline
     assert any(ms == 1500 for ms, _ in a.root.scheduled)
@@ -518,17 +519,17 @@ def test_gui_update_card_controls(monkeypatch, tmp_path):
     a.check_update()
     a.ctl._update_thread.join(10)
     a._poll()
-    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.0.5 — Build 005"
+    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.1.0 — Build 007"
     assert a.btn_install_update.cfg["state"] == "normal"
     assert a.ctl.update_path == str(folder) and a.ctl.cfg.update_path == str(folder)     # persisted via save_settings
     # "Để sau" (dialog closed without confirming) -> nothing happens
     a.install_update()
     assert a.btn_install_update.cfg["state"] == "normal" and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
     # latest / older render as status text only
-    a.ctl.update_check = up.check_for_update(str(folder), current_build=5)
+    a.ctl.update_check = up.check_for_update(str(folder), current_build=B_NEWER)
     a._render_update()
     assert a.lbl_update.cfg["text"] == "Đã là phiên bản mới nhất." and a.btn_install_update.cfg["state"] == "disabled"
-    a.ctl.update_check = up.check_for_update(str(folder), current_build=6)
+    a.ctl.update_check = up.check_for_update(str(folder), current_build=B_NEWER + 1)
     a._render_update()
     assert a.lbl_update.cfg["text"] == "Phiên bản trên đường dẫn cập nhật cũ hơn phiên bản hiện tại."
 

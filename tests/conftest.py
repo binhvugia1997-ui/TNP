@@ -10,6 +10,15 @@ sys.path.insert(0, str(ROOT / "tools"))
 from make_samples import make_report, make_template, make_sample_tree  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_learning_dir(tmp_path, monkeypatch):
+    """PROMPT-006: the image-learning user data (learning_data/) must never be written into the repository by
+    tests – every test gets its own folder unless it passes an explicit directory."""
+    import app.runtime_paths as rp
+    monkeypatch.setattr(rp, "learning_dir", lambda create=True: tmp_path / "learning_data")
+    yield
+
+
 @pytest.fixture(scope="session")
 def sample_tree(tmp_path_factory):
     root = tmp_path_factory.mktemp("sample")

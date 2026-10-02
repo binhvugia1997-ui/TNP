@@ -704,6 +704,20 @@ class ExcelWriter:
             self.insert_planned_images(row, field, pl)
         self._dirty = True
 
+    def replace_improvement_images(self, row: int, paths: List[Path]) -> int:
+        """PROMPT-006 re-apply after user confirmation: swap ONLY the pictures of the ``improvement_image`` cell of
+        ``row`` (text fields, QPN, WEEK, vendor/date, other rows and sheets are untouched).  Returns the number of
+        pictures placed.  An empty list clears the cell (nothing confirmed as After)."""
+        if "improvement_image" not in self.columns:
+            raise TemplateError("Không tìm thấy cột Hình ảnh cải tiến trong form Excel")
+        self._ensure_backup()
+        self._remove_images_in_cell(row, "improvement_image")
+        self._placed = [t for t in self._placed if not (t[1] == row and t[2] == "improvement_image")]
+        if not paths:
+            return 0
+        self.place_images(row, "improvement_image", [Path(x) for x in paths])
+        return len(paths)
+
     def image_bounds_report(self, row: Optional[int] = None) -> List[str]:
         """#39/#42: compare every picture placed by this writer with its destination rectangle as the workbook
         stands now (row heights converted back to pixels).  Returns human-readable violations (empty = OK)."""

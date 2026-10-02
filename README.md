@@ -411,3 +411,27 @@ Checklist smoke test Windows: (A) máy sạch không Python/Ollama → winget c�
   `release\version.json` (SHA256 của đúng file ZIP). Xuất bản = copy ZIP vào thư mục Update **trước**, copy
   `version.json` **sau cùng**.
 
+
+## Học & sửa ảnh cải tiến (PROMPT-006 – thử nghiệm, v1.1.0-beta / Build 006)
+
+Lớp bổ sung **trên** bộ nhận diện ảnh "Sau cải tiến" theo hình học (PROMPT-004C vẫn là chuẩn mặc định); hoàn toàn
+độc lập với Qwen/Ollama (chạy được với `use_ollama=false`).
+
+* Mỗi ảnh trong các slide cải tiến trở thành một **ứng viên** với đặc trưng bố cục đã chuẩn hoá (vị trí/kích thước
+  tương đối, chú thích Trước/Sau, chữ xanh, mũi tên, mục kiểm tra/kiểm soát, logo…) – không OCR, không pixel,
+  `IMAGE_FEATURE_SCHEMA = 1`, định danh `MN|S<slide>|#<shape>|<order>` không phụ thuộc đường dẫn.
+* Độ tin cậy 0–1 theo bằng chứng (chú thích Sau 0.95, chữ xanh 0.82, đích mũi tên 0.78, chưa rõ 0.5, Trước 0.05…);
+  ngưỡng `THRESHOLD_INCLUDE = 0.75` / `THRESHOLD_EXCLUDE = 0.35`, vùng giữa → bỏ qua + "Cần kiểm tra".
+* Tab **Cấu hình & Ollama → Dữ liệu học ảnh cải tiến**: "Kiểm tra ảnh cải tiến" mở cửa sổ duyệt từng ảnh (ảnh xem
+  trước, file, Management Number, slide, kết quả đề xuất, độ tin cậy, bằng chứng, chữ gần ảnh) với các nút
+  *Sau cải tiến / Trước cải tiến / Kiểm tra / Kiểm soát / Không lấy*, *Ảnh trước*, *Ảnh tiếp*, *Lưu xác nhận*.
+  Lưu xác nhận ghi `learning_data/image_labels.jsonl` và cập nhật lại **chỉ ô Hình ảnh cải tiến** của dòng tương ứng
+  (sao lưu trước khi sửa như mọi lần ghi khác).  Nhãn người dùng luôn thắng quy tắc và mô hình; ảnh bị loại cứng
+  (logo/mũi tên/icon) không bao giờ được chèn.
+* "Cập nhật mô hình ảnh": hồi quy logistic thuần Python (AFTER vs NON_AFTER) trên đặc trưng cấu trúc, cần ≥ 10 mẫu
+  và ≥ 3 mẫu mỗi lớp, nếu không: *"Chưa đủ dữ liệu học — đang dùng quy tắc hiện tại."*  Mô hình lưu tại
+  `learning_data/model/image_model.json` (kèm schema, thời điểm, số mẫu); thiếu/hỏng/không tương thích →
+  *"Mô hình ảnh không khả dụng — sử dụng quy tắc mặc định."* và xử lý vẫn tiếp tục.  Mô hình chỉ quyết định các ảnh
+  trong vùng chưa chắc chắn.
+* `learning_data/` nằm cạnh chương trình, là dữ liệu người dùng: bộ cập nhật giữ nguyên, gói phát hành không chứa,
+  không có nút xoá toàn bộ.  Bản sao nguồn ổn định: `backup/ReportExtractor_v1.0.4_Build004_STABLE/`.

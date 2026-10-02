@@ -79,3 +79,20 @@
            tests/test_updater.py (46 tests) ...................................... done, 656 passed
            Windows portable build / real update round-trip ......................... NOT possible in Linux sandbox
 
+
+- PROMPT-006 Improvement-image learning & correction mode (v1.1.0-beta, Build 006 – experimental, not for
+           production release).  §0 stable backup backup/ReportExtractor_v1.0.4_Build004_STABLE (83 tracked source
+           files, verified, never modified) + tools/make_stable_backup.py.  app/image_learning.py: ImageCandidate
+           records (normalised PPT geometry, caption/blue/arrow/inspection/logo evidence, IMAGE_FEATURE_SCHEMA=1,
+           path-independent candidate_id), calibrated deterministic confidence + Vietnamese evidence lines,
+           LabelStore (learning_data/image_labels.jsonl, append-only, last label wins, relabel audit, duplicate
+           protection), pure-Python logistic regression AFTER vs NON_AFTER (MIN 10 examples / 3 per class,
+           learning_data/model/image_model.json with metadata; missing/corrupt/incompatible → rules only),
+           decision = hard exclusions > user labels > deterministic thresholds (0.75 / 0.35) > model on the
+           uncertain band only.  Pipeline: extract_record(learning=…), BatchOptions.learning_dir, FileResult
+           .image_candidates; app/image_review.py re-applies confirmed labels to the improvement_image cell only
+           (ExcelWriter.replace_improvement_images, backup rule unchanged).  GUI tab 2 card "Dữ liệu học ảnh cải
+           tiến" (counts, Kiểm tra ảnh cải tiến review window, Cập nhật mô hình ảnh, Mở thư mục dữ liệu học, Xuất
+           dữ liệu học).  Updater preserves learning_data; build validator forbids it in the artefact.
+           tests/test_image_learning.py (27 tests) ................................ done, 683 passed
+           Real-data labelling / learned-model validation on Windows ............... NOT performed (no labels yet)

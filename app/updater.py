@@ -45,6 +45,7 @@ STAGED_MANIFEST = "update.json"
 # Entries of the portable folder that belong to the USER, never to a release package -> never replaced/deleted.
 PRESERVED_ENTRIES = frozenset(e.lower() for e in (
     "config", "logs", "output", "backup", "config.json", STAGING_DIR, BACKUP_DIR, "history.json",
+    "learning_data",                                   # PROMPT-006 image labels / thumbnails / local model
 ))
 PRESERVED_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".pptx", ".ppt", ".log", ".json")   # root-level user files
 

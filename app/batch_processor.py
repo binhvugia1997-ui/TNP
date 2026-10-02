@@ -78,6 +78,9 @@ class BatchOptions:
     period: Optional[ProcessingPeriod] = None
     use_fast_cache: bool = True
     today: Optional[date] = None
+    # PROMPT-006: image learning folder (None -> runtime_paths.learning_dir()); False disables the subsystem
+    learning_dir: Optional[Path] = None
+    use_image_learning: bool = True
 
 
 @dataclass
@@ -127,6 +130,14 @@ class BatchProcessor:
         self.on_log = on_log or (lambda m: None)
         self.on_prescan = on_prescan or (lambda r: None)
         self.prescan_result: Optional[PreScanResult] = None
+        self.learning = None
+        if opts.use_image_learning:
+            try:
+                from .image_learning import ImageLearning
+                self.learning = ImageLearning(opts.learning_dir)
+                LOG.info("image learning: dir=%s model=%s", self.learning.dir, self.learning.model_status)
+            except Exception as e:  # noqa: BLE001 – learning must never block processing
+                LOG.warning("image learning unavailable (%s) – deterministic rules only", e)
         self.cache: Optional[FastScanCache] = None
         self.stop_event = threading.Event()
         self.summary = BatchSummary(total=len(opts.files))
@@ -412,7 +423,9 @@ class BatchProcessor:
 
             # --- 3. extract original content (program copies WHAT) ----------
             self.on_file(idx, "extracting", "")
-            rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None)
+            rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None,
+                                 learning=self.learning)
+            fr.image_candidates = list(rec.image_candidates)
             fr.management_number = rec.management_number
             fr.after_picture_slides = list(rec.after_picture_slides)
             fr.vendor = rec.vendor

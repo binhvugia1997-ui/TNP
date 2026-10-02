@@ -30,7 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_PYTHON = ((3, 10), (3, 11), (3, 12), (3, 13))   # explicit tuples, identical to setup.bat policy
 FORBIDDEN_IN_ARTIFACT = ("tests", ".venv", ".venv-build", ".git", ".pytest_cache", "sample_data", "__pycache__",
-                         "update_staging", "update_backup", "release")
+                         "update_staging", "update_backup", "release", "learning_data")
 FORBIDDEN_SUFFIXES = (".pptx", ".ppt", ".xlsx", ".pyc")
 # Narrow allowlist of dependency RUNTIME resources that legitimately carry a forbidden suffix.  Compared as
 # lower-cased path-component tuples (platform independent).  python-pptx needs its default template to build a

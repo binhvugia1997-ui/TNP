@@ -246,7 +246,7 @@ class GuiController:
     def __init__(self, cfg: Optional[AppConfig] = None,
                  processor_factory: Callable[..., BatchProcessor] = BatchProcessor,
                  client_factory: Callable[..., OllamaClient] = OllamaClient,
-                 config_path: Optional[Path] = None):
+                 config_path: Optional[Path] = None, learning_dir_override: Optional[Path] = None):
         self.cfg = cfg or AppConfig.load(config_path)
         self._config_path = config_path
         self._processor_factory = processor_factory
@@ -311,6 +311,121 @@ class GuiController:
         self.discovery_results: List[OllamaDiscoveryResult] = []
         self.discovery_message: str = ""
         self.discovery_runs = 0
+        # PROMPT-006 image learning (user data in learning_data/; independent from Ollama)
+        self.learning_dir: Optional[Path] = learning_dir_override
+        self._learning = None
+        self.review_index = 0
+        self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
+
+    # ------------------------------------------------------------------ PROMPT-006 image learning
+    @property
+    def learning(self):
+        if self._learning is None:
+            from .image_learning import ImageLearning
+            try:
+                self._learning = ImageLearning(self.learning_dir)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("image learning unavailable: %s", e)
+                return None
+        return self._learning
+
+    def learning_status_text(self) -> str:
+        lrn = self.learning
+        if lrn is None:
+            from .image_learning import MSG_MODEL_UNAVAILABLE
+            return MSG_MODEL_UNAVAILABLE
+        return lrn.status_text()
+
+    def learning_counts(self) -> Dict[str, int]:
+        lrn = self.learning
+        return lrn.store.counts() if lrn else {"total": 0, "after": 0, "non_after": 0}
+
+    def learning_folder(self) -> Path:
+        lrn = self.learning
+        from .image_learning import learning_dir as _ld
+        return lrn.dir if lrn else _ld(self.learning_dir)
+
+    def review_candidates(self) -> list:
+        """Reviewable pictures of the LAST finished batch (hard-excluded logos/arrows are never offered)."""
+        if self.is_running() or not self.processor:
+            return []
+        out = []
+        for fr in getattr(self.processor, "results", []):
+            out.extend(c for c in getattr(fr, "image_candidates", []) if not c.hard_excluded)
+        return out
+
+    def review_summary_text(self) -> str:
+        cands = self.review_candidates()
+        if not cands:
+            return "Chưa có ảnh để kiểm tra (chạy xử lý trước)."
+        n_rev = sum(1 for c in cands if c.decision == "review")
+        return f"{len(cands)} ảnh ứng viên, {n_rev} ảnh cần xác nhận"
+
+    @staticmethod
+    def candidate_blob(c) -> Optional[bytes]:
+        """Raw picture bytes of a candidate (re-read from the PPTX; preview only)."""
+        try:
+            from .pptx_parser import parse_pptx
+            sl = parse_pptx(c.source_file).slide(c.slide)
+            for p in (sl.pictures if sl else []):
+                if p.shape_id == c.picture_id:
+                    return p.image_blob
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("candidate blob unavailable: %s", e)
+        return None
+
+    def set_pending_label(self, cand, label: str) -> None:
+        from .image_learning import LABELS
+        if label not in LABELS:
+            raise ValueError(label)
+        self.pending_labels[cand.candidate_id] = label
+
+    def save_confirmations(self, cands) -> Tuple[bool, str]:
+        """Persist the pending labels, then re-apply them to the Excel result (improvement-image cells only)."""
+        lrn = self.learning
+        if lrn is None:
+            return False, "Không ghi được dữ liệu học (thư mục learning_data không khả dụng)."
+        if not self.pending_labels:
+            return False, "Chưa chọn nhãn nào."
+        by_id = {c.candidate_id: c for c in cands}
+        written, touched = 0, []
+        for cid, label in list(self.pending_labels.items()):
+            c = by_id.get(cid)
+            if c is None:
+                continue
+            if lrn.store.label(c, label) is not None:
+                written += 1
+            touched.append(c)
+        self.pending_labels.clear()
+        msg = f"Đã lưu {written} nhãn xác nhận."
+        if touched and self.template and self.output and Path(self.output).exists():
+            from .image_review import reapply_labels
+            res = reapply_labels(Path(self.template), Path(self.output), touched, lrn)
+            if res.updated_rows:
+                msg += f" Đã cập nhật ảnh cải tiến cho {len(res.updated_rows)} dòng Excel ({res.pictures} ảnh)."
+            if res.errors:
+                msg += " Lỗi: " + "; ".join(res.errors)
+            self.log_lines.extend(res.messages + res.errors)
+        return True, msg
+
+    def train_image_model(self) -> Tuple[bool, str]:
+        lrn = self.learning
+        if lrn is None:
+            from .image_learning import MSG_MODEL_UNAVAILABLE
+            return False, MSG_MODEL_UNAVAILABLE
+        ok, msg = lrn.train()
+        self.log_lines.append(msg)
+        return ok, msg
+
+    def export_learning_data(self, target: str) -> Tuple[bool, str]:
+        lrn = self.learning
+        if lrn is None:
+            return False, "Không có dữ liệu học."
+        try:
+            p = lrn.store.export(Path(target))
+        except OSError as e:
+            return False, f"Không xuất được dữ liệu học: {e}"
+        return True, f"Đã xuất {lrn.store.counts()['total']} mẫu ra {p}"
 
     # ------------------------------------------------------------------ Ollama endpoint
     @property
@@ -935,7 +1050,7 @@ class GuiController:
                             use_ollama=use_ollama and bool(self.model),
                             fill_temporary_column=bool(self.cfg.fill_temporary_column),
                             vendors=list(self.cfg.vendors or []), row_mode=self.cfg.row_mode or "match",
-                            period=self.effective_period()[0])
+                            period=self.effective_period()[0], learning_dir=self.learning_dir)
 
     def start(self, use_ollama: bool = True, in_thread: bool = True) -> bool:
         """Start the production batch; returns False when validation fails or already running."""

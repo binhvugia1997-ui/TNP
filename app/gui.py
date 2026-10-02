@@ -785,8 +785,29 @@ class ReportExtractorApp:
                   style="Secondary.TLabel", wraplength=900).grid(row=4, column=0, columnspan=3, sticky="w", pady=(XS, 0))
         self.var_update_path.trace_add("write", lambda *_: self._on_update_path_edited())
 
+        # ---- Dữ liệu học ảnh cải tiến (PROMPT-006: local labels + tiny local model; no Ollama) ----------
+        lf = self._card(page, "Dữ liệu học ảnh cải tiến", 3)
+        self.lbl_learning = ttk.Label(lf, text=self.ctl.learning_status_text(), style="Card.TLabel", wraplength=900)
+        self.lbl_learning.grid(row=0, column=0, sticky="w", pady=(0, XS))
+        lbtns = ttk.Frame(lf, style="Card.TFrame")
+        lbtns.grid(row=1, column=0, sticky="w", pady=(S, XS))
+        self.btn_review_images = ttk.Button(lbtns, text="Kiểm tra ảnh cải tiến", command=self.open_image_review,
+                                            style="Primary.TButton")
+        self.btn_review_images.pack(side="left", padx=(0, XS))
+        self.btn_train_images = ttk.Button(lbtns, text="Cập nhật mô hình ảnh", command=self.train_image_model)
+        self.btn_train_images.pack(side="left", padx=(0, XS))
+        ttk.Button(lbtns, text="Mở thư mục dữ liệu học", command=self.open_learning_folder).pack(side="left", padx=(0, XS))
+        ttk.Button(lbtns, text="Xuất dữ liệu học", command=self.export_learning_data).pack(side="left")
+        self.lbl_review_summary = ttk.Label(lf, text=self.ctl.review_summary_text(), style="Secondary.TLabel",
+                                            wraplength=900)
+        self.lbl_review_summary.grid(row=2, column=0, sticky="w")
+        ttk.Label(lf, text="Nhãn xác nhận được lưu trong learning_data/ cạnh chương trình (giữ nguyên khi cập nhật). "
+                           "Mô hình chỉ dùng đặc trưng bố cục slide, không gửi dữ liệu đi đâu; nhãn người dùng luôn "
+                           "được ưu tiên.", style="Secondary.TLabel", wraplength=900).grid(row=3, column=0, sticky="w",
+                                                                                             pady=(XS, 0))
+
         # ---- Nhật ký xử lý (GUI copy of the log stream; clearing never touches app.log) --------------
-        lg = self._card(page, "Nhật ký xử lý", 3, weight=1)
+        lg = self._card(page, "Nhật ký xử lý", 4, weight=1)
         lbtn = ttk.Frame(lg.head, style="Card.TFrame")
         lbtn.grid(row=0, column=2, sticky="e")
         ttk.Button(lbtn, text="Mở file log", command=self.open_log).pack(side="left", padx=(0, XS))
@@ -1596,6 +1617,7 @@ class ReportExtractorApp:
             self._render_row(i)                      # transient "Đang ..." statuses replaced by final ones
         self._render_counts()
         self._render_progress()                      # 100% when every report reached a terminal state; timer frozen
+        self._render_learning()
         if self.ctl.worker_failure:
             self.lbl_stage.configure(text=self.ctl.worker_failure)
         else:
@@ -1691,6 +1713,141 @@ class ReportExtractorApp:
             open_path(str(p))
         else:
             messagebox.showinfo(APP_NAME, "Chưa có file log (chưa chạy lần nào).")
+
+    # ------------------------------------------------------------------ PROMPT-006 image review / learning
+    def _render_learning(self) -> None:
+        if hasattr(self, "lbl_learning"):
+            self.lbl_learning.configure(text=self.ctl.learning_status_text())
+            self.lbl_review_summary.configure(text=self.ctl.review_summary_text())
+
+    def train_image_model(self) -> None:
+        ok, msg = self.ctl.train_image_model()
+        self.log(msg)
+        self._render_learning()
+        (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
+
+    def open_learning_folder(self) -> None:
+        open_path(str(self.ctl.learning_folder()))
+
+    def export_learning_data(self) -> None:
+        target = filedialog.asksaveasfilename(title="Xuất dữ liệu học", defaultextension=".json",
+                                              initialfile="image_labels_export.json",
+                                              filetypes=[("JSON", "*.json")])
+        if not target or target is True:
+            return
+        ok, msg = self.ctl.export_learning_data(str(target))
+        self.log(msg)
+        (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
+
+    def open_image_review(self) -> None:
+        from .image_learning import LABELS, LABEL_VI
+        cands = self.ctl.review_candidates()
+        if not cands:
+            messagebox.showinfo(APP_NAME, "Chưa có ảnh để kiểm tra. Hãy chạy xử lý báo cáo trước.")
+            return
+        # pictures needing a decision first, then the rest in slide order
+        cands.sort(key=lambda c: (0 if c.decision == "review" else 1, c.source_name, c.slide, c.order))
+        self.ctl.review_index = 0
+        win = tk.Toplevel(self.root)
+        win.title("Kiểm tra ảnh cải tiến")
+        win.geometry("860x620")
+        win.columnconfigure(1, weight=1)
+        win.rowconfigure(0, weight=1)
+        self.review_win, self.review_cands = win, cands
+        self.review_thumb = ttk.Label(win, text="(không có ảnh xem trước)", anchor="center")
+        self.review_thumb.grid(row=0, column=0, sticky="nsew", padx=M, pady=M)
+        info = ttk.Frame(win)
+        info.grid(row=0, column=1, sticky="nsew", padx=M, pady=M)
+        info.columnconfigure(0, weight=1)
+        info.rowconfigure(1, weight=1)
+        self.review_head = ttk.Label(info, text="", font=(FONT_FAMILY, 10, "bold"), wraplength=480)
+        self.review_head.grid(row=0, column=0, sticky="w")
+        self.review_text = tk.Text(info, height=18, wrap="word", font=(MONO_FAMILY, 9))
+        self.review_text.grid(row=1, column=0, sticky="nsew", pady=(S, 0))
+        lab = ttk.Frame(win)
+        lab.grid(row=1, column=0, columnspan=2, sticky="w", padx=M)
+        self.review_label_buttons = {}
+        for key in LABELS:
+            b = ttk.Button(lab, text=LABEL_VI[key], command=lambda k=key: self._review_set_label(k))
+            b.pack(side="left", padx=(0, XS))
+            self.review_label_buttons[key] = b
+        nav = ttk.Frame(win)
+        nav.grid(row=2, column=0, columnspan=2, sticky="ew", padx=M, pady=M)
+        self.btn_review_prev = ttk.Button(nav, text="Ảnh trước", command=lambda: self._review_move(-1))
+        self.btn_review_prev.pack(side="left", padx=(0, XS))
+        self.btn_review_next = ttk.Button(nav, text="Ảnh tiếp", command=lambda: self._review_move(1))
+        self.btn_review_next.pack(side="left", padx=(0, XS))
+        self.btn_review_save = ttk.Button(nav, text="Lưu xác nhận", style="Primary.TButton",
+                                          command=self._review_save)
+        self.btn_review_save.pack(side="right")
+        self.lbl_review_pos = ttk.Label(nav, text="")
+        self.lbl_review_pos.pack(side="left", padx=(M, 0))
+        self._review_render()
+
+    def _review_current(self):
+        cands = getattr(self, "review_cands", [])
+        if not cands:
+            return None
+        self.ctl.review_index = max(0, min(self.ctl.review_index, len(cands) - 1))
+        return cands[self.ctl.review_index]
+
+    def _review_render(self) -> None:
+        from .image_learning import LABEL_VI, UNLABELED, explain
+        c = self._review_current()
+        if c is None:
+            return
+        n = len(self.review_cands)
+        chosen = self.ctl.pending_labels.get(c.candidate_id) or c.user_label
+        self.review_head.configure(text=f"{c.source_name}\nManagement Number: {c.management_number or '—'}   "
+                                        f"Slide {c.slide}   Ảnh #{c.picture_id}")
+        body = explain(c)
+        body += f"\n\nNhãn hiện tại: {LABEL_VI.get(chosen, LABEL_VI[UNLABELED])}"
+        if c.candidate_id in self.ctl.pending_labels:
+            body += "  (chưa lưu)"
+        self.review_text.configure(state="normal")
+        self.review_text.delete("1.0", "end")
+        self.review_text.insert("end", body)
+        self.review_text.configure(state="disabled")
+        self.lbl_review_pos.configure(text=f"Ảnh {self.ctl.review_index + 1}/{n}")
+        self.btn_review_prev.configure(state="normal" if self.ctl.review_index > 0 else "disabled")
+        self.btn_review_next.configure(state="normal" if self.ctl.review_index < n - 1 else "disabled")
+        self.btn_review_save.configure(state="normal" if self.ctl.pending_labels else "disabled")
+        self._review_thumbnail(c)
+
+    def _review_thumbnail(self, c) -> None:
+        """Best effort preview (Tk PhotoImage from the stored PNG thumbnail); text fallback when unavailable."""
+        try:
+            path = c.thumbnail
+            if not path or not Path(path).exists():
+                from .image_learning import save_thumbnail
+                blob = self.ctl.candidate_blob(c)
+                path = save_thumbnail(c, blob, self.ctl.learning_folder()) if blob else ""
+            if path and hasattr(tk, "PhotoImage"):
+                img = tk.PhotoImage(file=path)
+                self.review_thumb.configure(image=img, text="")
+                self.review_thumb.image = img
+                return
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("thumbnail preview skipped: %s", e)
+        self.review_thumb.configure(image="", text=f"Slide {c.slide} – ảnh #{c.picture_id}\n(không có ảnh xem trước)")
+
+    def _review_set_label(self, label: str) -> None:
+        c = self._review_current()
+        if c is None:
+            return
+        self.ctl.set_pending_label(c, label)
+        self._review_render()
+
+    def _review_move(self, step: int) -> None:
+        self.ctl.review_index += step
+        self._review_render()
+
+    def _review_save(self) -> None:
+        ok, msg = self.ctl.save_confirmations(getattr(self, "review_cands", []))
+        self.log(msg)
+        self._render_learning()
+        self._review_render()
+        (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
 
     def open_log_folder(self) -> None:
         p = self.ctl.log_file()

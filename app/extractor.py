@@ -62,6 +62,7 @@ class ExtractedRecord:
     after_pictures: List["PictureRef"] = field(default_factory=list)      # ONLY "Sau cải tiến" pictures (source order)
     after_picture_slides: List[int] = field(default_factory=list)
     picture_notes: List[str] = field(default_factory=list)                # diagnostics: every picture decision
+    image_candidates: list = field(default_factory=list)                   # PROMPT-006 ImageCandidate records
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
     # Vendor: detected from the ORIGINAL improvement text ("Tại công đoạn assy <Vendor>")
@@ -678,9 +679,17 @@ def defect_only_in_image(report: ReportData, cls: Classification) -> bool:
     return False
 
 
+def _slide_of_reason(text: str) -> int:
+    m = re.search(r"slide (\d+)", text)
+    return int(m.group(1)) if m else -1
+
+
 def extract_record(report: ReportData, cls: Classification,
                    item_mapping: Optional[Dict[str, str]] = None,
-                   known_models: Sequence[str] = (), vendors: Optional[List[str]] = None) -> ExtractedRecord:
+                   known_models: Sequence[str] = (), vendors: Optional[List[str]] = None,
+                   learning=None) -> ExtractedRecord:
+    """``learning``: optional :class:`app.image_learning.ImageLearning`; when given (PROMPT-006) the deterministic
+    After-picture selection is refined by user-confirmed labels / the local model.  ``None`` = PROMPT-004C rules."""
     rec = ExtractedRecord()
     rec.qpn_slide = cls.qpn_slide
     rec.management_number = extract_management_number(report, cls.management_number)
@@ -723,8 +732,23 @@ def extract_record(report: ReportData, cls: Classification,
         rec.after_pictures = list(sel.after)
         rec.after_picture_slides = list(sel.slides_with_after)
         rec.picture_notes = list(sel.notes)
-        rec.review_reasons.extend(sel.reasons)
-        if not sel.after and not sel.reasons:
+        reasons = list(sel.reasons)
+        if learning is not None:
+            from .image_learning import select_with_learning
+            refs, cands, extra = select_with_learning(report, rec.improvement_image_slides, sel, learning,
+                                                      rec.management_number, str(report.path))
+            rec.after_pictures = refs
+            rec.image_candidates = cands
+            rec.after_picture_slides = sorted({r.slide for r in refs})
+            reasons.extend(extra)
+            # a learned/user decision resolved the ambiguity -> drop the generic ambiguity note for that slide
+            resolved = {c.slide for c in cands if c.decision_source in ("model", "user")}
+            still_review = {c.slide for c in cands if c.decision == "review"}
+            reasons = [r for r in reasons
+                       if not ("Không xác định chắc chắn ảnh Sau cải tiến tại slide " in r
+                               and _slide_of_reason(r) in resolved - still_review)]
+        rec.review_reasons.extend(reasons)
+        if not rec.after_pictures and not reasons:
             rec.review_reasons.append("Không tìm thấy ảnh Sau cải tiến trong các slide cải tiến")
     else:
         rec.review_reasons.append("Không có hình ảnh cải tiến")

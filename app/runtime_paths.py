@@ -72,6 +72,12 @@ def output_dir(create: bool = True) -> Path:
     return _writable_dir(OUTPUT_DIR_NAME, create)
 
 
+def learning_dir(create: bool = True) -> Path:
+    """PROMPT-006 user data (image labels / thumbnails / local model) – beside the portable folder, never inside
+    ``_internal``; preserved by the updater and never packaged."""
+    return _writable_dir("learning_data", create)
+
+
 def config_file() -> Path:
     return config_dir() / "config.json"
 
