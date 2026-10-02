@@ -57,7 +57,8 @@ class FileResult:
     """One entry of batch_result.json."""
     source_file: str
     status: str = "waiting"            # completed | needs_review | error | skipped
-    new_row: bool = False              # the destination row was created by this run (Management Number was absent)
+    new_row: bool = False              # always False since PROMPT-004 (rows are never created automatically)
+    duplicate_rows: List[int] = field(default_factory=list)    # extra rows with the same Management Number (marked red)
     management_number: str = ""
     vendor: str = ""
     occurrence_date: str = ""

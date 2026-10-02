@@ -131,22 +131,22 @@ với neo (ảnh cùng hàng cạnh ảnh đã có chú thích dùng chung chú 
 Qwen chỉ chọn slide/mục, không chọn từng ảnh. Chi tiết quyết định từng ảnh: `python run.py --inspect <pptx>`.
 
 ### Management Number trùng nhiều dòng
-Dòng trên cùng là đích; các dòng trùng giữ nguyên và được tô đỏ; batch tiếp tục (Cần kiểm tra).
+Dòng trên cùng là đích; các dòng trùng giữ nguyên và được tô đỏ; batch tiếp tục (không ép `Cần kiểm tra`; xem PROMPT-004).
 
 
 | Field | Rule |
 |---|---|
-| Management number | From file name / report text (e.g. `260918080-VOC`); blank if not found |
+| Management number | From file name only (`260918080-VOC`, `260922134`); must already exist in master – never creates a row |
 | Tên vendor | **always blank** (user fills manually) |
-| Ngày phát sinh | **always blank** (user fills manually) |
+| Ngày phát sinh | derived only from Management Number YYMMDD (`260923045` → 23/09/2026) |
 | Model | `SM-A185` → `A185`; sheet *Phân loại* preferred |
 | Item | sheet *Phân loại* mapping preferred (keyword → Item) |
-| Nội dung lỗi | original defect lines with quantities (`Xước: 15ea …`) |
+| Nội dung lỗi | file name after `LỖI` (date/SEV/parenthetical stripped), e.g. `BONG ATN, MỤN`; no invented quantities |
 | QPN | **complete “Quality Problem Notice” slide rendered as PNG**, embedded |
 | Nguyên nhân | full original text of cause sections (sub-sections kept) |
 | Nội dung đối sách cải tiến | **full original text** of all improvement slides in source order incl. *ĐỐI SÁCH LÂU DÀI*; wrap + top aligned |
 | Xử lý tạm thời | **excluded** by section structure (not by phrase) |
-| Hình ảnh cải tiến | improvement slides rendered and stacked vertically (JPEG), embedded |
+| Hình ảnh cải tiến | ONLY `Sau cải tiến` production pictures, source order, separate image objects |
 | WEEK +1 … +8 | blank (never invented) |
 | Source `.pptx` / template | read-only; output is always a copy |
 
@@ -254,21 +254,30 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
 * Log máy đọc được: `PERIOD_AUTO/PERIOD_MANUAL`, `PERIOD_SKIP`, `SOURCE_DUPLICATE`, `FAST_SKIP`, `CACHE_MISS reason=…`,
   `CACHE_EXPIRE`, `MASTER_SKIP`, `MASTER_MISS`.
 
-### Management Number chưa có trong Excel → tự thêm dòng mới
+### Management Number chưa có trong Excel → KHÔNG tạo dòng mới (PROMPT-004)
 
-* Điều kiện: mã hợp lệ theo parser hiện có (có ngày YYMMDD thật), trong thời gian xử lý, không phải bản trùng bị bỏ.
-  Tên file không có mã / ngày sai / ngoài kỳ / bản trùng → **không** tạo dòng.
-* Vị trí: `ExcelWriter.create_row` dùng `next_row()` – dòng báo cáo trống đầu tiên của bảng (tận dụng dòng form trống
-  có sẵn), nếu không thì ngay sau dòng báo cáo cuối; không bao giờ là header/tiêu đề/sheet khác.
-* Chỉ sao chép **định dạng** từ dòng báo cáo gần nhất phía trên (`_copy_row_style`: style/border/fill/font/number format/
-  alignment/wrap, merge một dòng, chiều cao dòng). Không sao chép giá trị, ảnh QPN/ảnh cải tiến, WEEK đã nhập tay.
-* Ghi Management Number (+ STT) rồi `save()` ngay, sau đó xử lý PPT bằng pipeline chuẩn vào đúng dòng đó; lần chạy sau tìm
-  lại được dòng này (kể cả khi trích xuất lỗi) và điền tiếp theo cơ chế incremental – không bao giờ tạo dòng thứ hai.
-* Dòng Excel trùng mã đã có sẵn → giữ nguyên rule cũ (dòng trên cùng là đích, các dòng kia tô đỏ), không thêm dòng.
-* Cache: cache hit nhưng mã không có trong file Excel hiện tại → `CACHE_MISS reason=master_row_missing` → tạo dòng mới
-  (mỗi tháng một file Excel khác nhau).
-* Log: `MASTER_NEW management_number=… row=…`, `MASTER_NEW_RETRY …existing_partial_row=…`, `MASTER_NEW_FAILED …`.
-  Chẩn đoán GUI: `Dòng Excel: Tạo mới (dòng N)`.
+* Management Number chỉ lấy từ tên file (`260918080-VOC`, `260922134`), so khớp chính xác (chuẩn hoá) với cột trong
+  master. Không tìm thấy → trạng thái `Không tìm thấy Management Number trong Excel`, **không ghi gì**, không tạo dòng;
+  lý do: `Không tìm thấy Management Number … trong Excel – không tạo dòng mới`. Người dùng thêm dòng/sửa mã rồi chạy lại.
+* Pre-scan: dòng tổng kết `Không tìm thấy Management Number trong Excel: N`; cache hit nhưng mã không còn trong Excel →
+  `CACHE_MISS reason=master_row_missing` → cũng là *không tìm thấy*.
+* Ngày phát sinh chỉ suy ra từ YYMMDD của Management Number (`260923045` → 23/09/2026); bỏ qua mọi ngày trong tên
+  file/slide. Nội dung lỗi ưu tiên tên file sau `LỖI` (bỏ ngày, `SEV`, ngoặc cuối, đuôi file): `… LỖI BONG ATN, MỤN
+  22.9.2026 SEV.pptx` → `BONG ATN, MỤN`.
+
+### Cập nhật tăng dần, trùng dòng, sao lưu (PROMPT-004)
+
+* Một file `Kiem_chung.xlsx` cố định. Dòng đã đủ 9 trường quản lý (text + ảnh QPN + ảnh cải tiến) → `Bỏ qua — đã cập nhật`
+  kiểm tra rẻ trước khi parse/Qwen. Dòng thiếu → chỉ điền trường còn trống (kể cả trường người dùng đã xoá tay), không
+  hỏi, không ghi đè giá trị đã có; ảnh QPN/ảnh cải tiến có sẵn không bị thay/chèn lại; ảnh cải tiến thiếu được điền theo
+  rule chỉ-ảnh-Sau. WEEK +1..+8, công thức, cột/sheet khác giữ nguyên; sheet `Data` không dùng.
+* Trùng Management Number: dòng trên cùng là dòng dùng; các dòng khác giữ nguyên giá trị, tô đỏ (`FFC7CE`); batch tiếp
+  tục và file vẫn có thể `Hoàn thành`. Chẩn đoán: `Dòng sử dụng: 18`, `Management Number bị trùng tại dòng: 24, 31 – Đã
+  đánh dấu đỏ các dòng trùng.` Qwen không bao giờ chọn dòng.
+* Sao lưu: trước lần sửa workbook **đầu tiên** của batch (điền, QPN, ảnh, tô đỏ) tạo một bản
+  `<thư mục output>\backup\<tên>_backup_YYYYMMDD_HHMMSS.xlsx` (log `MASTER_BACKUP file=…`). Batch chỉ bỏ qua → không
+  sao lưu, không ghi. Sao lưu thất bại → không sửa master (`Không tạo được bản sao lưu Excel trước khi ghi …`).
+
 * GUI gồm 2 tab: `Xử lý báo cáo` (thư mục, file, thời gian xử lý, kết quả, tiến độ) và `Cấu hình & Ollama`.
 
 ### Danh sách file đã quét (kiểm tra trước khi xử lý)

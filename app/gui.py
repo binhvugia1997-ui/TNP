@@ -31,7 +31,7 @@ from .diagnostics import format_diagnostics, run_diagnostics
 from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, SCAN_FILTERS_VI, USER_EXCLUDED,
                              GuiController, default_output_path)
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD,
-                      ACTION_PROCESS, ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE)
+                      ACTION_MASTER_NOT_FOUND, ACTION_PROCESS, ACTION_SOURCE_DUPLICATE)
 from .scanner import parse_dnd_paths
 
 try:  # optional drag & drop support
@@ -78,7 +78,7 @@ RESULT_STRETCH = ("file", "note")
 STATUS_ICON = {"waiting": "○", "completed": "✓", "needs_review": "⚠", "error": "✗", "skipped": "•", "not_written": "⚠",
                "outside_period": "–", "source_duplicate": "•", "fast_skip": "•"}
 # scanned-file row tag per pre-scan state (text stays the status; colour is supplemental only)
-SCAN_TAGS = {ACTION_PROCESS: "candidate", ACTION_PROCESS_NEW_ROW: "candidate", USER_EXCLUDED: "excluded",
+SCAN_TAGS = {ACTION_PROCESS: "candidate", ACTION_MASTER_NOT_FOUND: "invalid", USER_EXCLUDED: "excluded",
              ACTION_OUTSIDE_PERIOD: "outside", ACTION_SOURCE_DUPLICATE: "duplicate", ACTION_FAST_SKIP: "fast_skip",
              ACTION_MASTER_COMPLETE: "complete", ACTION_INVALID_MGMT: "invalid"}
 SCAN_TAG_COLORS = {"candidate": PALETTE["primary"], "excluded": PALETTE["muted"], "outside": PALETTE["muted"],
@@ -94,13 +94,13 @@ SUMMARY_CARDS = (("completed", "Hoàn thành", "Success.TLabel"), ("needs_review
 
 def prescan_stage_text(counts) -> str:
     """Stage line after the pre-scan, built from the canonical ``PreScanResult.counts()`` schema with
-    default-safe access (``master_not_found`` was replaced by ``new_rows`` when automatic row creation arrived)."""
+    default-safe access (``master_not_found``: keys absent from the master – reported, never created)."""
     c = dict(counts or {})
     g = lambda k: c.get(k, 0)  # noqa: E731
     return (f"Quét nhanh: {g('discovered')} file, cần xử lý thực tế {g('candidates')} "
             f"(ngoài thời gian {g('outside_period')}, trùng {g('source_duplicates')}, "
             f"đã xử lý gần đây {g('fast_skipped')}, Excel đầy đủ {g('master_complete')}, "
-            f"mã mới thêm vào Excel {g('new_rows')}, cần bổ sung {g('incomplete')})")
+            f"không có trong Excel {g('master_not_found')}, cần bổ sung {g('incomplete')})")
 
 
 def summary_counts(summary) -> Dict[str, int]:

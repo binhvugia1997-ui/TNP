@@ -264,6 +264,9 @@ class TemplateError(RuntimeError):
     pass
 
 
+BACKUP_DIR_NAME = "backup"
+
+
 class ExcelWriter:
     def __init__(self, template: Path, output: Path, probe: bool = False):
         """``probe=True`` opens the current master state READ-ONLY for the pre-scan (no copy of the template,
@@ -289,6 +292,37 @@ class ExcelWriter:
         self.item_mapping, self.known_models = self._read_mapping_sheet()
         self._dirty = False
         self._placed: List[Tuple[Any, int, str]] = []   # (image, row, field) written by THIS writer
+        # PROMPT-004 §17: one safety copy of the master is taken right before the FIRST real modification
+        self.backup_dir = self.output.parent / BACKUP_DIR_NAME
+        self.backup_path: Optional[Path] = None
+        self.backup_enabled = True
+
+    # ------------------------------------------------------------------
+    # Safety backup (before the first modification only)
+    # ------------------------------------------------------------------
+    def _ensure_backup(self) -> None:
+        """Called by every mutating primitive.  First call of the batch: copy ``output`` to
+        ``backup/<name>_backup_<timestamp>.xlsx``; failure raises *before* anything is modified.  A batch that only
+        skips complete rows never calls this, so no unnecessary backup is created."""
+        if self.probe:
+            raise TemplateError("Workbook mở ở chế độ quét (probe) – không ghi")
+        self._dirty = True
+        if self.backup_path is not None or not self.backup_enabled:
+            return
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target = self.backup_dir / f"{self.output.stem}_backup_{stamp}{self.output.suffix}"
+            n = 1
+            while target.exists():
+                target = self.backup_dir / f"{self.output.stem}_backup_{stamp}_{n}{self.output.suffix}"
+                n += 1
+            shutil.copyfile(self.output, target)
+        except OSError as e:
+            self._dirty = False
+            raise TemplateError(f"Không tạo được bản sao lưu Excel trước khi ghi ({e}) – không sửa file gốc") from e
+        self.backup_path = target
+        LOG.info("MASTER_BACKUP file=%s", target)
 
     # ------------------------------------------------------------------
     # Template analysis
@@ -511,6 +545,7 @@ class ExcelWriter:
         ws = self.ws
         if src_row < self.data_start or src_row == dst_row:
             return
+        self._ensure_backup()
         max_col = max(list(self.columns.values()) + [ws.max_column])
         for c in range(1, max_col + 1):
             s = ws.cell(row=src_row, column=c)
@@ -582,6 +617,9 @@ class ExcelWriter:
         if field not in self.columns:
             return None
         cell, _ = self._anchor(row, self.columns[field])
+        if cell.value == (value if value not in ("",) else None) and not (wrap and isinstance(value, str) and value):
+            return cell                              # nothing changes -> no backup, no dirty flag
+        self._ensure_backup()
         cell.value = value if value not in ("",) else None
         if wrap and isinstance(value, str):
             al = copy(cell.alignment) if cell.alignment else Alignment()
@@ -615,6 +653,7 @@ class ExcelWriter:
         validate containment (#39) and only then create the anchors.  Never writes an overflowing geometry."""
         if not planned:
             return
+        self._ensure_backup()
         col = self.columns[field]
         cell, rng = self._anchor(row, col)
         area_w = self._col_width_px(col, rng)
@@ -651,6 +690,8 @@ class ExcelWriter:
                                       want_qpn: bool, want_imp: bool) -> None:
         """Shared #35 sequence: candidate plans -> final row height -> fit to final rectangle -> anchors."""
         plans = {}
+        if (want_qpn and qpn_png) or (want_imp and improvement_jpg):
+            self._ensure_backup()
         if want_qpn and qpn_png:
             self._remove_images_in_cell(row, "qpn")
             plans["qpn"] = self.plan_field_images(row, "qpn", [Path(qpn_png)])
@@ -747,6 +788,7 @@ class ExcelWriter:
         if "occurrence_date" not in self.columns or value is None:
             return
         cell, _ = self._anchor(row, self.columns["occurrence_date"])
+        self._ensure_backup()
         template_fmt = cell.number_format
         cell.value = value                      # openpyxl switches 'General' to 'yyyy-mm-dd' here
         if not template_fmt or template_fmt == "General":
@@ -784,6 +826,8 @@ class ExcelWriter:
     def _remove_images_in_cell(self, row: int, field: str) -> None:
         if field not in self.columns:
             return
+        if self._has_image_in_cell(row, field):
+            self._ensure_backup()
         cell, _ = self._anchor(row, self.columns[field])
         keep = []
         for img in getattr(self.ws, "_images", []):
@@ -916,8 +960,11 @@ class ExcelWriter:
 
     def mark_rows_red(self, rows: List[int]) -> None:
         """Highlight duplicate Management Number rows (values untouched)."""
+        if not rows:
+            return
         red = PatternFill("solid", fgColor="FFC7CE")
         last_col = max(self.columns.values()) if self.columns else self.ws.max_column
+        self._ensure_backup()
         for r in rows:
             for c in range(1, last_col + 1):
                 cell = self.ws.cell(row=r, column=c)
@@ -975,6 +1022,8 @@ class ExcelWriter:
     def save(self) -> Path:
         if self.probe:
             raise TemplateError("Workbook mở ở chế độ quét (probe) – không ghi")
+        if not self._dirty and not self._placed:
+            return self.output                           # skip-only batch: the master is not rewritten
         tmp = self.output.with_name(self.output.stem + ".saving.xlsx")
         problems = self.image_bounds_report()
         if problems:                                   # never persist an overflowing picture (#39)

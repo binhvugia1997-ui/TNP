@@ -25,7 +25,7 @@ from .ollama_client import OllamaClient, OllamaError, preferred_model
 from .ollama_discovery import (OllamaDiscovery, OllamaDiscoveryResult, discovery_summary_vi, missing_model_message,
                                model_available)
 from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS,
-                      ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
+                      ACTION_MASTER_NOT_FOUND, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
                       CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, MasterLookup, PreScanItem,
                       PreScanResult, ProcessingPeriod, auto_period_from_excel, month_period, normalize_source_path,
                       prescan, range_period)
@@ -54,7 +54,7 @@ PERIOD_MODES = ("auto", "month", "range", "all")
 USER_EXCLUDED = "USER_EXCLUDED"
 SCAN_LABELS_VI: Dict[str, str] = {
     ACTION_PROCESS: "Sẽ xử lý — cần bổ sung dữ liệu",
-    ACTION_PROCESS_NEW_ROW: "Sẽ thêm mới vào Excel",
+    ACTION_MASTER_NOT_FOUND: "Không tìm thấy Management Number trong Excel",
     ACTION_FAST_SKIP: "Bỏ qua — đã xử lý gần đây",
     ACTION_MASTER_COMPLETE: "Bỏ qua — Excel đã đầy đủ",
     ACTION_OUTSIDE_PERIOD: "Ngoài thời gian xử lý",
@@ -199,7 +199,7 @@ class ScanRow:
 
     @property
     def is_candidate(self) -> bool:
-        return self.action in (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW)
+        return self.action == ACTION_PROCESS
 
     @property
     def state(self) -> str:
@@ -1115,7 +1115,9 @@ class GuiController:
             "Tên file": Path(fr.source_file).name,
             "Trạng thái": status_label(fr.status) + (f" (dòng Excel {fr.excel_row})" if fr.excel_row else ""),
             "Management Number": fr.management_number or "(trống)",
-            "Dòng Excel": ("Tạo mới" if fr.new_row else "Có sẵn") + (f" (dòng {fr.excel_row})" if fr.excel_row else ""),
+            "Dòng sử dụng": str(fr.excel_row) if fr.excel_row else "(không ghi)",
+            "Management Number bị trùng tại dòng": (", ".join(map(str, fr.duplicate_rows)) + " – Đã đánh dấu đỏ các dòng trùng."
+                                                  if fr.duplicate_rows else "(không)"),
             "Ngày phát sinh": fr.occurrence_date or "(trống)",
             "Vendor": fr.vendor.replace("\n", " / ") if fr.vendor else "(trống)",
             "Model": fr.model or "(trống)",

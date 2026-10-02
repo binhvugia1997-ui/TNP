@@ -200,6 +200,7 @@ def test_batch_qpn_panel_and_fail_closed(template, tmp_path):
     ok_deck = make_deck(tmp_path / "a" / _name("picture"), "picture")
     bad_deck = make_deck(tmp_path / "b" / _name("ambiguous").replace(MGMT, "260923046-VOC"), "ambiguous", "260923046-VOC")
     out = tmp_path / "out" / "k.xlsx"
+    _prefill(template, [{"mgmt": MGMT}, {"mgmt": "260923046-VOC"}])        # PROMPT-004: rows must pre-exist
     summary, proc = _run([ok_deck, bad_deck], template, out)
     fr_ok, fr_bad = proc.results
     assert fr_ok.qpn_image and Path(fr_ok.qpn_image).exists()

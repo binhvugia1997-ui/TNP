@@ -145,22 +145,23 @@ def test_match_mode_updates_existing_row_and_preserves_key(sample_tree, template
 def test_match_mode_not_found_duplicate_and_missing_key(sample_tree, template, tmp_path, report_factory):
     _prefill(template, [("260918081-VOC", None, None), ("260918081-VOC", None, None)])
     nokey = report_factory("bao_cao.pptx")
-    files = [sample_tree["files"][0], sample_tree["files"][1], nokey]      # absent (-> new row) / duplicate / no key
+    files = [sample_tree["files"][0], sample_tree["files"][1], nokey]      # absent (-> not written) / duplicate / no key
     out = tmp_path / "out" / "k.xlsx"
     summary, events, proc = _run(files, template, out)
-    assert summary.not_written == 1 and summary.completed == 1 and summary.needs_review == 1 and summary.new_rows == 1
+    assert summary.not_written == 2 and summary.completed == 1 and summary.needs_review == 0 and summary.new_rows == 0
     msgs = [r.error for r in proc.results]
-    assert proc.results[0].new_row and proc.results[0].excel_row == 6                 # appended after the table
+    assert not proc.results[0].new_row and proc.results[0].excel_row is None          # PROMPT-004: never appended
+    assert "Không tìm thấy Management Number 260918080-VOC trong Excel" in msgs[0]
     assert "Không xác định được Management Number từ tên file" in msgs[2]
-    # duplicate key: topmost row is the canonical destination, the other row stays untouched but is marked red
+    # duplicate key: topmost row is the canonical destination, the other row stays untouched but is marked red;
+    # the report still finishes as Hoàn thành (duplicates are diagnostics, not a review reason)
     dup = proc.results[1]
-    assert dup.status == "needs_review" and dup.excel_row == 4
-    assert any("xuất hiện 2 dòng (4, 5)" in r and "tô đỏ" in r for r in dup.review_reasons)
+    assert dup.status == "completed" and dup.excel_row == 4 and dup.duplicate_rows == [5]
+    assert not any("tô đỏ" in r for r in dup.review_reasons)
     ws = load_workbook(out)["Kiểm chứng"]
     assert ws.cell(row=4, column=5).value == "A185" and ws.cell(row=5, column=5).value is None
     assert ws.cell(row=5, column=2).fill.fgColor.rgb.endswith("FFC7CE") and not str(ws.cell(row=4, column=2).fill.fgColor.rgb).endswith("FFC7CE")
-    assert ws.cell(row=6, column=2).value == "260918080-VOC" and ws.cell(row=6, column=5).value == "A185"
-    for r in (7, 8):                                                       # nothing written anywhere else
+    for r in (6, 7, 8):                                                    # nothing written anywhere else
         assert ws.cell(row=r, column=2).value is None and ws.cell(row=r, column=10).value is None
 
 

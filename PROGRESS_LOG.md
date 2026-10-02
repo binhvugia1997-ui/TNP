@@ -19,3 +19,11 @@
 - Fixes    openpyxl closed-image-buffer on 2nd save; header mis-detection on reopen;
            cover title mis-classified as improvement; defect cell extraction.
 - Tests    40 passed (pytest).
+
+- PROMPT-004  Final production extraction / fixed-master rules (v1.0.3, no new release):
+           no auto-created production rows (MASTER_NOT_FOUND status, prescan counter), duplicate rows →
+           topmost used + others red, diagnostics "Dòng sử dụng / bị trùng tại dòng / Đã đánh dấu đỏ",
+           one safety backup before first workbook modification per batch (none for skip-only, failure →
+           master untouched), content-region / After-only picture rules re-verified.
+           tests/test_prompt004.py (25 tests) ................................... done, 488 passed
+           Real-data validation (September five-report dataset, Windows) ........ NOT run in sandbox

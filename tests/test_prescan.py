@@ -18,7 +18,7 @@ from app.config import AppConfig
 from app.excel_writer import MANAGED_FIELDS
 from app.extractor import derive_occurrence_date, management_number_from_filename
 from app.gui_controller import FINAL_STATUSES, GuiController, UiEvent
-from app.prescan import (ACTION_FAST_SKIP, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS_NEW_ROW,
+from app.prescan import (ACTION_FAST_SKIP, ACTION_OUTSIDE_PERIOD, ACTION_MASTER_NOT_FOUND,
                          ACTION_PROCESS, ACTION_SOURCE_DUPLICATE, AUTO_PERIOD_FAIL_VI, CACHE_FILE_NAME,
                          PERIOD_DIFFERS_VI, FastScanCache, MasterLookup, ProcessingPeriod, auto_period_from_excel,
                          cache_cutoff, detect_month_from_excel_name, month_period, prescan, range_period)
@@ -362,7 +362,7 @@ def test_cleanup_only_touches_cache_file(sample_tree, tmp_path):                
 
 
 # ================================================================ 41. master Excel pre-check
-def test_master_complete_no_pptx_open_and_absent_key_is_new_row_candidate(sample_tree, tmp_path, monkeypatch):   # 42-44
+def test_master_complete_no_pptx_open_and_absent_key_is_not_found(sample_tree, tmp_path, monkeypatch):   # 42-44
     spies = Spies(monkeypatch)
     tpl = tmp_path / "Kiem_chung_09_2026.xlsx"
     shutil.copy(sample_tree["template"], tpl)
@@ -376,11 +376,11 @@ def test_master_complete_no_pptx_open_and_absent_key_is_new_row_candidate(sample
     assert summary.skipped == 1 and summary.candidates == 0 and summary.prescan["master_complete"] == 1
     data = json.loads((out.parent / "logs" / CACHE_FILE_NAME).read_text(encoding="utf-8"))
     assert data["entries"]["260915001-VOC"]["status"] == "skipped"
-    # absent key: pre-scan marks it PROCESS_NEW_ROW (a real candidate), never a rejection
+    # absent key: pre-scan reports MASTER_NOT_FOUND (never a candidate, never a new row)
     absent = _fake_pptx(tmp_path / "in", "260916002-VOC_new.pptx")
     res = prescan([absent], SEP, None, MasterLookup(lambda m: [], lambda r: []), today=RUN_TODAY)
-    assert res.items[0].action == ACTION_PROCESS_NEW_ROW and len(res.candidates) == 1
-    assert res.counts()["new_rows"] == 1 and "Mã mới sẽ thêm vào Excel: 1" in res.summary_lines_vi()
+    assert res.items[0].action == ACTION_MASTER_NOT_FOUND and len(res.candidates) == 0
+    assert res.counts()["master_not_found"] == 1 and "Không tìm thấy Management Number trong Excel: 1" in res.summary_lines_vi()
 
 
 def test_incomplete_master_row_proceeds(sample_tree, tmp_path, monkeypatch):          # 45
@@ -465,7 +465,7 @@ def test_excel_duplicate_rows_rule_unchanged(sample_tree, tmp_path, monkeypatch)
     ws = load_workbook(out)["Kiểm chứng"]
     assert ws.cell(row=4, column=9).value and not ws.cell(row=5, column=9).value       # topmost updated only
     assert ws.cell(row=5, column=2).fill.fgColor.rgb.endswith("FFC7CE")               # extra row red
-    assert any("xuất hiện 2 dòng" in r for r in p.results[0].review_reasons)
+    assert p.results[0].duplicate_rows == [5] and p.results[0].status == "completed"     # PROMPT-004 §15: diagnostics, not review
     # complete-row skip through the pre-scan also keeps the red marking
     tpl2 = tmp_path / "Kiem_chung_T09_2026.xlsx"
     shutil.copy(sample_tree["template"], tpl2)
@@ -518,28 +518,28 @@ def test_gui_counters_progress_denominator_and_eta(sample_tree, tmp_path, monkey
     assert kinds.index("prescan") < kinds.index("row")                                 # counters first
     c = ctl.scan_result.counts()                            # reviewed list = all 7 discovered files
     assert c == {"discovered": 7, "outside_period": 2, "source_duplicates": 1, "fast_skipped": 1,
-                 "master_complete": 1, "new_rows": 1, "incomplete": 1, "invalid_management_number": 0, "candidates": 2}
-    assert ctl.progress.total == 2 and ctl.progress.done == 2 and ctl.progress.percent == 100.0   # 61 (new row counts)
-    assert ctl.progress.text == "Đã xử lý: 2 / 2 — 100%"
-    assert len(ctl.report_durations) == 2                                              # 62: skips not measured
-    assert all(r.is_final for r in ctl.rows) and len(ctl.files) == 2                  # queue = candidates only
+                 "master_complete": 1, "master_not_found": 1, "incomplete": 1, "invalid_management_number": 0, "candidates": 1}
+    assert ctl.progress.total == 1 and ctl.progress.done == 1 and ctl.progress.percent == 100.0   # 61 (not-found excluded)
+    assert ctl.progress.text == "Đã xử lý: 1 / 1 — 100%"
+    assert len(ctl.report_durations) == 1                                              # 62: skips not measured
+    assert all(r.is_final for r in ctl.rows) and len(ctl.files) == 1                  # queue = candidates only
     scan = {r.path.name: r.status_vi for r in ctl.scan_rows()}
     assert scan["260820001-VOC_aug.pptx"] == scan["261002002-VOC_oct.pptx"] == "Ngoài thời gian xử lý"
     assert scan["260917005-VOC_a.pptx"] == "Trùng Management Number trong folder"
     assert scan["260917005-VOC_b.pptx"] == "Bỏ qua — đã xử lý gần đây"
     assert scan["260915003-VOC_done.pptx"] == "Bỏ qua — Excel đã đầy đủ"
-    assert scan["260916004-VOC_absent.pptx"] == "Sẽ thêm mới vào Excel"
+    assert scan["260916004-VOC_absent.pptx"] == "Không tìm thấy Management Number trong Excel"
     stages = {r.path.name: r.stage for r in ctl.rows}
-    assert stages["260916004-VOC_absent.pptx"] == "error"                             # new row created, fake PPTX fails
+    assert "260916004-VOC_absent.pptx" not in stages                                   # PROMPT-004: never queued
     assert stages["260918080-VOC_real.pptx"] == "completed"
     lines = ctl.summary_lines()
     assert "Tổng file phát hiện: 7" in lines and "Ngoài thời gian xử lý: 2" in lines
     assert "Trùng Management Number trong folder: 1" in lines and "Bỏ qua nhanh — đã xử lý gần đây: 1" in lines
-    assert "Bỏ qua — Excel đã đầy đủ: 1" in lines and "Mã mới sẽ thêm vào Excel: 1" in lines
-    assert "Cần bổ sung dữ liệu: 1" in lines and "Cần xử lý thực tế: 2" in lines
+    assert "Bỏ qua — Excel đã đầy đủ: 1" in lines and "Không tìm thấy Management Number trong Excel: 1" in lines
+    assert "Cần bổ sung dữ liệu: 1" in lines and "Cần xử lý thực tế: 1" in lines
     ws = load_workbook(out)["Kiểm chứng"]
     keys = [ws.cell(row=r, column=2).value for r in range(4, 9)]
-    assert keys == ["260918080-VOC", "260915003-VOC", "260917005-VOC", "260916004-VOC", None]   # one new row, key kept
+    assert keys == ["260918080-VOC", "260915003-VOC", "260917005-VOC", None, None]           # no new row ever
     assert set(FINAL_STATUSES) >= {"outside_period", "source_duplicate", "fast_skip"}
 
 

@@ -430,7 +430,7 @@ def test_double_click_result_opens_diagnostics(monkeypatch, tmp_path):
 
 # ------------------------------------------------------------------ 25, 26 architecture guards
 def test_no_obsolete_master_not_found_access():
-    assert "master_not_found" not in SRC.replace("``master_not_found`` was replaced", "")
+    assert "c['master_not_found']" not in SRC and 'counts["master_not_found"]' not in SRC
     assert re.search(r"\[\s*['\"]master_not_found['\"]\s*\]", SRC) is None
     counts_fn = SRC[SRC.index("def summary_counts("):SRC.index("def ollama_indicator_text(")]
     assert "getattr(summary, key, 0)" in counts_fn

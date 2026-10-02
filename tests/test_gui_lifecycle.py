@@ -94,24 +94,24 @@ def _row_status(app, i):
 
 
 # ------------------------------------------------------------------ #1 / #14 canonical schema + exact KeyError
-def test_prescan_counts_schema_is_canonical_and_has_no_master_not_found(tmp_path):
+def test_prescan_counts_schema_is_canonical(tmp_path):
     res = PreScanResult(period=SimpleNamespace(label_vi=lambda: "all"))
-    assert tuple(res.counts()) == PRESCAN_COUNT_KEYS and "master_not_found" not in PRESCAN_COUNT_KEYS
+    assert tuple(res.counts()) == PRESCAN_COUNT_KEYS and "master_not_found" in PRESCAN_COUNT_KEYS
     import pathlib
     gui_src = pathlib.Path("app/gui.py").read_text(encoding="utf-8")
-    assert "c['master_not_found']" not in gui_src and "prescan_stage_text(" in gui_src
+    assert "c['master_not_found']" not in gui_src and "prescan_stage_text(" in gui_src   # default-safe access only
 
 
 def test_prescan_event_without_master_not_found_does_not_kill_poll(monkeypatch, tmp_path):
     gui, app, clock, Top = _make_view(monkeypatch, tmp_path, 1)
     counts = {k: 0 for k in PRESCAN_COUNT_KEYS}
-    counts.update(discovered=1, candidates=1, new_rows=1)
+    counts.update(discovered=1, candidates=1, incomplete=1)
     fake = SimpleNamespace(counts=lambda: counts, candidates=[SimpleNamespace(index=0)],
                            summary_lines_vi=lambda: ["x"])
     app.ctl._queue.put(UiEvent("prescan", fake))
     app._poll()                                              # old code: KeyError here, loop dead
     assert "KeyError" not in app.txt_log.cfg.get("text", "") and app.ctl.is_running()
-    assert "mã mới thêm vào Excel 1" in app.lbl_stage.cfg["text"] and "Đang quét" not in app.lbl_stage.cfg["text"]
+    assert "cần bổ sung 1" in app.lbl_stage.cfg["text"] and "Đang quét" not in app.lbl_stage.cfg["text"]
     assert app.root.scheduled and app.root.scheduled[-1][0] == 100   # re-armed
     app.ctl._queue.put(UiEvent("row", (0, "reading", "")))
     app.ctl._queue.put(UiEvent("row", (0, "completed", "")))

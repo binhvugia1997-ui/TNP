@@ -18,14 +18,14 @@ from .classifier import classify
 from .excel_writer import ExcelWriter
 from .extractor import extract_record
 from .history import History, fingerprint
-from .extractor import derive_occurrence_date, management_number_from_filename
+from .extractor import management_number_from_filename
 from .excel_writer import MANAGED_FIELDS
 from .image_extractor import export_after_pictures
 from .logger import BatchResultLog, FileResult, setup_logging
 from .ollama_client import OllamaClient
 from .pptx_parser import parse_pptx
-from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, PROCESS_ACTIONS,
-                      CACHE_FILE_NAME,
+from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_MASTER_NOT_FOUND,
+                      PROCESS_ACTIONS, CACHE_FILE_NAME,
                       FastScanCache, MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, prescan)
 from .qpn_renderer import SlideRenderer, render_qpn_panel
 
@@ -98,8 +98,9 @@ class BatchSummary:
     outside_period: int = 0
     source_duplicates: int = 0
     fast_skipped: int = 0
-    new_rows_planned: int = 0            # pre-scan: valid keys absent from the master
-    new_rows: int = 0                    # rows actually created in this run
+    master_not_found: int = 0            # pre-scan: valid keys absent from the master (reported, never created)
+    new_rows: int = 0                    # always 0 since PROMPT-004 (kept for result-log compatibility)
+    backup_file: str = ""                # safety copy taken before the first real workbook modification
 
     def as_dict(self) -> Dict:
         return self.__dict__.copy()
@@ -202,6 +203,9 @@ class BatchProcessor:
                 writer.save()
             except Exception as e:  # noqa: BLE001
                 LOG.error("Final save failed: %s", e)
+            self.summary.backup_file = str(writer.backup_path) if writer.backup_path else ""
+            if writer.backup_path:
+                self._log(f"Bản sao lưu Excel trước khi ghi: {writer.backup_path}")
             writer.close()
             order = {str(p): i for i, p in enumerate(opts.files)}
             self.results.sort(key=lambda r: order.get(r.source_file, len(order)))   # file order, like the GUI table
@@ -246,7 +250,7 @@ class BatchProcessor:
         self.summary.outside_period = c["outside_period"]
         self.summary.source_duplicates = c["source_duplicates"]
         self.summary.fast_skipped = c["fast_skipped"]
-        self.summary.new_rows_planned = c["new_rows"]
+        self.summary.master_not_found = c["master_not_found"]
         self.on_prescan(res)
         for line in res.summary_lines_vi():
             self._log(line)
@@ -257,7 +261,7 @@ class BatchProcessor:
             fr = FileResult(source_file=str(it.path), started_at=datetime.now().isoformat(timespec="seconds"),
                             management_number=it.management_number)
             fr.occurrence_date = f"{it.occurrence_date:%d/%m/%Y}" if it.occurrence_date else ""
-            if it.action == ACTION_INVALID_MGMT:
+            if it.action in (ACTION_INVALID_MGMT, ACTION_MASTER_NOT_FOUND):
                 self._not_written(it.index, fr, None, it.reason.replace("Cần kiểm tra: ", ""))
             elif it.action == ACTION_MASTER_COMPLETE:
                 self._skip_complete(it.index, fr, writer, it.management_number, it.path)
@@ -278,10 +282,7 @@ class BatchProcessor:
         are still highlighted red; the outcome is safe for the 7-day cache."""
         rows = writer.find_rows_by_management_number(mgmt)
         row = rows[0] if rows else None
-        if len(rows) > 1:
-            writer.mark_rows_red(rows[1:])
-            LOG.warning("%s: Management Number %s xuất hiện %s dòng %s; dòng %s là dòng chính",
-                        path.name, mgmt, len(rows), rows, row)
+        fr.duplicate_rows = self._handle_duplicate_rows(writer, mgmt, rows, path)
         fr.status = "skipped"
         fr.excel_row = row
         fr.error = f"Bỏ qua — đã cập nhật (dòng {row})"
@@ -291,6 +292,18 @@ class BatchProcessor:
         self._remember(mgmt, path, "skipped")
         self.on_file(idx, "skipped", fr.error)
         return fr
+
+    def _handle_duplicate_rows(self, writer: ExcelWriter, mgmt: str, rows: List[int], path: Path) -> List[int]:
+        """Duplicate Management Number rows (PROMPT-004 §15): the TOPMOST data row is the canonical destination,
+        the other rows keep their business data untouched and are marked red (the batch continues, the report may
+        still finish as Hoàn thành).  Returns the extra (red) rows."""
+        if len(rows) <= 1:
+            return []
+        extra = rows[1:]
+        writer.mark_rows_red(extra)                        # backup is taken by the writer before the first change
+        LOG.warning("%s: Management Number %s – Dòng sử dụng: %s; Management Number bị trùng tại dòng: %s; "
+                    "Đã đánh dấu đỏ các dòng trùng.", path.name, mgmt, rows[0], ", ".join(map(str, extra)))
+        return extra
 
     def _remember(self, mgmt: str, path: Path, status: str) -> None:
         """Feed the recent-success cache; any failure is logged and ignored (never blocks the batch)."""
@@ -322,31 +335,10 @@ class BatchProcessor:
                     return self._not_written(idx, fr, None, "Không xác định được Management Number từ tên file")
                 rows = writer.find_rows_by_management_number(mgmt)
                 if not rows:
-                    # NEW RULE: valid key (parser + YYMMDD date), inside the period, not an ignored duplicate
-                    # (both guaranteed by the pre-scan queue) -> create ONE blank report row, write the key, save.
-                    occ, why = derive_occurrence_date(mgmt)
-                    if occ is None:
-                        return self._not_written(idx, fr, None, f"Không tạo dòng mới cho {mgmt}: {why}")
-                    try:
-                        new_row = writer.create_row(mgmt)
-                        writer.save()                       # key is on disk before any parsing can fail
-                    except Exception as e:  # noqa: BLE001
-                        LOG.error("MASTER_NEW_FAILED management_number=%s reason=%s", mgmt, e)
-                        raise RuntimeError(f"Không tạo được dòng mới cho Management Number {mgmt}: {e}") from e
-                    rows = [new_row]
-                    fr.new_row = True
-                    self.summary.new_rows += 1
-                    LOG.info("MASTER_NEW management_number=%s row=%s", mgmt, new_row)
-                    self.on_file(idx, "waiting", f"Đã thêm mới Management Number vào Excel (dòng {new_row})")
-                duplicate_note = ""
-                if len(rows) > 1:
-                    # rule: topmost row is the canonical destination; the other rows stay untouched but are
-                    # highlighted red so the user can clean the master up; the batch continues.
-                    extra = rows[1:]
-                    writer.mark_rows_red(extra)
-                    duplicate_note = (f"Management Number {mgmt} xuất hiện {len(rows)} dòng ({', '.join(map(str, rows))}); "
-                                      f"đã cập nhật dòng {rows[0]}, các dòng trùng {', '.join(map(str, extra))} được tô đỏ")
-                    LOG.warning("%s: %s", path.name, duplicate_note)
+                    # PROMPT-004: never create a production row automatically – report and leave the file for a rerun
+                    return self._not_written(idx, fr, None,
+                                             f"Không tìm thấy Management Number {mgmt} trong Excel – không tạo dòng mới")
+                fr.duplicate_rows = self._handle_duplicate_rows(writer, mgmt, rows, path)
                 row = rows[0]
                 missing = writer.missing_managed_fields(row)
                 if not missing and not self.opts.force_reprocess:
@@ -463,8 +455,6 @@ class BatchProcessor:
                     rec.review_reasons = filter_review_reasons(rec.review_reasons, missing)
                     fr.filled_fields = [f for f in missing if _rec_has(rec, f, qpn_png, imp_jpg)]
                 rec.review_reasons.extend(conflicts)
-                if duplicate_note:
-                    rec.review_reasons.append(duplicate_note)
                 note = "; ".join(rec.review_reasons)
                 if "status" in writer.columns:
                     cell, _ = writer._anchor(row, writer.columns["status"])
@@ -569,7 +559,9 @@ def format_file_diagnostics(fr: FileResult) -> str:
     lines = [
         f"Báo cáo            : {fr.source_file}",
         f"Trạng thái         : {fr.status}" + (f"  (dòng Excel {fr.excel_row})" if fr.excel_row else ""),
-        f"Dòng Excel         : {'Tạo mới' if fr.new_row else 'Có sẵn'}" + (f" (dòng {fr.excel_row})" if fr.excel_row else ""),
+        f"Dòng sử dụng       : {fr.excel_row if fr.excel_row else '(không ghi)'}",
+        f"Management Number bị trùng tại dòng: {', '.join(map(str, fr.duplicate_rows)) if fr.duplicate_rows else '(không)'}"
+        + ("  – Đã đánh dấu đỏ các dòng trùng." if fr.duplicate_rows else ""),
         f"Bộ phân loại       : {fr.classifier or '-'}" + (f"  (độ tin cậy AI {fr.confidence:.2f})" if fr.confidence is not None else ""),
         f"Management number  : {fr.management_number or '(trống)'}  (từ tên file – khoá dòng Excel)",
         f"Vendor (danh sách chuẩn, từ đối sách): {fr.vendor.replace(chr(10), ' / ') if fr.vendor else '(trống)'}",

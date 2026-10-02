@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 import app.batch_processor as bp
 from app.config import AppConfig
 from app.gui_controller import (NO_SCAN_VI, RUNNING_VI, SCAN_FILTERS_VI, STALE_LIST_VI, USER_EXCLUDED, GuiController)
-from app.prescan import (ACTION_OUTSIDE_PERIOD, ACTION_PROCESS, ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE,
+from app.prescan import (ACTION_OUTSIDE_PERIOD, ACTION_MASTER_NOT_FOUND, ACTION_PROCESS, ACTION_SOURCE_DUPLICATE,
                          CACHE_FILE_NAME)
 
 SHEET = "Kiểm chứng"
@@ -33,7 +33,8 @@ def world(sample_tree, template, tmp_path, monkeypatch):
     sep.mkdir(parents=True)
     shutil.copy(sample_tree["files"][0], sep / "260918080-VOC_a.pptx")          # existing partial row
     shutil.copy(sample_tree["files"][1], sep / "260918081-VOC_b.pptx")          # existing partial row
-    shutil.copy(sample_tree["files"][2], sep / "260918082-VOC_c.pptx")          # NEW key -> PROCESS_NEW_ROW
+    shutil.copy(sample_tree["files"][2], sep / "260918082-VOC_c.pptx")          # existing partial row
+    _fake(sep, "260918083-VOC_absent.pptx")                                     # key absent from master -> MASTER_NOT_FOUND
     _fake(reports / "2026-10", "261002001-VOC_oct.pptx")                        # outside period
     _fake(sep / "dup", "260918080-VOC_copy.pptx")                               # source duplicate (older)
     import os
@@ -43,6 +44,7 @@ def world(sample_tree, template, tmp_path, monkeypatch):
     ws = wb[SHEET]
     ws.cell(row=4, column=2, value="260918080-VOC")
     ws.cell(row=5, column=2, value="260918081-VOC")
+    ws.cell(row=6, column=2, value="260918082-VOC")
     wb.save(template)
     out = tmp_path / "Output" / "Kiem_chung_09_2026.xlsx"
 
@@ -94,10 +96,12 @@ def test_scan_list_shows_candidates_and_skips_without_opening_pptx(world, monkey
     res = ctl.scan()
     assert calls["parse"] == [] and not world.out.exists()                       # nothing opened / written
     rows = _by_name(ctl)
-    assert len(rows) == 6 and len(ctl.all_files) == 6
+    assert len(rows) == 7 and len(ctl.all_files) == 7
     assert rows["260918080-VOC_a.pptx"].action == ACTION_PROCESS and rows["260918080-VOC_a.pptx"].will_process
-    assert rows["260918082-VOC_c.pptx"].action == ACTION_PROCESS_NEW_ROW
-    assert rows["260918082-VOC_c.pptx"].status_vi == "Sẽ thêm mới vào Excel"
+    assert rows["260918082-VOC_c.pptx"].action == ACTION_PROCESS
+    assert rows["260918083-VOC_absent.pptx"].action == ACTION_MASTER_NOT_FOUND          # PROMPT-004: never a candidate
+    assert rows["260918083-VOC_absent.pptx"].status_vi == "Không tìm thấy Management Number trong Excel"
+    assert not rows["260918083-VOC_absent.pptx"].will_process
     assert rows["261002001-VOC_oct.pptx"].status_vi == "Ngoài thời gian xử lý"
     assert rows["khong_ma.pptx"].status_vi.startswith("Không xác định được Management Number")
     dup = [r for r in rows.values() if r.action == ACTION_SOURCE_DUPLICATE]
@@ -108,7 +112,7 @@ def test_scan_list_shows_candidates_and_skips_without_opening_pptx(world, monkey
     # filters only change the display
     assert {r.path.name for r in ctl.scan_rows(SCAN_FILTERS_VI[0])} == {"260918080-VOC_a.pptx", "260918081-VOC_b.pptx",
                                                                         "260918082-VOC_c.pptx"}
-    assert len(ctl.scan_rows(SCAN_FILTERS_VI[2])) == 3
+    assert len(ctl.scan_rows(SCAN_FILTERS_VI[2])) == 4                               # skips incl. the absent key
     assert len(ctl.final_queue()) == 3 and res.counts()["candidates"] == 3
     assert ctl.queue_text() == "Cần xử lý sau khi quét: 3   Đã loại thủ công: 0   Sẽ xử lý: 3"
 
@@ -137,7 +141,8 @@ def test_exclude_one_and_many_never_touches_files_or_excel(world, monkeypatch):
     ws = load_workbook(world.out)[SHEET]
     assert ws.cell(row=4, column=5).value == "A185"                                # processed one
     assert ws.cell(row=5, column=5).value is None                                  # 11: excluded existing row untouched
-    assert ws.cell(row=6, column=2).value is None                                  # 12, 29: no new row for excluded key
+    assert ws.cell(row=6, column=5).value is None                                  # 12, 29: excluded key row untouched
+    assert ws.cell(row=7, column=2).value is None                                  # PROMPT-004: never a new row
     cache = json.loads((world.out.parent / "logs" / CACHE_FILE_NAME).read_text(encoding="utf-8"))
     assert set(cache["entries"]) == {"260918080-VOC"}                             # 13
 
@@ -158,9 +163,13 @@ def test_delete_key_and_context_menu_share_the_controller_action(world, monkeypa
 # ---------------------------------------------------------------- 14, 15, 30: queue / progress
 def test_queue_denominator_and_eta_use_final_list(world, tmp_path, monkeypatch):
     ctl = world.ctl
-    # 20 candidates (fake new keys + 3 real) – exclude 3 -> 17
+    # 20 candidates (fake keys pre-registered in the master + 3 real) – exclude 3 -> 17
+    wb = load_workbook(world.template)
     for i in range(17):
-        _fake(world.reports / "2026-09" / "more", f"2609{i + 1:02d}9{i:02d}-VOC_x.pptx")
+        key = f"2609{i + 1:02d}9{i:02d}-VOC"
+        _fake(world.reports / "2026-09" / "more", f"{key}_x.pptx")
+        wb[SHEET].cell(row=7 + i, column=2, value=key)
+    wb.save(world.template)
     ctl.scan()
     assert ctl.queue_counts()["candidates"] == 20
     cands = [r for r in ctl.scan_rows(SCAN_FILTERS_VI[0])][:3]
@@ -173,13 +182,11 @@ def test_queue_denominator_and_eta_use_final_list(world, tmp_path, monkeypatch):
     assert ctl.progress.total == 17 and len(ctl.files) == 17                        # 14
     assert ctl.progress.text == "Đã xử lý: 17 / 17 — 100%"
     assert len(ctl.report_durations) <= 10 and ctl.summary.total == 17             # 15: ETA samples from queue only
-    # 30: retained new key -> row appended only when processed
+    # 30 (PROMPT-004): a key absent from the master is never appended, whatever the manual queue says
     ws = load_workbook(world.out)[SHEET]
     keys = [ws.cell(row=r, column=2).value for r in range(4, ws.max_row + 1) if ws.cell(row=r, column=2).value]
-    new_total = sum(1 for r in ctl.scan_rows() if r.action == ACTION_PROCESS_NEW_ROW)
-    new_excluded = sum(1 for r in cands if r.action == ACTION_PROCESS_NEW_ROW)
-    assert len(keys) == 2 + new_total - new_excluded                                  # existing 2 + new rows processed
-    assert len(set(keys)) == len(keys)                                               # no duplicate rows
+    assert len(keys) == 20 and len(set(keys)) == len(keys)                           # pre-existing keys only, no new rows
+    assert ws.cell(row=24, column=2).value is None
 
 
 # ---------------------------------------------------------------- 16-19: restore

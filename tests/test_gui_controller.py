@@ -140,13 +140,12 @@ def test_missing_management_number_row_is_separate_status(sample_tree, tmp_path,
     _run_to_end(ctl)
     by_key = {r.management_number: r for r in ctl.rows}
     assert by_key["260918080-VOC"].stage == "completed"
-    other = by_key["260918081-VOC"]
-    assert other.stage == "completed"                              # absent key -> new row created + processed
+    assert "260918081-VOC" not in by_key                           # absent key never enters the queue (PROMPT-004)
     s = ctl.summary
-    assert s.not_written == 0 and s.failed == 0 and s.new_rows >= 1
-    assert "Lỗi: 0" in ctl.summary_lines()
-    fr = next(ctl.result_for(i) for i in range(len(ctl.files)) if ctl.result_for(i).management_number == "260918081-VOC")
-    assert fr.new_row and ctl.diagnostics_for(fr and ctl.files.index(Path(fr.source_file)))["Dòng Excel"].startswith("Tạo mới")
+    assert s.completed == 1 and s.failed == 0 and s.new_rows == 0 and s.total == 1
+    assert "Lỗi: 0" in ctl.summary_lines() and "Không tìm thấy Management Number trong Excel: 3" in ctl.summary_lines()
+    row = next(r for r in ctl.scan_rows() if r.management_number == "260918081-VOC")
+    assert row.status_vi == "Không tìm thấy Management Number trong Excel" and not row.will_process
 
 
 def test_start_stop_state_transitions(sample_tree, tmp_path):
