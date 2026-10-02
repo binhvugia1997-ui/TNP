@@ -17,15 +17,16 @@ class _R:
 
 
 # 1. git installed + valid repo -> short revision used normally
-def test_git_available_returns_short_revision(monkeypatch):
+def test_git_available_returns_short_revision(monkeypatch, tmp_path):
     seen = {}
 
     def fake_run(cmd, **kw):
         seen["cmd"], seen["kw"] = cmd, kw
         return _R("abc1234\n")
     monkeypatch.setattr(bp.subprocess, "run", fake_run)
-    assert bp.get_git_revision(Path("/repo")) == "abc1234"
-    assert seen["cmd"] == ["git", "rev-parse", "--short", "HEAD"] and seen["kw"]["cwd"] == "/repo"
+    assert bp.get_git_revision(tmp_path) == "abc1234"
+    assert seen["cmd"] == ["git", "rev-parse", "--short", "HEAD"]
+    assert Path(seen["kw"]["cwd"]).resolve() == tmp_path.resolve()          # platform-independent cwd check
     assert seen["kw"]["check"] is True and seen["kw"]["timeout"] > 0
 
 
