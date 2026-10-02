@@ -55,3 +55,10 @@
            "Đã tạo dòng mới: <row> – Management Number mới: <key>".  tests/test_master_not_found.py rewritten to the
            004D rule (8 tests), tests/test_new_master_row.py restored, tests/test_new_row.py (19) . done, 590 passed
            Real-data validation (September dataset, Windows) ......................... NOT run in sandbox
+
+- PROMPT-004E Portable build must not require Git: tools/build_portable.py `get_git_revision()` (never raises;
+           FileNotFoundError / CalledProcessError / TimeoutExpired / OSError → "unavailable"),
+           `write_release_metadata()` (VERSION.txt `git=unavailable` + `Git revision: unavailable`, README
+           `Git: unavailable`); also fixed latent `render_doc(name=…)` keyword collision in the same step.
+           tests/test_build_git_optional.py (12 tests) ............................ done, 602 passed
+           Windows portable build rerun ........................................... NOT possible in Linux sandbox

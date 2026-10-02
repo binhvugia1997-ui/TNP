@@ -70,6 +70,29 @@ def check_python(py: Path) -> None:
     print(f"   Python {major}.{minor} 64-bit OK ({py})")
 
 
+GIT_UNAVAILABLE = "unavailable"
+
+
+def get_git_revision(root: Path = ROOT, timeout: float = 10.0) -> str:
+    """Short git revision of ``root`` – informational metadata ONLY, never a build prerequisite.
+
+    Returns ``GIT_UNAVAILABLE`` ("unavailable") deterministically when git is not installed
+    (FileNotFoundError), the folder is not a repository / the command fails (non-zero exit), the call times
+    out, or any other OS-level error happens.  Never raises.
+    """
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(root), capture_output=True,
+                           text=True, timeout=timeout, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"[info] Git revision không khả dụng ({type(e).__name__}) – ghi '{GIT_UNAVAILABLE}' vào metadata")
+        return GIT_UNAVAILABLE
+    except Exception as e:  # noqa: BLE001 – metadata must never abort the build
+        print(f"[info] Git revision không khả dụng ({type(e).__name__}: {e}) – ghi '{GIT_UNAVAILABLE}'")
+        return GIT_UNAVAILABLE
+    rev = (r.stdout or "").strip()
+    return rev if rev else GIT_UNAVAILABLE
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -78,11 +101,36 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def render_doc(name: str, **fields: str) -> str:
-    text = (DOCS_DIR / name).read_text(encoding="utf-8")
+def render_doc(doc_name: str, **fields: str) -> str:
+    """Fill ``{placeholders}`` of release_docs/<doc_name>.  First positional parameter is deliberately NOT called
+    ``name`` – ``name`` is one of the template fields (portable folder name)."""
+    text = (DOCS_DIR / doc_name).read_text(encoding="utf-8")
     for k, v in fields.items():
         text = text.replace("{" + k + "}", v)
     return text
+
+
+def write_release_metadata(folder: Path, version: str, build_id: str, name: str,
+                           built: str | None = None, git_rev: str | None = None) -> str:
+    """Write README.txt / FIRST_RUN.txt / VERSION.txt / Install_Ollama_Optional.bat into ``folder``.
+
+    ``git_rev`` defaults to ``get_git_revision()``; when git is unavailable the metadata is still complete and valid
+    (``git=unavailable`` / ``Git revision: unavailable``).  Returns the revision string that was written.
+    """
+    built = built or _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    git_rev = git_rev if git_rev else get_git_revision()
+    fields = dict(version=version, build_id=build_id, built=built, git=git_rev, name=name,
+                  python=platform.python_version())
+    (folder / "README.txt").write_text(render_doc("README.txt", **fields), encoding="utf-8-sig")
+    (folder / "FIRST_RUN.txt").write_text(render_doc("FIRST_RUN.txt", **fields), encoding="utf-8-sig")
+    (folder / "VERSION.txt").write_text(
+        f"Report Extractor\nversion={version}\nprompt={build_id}\nbuilt={built}\ngit={git_rev}\n"
+        f"Git revision: {git_rev}\n"
+        f"python={platform.python_version()}\npackaging=PyInstaller onedir windowed (no UPX)\n"
+        f"ollama_bundled=no\nmodel_bundled=no\ndefault_server=http://127.0.0.1:11434\ndefault_model=qwen3:4b\n",
+        encoding="utf-8-sig")
+    shutil.copyfile(DOCS_DIR / "Install_Ollama_Optional.bat", folder / "Install_Ollama_Optional.bat")
+    return git_rev
 
 
 def validate_artifact(folder: Path, exe_name: str = "ReportExtractor.exe") -> list[str]:
@@ -174,19 +222,8 @@ def main() -> int:
         (folder / sub / ".keep").write_text("", encoding="utf-8")
 
     step(8, "Tài liệu README.txt / FIRST_RUN.txt / VERSION.txt / Install_Ollama_Optional.bat")
-    built = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    git_rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT), capture_output=True,
-                             text=True).stdout.strip() or "unknown"
-    fields = dict(version=version, build_id=build_id, built=built, git=git_rev, name=name,
-                  python=platform.python_version())
-    (folder / "README.txt").write_text(render_doc("README.txt", **fields), encoding="utf-8-sig")
-    (folder / "FIRST_RUN.txt").write_text(render_doc("FIRST_RUN.txt", **fields), encoding="utf-8-sig")
-    (folder / "VERSION.txt").write_text(
-        f"Report Extractor\nversion={version}\nprompt={build_id}\nbuilt={built}\ngit={git_rev}\n"
-        f"python={platform.python_version()}\npackaging=PyInstaller onedir windowed (no UPX)\n"
-        f"ollama_bundled=no\nmodel_bundled=no\ndefault_server=http://127.0.0.1:11434\ndefault_model=qwen3:4b\n",
-        encoding="utf-8-sig")
-    shutil.copyfile(DOCS_DIR / "Install_Ollama_Optional.bat", folder / "Install_Ollama_Optional.bat")
+    git_rev = write_release_metadata(folder, version, build_id, name)
+    print(f"  Git revision: {git_rev}")
 
     step(9, "Kiểm tra gói (không chứa file dev, không config máy dev, không Ollama/model)")
     problems = validate_artifact(folder)
