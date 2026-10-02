@@ -289,6 +289,14 @@ lưu.` và người dùng sửa Server/Port, `Kiểm tra kết nối` hoặc `T�
 (`probe_timeout`, mặc định 3 s) tách riêng khỏi timeout suy luận Qwen (`request_timeout`, 180 s). IP LAN cũ đã lưu
 không bao giờ ngăn phát hiện Ollama local; `Lưu cấu hình` vẫn lưu đúng giá trị đang hiển thị.
 
+### Màu chữ / độ tương phản GUI (PROMPT-004B)
+
+Mọi style ttk có chữ (nút, nhãn, tab, Treeview, Entry/Combobox) khai báo tường minh cả foreground lẫn background cho các
+trạng thái normal / active / pressed / disabled / selected / readonly trong `build_style_spec(theme)`; theme `clam` được
+ưu tiên trên mọi hệ điều hành vì tôn trọng màu nền nút (theme Windows `vista` bỏ qua background của TButton nên chữ trắng
+của nút `BẮT ĐẦU XỬ LÝ` từng bị "tàng hình"). Với theme native, nút chính dùng chữ tối trên nền mặc định. Hàm
+`audit_style_contrast()` kiểm tra tỉ lệ tương phản WCAG (≥ 4.5:1, disabled ≥ 3:1) và được chạy trong test.
+
 * GUI gồm 2 tab: `Xử lý báo cáo` (thư mục, file, thời gian xử lý, kết quả, tiến độ) và `Cấu hình & Ollama`.
 
 ### Danh sách file đã quét (kiểm tra trước khi xử lý)

@@ -75,7 +75,7 @@ def test_whole_page_scroll_layer():
 
 
 def test_styling_is_centralised():
-    styles = SRC[SRC.index("def configure_styles("):SRC.index("def apply_dpi_awareness(")]
+    styles = SRC[SRC.index("def build_style_spec("):SRC.index("def apply_dpi_awareness(")]
     for name in ("App.TFrame", "Card.TFrame", "Header.TLabel", "Section.TLabel", "Secondary.TLabel", "Primary.TButton",
                  "Danger.TButton", "Success.TLabel", "Warning.TLabel", "Error.TLabel", "Status.Treeview"):
         assert f'"{name}"' in styles, name

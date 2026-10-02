@@ -31,3 +31,7 @@
 - PROMPT-004A Ollama local-first connection: 127.0.0.1 → saved server → manual/LAN (never automatic
            LAN scan); probe_timeout (3 s) separate from request_timeout (180 s); GUI controls updated
            when local is selected. tests/test_ollama_local_first.py (14 tests) ..... done, 502 passed
+
+- PROMPT-004B GUI contrast hotfix: declarative theme-aware style spec with explicit fg/bg for every state,
+           clam preferred, WCAG contrast audit; palette tuned (secondary/warning/error/muted);
+           tests/test_gui_contrast.py (39 tests) ............................... done, 541 passed

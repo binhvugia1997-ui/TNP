@@ -51,13 +51,17 @@ PALETTE = {
     "card": "#ffffff",          # cards
     "border": "#d9dce1",
     "text": "#1f2328",
-    "secondary": "#6b7280",
+    "secondary": "#5f6672",      # ≥ 4.5:1 on the window background and on cards
     "primary": "#0b57d0",       # blue accent
     "primary_active": "#0947a8",
     "success": "#1a7f37",
-    "warning": "#b26a00",
-    "error": "#c62828",
-    "muted": "#9e9e9e",
+    "warning": "#9a5b00",        # ≥ 4.5:1 on white
+    "error": "#b71c1c",
+    "muted": "#6e6e6e",         # readable grey on white, stripe AND selection colour
+    "disabled_text": "#6b7280",  # disabled widgets: still legible, never equal to the face colour
+    "button_face": "#e9ecef",    # ordinary buttons / headings / tabs (light grey, dark text)
+    "button_face_active": "#dde1e6",
+    "primary_disabled": "#6f8fcf",   # disabled primary button: white text still ≥ 3:1
     "stripe": "#f7f8fa",
     "selection": "#dbe7ff",
 }
@@ -156,13 +160,41 @@ def open_path(path: str) -> None:
 
 
 # ----------------------------------------------------------------------------- styling system
+# Themes whose button element is drawn natively by Windows: they IGNORE ``background`` for TButton but still honour
+# ``foreground`` – a white foreground meant for a blue button becomes white-on-light-grey (invisible text).
+NATIVE_THEMES = ("vista", "winnative", "xpnative", "aqua")
+MIN_CONTRAST = 4.5          # WCAG AA for normal text
+MIN_CONTRAST_SOFT = 3.0     # disabled text / coloured table tags on the selection colour
+
+
+def _rgb(color: str):
+    c = color.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def relative_luminance(color: str) -> float:
+    def lin(v):
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(v) for v in _rgb(color))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(fg: str, bg: str) -> float:
+    """WCAG contrast ratio between two '#rrggbb' colours (1.0 = identical, 21.0 = black/white)."""
+    a, b = relative_luminance(fg), relative_luminance(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
 def pick_theme(style) -> str:
-    """Best available built-in theme: Windows native when usable, otherwise the controllable 'clam'."""
+    """'clam' first on every platform: it is the only built-in theme that honours explicit background/foreground
+    for buttons, tabs and tree rows in all states, so the colours below are what the user actually sees (the
+    Windows native themes paint buttons themselves and ignore our backgrounds)."""
     try:
         names = tuple(style.theme_names() or ())
     except Exception:  # noqa: BLE001
         names = ()
-    order = ("vista", "winnative", "clam") if sys.platform == "win32" else ("clam", "alt", "default")
+    order = ("clam", "vista", "winnative", "alt", "default") if sys.platform == "win32" else ("clam", "alt", "default")
     for name in order:
         if name in names:
             try:
@@ -173,49 +205,127 @@ def pick_theme(style) -> str:
     return ""
 
 
+def build_style_spec(theme: str) -> Dict[str, Dict[str, Any]]:
+    """Declarative, theme-aware style table: ``{style: {"configure": {...}, "map": {...}}}``.  Every style that
+    draws text declares BOTH foreground and background explicitly for normal / disabled / active / selected /
+    focus, so nothing depends on the platform's implicit ttk defaults.  Pure function – unit-tested for contrast."""
+    P = PALETTE
+    base = (FONT_FAMILY, 10)
+    bold = (FONT_FAMILY, 10, "bold")
+    native = theme in NATIVE_THEMES
+    # Native button faces are light grey and cannot be recoloured -> dark text on them; clam -> white on blue.
+    btn_face = P["button_face"] if native else P["primary"]
+    btn_face_active = P["button_face_active"] if native else P["primary_active"]
+    btn_face_disabled = P["button_face"] if native else P["primary_disabled"]
+    btn_fg = P["text"] if native else "#ffffff"
+    btn_fg_disabled = P["disabled_text"] if native else "#ffffff"
+    spec: Dict[str, Dict[str, Any]] = {
+        ".": {"configure": dict(font=base, background=P["bg"], foreground=P["text"]),
+              "map": dict(foreground=[("disabled", P["disabled_text"])])},
+        "App.TFrame": {"configure": dict(background=P["bg"])},
+        "Card.TFrame": {"configure": dict(background=P["card"], relief="flat")},
+        "CardBorder.TFrame": {"configure": dict(background=P["border"])},
+        "TLabel": {"configure": dict(background=P["bg"], foreground=P["text"])},
+        "Card.TLabel": {"configure": dict(background=P["card"], foreground=P["text"])},
+        "Header.TLabel": {"configure": dict(font=(FONT_FAMILY, 17, "bold"), background=P["bg"], foreground=P["text"])},
+        "SubHeader.TLabel": {"configure": dict(font=base, foreground=P["secondary"], background=P["bg"])},
+        "Version.TLabel": {"configure": dict(font=(FONT_FAMILY, 9), foreground=P["secondary"], background=P["bg"])},
+        "Section.TLabel": {"configure": dict(font=(FONT_FAMILY, 11, "bold"), background=P["card"], foreground=P["text"])},
+        "Secondary.TLabel": {"configure": dict(font=(FONT_FAMILY, 9), foreground=P["secondary"], background=P["card"])},
+        "Field.TLabel": {"configure": dict(font=base, background=P["card"], foreground=P["text"])},
+        "Success.TLabel": {"configure": dict(foreground=P["success"], font=bold, background=P["card"])},
+        "Warning.TLabel": {"configure": dict(foreground=P["warning"], font=bold, background=P["card"])},
+        "Error.TLabel": {"configure": dict(foreground=P["error"], font=bold, background=P["card"])},
+        "Progress.TLabel": {"configure": dict(font=(FONT_FAMILY, 12, "bold"), background=P["card"], foreground=P["text"])},
+        "Percent.TLabel": {"configure": dict(font=(FONT_FAMILY, 16, "bold"), foreground=P["primary"], background=P["card"])},
+        "CardValue.TLabel": {"configure": dict(font=(FONT_FAMILY, 15, "bold"), background=P["card"], foreground=P["text"])},
+        "TButton": {"configure": dict(font=base, padding=(M, XS), foreground=P["text"], background=P["button_face"]),
+                    "map": dict(foreground=[("disabled", P["disabled_text"]), ("active", P["text"]), ("pressed", P["text"])],
+                                background=[("disabled", P["button_face"]), ("active", P["button_face_active"]),
+                                            ("pressed", P["button_face_active"])])},
+        "Primary.TButton": {"configure": dict(font=(FONT_FAMILY, 11, "bold"), padding=(L, S), foreground=btn_fg,
+                                              background=btn_face, borderwidth=0 if not native else 1),
+                            "map": dict(background=[("disabled", btn_face_disabled), ("pressed", btn_face_active),
+                                                    ("active", btn_face_active)],
+                                        foreground=[("disabled", btn_fg_disabled), ("pressed", btn_fg), ("active", btn_fg)])},
+        "Danger.TButton": {"configure": dict(font=bold, padding=(L, S), foreground=P["error"], background=P["button_face"]),
+                           "map": dict(foreground=[("disabled", P["disabled_text"]), ("active", P["error"]), ("pressed", P["error"])],
+                                       background=[("disabled", P["button_face"]), ("active", P["button_face_active"]),
+                                                   ("pressed", P["button_face_active"])])},
+        "Card.TCheckbutton": {"configure": dict(background=P["card"], foreground=P["text"]),
+                              "map": dict(foreground=[("disabled", P["disabled_text"])], background=[("active", P["card"])])},
+        "Card.TRadiobutton": {"configure": dict(background=P["card"], foreground=P["text"]),
+                              "map": dict(foreground=[("disabled", P["disabled_text"])], background=[("active", P["card"])])},
+        "TEntry": {"configure": dict(fieldbackground=P["card"], foreground=P["text"], insertcolor=P["text"]),
+                   "map": dict(fieldbackground=[("disabled", P["bg"]), ("readonly", P["bg"])],
+                               foreground=[("disabled", P["disabled_text"])])},
+        "TCombobox": {"configure": dict(fieldbackground=P["card"], foreground=P["text"], background=P["button_face"],
+                                        arrowcolor=P["text"]),
+                      "map": dict(fieldbackground=[("disabled", P["bg"]), ("readonly", P["card"])],
+                                  foreground=[("disabled", P["disabled_text"]), ("readonly", P["text"])],
+                                  selectbackground=[("readonly", P["card"]), ("!focus", P["card"])],
+                                  selectforeground=[("readonly", P["text"]), ("!focus", P["text"])])},
+        "TSpinbox": {"configure": dict(fieldbackground=P["card"], foreground=P["text"], arrowcolor=P["text"]),
+                     "map": dict(fieldbackground=[("disabled", P["bg"])], foreground=[("disabled", P["disabled_text"])])},
+        "TLabelframe": {"configure": dict(background=P["card"])},
+        "TLabelframe.Label": {"configure": dict(background=P["card"], foreground=P["text"], font=bold)},
+        "Status.Treeview": {"configure": dict(font=base, rowheight=24, fieldbackground=P["card"], background=P["card"],
+                                              foreground=P["text"]),
+                            "map": dict(background=[("selected", P["selection"])], foreground=[("selected", P["text"])])},
+        "Status.Treeview.Heading": {"configure": dict(font=bold, background=P["bg"], foreground=P["text"]),
+                                    "map": dict(background=[("active", P["button_face_active"])], foreground=[("active", P["text"])])},
+        "TNotebook": {"configure": dict(background=P["bg"], tabmargins=(M, S, M, 0))},
+        "TNotebook.Tab": {"configure": dict(font=bold, padding=(L, S), background=P["bg"], foreground=P["text"]),
+                          "map": dict(background=[("selected", P["card"]), ("active", P["button_face_active"])],
+                                      foreground=[("selected", P["text"]), ("active", P["text"]), ("disabled", P["disabled_text"])])},
+        "Horizontal.TProgressbar": {"configure": dict(thickness=14, background=P["primary"], troughcolor="#e5e7eb")},
+    }
+    return spec
+
+
+def _states_fg_bg(entry: Dict[str, Any]):
+    """Yield (state, fg, bg) for every state a style can be in (normal + each mapped state)."""
+    conf = entry.get("configure", {})
+    maps = entry.get("map", {})
+    fg0, bg0 = conf.get("foreground"), conf.get("background") or conf.get("fieldbackground")
+    if fg0 is None or bg0 is None:
+        return
+    yield "normal", fg0, bg0
+    states = {st for key in ("foreground", "background", "fieldbackground") for st, _ in maps.get(key, [])}
+    for st in sorted(states):
+        fg = dict(maps.get("foreground", [])).get(st, fg0)
+        bg = dict(maps.get("background", [])).get(st, dict(maps.get("fieldbackground", [])).get(st, bg0))
+        yield st, fg, bg
+
+
+def audit_style_contrast(spec: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Return human-readable violations: any text style whose foreground is identical to or has too little contrast
+    with its background in ANY state.  Empty list = every text/button/tab/tree state is readable."""
+    problems = []
+    for name, entry in spec.items():
+        for state, fg, bg in _states_fg_bg(entry):
+            if not (str(fg).startswith("#") and str(bg).startswith("#")):
+                continue
+            need = MIN_CONTRAST_SOFT if "disabled" in state else MIN_CONTRAST
+            ratio = contrast_ratio(fg, bg)
+            if fg.lower() == bg.lower() or ratio < need:
+                problems.append(f"{name}[{state}] fg={fg} bg={bg} contrast={ratio:.2f} < {need}")
+    return problems
+
+
 def configure_styles(root) -> str:
     """Central semantic ttk styles (no colours/fonts scattered through widget construction)."""
     style = ttk.Style(root)
     theme = pick_theme(style)
-    base = (FONT_FAMILY, 10)
-    bold = (FONT_FAMILY, 10, "bold")
     try:
         root.configure(background=PALETTE["bg"])
     except Exception:  # noqa: BLE001
         pass
-    style.configure(".", font=base, background=PALETTE["bg"], foreground=PALETTE["text"])
-    style.configure("App.TFrame", background=PALETTE["bg"])
-    style.configure("Card.TFrame", background=PALETTE["card"], relief="flat")
-    style.configure("CardBorder.TFrame", background=PALETTE["border"])
-    style.configure("TLabel", background=PALETTE["bg"])
-    style.configure("Card.TLabel", background=PALETTE["card"])
-    style.configure("Header.TLabel", font=(FONT_FAMILY, 17, "bold"), background=PALETTE["bg"])
-    style.configure("SubHeader.TLabel", font=(FONT_FAMILY, 10), foreground=PALETTE["secondary"], background=PALETTE["bg"])
-    style.configure("Version.TLabel", font=(FONT_FAMILY, 9), foreground=PALETTE["secondary"], background=PALETTE["bg"])
-    style.configure("Section.TLabel", font=(FONT_FAMILY, 11, "bold"), background=PALETTE["card"])
-    style.configure("Secondary.TLabel", font=(FONT_FAMILY, 9), foreground=PALETTE["secondary"], background=PALETTE["card"])
-    style.configure("Field.TLabel", font=base, background=PALETTE["card"])
-    style.configure("Success.TLabel", foreground=PALETTE["success"], font=bold, background=PALETTE["card"])
-    style.configure("Warning.TLabel", foreground=PALETTE["warning"], font=bold, background=PALETTE["card"])
-    style.configure("Error.TLabel", foreground=PALETTE["error"], font=bold, background=PALETTE["card"])
-    style.configure("Progress.TLabel", font=(FONT_FAMILY, 12, "bold"), background=PALETTE["card"])
-    style.configure("Percent.TLabel", font=(FONT_FAMILY, 16, "bold"), foreground=PALETTE["primary"], background=PALETTE["card"])
-    style.configure("CardValue.TLabel", font=(FONT_FAMILY, 15, "bold"), background=PALETTE["card"])
-    style.configure("TButton", font=base, padding=(M, XS))
-    style.configure("Primary.TButton", font=(FONT_FAMILY, 11, "bold"), padding=(L, S), foreground="#ffffff",
-                    background=PALETTE["primary"], borderwidth=0)
-    style.map("Primary.TButton", background=[("disabled", "#9bb6e6"), ("active", PALETTE["primary_active"]),
-                                             ("pressed", PALETTE["primary_active"])],
-              foreground=[("disabled", "#f0f0f0")])
-    style.configure("Danger.TButton", font=bold, padding=(L, S), foreground=PALETTE["error"])
-    style.configure("Card.TCheckbutton", background=PALETTE["card"])
-    style.configure("Card.TRadiobutton", background=PALETTE["card"])
-    style.configure("Status.Treeview", font=base, rowheight=24, fieldbackground=PALETTE["card"], background=PALETTE["card"])
-    style.configure("Status.Treeview.Heading", font=bold)
-    style.map("Status.Treeview", background=[("selected", PALETTE["selection"])], foreground=[("selected", PALETTE["text"])])
-    style.configure("TNotebook", background=PALETTE["bg"], tabmargins=(M, S, M, 0))
-    style.configure("TNotebook.Tab", font=bold, padding=(L, S))
-    style.configure("Horizontal.TProgressbar", thickness=14, background=PALETTE["primary"], troughcolor="#e5e7eb")
+    for name, entry in build_style_spec(theme).items():
+        if entry.get("configure"):
+            style.configure(name, **entry["configure"])
+        if entry.get("map"):
+            style.map(name, **entry["map"])
     return theme
 
 
