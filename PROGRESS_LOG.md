@@ -69,3 +69,13 @@
            real_data/September reports, Kiem_chung.xlsx, config.json, ollama/gguf, tests/__pycache__ stay
            rejected.  8 regression tests in tests/test_build_git_optional.py .......... done, 610 passed
            Windows portable build rerun ........................................... NOT possible in Linux sandbox
+
+- PROMPT-005 Offline/LAN self-update (v1.0.4, Build 004): numeric BUILD_NUMBER as the only build identity
+           (Git = internal metadata), app/updater.py (manifest parsing, numeric comparison, package safety incl.
+           SHA256, local staging, external updater via the staged copy, wait-for-exit, update_backup rollback,
+           restart, update.log), config.update_path, GUI card "Cập nhật phần mềm" (path + Chọn... + Kiểm tra cập
+           nhật + Cập nhật ngay, Cập nhật/Để sau confirmation, async startup check), --apply-update entry point,
+           build script writes release/ReportExtractor_<version>.zip + version.json (exact SHA256).
+           tests/test_updater.py (46 tests) ...................................... done, 656 passed
+           Windows portable build / real update round-trip ......................... NOT possible in Linux sandbox
+

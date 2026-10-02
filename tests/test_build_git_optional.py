@@ -74,13 +74,13 @@ def test_fallback_metadata_written_correctly(tmp_path, monkeypatch):
     monkeypatch.setattr(bp.subprocess, "run", fake_run)
     folder = tmp_path / "ReportExtractor_v1.0.3_Portable"
     folder.mkdir()
-    rev = bp.write_release_metadata(folder, "1.0.3", "PROMPT-003", folder.name, built="2026-10-02 10:00")
+    rev = bp.write_release_metadata(folder, "1.0.4", "004", folder.name, built="2026-10-02 10:00")
     assert rev == "unavailable"
     version_txt = (folder / "VERSION.txt").read_text(encoding="utf-8-sig")
     assert "git=unavailable" in version_txt and "Git revision: unavailable" in version_txt
-    assert "version=1.0.3" in version_txt and "prompt=PROMPT-003" in version_txt and "built=2026-10-02 10:00" in version_txt
+    assert "version=1.0.4" in version_txt and "build=004" in version_txt and "prompt=" not in version_txt and "built=2026-10-02 10:00" in version_txt
     readme = (folder / "README.txt").read_text(encoding="utf-8-sig")
-    assert "Git: unavailable" in readme and "{git}" not in readme
+    assert "Git (nội bộ): unavailable" in readme and "{git}" not in readme
     for f in ("FIRST_RUN.txt", "Install_Ollama_Optional.bat"):
         assert (folder / f).is_file()
 
@@ -89,7 +89,7 @@ def test_metadata_with_git_available_uses_revision(tmp_path, monkeypatch):
     monkeypatch.setattr(bp.subprocess, "run", lambda cmd, **kw: _R("deadbee\n"))
     folder = tmp_path / "P"
     folder.mkdir()
-    assert bp.write_release_metadata(folder, "1.0.3", "PROMPT-003", "P") == "deadbee"
+    assert bp.write_release_metadata(folder, "1.0.4", "004", "P") == "deadbee"
     assert "git=deadbee" in (folder / "VERSION.txt").read_text(encoding="utf-8-sig")
 
 
@@ -103,7 +103,7 @@ def test_build_metadata_and_artifact_validation_succeed_without_git(tmp_path, mo
     (folder / "ReportExtractor.exe").write_bytes(b"MZ")
     for sub in ("Output", "logs", "config"):
         (folder / sub).mkdir()
-    bp.write_release_metadata(folder, "1.0.3", "PROMPT-003", folder.name)       # must not raise
+    bp.write_release_metadata(folder, "1.0.4", "004", folder.name)       # must not raise
     assert bp.validate_artifact(folder) == []
     # main() no longer calls git directly: the only git invocation lives in the safe helper
     src = Path(bp.__file__).read_text(encoding="utf-8")

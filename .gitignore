@@ -19,3 +19,5 @@ logs/
 release/
 *.zip
 config/
+update_staging/
+update_backup/

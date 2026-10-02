@@ -117,6 +117,7 @@ class AppConfig:
     period_year: int = 0
     period_from: str = ""                 # last manual range dd/mm/yyyy
     period_to: str = ""
+    update_path: str = ""                 # PROMPT-005: local / UNC folder with version.json + release ZIP (optional)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------

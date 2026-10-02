@@ -32,6 +32,9 @@ from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSID
                       prescan, range_period)
 from .excel_writer import ExcelWriter
 from .scanner import scan_inputs
+from . import updater
+from .runtime_paths import portable_root
+from .updater import UpdateCheck, version_label
 
 LOG = logging.getLogger("report_extractor.gui")
 DEFAULT_OUTPUT_NAME = "Kiem_chung_Ket_qua.xlsx"
@@ -262,6 +265,13 @@ class GuiController:
         self.period_year: str = str(self.cfg.period_year or "")
         self.period_from: str = self.cfg.period_from or ""
         self.period_to: str = self.cfg.period_to or ""
+        # PROMPT-005 offline update (optional infrastructure – never blocks processing)
+        self.update_path: str = (self.cfg.update_path or "").strip()
+        self.update_check: Optional[UpdateCheck] = None
+        self.update_busy: bool = False
+        self.update_dirty: bool = False          # GUI refreshes the update card when set
+        self.update_notice: str = ""             # one-shot "Cập nhật thành công lên phiên bản X."
+        self._update_thread: Optional[threading.Thread] = None
         self.prescan: Optional[PreScanResult] = None
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # reviewed scan list (before Start): real pre-scan result + manual exclusions
@@ -1272,6 +1282,83 @@ class GuiController:
         }
 
     # ------------------------------------------------------------------ settings
+    # ------------------------------------------------------------------ PROMPT-005 offline update
+    def current_version_text(self) -> str:
+        return f"Phiên bản hiện tại: {version_label()}"
+
+    def set_update_path(self, path: str) -> None:
+        new = (path or "").strip().strip('"')
+        if new != self.update_path:
+            self.update_path = new
+            self.update_check = None
+            self.update_dirty = True
+
+    def update_status_text(self) -> str:
+        if self.update_busy:
+            return "Đang kiểm tra cập nhật…"
+        if self.update_check is None:
+            return "Chưa kiểm tra cập nhật." if self.update_path else updater.MSG["no_path"]
+        return self.update_check.message
+
+    def update_available(self) -> bool:
+        return bool(self.update_check and self.update_check.available) and not self.update_busy
+
+    def check_update(self) -> UpdateCheck:
+        """Synchronous read-only check (used by the worker thread and by tests)."""
+        self.update_busy = True
+        try:
+            res = updater.check_for_update(self.update_path)
+        except Exception as e:  # noqa: BLE001 – infrastructure problem must never crash the GUI
+            LOG.exception("UPDATE_CHECK unexpected error")
+            res = UpdateCheck("inaccessible", f"{updater.MSG['inaccessible']} ({type(e).__name__})", self.update_path)
+        self.update_check = res
+        self.update_busy = False
+        self.update_dirty = True
+        return res
+
+    def check_update_async(self, startup: bool = False) -> bool:
+        """Non-blocking check; the startup variant silently does nothing when no path is configured."""
+        if self._update_thread and self._update_thread.is_alive():
+            return False
+        if startup and not self.update_path:
+            return False
+        self.update_busy = True
+        self.update_dirty = True
+        self._update_thread = threading.Thread(target=self.check_update, name="update-check", daemon=True)
+        self._update_thread.start()
+        return True
+
+    def consume_update_notice(self) -> str:
+        """One-shot message after a restart performed by the updater (empty when there is none)."""
+        data = updater.consume_result(portable_root())
+        if not data:
+            return ""
+        if data.get("status") == "ok":
+            self.update_notice = f"Cập nhật thành công lên phiên bản {data.get('version', '')}."
+            updater.cleanup_staging(portable_root())
+        elif data.get("status") in ("rolled_back", "failed"):
+            self.update_notice = f"Cập nhật không thành công – đã khôi phục phiên bản trước. {data.get('detail', '')}".strip()
+        else:
+            self.update_notice = f"Cập nhật thất bại ({data.get('status')}). {data.get('detail', '')}".strip()
+        return self.update_notice
+
+    def install_update(self, spawn=None) -> Tuple[bool, str]:
+        """Stage + verify + launch the external updater.  On success the caller must close the application."""
+        if self.is_running():
+            return False, "Đang xử lý báo cáo – hãy đợi xong rồi cập nhật."
+        if not self.update_available():
+            return False, "Không có bản cập nhật để cài."
+        try:
+            staged = updater.stage_update(self.update_check, portable_root())
+            cmd = updater.launch_updater(staged, spawn) if spawn else updater.launch_updater(staged)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e) or type(e).__name__
+            LOG.error("UPDATE_INSTALL failed: %s", msg)
+            updater.cleanup_staging(portable_root())
+            return False, msg
+        LOG.info("UPDATE_INSTALL updater launched: %s", cmd)
+        return True, f"Đang cài đặt {self.update_check.info.label()} – ứng dụng sẽ tự khởi động lại."
+
     def save_settings(self) -> None:
         c = self.cfg
         c.last_report_folder = self.report_folder
@@ -1288,6 +1375,7 @@ class GuiController:
         except ValueError:
             c.period_month, c.period_year = 0, 0
         c.period_from, c.period_to = self.period_from, self.period_to
+        c.update_path = self.update_path
         try:
             c.save(self._config_path)
         except OSError as e:

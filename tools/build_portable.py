@@ -18,6 +18,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import importlib.util
+import json
 import os
 import platform
 import shutil
@@ -28,7 +29,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_PYTHON = ((3, 10), (3, 11), (3, 12), (3, 13))   # explicit tuples, identical to setup.bat policy
-FORBIDDEN_IN_ARTIFACT = ("tests", ".venv", ".venv-build", ".git", ".pytest_cache", "sample_data", "__pycache__")
+FORBIDDEN_IN_ARTIFACT = ("tests", ".venv", ".venv-build", ".git", ".pytest_cache", "sample_data", "__pycache__",
+                         "update_staging", "update_backup", "release")
 FORBIDDEN_SUFFIXES = (".pptx", ".ppt", ".xlsx", ".pyc")
 # Narrow allowlist of dependency RUNTIME resources that legitimately carry a forbidden suffix.  Compared as
 # lower-cased path-component tuples (platform independent).  python-pptx needs its default template to build a
@@ -39,11 +41,36 @@ ALLOWED_DEPENDENCY_RESOURCES = (
 DOCS_DIR = ROOT / "release_docs"
 
 
-def _version() -> tuple[str, str]:
+def _version_module():
     spec = importlib.util.spec_from_file_location("app_version", ROOT / "app" / "__init__.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+def _version() -> tuple[str, str]:
+    """(version, zero-padded numeric build) from the single authoritative app/__init__.py."""
+    mod = _version_module()
     return mod.__version__, mod.BUILD_ID
+
+
+def build_number() -> int:
+    return int(_version_module().BUILD_NUMBER)
+
+
+def package_name(version: str) -> str:
+    """Release ZIP referenced by version.json: ReportExtractor_<version>.zip"""
+    return f"ReportExtractor_{version}.zip"
+
+
+def write_version_manifest(release_dir: Path, version: str, build: int, zip_path: Path,
+                           built: str | None = None) -> Path:
+    """release/version.json for the offline updater – sha256 of the EXACT zip; written LAST."""
+    data = {"version": version, "build": int(build), "package": zip_path.name, "sha256": sha256(zip_path),
+            "size": zip_path.stat().st_size, "built": built or _dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
+    out = Path(release_dir) / "version.json"
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return out
 
 
 def step(n: int, title: str) -> None:
@@ -130,7 +157,7 @@ def write_release_metadata(folder: Path, version: str, build_id: str, name: str,
     (folder / "README.txt").write_text(render_doc("README.txt", **fields), encoding="utf-8-sig")
     (folder / "FIRST_RUN.txt").write_text(render_doc("FIRST_RUN.txt", **fields), encoding="utf-8-sig")
     (folder / "VERSION.txt").write_text(
-        f"Report Extractor\nversion={version}\nprompt={build_id}\nbuilt={built}\ngit={git_rev}\n"
+        f"Report Extractor\nversion={version}\nbuild={build_id}\nbuilt={built}\ngit={git_rev}\n"
         f"Git revision: {git_rev}\n"
         f"python={platform.python_version()}\npackaging=PyInstaller onedir windowed (no UPX)\n"
         f"ollama_bundled=no\nmodel_bundled=no\ndefault_server=http://127.0.0.1:11434\ndefault_model=qwen3:4b\n",
@@ -243,10 +270,10 @@ def main() -> int:
         fail("gói không hợp lệ:\n   - " + "\n   - ".join(problems))
     print("   OK")
 
-    step(10, "Nén ZIP và SHA256SUMS.txt")
+    step(10, "Nén ZIP, SHA256SUMS.txt và version.json (gói cập nhật offline)")
     release = ROOT / "release"
     release.mkdir(exist_ok=True)
-    zip_path = release / f"{name}.zip"
+    zip_path = release / package_name(version)
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -261,9 +288,13 @@ def main() -> int:
     (folder / "SHA256SUMS.txt").write_text(sums, encoding="utf-8")
     (release / "SHA256SUMS.txt").write_text(sums, encoding="utf-8")
     print("   " + sums.replace("\n", "\n   ").rstrip())
+    manifest = write_version_manifest(release, version, build_number(), zip_path)
+    print(f"   version.json: {manifest.read_text(encoding='utf-8').strip()}")
 
     step(11, "Hoàn tất")
-    print(f"   Thư mục portable: {folder}\n   ZIP: {zip_path}\n   SHA256SUMS: {release / 'SHA256SUMS.txt'}")
+    print(f"   Thư mục portable: {folder}\n   ZIP: {zip_path}\n   SHA256SUMS: {release / 'SHA256SUMS.txt'}\n"
+          f"   version.json: {manifest}\n"
+          f"   Phát hành: copy {zip_path.name} vào thư mục Update TRƯỚC, sau đó copy version.json SAU CÙNG.")
     return 0
 
 

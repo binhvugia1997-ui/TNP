@@ -1,4 +1,4 @@
-REPORT EXTRACTOR {version} ({build_id}) – BẢN PORTABLE WINDOWS
+REPORT EXTRACTOR {version} – Build {build_id} – BẢN PORTABLE WINDOWS
 =====================================================================
 
 Chuyển báo cáo PowerPoint (PPTX) thành Bảng kiểm chứng Excel, hoàn toàn chạy
@@ -48,7 +48,15 @@ Chương trình KHÔNG kèm Ollama hay model. Không có Ollama vẫn chạy bì
   - Kiểm tra tính toàn vẹn: so sánh SHA256 trong SHA256SUMS.txt
       certutil -hashfile ReportExtractor.exe SHA256
 
-5. THÔNG TIN BẢN DỰNG
+5. CẬP NHẬT PHẦN MỀM (OFFLINE / MẠNG NỘI BỘ)
+  - Tab "Cấu hình & Ollama" → "Cập nhật phần mềm": nhập "Đường dẫn cập nhật" (vd. D:\ReportExtractor_Update
+    hoặc \\SERVER\ReportExtractor\Update) → "Kiểm tra cập nhật" → nếu có bản mới bấm "Cập nhật ngay".
+  - Thư mục cập nhật chứa version.json + ReportExtractor_<phiên bản>.zip. Không cần Git/Internet/Python.
+  - Gói được sao chép về update_staging\, kiểm tra SHA256, rồi trình cập nhật thay thế file chương trình,
+    bản cũ giữ trong update_backup\ để khôi phục nếu lỗi. config\, logs\, Output\, file Excel KHÔNG bị đụng tới.
+  - Dùng quyền truy cập Windows hiện có; chương trình không hỏi / không lưu mật khẩu. Nhật ký: logs\update.log.
+
+6. THÔNG TIN BẢN DỰNG
 ---------------------
-  Phiên bản: {version}   Prompt: {build_id}   Build: {built}   Git: {git}
+  Phiên bản: {version}   Build: {build_id}   Ngày build: {built}   Git (nội bộ): {git}
   Đóng gói: PyInstaller onedir (windowed, không UPX)   Python: {python}

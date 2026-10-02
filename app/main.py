@@ -109,6 +109,7 @@ def main(argv=None) -> int:
     parser.add_argument("--inspect", metavar="PATH", help="in cấu trúc file .pptx hoặc form .xlsx để kiểm tra mapping")
     parser.add_argument("--out", metavar="FILE", help="ghi kết quả --inspect ra file UTF-8 (mặc định inspect_template.txt / inspect_report.txt)")
     parser.add_argument("--version", action="store_true")
+    parser.add_argument("--apply-update", metavar="MANIFEST", help=argparse.SUPPRESS)   # internal: staged updater
     args = parser.parse_args(argv)
     force_utf8_stdio()
 
@@ -116,6 +117,9 @@ def main(argv=None) -> int:
         from . import APP_TITLE, VERSION_LINE
         print(f"{APP_TITLE} ({VERSION_LINE})")
         return 0
+    if args.apply_update:
+        from .updater import apply_update
+        return apply_update(Path(args.apply_update))
     if args.inspect:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
         p = Path(args.inspect)

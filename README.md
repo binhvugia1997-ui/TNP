@@ -384,3 +384,30 @@ Checklist smoke test Windows: (A) máy sạch không Python/Ollama → winget c�
 (B) có Python, không Ollama; (C) Python + Ollama, chưa model → chọn [4]; (D) đã có qwen3:4b → "đã tồn tại — bỏ qua tải xuống";
 (E) bỏ qua Ollama local, cấu hình IP máy khác trong tab Cấu hình; (F) đường dẫn có dấu cách; (G) chạy setup.bat lần 2 →
 ".venv: dùng lại", không tải lại model.
+
+## Cập nhật offline / mạng nội bộ (PROMPT-005)
+
+* Định danh ứng dụng: `app/__init__.py` là nguồn duy nhất – `__version__ = "1.0.4"`, `BUILD_NUMBER = 4`
+  (hiển thị **Build 004**, số thuần tuý; Git revision chỉ là metadata nội bộ trong VERSION.txt).
+* Tab **Cấu hình & Ollama → Cập nhật phần mềm**: `Đường dẫn cập nhật` (thư mục cục bộ hoặc UNC
+  `\\SERVER\ReportExtractor\Update`, lưu vào `config.json` khoá `update_path`), nút **Kiểm tra cập nhật** (chỉ đọc) và
+  **Cập nhật ngay** (chỉ bật khi có bản mới). Sau khi khởi động, nếu đã cấu hình đường dẫn, ứng dụng kiểm tra ngầm
+  (thread, không chặn GUI; share offline → chỉ một dòng trạng thái `Không truy cập được thư mục cập nhật.`).
+* Thư mục cập nhật: `version.json` + `ReportExtractor_<version>.zip`.
+  `{"version": "1.0.5", "build": 5, "package": "ReportExtractor_1.0.5.zip", "sha256": "<hash>"}` – `build` là số
+  nguyên và là thứ tự duy nhất: 5 > 4 → `Có phiên bản mới: 1.0.5 — Build 005`; bằng → `Đã là phiên bản mới nhất.`;
+  nhỏ hơn → `Phiên bản trên đường dẫn cập nhật cũ hơn phiên bản hiện tại.` (không hạ cấp tự động).
+* Luồng cài đặt (không bao giờ ghi đè EXE đang chạy): xác nhận `Cập nhật` / `Để sau` → copy ZIP về
+  `<portable>\update_staging\` → kiểm tra (tồn tại, mở được, `ReportExtractor.exe`, `VERSION.txt` khớp version/build,
+  SHA256 khớp nếu có – sai → `Gói cập nhật không hợp lệ hoặc bị thay đổi.`) → giải nén → chạy
+  `update_staging\…\ReportExtractor.exe --apply-update update.json` → ứng dụng thoát → trình cập nhật đợi tiến trình cũ
+  → chuyển file runtime hiện tại sang `update_backup\` → chép bản mới → lỗi thì khôi phục từ `update_backup\` →
+  khởi động lại `ReportExtractor.exe` → GUI hiện một lần `Cập nhật thành công lên phiên bản 1.0.5.`
+* Không bao giờ thay thế/xoá: `config\`, `logs\`, `Output\`, `backup\`, `config.json`, file Excel/PPTX ở thư mục gốc,
+  `update_staging\`, `update_backup\`. Không lưu tài khoản/mật khẩu; thiếu quyền → `Không có quyền truy cập đường dẫn cập nhật.`
+* Nhật ký riêng `logs\update.log` (UPDATE_CHECK / UPDATE_HASH / UPDATE_STAGE / UPDATE_LAUNCH / UPDATE_APPLY /
+  UPDATE_REPLACE / UPDATE_ROLLBACK / UPDATE_RESTART).
+* Phát hành: `build_portable.bat` tạo `release\ReportExtractor_<version>.zip`, `release\SHA256SUMS.txt` và
+  `release\version.json` (SHA256 của đúng file ZIP). Xuất bản = copy ZIP vào thư mục Update **trước**, copy
+  `version.json` **sau cùng**.
+

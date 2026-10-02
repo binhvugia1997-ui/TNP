@@ -21,4 +21,4 @@ LẦN CHẠY ĐẦU TIÊN – REPORT EXTRACTOR {version}
 5. Nếu không khởi động được: mở logs\startup_error.log và gửi nội dung cho người hỗ trợ
    cùng VERSION.txt.
 
-Prompt {build_id} – build {built}
+Build {build_id} – ngày build {built}
