@@ -124,9 +124,19 @@ SẢN XUẤT`…), nhãn tròn bên trái (`Nguyên nhân`, `Cải tiến trong 
 vẫn được lấy (phần nội dung).
 
 ### Hình ảnh cải tiến = CHỈ ảnh "Sau cải tiến" của cải tiến sản xuất
-Neo = nút chú thích `Trước/Sau cải tiến` hoặc dòng `+ Trước:` / `+ Sau:`; mỗi ảnh được gán theo hình học tương đối
-với neo (ảnh cùng hàng cạnh ảnh đã có chú thích dùng chung chú thích). Ảnh Trước, mũi tên, logo, ảnh của slide/mục
-`Cải tiến trong kiểm tra` / `kiểm soát` không được chèn. Ảnh không xác định chắc chắn → **không chèn** và ghi
+Thứ tự bằng chứng (PROMPT-004C, chỉ dùng cấu trúc PPTX – không OCR, không pixel, không Qwen):
+1. nút chú thích `Trước/Sau cải tiến` gán cho ảnh gần nhất (ảnh cùng hàng dùng chung chú thích);
+2. dòng `+ Trước:` / `+ Sau:` sở hữu vùng dọc bên dưới tới dòng kế tiếp;
+3. **chữ màu xanh** (màu run/paragraph gốc, kể cả màu theme đã quy đổi; HSV hue 190–260°, bão hoà ≥ 0.35) của khối
+   nội dung sản xuất, nằm ngay trên/bên cạnh ảnh → ảnh Sau; chữ xanh ở tiêu đề, logo, sidebar, footer, mục kiểm tra/
+   kiểm soát không được tính;
+4. **mũi tên định hướng** (auto-shape rightArrow/leftArrow/upArrow/downArrow… có xoay/lật, hoặc connector có đầu mũi
+   tên) nằm trong khối nghiệp vụ, có ảnh ở cả hai phía trong hành lang của trục mũi tên: ảnh phía **đích** = Sau, phía
+   nguồn = Trước; mỗi mũi tên chỉ gom nhóm ảnh liền kề (khoảng trống > 12 % slide kết thúc nhóm) nên mũi tên của mục
+   này không phân loại ảnh của mục khác; mũi tên trong dải tiêu đề/footer hoặc không có ảnh hai phía bị bỏ qua;
+   chữ xanh + đích mũi tên trùng nhau = bằng chứng rất mạnh; mâu thuẫn → không chèn.
+Ảnh Trước, mũi tên, logo, ảnh của slide/mục `Cải tiến trong kiểm tra` / `kiểm soát` không được chèn. Ảnh duy nhất
+không có bằng chứng **không** được coi là Sau. Ảnh không xác định chắc chắn → **không chèn** và ghi
 `Cần kiểm tra: Không xác định chắc chắn ảnh Sau cải tiến tại slide X` (không bao giờ chèn toàn bộ ảnh của slide).
 Qwen chỉ chọn slide/mục, không chọn từng ảnh. Chi tiết quyết định từng ảnh: `python run.py --inspect <pptx>`.
 

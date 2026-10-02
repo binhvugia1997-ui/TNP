@@ -39,3 +39,8 @@
 - PROMPT-004C Scanner visibility: discovery separated from eligibility, SCAN_REJECT diagnostics, default list
            shows every discovered report, attention rows never hidden, bucketed counters;
            tests/test_scanner_visibility.py (7 tests) ........................... done, 548 passed
+
+- PROMPT-004C-B After-picture evidence without captions: parser exposes per-paragraph colours (RGB + theme)
+           and directional arrows (auto-shapes/connectors, rotation/flip); selector adds blue-After-text and
+           arrow-destination evidence (block-scoped, contiguous groups, conflicts → ambiguous);
+           tests/test_after_evidence.py (18 tests) ............................ done, 566 passed

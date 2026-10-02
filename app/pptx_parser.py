@@ -16,6 +16,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 EMU_PER_INCH = 914400
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 
 # ----------------------------------------------------------------------------
@@ -51,6 +52,8 @@ class Block:
     prst: str = ""                                        # preset geometry (rect, ellipse, roundRect, rightArrow…)
     rotation: float = 0.0                                 # degrees
     n_lines: int = 0                                      # paragraphs in the text frame
+    line_colors: List[str] = field(default_factory=list)  # '#rrggbb' per paragraph ('' = inherited/unknown)
+    direction: str = ""                                   # arrows only: "right" | "left" | "up" | "down" | ""
 
     @property
     def is_text(self) -> bool:
@@ -73,6 +76,8 @@ class SlideData:
     height: int = 0
     notes: str = ""
     xml_stats: dict = field(default_factory=dict)          # raw-XML inventory (diagnostics)
+    arrows: List[Block] = field(default_factory=list)      # directional arrow shapes/connectors (structure only,
+                                                           # never content; kept out of ``blocks`` on purpose)
 
     @property
     def alt_texts(self) -> List[str]:
@@ -177,6 +182,126 @@ def _iter_shapes(shapes, offset=(0, 0)) -> Iterator[Tuple[Any, Tuple[int, int]]]
             yield shape, offset
 
 
+_THEME_SLOTS = {"TEXT_1": "dk1", "DARK_1": "dk1", "BACKGROUND_1": "lt1", "LIGHT_1": "lt1", "TEXT_2": "dk2",
+                "DARK_2": "dk2", "BACKGROUND_2": "lt2", "LIGHT_2": "lt2", "ACCENT_1": "accent1", "ACCENT_2": "accent2",
+                "ACCENT_3": "accent3", "ACCENT_4": "accent4", "ACCENT_5": "accent5", "ACCENT_6": "accent6",
+                "HYPERLINK": "hlink", "FOLLOWED_HYPERLINK": "folHlink"}
+
+
+def theme_color_map(prs) -> dict:
+    """{'accent1': '#4f81bd', 'dk1': '#000000', …} from the first slide master's theme (best effort)."""
+    out: dict = {}
+    try:
+        from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+        theme_part = prs.slide_masters[0].part.part_related_by(RT.THEME)
+        from lxml import etree
+        root = etree.fromstring(theme_part.blob)
+        scheme = root.find(".//{%s}clrScheme" % _NS_A)
+        for child in (scheme if scheme is not None else []):
+            slot = etree.QName(child).localname
+            srgb = child.find("{%s}srgbClr" % _NS_A)
+            sysc = child.find("{%s}sysClr" % _NS_A)
+            val = srgb.get("val") if srgb is not None else (sysc.get("lastClr") if sysc is not None else None)
+            if val:
+                out[slot] = "#" + val.lower()
+    except Exception:
+        pass
+    return out
+
+
+def _run_color(run, theme: dict) -> str:
+    """'#rrggbb' of a run's font colour (RGB or theme-resolved), '' when inherited/unknown."""
+    try:
+        color = run.font.color
+        if color is None or color.type is None:
+            return ""
+        from pptx.enum.dml import MSO_COLOR_TYPE
+        if color.type == MSO_COLOR_TYPE.RGB:
+            return "#" + str(color.rgb).lower()
+        if color.type == MSO_COLOR_TYPE.SCHEME:
+            name = str(color.theme_color).split(".")[-1].split(" ")[0]
+            return theme.get(_THEME_SLOTS.get(name, ""), "")
+    except Exception:
+        return ""
+    return ""
+
+
+def _paragraph_color(paragraph, theme: dict) -> str:
+    """Colour covering the majority of the paragraph's characters ('' when inherited)."""
+    weights: dict = {}
+    total = 0
+    for r in paragraph.runs:
+        n = len((r.text or "").strip())
+        if not n:
+            continue
+        total += n
+        weights[_run_color(r, theme)] = weights.get(_run_color(r, theme), 0) + n
+    if not total:
+        return ""
+    color, n = max(weights.items(), key=lambda kv: kv[1])
+    return color if n * 2 >= total else ""
+
+
+_ARROW_BASE = {"rightArrow": "right", "leftArrow": "left", "upArrow": "up", "downArrow": "down",
+               "notchedRightArrow": "right", "stripedRightArrow": "right", "homePlate": "right", "chevron": "right",
+               "bentUpArrow": "up", "uturnArrow": "", "leftRightArrow": "", "upDownArrow": "", "quadArrow": "",
+               "leftRightUpArrow": "", "curvedRightArrow": "right", "curvedLeftArrow": "left",
+               "curvedUpArrow": "up", "curvedDownArrow": "down", "swooshArrow": "right", "circularArrow": ""}
+_DIRS = ("right", "down", "left", "up")           # clockwise rotation order
+
+
+def _rotate_dir(d: str, rotation: float, flip_h: bool, flip_v: bool) -> str:
+    if not d:
+        return ""
+    if flip_h and d in ("left", "right"):
+        d = "left" if d == "right" else "right"
+    if flip_v and d in ("up", "down"):
+        d = "up" if d == "down" else "down"
+    steps = int(round((rotation % 360) / 90.0)) % 4
+    return _DIRS[(_DIRS.index(d) + steps) % 4]
+
+
+def arrow_block(shape, offset, prst: str, rotation: float) -> Optional[Block]:
+    """A directional arrow (auto-shape or connector with an arrow head) as a structural Block(kind='arrow')."""
+    try:
+        elm = shape._element
+        xfrm = elm.find(".//{%s}xfrm" % _NS_A)
+        flip_h = bool(xfrm is not None and xfrm.get("flipH") in ("1", "true"))
+        flip_v = bool(xfrm is not None and xfrm.get("flipV") in ("1", "true"))
+        direction = ""
+        if prst in _ARROW_BASE:
+            direction = _rotate_dir(_ARROW_BASE[prst], rotation, flip_h, flip_v)
+        elif "Connector" in prst or prst == "line" or etree_localname(elm) == "cxnSp":
+            ln = elm.find(".//{%s}ln" % _NS_A)
+            head = ln.find("{%s}headEnd" % _NS_A) if ln is not None else None
+            tail = ln.find("{%s}tailEnd" % _NS_A) if ln is not None else None
+            head_arrow = head is not None and head.get("type", "none") not in ("none", None)
+            tail_arrow = tail is not None and tail.get("type", "none") not in ("none", None)
+            if head_arrow == tail_arrow:
+                return None                                   # no head or double-headed: not directional
+            w, h = int(shape.width or 0), int(shape.height or 0)
+            if w >= h:
+                d = "left" if flip_h else "right"             # start→end runs left→right unless flipped
+            else:
+                d = "up" if flip_v else "down"
+            if head_arrow:                                    # arrow head at the START point
+                d = {"right": "left", "left": "right", "up": "down", "down": "up"}[d]
+            direction = _rotate_dir(d, rotation, False, False)
+        else:
+            return None
+        b = Block(kind="arrow", left=int(shape.left or 0) + offset[0], top=int(shape.top or 0) + offset[1],
+                  width=int(shape.width or 0), height=int(shape.height or 0), shape_id=shape.shape_id,
+                  shape_name=shape.name, prst=prst, rotation=rotation, direction=direction)
+        return b
+    except Exception:
+        return None
+
+
+def etree_localname(elm) -> str:
+    tag = elm.tag
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
 def _shape_geometry(shape) -> Tuple[str, float]:
     """(preset geometry name, rotation in degrees) – best effort."""
     prst = ""
@@ -194,9 +319,11 @@ def _shape_geometry(shape) -> Tuple[str, float]:
     return prst, rot
 
 
-def _frame_blocks(shape, offset, is_title: bool) -> List[Block]:
+def _frame_blocks(shape, offset, is_title: bool, theme: Optional[dict] = None) -> List[Block]:
     blocks: List[Block] = []
+    theme = theme or {}
     tf = shape.text_frame
+    colors: List[str] = []
     left = int(shape.left or 0) + offset[0]
     top = int(shape.top or 0) + offset[1]
     width = int(shape.width or 0)
@@ -211,6 +338,7 @@ def _frame_blocks(shape, offset, is_title: bool) -> List[Block]:
                 size = r.font.size.pt
                 break
         lines.append((txt, p.level or 0, bold, size))
+        colors.append(_paragraph_color(p, theme))
     # Keep a text frame as ONE block (so multi-line content stays together) but
     # remember paragraph metadata for heading detection of the first line.
     text = "\n".join(t for t, *_ in lines)
@@ -229,6 +357,7 @@ def _frame_blocks(shape, offset, is_title: bool) -> List[Block]:
         size_pt=lines[0][3] if lines else None,
         level=lines[0][1] if lines else 0,
         n_lines=len(lines),
+        line_colors=colors,
     )
     b.prst, b.rotation = _shape_geometry(shape)
     blocks.append(b)
@@ -463,9 +592,11 @@ def parse_pptx(path: str | Path) -> ReportData:
     prs = Presentation(str(path))
     report = ReportData(path=path, slide_width=int(prs.slide_width or 0),
                         slide_height=int(prs.slide_height or 0))
+    theme = theme_color_map(prs)
     for idx, slide in enumerate(prs.slides, start=1):
         sd = SlideData(number=idx, width=report.slide_width, height=report.slide_height)
         blocks: List[Block] = []
+        arrows: List[Block] = []
         title_shape_id = None
         try:
             if slide.shapes.title is not None:
@@ -484,8 +615,14 @@ def parse_pptx(path: str | Path) -> ReportData:
                     if tb:
                         blocks.append(tb)
                     continue
+                prst, rot = _shape_geometry(shape)
+                if prst in _ARROW_BASE or "Connector" in prst or prst == "line" or \
+                        etree_localname(shape._element) == "cxnSp":
+                    ab = arrow_block(shape, offset, prst, rot)
+                    if ab is not None:
+                        arrows.append(ab)
                 if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
-                    blocks.extend(_frame_blocks(shape, offset, shape.shape_id == title_shape_id))
+                    blocks.extend(_frame_blocks(shape, offset, shape.shape_id == title_shape_id, theme))
                     continue
                 # placeholder pictures / OLE objects with an image
                 if shape.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER and hasattr(shape, "image"):
@@ -508,6 +645,7 @@ def parse_pptx(path: str | Path) -> ReportData:
         except Exception:
             sd.xml_stats = {}
         sd.blocks = reading_order(blocks, report.slide_height)
+        sd.arrows = sorted(arrows, key=lambda a: (a.top, a.left))
         try:
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
                 sd.notes = clean_text(slide.notes_slide.notes_text_frame.text)
