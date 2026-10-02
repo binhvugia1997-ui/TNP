@@ -297,6 +297,15 @@ trạng thái normal / active / pressed / disabled / selected / readonly trong `
 của nút `BẮT ĐẦU XỬ LÝ` từng bị "tàng hình"). Với theme native, nút chính dùng chữ tối trên nền mặc định. Hàm
 `audit_style_contrast()` kiểm tra tỉ lệ tương phản WCAG (≥ 4.5:1, disabled ≥ 3:1) và được chạy trong test.
 
+### Quét thư mục ≠ điều kiện xử lý (PROMPT-004C)
+
+`scanner.py` chỉ loại bỏ artefact hệ thống (file khoá `~$…`, file/thư mục ẩn, phần mở rộng không phải PowerPoint) và ghi
+log `SCAN_REJECT file=… reason=…` cho mọi mục giống PowerPoint bị bỏ; **không bao giờ** loại file theo nội dung tên
+(Management Number, model, FRONT/REAR, ngoặc đơn, thiếu `SEV`/ngày, vendor…). Mọi báo cáo tìm thấy đều hiển thị trong
+danh sách (bộ lọc mặc định `Tất cả file đã quét`; bộ lọc `File cần xử lý` vẫn giữ các dòng cần chú ý
+`Không tìm thấy Management Number trong Excel` / `Không xác định được Management Number`). Dòng tổng kết:
+`Tổng file phát hiện · Sẽ xử lý · Bỏ qua/đã cập nhật · Không tìm thấy Management Number · Lỗi/không hợp lệ · Đã loại thủ công`.
+
 * GUI gồm 2 tab: `Xử lý báo cáo` (thư mục, file, thời gian xử lý, kết quả, tiến độ) và `Cấu hình & Ollama`.
 
 ### Danh sách file đã quét (kiểm tra trước khi xử lý)

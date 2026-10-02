@@ -111,10 +111,12 @@ def test_scan_list_shows_candidates_and_skips_without_opening_pptx(world, monkey
     assert rows["260918080-VOC_a.pptx"].as_values(1)[-1].endswith("260918080-VOC_a.pptx")
     # filters only change the display
     assert {r.path.name for r in ctl.scan_rows(SCAN_FILTERS_VI[0])} == {"260918080-VOC_a.pptx", "260918081-VOC_b.pptx",
-                                                                        "260918082-VOC_c.pptx"}
+                                                                        "260918082-VOC_c.pptx",
+                                                                        "260918083-VOC_absent.pptx", "khong_ma.pptx"}  # 004C: problems stay visible
     assert len(ctl.scan_rows(SCAN_FILTERS_VI[2])) == 4                               # skips incl. the absent key
     assert len(ctl.final_queue()) == 3 and res.counts()["candidates"] == 3
-    assert ctl.queue_text() == "Cần xử lý sau khi quét: 3   Đã loại thủ công: 0   Sẽ xử lý: 3"
+    assert ctl.queue_text() == ("Tổng file phát hiện: 7   Sẽ xử lý: 3   Bỏ qua/đã cập nhật: 2   "
+                                "Không tìm thấy Management Number: 1   Lỗi/không hợp lệ: 1   Đã loại thủ công: 0")
 
 
 # ---------------------------------------------------------------- 3-13, 29: exclusion
@@ -129,7 +131,8 @@ def test_exclude_one_and_many_never_touches_files_or_excel(world, monkeypatch):
     assert ctl.exclude([rows["261002001-VOC_oct.pptx"].index])                    # not a candidate -> problem text
     assert _by_name(ctl)["260918082-VOC_c.pptx"].state == USER_EXCLUDED
     assert _by_name(ctl)["260918082-VOC_c.pptx"].status_vi == "Đã loại thủ công"
-    assert ctl.queue_text() == "Cần xử lý sau khi quét: 3   Đã loại thủ công: 1   Sẽ xử lý: 2"
+    assert ctl.queue_text() == ("Tổng file phát hiện: 7   Sẽ xử lý: 2   Bỏ qua/đã cập nhật: 2   "
+                                "Không tìm thấy Management Number: 1   Lỗi/không hợp lệ: 1   Đã loại thủ công: 1")
     assert ctl.exclude([rows["260918080-VOC_a.pptx"].index, rows["260918081-VOC_b.pptx"].index]) == ""   # 4
     assert ctl.queue_counts()["will_process"] == 0 and ctl.final_queue() == []
     assert ctl.restore([rows["260918080-VOC_a.pptx"].index]) == ""

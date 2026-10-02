@@ -35,3 +35,7 @@
 - PROMPT-004B GUI contrast hotfix: declarative theme-aware style spec with explicit fg/bg for every state,
            clam preferred, WCAG contrast audit; palette tuned (secondary/warning/error/muted);
            tests/test_gui_contrast.py (39 tests) ............................... done, 541 passed
+
+- PROMPT-004C Scanner visibility: discovery separated from eligibility, SCAN_REJECT diagnostics, default list
+           shows every discovered report, attention rows never hidden, bucketed counters;
+           tests/test_scanner_visibility.py (7 tests) ........................... done, 548 passed

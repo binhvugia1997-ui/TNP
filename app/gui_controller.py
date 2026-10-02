@@ -64,6 +64,8 @@ SCAN_LABELS_VI: Dict[str, str] = {
     USER_EXCLUDED: "Đã loại thủ công",
 }
 SCAN_FILTERS_VI = ("File cần xử lý", "Tất cả file đã quét", "File bị bỏ qua")
+DEFAULT_SCAN_FILTER_VI = SCAN_FILTERS_VI[1]       # every discovered report is visible first; filtering is opt-in
+ATTENTION_ACTIONS = (ACTION_MASTER_NOT_FOUND, ACTION_INVALID_MGMT)
 STALE_LIST_VI = "Danh sách file đã thay đổi điều kiện. Vui lòng quét lại."
 NO_SCAN_VI = "Chưa quét thư mục. Vui lòng bấm Quét lại."
 RUNNING_VI = "Đang xử lý – không thể thay đổi danh sách. Dùng 'Dừng sau báo cáo hiện tại'."
@@ -203,6 +205,12 @@ class ScanRow:
         return self.action == ACTION_PROCESS
 
     @property
+    def needs_attention(self) -> bool:
+        """Discovered report that cannot be processed as-is (key absent from the master / unreadable key):
+        never hidden from the default list – the user must see it with its status."""
+        return self.action in ATTENTION_ACTIONS
+
+    @property
     def state(self) -> str:
         return USER_EXCLUDED if self.excluded else self.action
 
@@ -338,7 +346,11 @@ class GuiController:
     def discover(self) -> int:
         """Cheap recursive discovery (names only – nothing is opened)."""
         folder = Path(self.report_folder) if self.report_folder else None
-        self.all_files = scan_inputs([folder]) if folder and folder.is_dir() else []
+        self.scan_rejections: List[Tuple[Path, str]] = []
+        self.all_files = (scan_inputs([folder], on_reject=lambda p, why: self.scan_rejections.append((p, why)))
+                          if folder and folder.is_dir() else [])
+        for p, why in self.scan_rejections:                  # every rejected PowerPoint-like entry is reported
+            self.log_lines.append(f"Bỏ qua khi quét thư mục: {p.name} – {why}")
         self._set_files(self.all_files)
         return len(self.all_files)
 
@@ -437,7 +449,7 @@ class GuiController:
                                 action=it.action, excluded=key in self.excluded_keys, reason=it.reason,
                                 excel_row=it.excel_row))
         if filter_name == SCAN_FILTERS_VI[0]:
-            rows = [r for r in rows if r.is_candidate]
+            rows = [r for r in rows if r.is_candidate or r.needs_attention]   # problems are never hidden
         elif filter_name == SCAN_FILTERS_VI[2]:
             rows = [r for r in rows if not r.will_process]
         return rows
@@ -485,13 +497,21 @@ class GuiController:
     def queue_counts(self) -> Dict[str, int]:
         cands = self.scan_result.candidates if self.scan_result else []
         excluded = sum(1 for it in cands if self.candidate_key(it.path, it.management_number) in self.excluded_keys)
+        pc = self.scan_result.counts() if self.scan_result else {}
         return {"candidates": len(cands), "excluded": excluded, "will_process": len(cands) - excluded,
-                "discovered": len(self.all_files)}
+                "discovered": len(self.all_files),
+                "skipped": pc.get("master_complete", 0) + pc.get("fast_skipped", 0) + pc.get("outside_period", 0)
+                + pc.get("source_duplicates", 0),
+                "master_not_found": pc.get("master_not_found", 0),
+                "invalid": pc.get("invalid_management_number", 0)}
 
     def queue_text(self) -> str:
+        """Discovery vs eligibility at a glance: every discovered file is accounted for in exactly one bucket
+        (+ manual exclusions), so a report that is not going to be processed is visible, never silently gone."""
         c = self.queue_counts()
-        return (f"Cần xử lý sau khi quét: {c['candidates']}   Đã loại thủ công: {c['excluded']}   "
-                f"Sẽ xử lý: {c['will_process']}")
+        return (f"Tổng file phát hiện: {c['discovered']}   Sẽ xử lý: {c['will_process']}   "
+                f"Bỏ qua/đã cập nhật: {c['skipped']}   Không tìm thấy Management Number: {c['master_not_found']}   "
+                f"Lỗi/không hợp lệ: {c['invalid']}   Đã loại thủ công: {c['excluded']}")
 
     def set_ollama(self, server: str, model: str) -> None:
         self.server = server

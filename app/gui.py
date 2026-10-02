@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from . import APP_NAME, APP_TITLE, BUILD_ID, __version__
 from .config import AppConfig
 from .diagnostics import format_diagnostics, run_diagnostics
-from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, SCAN_FILTERS_VI, USER_EXCLUDED,
+from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, DEFAULT_SCAN_FILTER_VI, SCAN_FILTERS_VI, USER_EXCLUDED,
                              GuiController, default_output_path)
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD,
                       ACTION_MASTER_NOT_FOUND, ACTION_PROCESS, ACTION_SOURCE_DUPLICATE)
@@ -588,7 +588,7 @@ class ReportExtractorApp:
         self._set_search_placeholder()
         self.var_search.trace_add("write", lambda *_: self._on_search_changed())
         ttk.Label(tb, text="Hiển thị", style="Field.TLabel").grid(row=0, column=1, padx=(0, XS))
-        self.var_scan_filter = tk.StringVar(value=SCAN_FILTERS_VI[0])
+        self.var_scan_filter = tk.StringVar(value=DEFAULT_SCAN_FILTER_VI)
         self.cb_scan_filter = ttk.Combobox(tb, textvariable=self.var_scan_filter, values=list(SCAN_FILTERS_VI),
                                            state="readonly", width=20)
         self.cb_scan_filter.grid(row=0, column=2, padx=(0, M))
