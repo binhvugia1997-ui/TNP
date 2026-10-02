@@ -52,6 +52,6 @@
            ("Hoàn thành — đã thêm Management Number mới"); date from the key only; backup before the row,
            backup failure → no row; no valid key in the filename → no row ("Cần kiểm tra — Không xác định được
            Management Number từ tên file"); counters "Management Number mới: N"; diagnostics
-           "Đã tạo dòng mới: <row> – Management Number mới: <key>".  tests/test_master_not_found.py removed,
-           tests/test_new_master_row.py restored, tests/test_new_row.py (19 tests) ....... done, 582 passed
+           "Đã tạo dòng mới: <row> – Management Number mới: <key>".  tests/test_master_not_found.py rewritten to the
+           004D rule (8 tests), tests/test_new_master_row.py restored, tests/test_new_row.py (19) . done, 590 passed
            Real-data validation (September dataset, Windows) ......................... NOT run in sandbox
