@@ -71,9 +71,9 @@ SCAN_TREE_ROWS = 12      # visible rows of "Danh sách báo cáo"; more rows scr
 RESULT_TREE_ROWS = 9     # visible rows of "Kết quả xử lý"
 
 # scanned-file table: (key, title, width, stretch)
+# compact operational list (PROMPT-006B addendum): the full path / note stay in ScanRow and in the details dialog
 SCAN_COLUMNS = (("stt", "STT", 48, False), ("mgmt", "Management Number", 160, False), ("date", "Ngày phát sinh", 110, False),
-                ("vendor", "Vendor", 100, False), ("file", "Tên file", 340, True), ("scan", "Trạng thái quét", 240, False),
-                ("path", "Đường dẫn", 420, False))
+                ("vendor", "Vendor", 110, False), ("file", "Tên file", 380, True), ("status", "Trạng thái", 260, False))
 # processed-results table (order used by RowState.as_values)
 COLUMNS = (("stt", "STT", 48), ("mgmt", "Management Number", 150), ("file", "Tên file", 320), ("vendor", "Vendor", 110),
            ("model", "Model", 80), ("item", "Item", 80), ("status", "Trạng thái", 220), ("note", "Ghi chú", 360))
@@ -1095,7 +1095,7 @@ class ReportExtractorApp:
     # ------------------------------------------------------------------ scanned-file list
     @staticmethod
     def _scan_values(row, stt: int):
-        return (stt, row.management_number, row.occurrence_date, "", row.path.name, row.status_vi, str(row.path))
+        return row.as_values(stt)
 
     def _render_scan(self) -> None:
         self.scan_tree.delete(*self.scan_tree.get_children())
@@ -1103,14 +1103,14 @@ class ReportExtractorApp:
         rows = self.ctl.scan_rows(self.var_scan_filter.get())
         needle = self.search_text()
         shown = 0
-        for n, row in enumerate(rows, start=1):
+        for row in rows:
             if not row_matches_search(row, needle):
                 continue
-            shown += 1
+            shown += 1                                            # STT = current display order (1, 2, 3, ...)
             tags = [SCAN_TAGS.get(row.state, "skip")]
             if shown % 2 == 0:
                 tags.append("stripe")
-            iid = self.scan_tree.insert("", "end", values=self._scan_values(row, n), tags=tuple(tags))
+            iid = self.scan_tree.insert("", "end", values=self._scan_values(row, shown), tags=tuple(tags))
             self.scan_items[iid] = row.index
         total = len(rows)
         self.lbl_list_count.configure(text=f"{shown} / {total} file" if needle else f"{total} file")
@@ -1165,9 +1165,7 @@ class ReportExtractorApp:
             return
         row = next((r for r in self.ctl.scan_rows() if r.index == idx[0]), None)
         if row:
-            messagebox.showinfo(APP_NAME, f"{row.path.name}\n\nManagement Number: {row.management_number or '(trống)'}\n"
-                                          f"Ngày phát sinh: {row.occurrence_date or '(trống)'}\n"
-                                          f"Trạng thái quét: {row.status_vi}\n{row.reason}\n\nĐường dẫn:\n{row.path}")
+            messagebox.showinfo(APP_NAME, row.details())
 
     def _on_drop(self, event) -> None:
         paths = parse_dnd_paths(event.data)
@@ -1560,6 +1558,8 @@ class ReportExtractorApp:
             self._render_row(i)
             p = self.ctl.progress
             self._render_progress()
+            if 0 <= i < len(self.ctl.rows) and self.ctl.rows[i].is_final:
+                self._render_scan()                   # regroup only on FINAL status (no jumping during processing)
             if p.current_index is not None and 0 <= i < len(self.ctl.rows) and not self.ctl.rows[i].is_final:
                 row = self.ctl.rows[i]
                 self.lbl_stage.configure(text=f"{row.status_vi} {p.current_detail}".strip())
@@ -1623,6 +1623,7 @@ class ReportExtractorApp:
         s = self.ctl.summary
         self._set_running(False)                     # Start enabled / Stop disabled / config editable
         self._render_scan_state()
+        self._render_scan()                          # final grouping (completed / review / skipped / removed last)
         for i in self.row_items:
             self._render_row(i)                      # transient "Đang ..." statuses replaced by final ones
         self._render_counts()

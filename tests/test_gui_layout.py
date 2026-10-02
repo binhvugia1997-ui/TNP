@@ -57,10 +57,10 @@ def test_file_list_columns():
     cols = re.search(r"SCAN_COLUMNS = \((.*?)\)\)\n", SRC, re.S).group(0)
     titles = re.findall(r'\("(\w+)", "([^"]+)", (\d+), (True|False)\)', cols)
     names = [t[1] for t in titles]
-    assert names == ["STT", "Management Number", "Ngày phát sinh", "Vendor", "Tên file", "Trạng thái quét", "Đường dẫn"]
+    assert names == ["STT", "Management Number", "Ngày phát sinh", "Vendor", "Tên file", "Trạng thái"]
     widths = {t[1]: int(t[2]) for t in titles}
     stretch = {t[1]: t[3] == "True" for t in titles}
-    assert widths["Tên file"] >= 300 and widths["Đường dẫn"] >= 250 and widths["Management Number"] >= 150
+    assert widths["Tên file"] >= 300 and widths["Management Number"] >= 150
     assert stretch["Tên file"] and not stretch["Management Number"] and not stretch["STT"]
 
 

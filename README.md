@@ -459,3 +459,10 @@ chữ hay không** – không bao giờ viết lại, tóm tắt hay đổi th�
   Không lấy / Mục trước / Mục tiếp / Lưu xác nhận).  Lưu xác nhận ghi nhãn và cập nhật lại **chỉ ô Nội dung đối
   sách cải tiến** của dòng Management Number tương ứng (sao lưu trước khi sửa).  **Cập nhật mô hình học** huấn
   luyện mô hình ảnh và mô hình nội dung độc lập, báo cáo hai dòng riêng.
+
+### Danh sách báo cáo (PROMPT-006B addendum)
+Bảng gọn: **STT · Management Number · Ngày phát sinh · Vendor · Tên file · Trạng thái**. Nhấp đúp một dòng để xem đường dẫn
+đầy đủ và chẩn đoán. Dòng được sắp theo nhóm: đang xử lý → chờ xử lý → cần kiểm tra/lỗi → hoàn thành → bỏ qua → **đã loại
+thủ công (luôn ở cuối)**. Loại thủ công (chuột phải / Delete) không xoá file, không quét lại, dòng xuống cuối với trạng thái
+`Đã loại thủ công` và không vào hàng đợi; `Khôi phục` đưa dòng về đúng nhóm. STT là thứ tự hiển thị, được tính lại sau mỗi
+thay đổi. Quét lại cùng thư mục giữ nguyên các dòng đã loại.

@@ -67,7 +67,9 @@ SCAN_LABELS_VI: Dict[str, str] = {
     ACTION_INVALID_MGMT: "Không xác định được Management Number từ tên file",
     USER_EXCLUDED: "Đã loại thủ công",
 }
-SCAN_FILTERS_VI = ("File cần xử lý", "Tất cả file đã quét", "File bị bỏ qua")
+SCAN_FILTERS_VI = ("File cần xử lý", "Tất cả file đã quét", "File bị bỏ qua", "File đã loại thủ công")
+# display groups of the scanned list (ascending = top to bottom); manual exclusions are always last
+GROUP_PROCESSING, GROUP_WAITING, GROUP_REVIEW, GROUP_COMPLETED, GROUP_SKIPPED, GROUP_EXCLUDED = range(6)
 DEFAULT_SCAN_FILTER_VI = SCAN_FILTERS_VI[1]       # every discovered report is visible first; filtering is opt-in
 ATTENTION_ACTIONS = (ACTION_INVALID_MGMT,)
 STALE_LIST_VI = "Danh sách file đã thay đổi điều kiện. Vui lòng quét lại."
@@ -203,6 +205,9 @@ class ScanRow:
     excluded: bool
     reason: str
     excel_row: Optional[int] = None
+    run_stage: str = ""               # live/final pipeline stage of the current batch for this file ('' = none)
+    vendor: str = ""                  # Vendor known from the current batch (display only)
+    note: str = ""                    # batch note (diagnostics only – not a main-table column)
 
     @property
     def is_candidate(self) -> bool:
@@ -223,15 +228,61 @@ class ScanRow:
         return USER_EXCLUDED if self.excluded else self.action
 
     @property
+    def scan_status_vi(self) -> str:
+        """Pure pre-scan label (ignores live batch status and manual exclusion)."""
+        return SCAN_LABELS_VI.get(self.state, self.state)
+
+    @property
     def status_vi(self) -> str:
+        if self.excluded:
+            return SCAN_LABELS_VI[USER_EXCLUDED]
+        if self.run_stage and self.run_stage != "waiting":
+            return status_label(self.run_stage)
         return SCAN_LABELS_VI.get(self.state, self.state)
 
     @property
     def will_process(self) -> bool:
         return self.is_candidate and not self.excluded
 
+    @property
+    def group(self) -> int:
+        """Deterministic display group (GROUP_* ranks); manual exclusions are ALWAYS last."""
+        if self.excluded:
+            return GROUP_EXCLUDED
+        st = self.run_stage
+        if st and st != "waiting":
+            if st in ("completed", "completed_new"):
+                return GROUP_COMPLETED
+            if st in ("needs_review", "not_written", "error"):
+                return GROUP_REVIEW
+            if st in ("skipped", "fast_skip", "outside_period", "source_duplicate"):
+                return GROUP_SKIPPED
+            return GROUP_PROCESSING                                  # live pipeline stage
+        if self.is_candidate:
+            return GROUP_WAITING
+        if self.needs_attention:
+            return GROUP_REVIEW
+        return GROUP_SKIPPED
+
     def as_values(self, stt: int) -> Tuple[Any, ...]:
-        return (stt, self.management_number, self.occurrence_date, self.path.name, "", self.status_vi, str(self.path))
+        """Compact main-table values (STT = current display order; path/note stay internal -> details())."""
+        return (stt, self.management_number, self.occurrence_date, self.vendor.replace("\n", " / "), self.path.name,
+                self.status_vi)
+
+    def details(self) -> str:
+        """Full diagnostics text (double-click): full path, status, pre-scan reason, batch note."""
+        lines = [self.path.name, "", f"Management Number: {self.management_number or '(trống)'}",
+                 f"Ngày phát sinh: {self.occurrence_date or '(trống)'}", f"Trạng thái: {self.status_vi}"]
+        if self.run_stage and not self.excluded:
+            lines.append(f"Trạng thái quét: {self.scan_status_vi}")
+        if self.reason:
+            lines.append(self.reason)
+        if self.note:
+            lines.append(f"Ghi chú: {self.note}")
+        if self.excel_row:
+            lines.append(f"Dòng Excel: {self.excel_row}")
+        lines += ["", "Đường dẫn:", str(self.path)]
+        return "\n".join(lines)
 
 
 @dataclass
@@ -535,6 +586,8 @@ class GuiController:
         """Select the report folder, discover PPT/PPTX recursively, propose the output path."""
         changed = folder.strip() != self.report_folder
         self.report_folder = folder.strip()
+        if changed:
+            self.excluded_keys = set()
         if not self.output or Path(self.output).name == DEFAULT_OUTPUT_NAME:
             self.output = default_output_path(self.report_folder)
         n = self.discover()
@@ -594,7 +647,8 @@ class GuiController:
             return self.scan_result
         self.discover()
         per, err = self.effective_period()
-        self.excluded_keys = set()
+        # manual exclusions survive an ordinary rescan of the same folder (keyed by normalised path + Management
+        # Number, so a renamed/moved file simply becomes a new candidate); a folder change clears them
         self.scan_stale, self.scan_message = False, ""
         if err:
             self.scan_result, self.scan_message = None, err
@@ -641,16 +695,23 @@ class GuiController:
         if not self.scan_result:
             return []
         rows: List[ScanRow] = []
+        live = {normalize_source_path(Path(r.path)): r for r in self.rows} if self.rows else {}
         for it in self.scan_result.items:
             key = self.candidate_key(it.path, it.management_number)
+            rs = live.get(normalize_source_path(Path(it.path)))
             rows.append(ScanRow(index=it.index, key=key, path=it.path, management_number=it.management_number,
                                 occurrence_date=f"{it.occurrence_date:%d/%m/%Y}" if it.occurrence_date else "",
                                 action=it.action, excluded=key in self.excluded_keys, reason=it.reason,
-                                excel_row=it.excel_row))
+                                excel_row=it.excel_row, run_stage=rs.stage if rs else "",
+                                vendor=rs.vendor if rs else "", note=rs.note if rs else ""))
         if filter_name == SCAN_FILTERS_VI[0]:
-            rows = [r for r in rows if r.is_candidate or r.needs_attention]   # problems are never hidden
+            rows = [r for r in rows if (r.is_candidate or r.needs_attention) and not r.excluded]   # problems never hidden
         elif filter_name == SCAN_FILTERS_VI[2]:
             rows = [r for r in rows if not r.will_process]
+        elif filter_name == SCAN_FILTERS_VI[3]:
+            rows = [r for r in rows if r.excluded]
+        # deterministic grouping: stable sort keeps the original scan order inside every group
+        rows.sort(key=lambda r: r.group)
         return rows
 
     def _scan_row(self, index: int) -> Optional[ScanRow]:

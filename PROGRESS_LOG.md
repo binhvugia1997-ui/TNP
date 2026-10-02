@@ -110,3 +110,16 @@
            review window, "Cập nhật mô hình học" trains both models independently with separate counts/results.
            tests/test_content_learning.py (20 tests) .............................. done, 703 passed
            Real-data content labelling / learned-model validation on Windows ....... NOT performed (no labels yet)
+
+## PROMPT-006B addendum — Danh sách báo cáo gọn + file loại thủ công tự xuống cuối (Build 007, không đổi build)
+- Cột hiển thị: STT · Management Number · Ngày phát sinh · Vendor · Tên file (giãn) · Trạng thái. Không còn cột "Đường dẫn";
+  đường dẫn đầy đủ / lý do quét / ghi chú vẫn nằm trong `ScanRow` và hiện qua nhấp đúp (`ScanRow.details()`).
+- Nhóm hiển thị cố định (`GuiController.scan_rows`, sort ổn định theo thứ tự quét trong từng nhóm):
+  đang xử lý → chờ / sẽ xử lý (kể cả Management Number mới) → cần kiểm tra / lỗi → hoàn thành → bỏ qua (đã đủ dữ liệu,
+  ngoài thời gian, trùng nguồn) → **Đã loại thủ công (luôn ở cuối)**.
+- Loại thủ công: dòng giữ nguyên, trạng thái `Đã loại thủ công`, ra khỏi hàng đợi (`final_queue`), xuống cuối ngay, không quét lại.
+  `Khôi phục` trả về đúng nhóm + hàng đợi. STT = thứ tự hiển thị hiện tại (tính lại 1..n), `index`/`key` không đổi.
+- Quét lại cùng thư mục giữ nguyên danh sách đã loại (khoá = đường dẫn chuẩn hoá + Management Number); đổi thư mục báo cáo
+  mới xoá danh sách này. Bộ lọc mới "File đã loại thủ công"; "File cần xử lý" không hiện dòng đã loại.
+- Danh sách chỉ sắp xếp lại khi một báo cáo đạt trạng thái cuối hoặc khi kết thúc batch (không nhảy dòng khi đang xử lý).
+- Kiểm thử: `tests/test_scan_list_compact.py` (13) — tổng 716 passed. Chưa build lại Portable.

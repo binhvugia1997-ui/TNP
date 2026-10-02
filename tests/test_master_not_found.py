@@ -192,7 +192,7 @@ def test_gui_prescan_counts_new_row_inside_the_denominator(sample_tree, template
     assert ctl.progress.total == 2 and len(ctl.files) == 2                        # new-row report IS in the denominator
     scan = {r.path.name: r for r in ctl.scan_rows()}
     row = scan["260918081-VOC_b.pptx"]
-    assert row.status_vi == "Sẽ xử lý — Management Number mới" and row.will_process and row.is_new_row
+    assert row.scan_status_vi == "Sẽ xử lý — Management Number mới" and row.will_process and row.is_new_row
     new = next(ctl.result_for(i) for i in range(2) if ctl.result_for(i).management_number == "260918081-VOC")
     assert new.new_row and new.excel_row == 5 and new.status in ("completed", "needs_review")
     gui_row = next(r for r in ctl.rows if r.management_number == "260918081-VOC")

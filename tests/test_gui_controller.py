@@ -147,7 +147,8 @@ def test_missing_management_number_row_is_separate_status(sample_tree, tmp_path,
     assert s.failed == 0 and s.new_rows == 3 and s.completed + s.needs_review == 4 and s.total == 4
     assert "Lỗi: 0" in ctl.summary_lines() and "Management Number mới: 3" in ctl.summary_lines()
     row = next(r for r in ctl.scan_rows() if r.management_number == "260918081-VOC")
-    assert row.status_vi == "Sẽ xử lý — Management Number mới" and row.will_process and row.is_new_row
+    assert row.scan_status_vi == "Sẽ xử lý — Management Number mới" and row.will_process and row.is_new_row
+    assert row.status_vi == "Hoàn thành — đã thêm Management Number mới"      # live batch status (006B addendum)
 
 
 def test_start_stop_state_transitions(sample_tree, tmp_path):

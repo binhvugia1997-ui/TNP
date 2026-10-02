@@ -108,7 +108,8 @@ def test_scan_list_shows_candidates_and_skips_without_opening_pptx(world, monkey
     assert len(dup) == 1 and dup[0].path.parent.name == "dup"
     assert rows["260918080-VOC_a.pptx"].occurrence_date == "18/09/2026"
     assert str(rows["260918080-VOC_a.pptx"].path) == str(world.reports / "2026-09" / "260918080-VOC_a.pptx")   # 31
-    assert rows["260918080-VOC_a.pptx"].as_values(1)[-1].endswith("260918080-VOC_a.pptx")
+    assert rows["260918080-VOC_a.pptx"].as_values(1)[4] == "260918080-VOC_a.pptx"           # compact: no path column
+    assert str(rows["260918080-VOC_a.pptx"].path) in rows["260918080-VOC_a.pptx"].details()   # path via diagnostics
     # filters only change the display
     assert {r.path.name for r in ctl.scan_rows(SCAN_FILTERS_VI[0])} == {"260918080-VOC_a.pptx", "260918081-VOC_b.pptx",
                                                                         "260918082-VOC_c.pptx",
@@ -211,18 +212,19 @@ def test_restore_only_reverses_manual_exclusion(world):
 
 
 # ---------------------------------------------------------------- 20-26: rescan / stale
-def test_rescan_resets_exclusions_and_inputs_invalidate_list(world, tmp_path):
+def test_rescan_keeps_exclusions_and_inputs_invalidate_list(world, tmp_path):
     ctl = world.ctl
     ctl.scan()
     i = _by_name(ctl)["260918080-VOC_a.pptx"].index
     ctl.exclude([i])
     assert ctl.queue_counts()["excluded"] == 1
-    ctl.scan()                                                                        # 20
-    assert ctl.queue_counts()["excluded"] == 0 and not ctl.scan_stale
+    ctl.scan()                                                                        # 20 (006B addendum: kept)
+    assert ctl.queue_counts()["excluded"] == 1 and not ctl.scan_stale
     # 21 folder
     other = tmp_path / "Other"
     other.mkdir()
     ctl.set_report_folder(str(other))
+    assert ctl.excluded_keys == set()                                                 # new folder -> clean slate
     assert ctl.scan_stale and STALE_LIST_VI in ctl.validate() and ctl.scan_message == STALE_LIST_VI
     assert not ctl.start(use_ollama=False)                                            # 26
     ctl.set_report_folder(str(world.reports))

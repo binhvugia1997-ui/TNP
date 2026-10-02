@@ -523,7 +523,7 @@ def test_gui_counters_progress_denominator_and_eta(sample_tree, tmp_path, monkey
     assert ctl.progress.text == "Đã xử lý: 2 / 2 — 100%"
     assert len(ctl.report_durations) == 2                                              # 62: skips not measured
     assert all(r.is_final for r in ctl.rows) and len(ctl.files) == 2                  # queue = candidates only
-    scan = {r.path.name: r.status_vi for r in ctl.scan_rows()}
+    scan = {r.path.name: r.scan_status_vi for r in ctl.scan_rows()}
     assert scan["260820001-VOC_aug.pptx"] == scan["261002002-VOC_oct.pptx"] == "Ngoài thời gian xử lý"
     assert scan["260917005-VOC_a.pptx"] == "Trùng Management Number trong folder"
     assert scan["260917005-VOC_b.pptx"] == "Bỏ qua — đã xử lý gần đây"
