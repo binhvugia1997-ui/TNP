@@ -12,6 +12,14 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:4b"
+LOCAL_OLLAMA = DEFAULT_OLLAMA                   # http://127.0.0.1:11434 – always probed first
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+DEFAULT_PROBE_TIMEOUT = 3
+
+
+def is_local_host(host: str) -> bool:
+    return str(host or "").strip().strip("[]").lower() in LOCAL_HOSTS
+
 
 
 def app_base_dir() -> Path:
@@ -96,7 +104,8 @@ class AppConfig:
     last_template: str = ""
     last_output_folder: str = ""
     last_output_file: str = ""
-    request_timeout: int = 180
+    request_timeout: int = 180            # Qwen inference (/api/generate) – NOT used for connection probes
+    probe_timeout: int = 3                # connection / model-list probe (/api/tags) – must fail fast
     render_dpi: int = 150
     force_reprocess: bool = False
     fill_temporary_column: bool = False

@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .batch_processor import STAGE_LABELS_VI, BatchOptions, BatchProcessor, BatchSummary, format_file_diagnostics
-from .config import DEFAULT_MODEL, DEFAULT_OLLAMA, AppConfig, endpoint_problem, normalize_ollama_url, split_endpoint
+from .config import (DEFAULT_MODEL, DEFAULT_OLLAMA, DEFAULT_PROBE_TIMEOUT, LOCAL_OLLAMA, AppConfig, endpoint_problem,
+                     is_local_host, normalize_ollama_url, split_endpoint)
 from .excel_writer import validate_template
 from .extractor import management_number_from_filename
 from .logger import FileResult
@@ -265,6 +266,8 @@ class GuiController:
         self.processor: Optional[BatchProcessor] = None
         self.ollama_status: str = ""
         self.ollama_ok: Optional[bool] = None
+        self.ollama_source: str = ""                 # "" | local | saved | none  (how the endpoint was chosen)
+        self.autoconnect_runs = 0
         self.log_lines: List[str] = []
         self.started_at: Optional[float] = None      # time.monotonic() when the batch really started
         self.finished_at: Optional[float] = None
@@ -317,6 +320,7 @@ class GuiController:
         if model is not None:
             self.model = model.strip()
         self.ollama_ok, self.ollama_status = None, ""        # endpoint changed -> status unknown
+        self.ollama_source = ""
         return ""
 
     # ------------------------------------------------------------------ inputs
@@ -619,6 +623,15 @@ class GuiController:
             return "timeout"
         return "unreachable"
 
+    def _make_client(self, server: str, timeout: Optional[int] = None):
+        """Production client: inference timeout = request_timeout (unchanged), probe timeout = short.
+        An explicit ``timeout`` (manual check) caps the probe only."""
+        probe = min(self.probe_timeout, float(timeout)) if timeout else self.probe_timeout
+        try:
+            return self._client_factory(server, timeout=int(self.cfg.request_timeout or 180), probe_timeout=probe)
+        except TypeError:                                       # factories that only accept (server, timeout)
+            return self._client_factory(server, timeout=int(timeout or self.cfg.request_timeout or 180))
+
     def check_ollama(self, timeout: Optional[int] = None) -> Tuple[bool, str]:
         """Same production client (server reachable → API answers → model present). (ok, message)."""
         server = self.server
@@ -632,7 +645,7 @@ class GuiController:
             self.ollama_ok, self.ollama_status = False, f"● {problem}"
             return False, self.ollama_status
         try:
-            client = self._client_factory(server, timeout=int(timeout or self.cfg.request_timeout or 180))
+            client = self._make_client(server, timeout)
             info = client.test_connection()
         except OllamaError as e:
             LOG.warning("Ollama check failed (%s): %s", server, e)
@@ -657,10 +670,102 @@ class GuiController:
             self.ollama_ok, self.ollama_status = True, f"● Đã kết nối — {model}"
         return bool(self.ollama_ok), self.ollama_status
 
-    def check_ollama_async(self) -> None:
+    # ------------------------------------------------------------------ Ollama local-first (PROMPT-004A)
+    @property
+    def probe_timeout(self) -> float:
+        """Connection / model-list probe timeout – separate from the Qwen inference timeout (request_timeout)."""
+        try:
+            t = float(getattr(self.cfg, "probe_timeout", DEFAULT_PROBE_TIMEOUT) or DEFAULT_PROBE_TIMEOUT)
+        except (TypeError, ValueError):
+            t = float(DEFAULT_PROBE_TIMEOUT)
+        return max(0.5, min(t, 15.0))
+
+    def _probe(self, server: str) -> Tuple[Optional[List[str]], str]:
+        """Real Ollama API (/api/tags) with the SHORT probe timeout. (models | None, error kind)."""
+        try:
+            info = self._client_factory(server, timeout=int(self.cfg.request_timeout or 180),
+                                        probe_timeout=self.probe_timeout).test_connection()
+        except TypeError:                                   # client factory without probe_timeout (tests/legacy)
+            try:
+                info = self._client_factory(server, timeout=int(self.probe_timeout) or 1).test_connection()
+            except Exception as e:  # noqa: BLE001
+                return None, self._classify_ollama_error(e)
+        except Exception as e:  # noqa: BLE001
+            return None, self._classify_ollama_error(e)
+        return list((info or {}).get("models", []) or []), ""
+
+    def _select_local(self, models: List[str]) -> Tuple[bool, str]:
+        """Local Ollama answered: show 127.0.0.1 / 11434 in the controls; never switch to an unrelated model."""
+        self.host, self.port = split_endpoint(LOCAL_OLLAMA)
+        self.ollama_source = "local"
+        if models:
+            self.available_models = models
+        model = self.model.strip()
+        if not model and DEFAULT_MODEL in models:
+            self.model = model = DEFAULT_MODEL
+        if model and model in models:
+            self.ollama_ok, self.ollama_status = True, f"Ollama local: Sẵn sàng — {model}"
+        else:
+            self.ollama_ok = False
+            self.ollama_status = f"Ollama local đang chạy nhưng không tìm thấy model {model or DEFAULT_MODEL}"
+        LOG.info("OLLAMA_AUTOCONNECT source=local ok=%s model=%s models=%d", self.ollama_ok, model, len(models))
+        return bool(self.ollama_ok), self.ollama_status
+
+    def auto_connect(self) -> Tuple[bool, str]:
+        """Connection priority: 1) local 127.0.0.1:11434  2) saved/configured server  3) nothing automatic
+        (manual Server/Port, "Kiểm tra kết nối", "Tìm Ollama trong mạng LAN" stay available).  Never starts a LAN
+        scan; every probe uses the short probe timeout so GUI start-up never waits for the inference timeout."""
+        self.autoconnect_runs += 1
+        models, _kind = self._probe(LOCAL_OLLAMA)
+        if models is not None:
+            return self._select_local(models)
+        saved = self.server
+        saved_label = self.endpoint_label
+        if saved and not is_local_host(self.host) and not endpoint_problem(self.host, self.port):
+            models, _kind = self._probe(saved)
+            if models is not None:
+                self.ollama_source = "saved"
+                if models:
+                    self.available_models = models
+                model = self.model.strip()
+                if model and model in models:
+                    self.ollama_ok, self.ollama_status = True, f"● Đã kết nối — {model} @ {saved_label}"
+                else:
+                    self.ollama_ok = False
+                    self.ollama_status = f"● Đã kết nối Ollama tại {saved_label} nhưng không tìm thấy model {model or DEFAULT_MODEL}"
+                LOG.info("OLLAMA_AUTOCONNECT source=saved server=%s ok=%s", saved_label, self.ollama_ok)
+                return bool(self.ollama_ok), self.ollama_status
+        self.ollama_source = "none"
+        self.ollama_ok, self.ollama_status = False, "Không kết nối được Ollama local hoặc server đã lưu."
+        LOG.info("OLLAMA_AUTOCONNECT source=none saved=%s", saved_label)
+        return False, self.ollama_status
+
+    def auto_connect_async(self) -> None:
+        def work():
+            try:
+                ok, msg = self.auto_connect()
+            except Exception as e:  # noqa: BLE001
+                LOG.exception("auto_connect crashed")
+                ok, msg = False, f"Không kết nối được Ollama local hoặc server đã lưu. ({type(e).__name__})"
+                self.ollama_ok, self.ollama_status, self.ollama_source = False, msg, "none"
+            self._queue.put(UiEvent("autoconnect", (ok, msg)))
+        threading.Thread(target=work, daemon=True, name="ollama-autoconnect").start()
+
+    def check_ollama_local_first(self, timeout: Optional[int] = None) -> Tuple[bool, str]:
+        """"Kiểm tra kết nối": check the endpoint in the controls; if it is a remote address that does not answer,
+        a running local Ollama is detected and selected instead (a stale LAN IP must never hide local Ollama)."""
+        ok, msg = self.check_ollama(timeout=timeout)
+        if ok or is_local_host(self.host):
+            return ok, msg
+        models, _kind = self._probe(LOCAL_OLLAMA)
+        if models is None:
+            return ok, msg
+        return self._select_local(models)
+
+    def check_ollama_async(self, local_first: bool = False) -> None:
         """Run the check on a worker thread; the result arrives as an 'ollama' event in pump()."""
         def work():
-            ok, msg = self.check_ollama()
+            ok, msg = self.check_ollama_local_first() if local_first else self.check_ollama()
             self._queue.put(UiEvent("ollama", (ok, msg)))
         threading.Thread(target=work, daemon=True, name="ollama-check").start()
 
@@ -672,7 +777,7 @@ class GuiController:
         if not server or endpoint_problem(self.host, self.port):
             return False, f"● {endpoint_problem(self.host, self.port) or 'Chưa nhập IP / Server của Ollama'}", []
         try:
-            info = self._client_factory(server, timeout=int(timeout or self.cfg.request_timeout or 180)).test_connection()
+            info = self._make_client(server, timeout).test_connection()
         except Exception as e:  # noqa: BLE001
             LOG.warning("Model discovery failed (%s): %s", server, e)
             kind = self._classify_ollama_error(e) if isinstance(e, OllamaError) else "unreachable"

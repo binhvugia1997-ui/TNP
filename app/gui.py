@@ -259,6 +259,8 @@ class ReportExtractorApp:
         self._build()
         self._bind_shortcuts()
         self._load_from_controller()
+        self.lbl_conn.configure(text="● Đang kiểm tra Ollama local (127.0.0.1:11434)…", style="Secondary.TLabel")
+        self.ctl.auto_connect_async()                 # local → saved server; short probe timeout, no LAN scan
         self.root.after(100, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -796,6 +798,21 @@ class ReportExtractorApp:
         if hasattr(self, "lbl_ai_run"):
             self.lbl_ai_run.configure(text=ollama_indicator_text(self.ctl), style=ollama_indicator_style(self.ctl))
 
+    def _sync_endpoint_widgets(self) -> None:
+        """Controller → Server/Port/Model widgets (used after the local-first auto-connect selected an endpoint);
+        the user may still edit the controls afterwards."""
+        c = self.ctl
+        if (self.var_host.get().strip(), self.var_port.get().strip(), self.var_model.get().strip()) == \
+                (c.host, str(c.port), c.model):
+            return
+        self._loading = True
+        try:
+            self.var_host.set(c.host)
+            self.var_port.set(str(c.port))
+            self.var_model.set(c.model)
+        finally:
+            self._loading = False
+
     def _on_endpoint_edited(self) -> None:
         if getattr(self, "_loading", False):
             return
@@ -998,7 +1015,7 @@ class ReportExtractorApp:
             self.lbl_conn.configure(text=f"● {problem}", style="Error.TLabel")
             return
         self.lbl_conn.configure(text=f"● Đang kiểm tra {self.ctl.endpoint_label}…", style="Secondary.TLabel")
-        self.ctl.check_ollama_async()                      # worker thread; result arrives in _poll()
+        self.ctl.check_ollama_async(local_first=True)      # worker thread; result arrives in _poll()
 
     def refresh_models(self) -> None:
         problem = self._push_endpoint()
@@ -1148,7 +1165,8 @@ class ReportExtractorApp:
             self.ctl.scan()                      # synchronous – the list was never scanned (e.g. keyboard-only user)
             self._render_scan()
         use_ai = True
-        ok, msg = self.ctl.check_ollama(timeout=15)
+        ok, msg = self.ctl.check_ollama_local_first(timeout=15)
+        self._sync_endpoint_widgets()
         self.lbl_conn.configure(text=msg, style="Success.TLabel" if ok else "Error.TLabel")
         self._render_ai_status()
         if not ok:
@@ -1293,13 +1311,20 @@ class ReportExtractorApp:
             for i in self.row_items:
                 self._render_row(i)
             self.lbl_stage.configure(text=prescan_stage_text(ev.payload.counts()))
-        elif ev.kind == "ollama":
+        elif ev.kind in ("ollama", "autoconnect"):
             ok, msg = ev.payload
-            self.lbl_conn.configure(text=msg, style="Success.TLabel" if ok else "Error.TLabel")
+            self._sync_endpoint_widgets()
+            style = "Success.TLabel" if ok else ("Warning.TLabel" if self.ctl.ollama_source == "local" else "Error.TLabel")
+            self.lbl_conn.configure(text=msg, style=style)
             self._render_ai_status()
             if self.ctl.available_models:
                 self.cb_model["values"] = self.ctl.available_models
-            self.log(msg)
+            if ev.kind == "autoconnect":
+                self.log(f"Kết nối Ollama tự động ({self.ctl.ollama_source or 'none'}): {msg}")
+                if not ok and self.ctl.ollama_source == "local" and self.ctl.available_models:
+                    self.log("Model đã cài trên Ollama local: " + ", ".join(self.ctl.available_models))
+            else:
+                self.log(msg)
         elif ev.kind == "models":
             ok, msg, models = ev.payload
             self.lbl_conn.configure(text=msg, style="Success.TLabel" if ok else "Error.TLabel")

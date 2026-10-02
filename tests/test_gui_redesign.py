@@ -353,7 +353,7 @@ def test_manual_remove_keeps_source_file_and_restore_returns_it(monkeypatch, tmp
 def test_ollama_check_is_asynchronous(monkeypatch, tmp_path):
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
     called = []
-    monkeypatch.setattr(a.ctl, "check_ollama_async", lambda: called.append("async"))
+    monkeypatch.setattr(a.ctl, "check_ollama_async", lambda **k: called.append("async"))
     monkeypatch.setattr(a.ctl, "check_ollama", lambda *a_, **k: called.append("SYNC"))
     a.var_host.set("192.168.1.50")
     a.var_port.set("11434")
@@ -364,7 +364,7 @@ def test_ollama_check_is_asynchronous(monkeypatch, tmp_path):
     a.ctl.ollama_ok = True
     a._poll()
     assert a.lbl_conn.cfg["style"] == "Success.TLabel" and a.lbl_ai_run.cfg["text"] == "● Ollama: qwen3:4b — Sẵn sàng"
-    assert "self.ctl.check_ollama_async()" in SRC[SRC.index("def check_ollama("):SRC.index("def refresh_models(")]
+    assert "self.ctl.check_ollama_async(" in SRC[SRC.index("def check_ollama("):SRC.index("def refresh_models(")]
 
 
 # ------------------------------------------------------------------ 20 log viewer

@@ -27,3 +27,7 @@
            master untouched), content-region / After-only picture rules re-verified.
            tests/test_prompt004.py (25 tests) ................................... done, 488 passed
            Real-data validation (September five-report dataset, Windows) ........ NOT run in sandbox
+
+- PROMPT-004A Ollama local-first connection: 127.0.0.1 → saved server → manual/LAN (never automatic
+           LAN scan); probe_timeout (3 s) separate from request_timeout (180 s); GUI controls updated
+           when local is selected. tests/test_ollama_local_first.py (14 tests) ..... done, 502 passed

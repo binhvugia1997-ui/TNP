@@ -49,16 +49,19 @@ def preferred_model(models: List[str]) -> Optional[str]:
 
 
 class OllamaClient:
-    def __init__(self, server: str, timeout: int = 180):
+    PROBE_TIMEOUT_CAP = 8        # /api/tags never waits longer than this, whatever the inference timeout is
+
+    def __init__(self, server: str, timeout: int = 180, probe_timeout: Optional[float] = None):
         self.base = normalize_ollama_url(server)
-        self.timeout = timeout
+        self.timeout = timeout                                   # inference (/api/generate)
+        self.probe_timeout = float(probe_timeout) if probe_timeout else min(float(timeout), self.PROBE_TIMEOUT_CAP)
         self.last_call: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     def list_models(self, timeout: Optional[float] = None) -> List[str]:
         url = f"{self.base}/api/tags"
         try:
-            r = requests.get(url, timeout=timeout or 8)
+            r = requests.get(url, timeout=timeout or self.probe_timeout)
             r.raise_for_status()
             return parse_models(r.json())
         except requests.RequestException as e:

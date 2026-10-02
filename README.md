@@ -278,6 +278,17 @@ Tên file → Management Number → Ngày phát sinh (YYMMDD, parser hiện có)
   `<thư mục output>\backup\<tên>_backup_YYYYMMDD_HHMMSS.xlsx` (log `MASTER_BACKUP file=…`). Batch chỉ bỏ qua → không
   sao lưu, không ghi. Sao lưu thất bại → không sửa master (`Không tạo được bản sao lưu Excel trước khi ghi …`).
 
+### Kết nối Ollama: ưu tiên local (PROMPT-004A)
+
+Khi mở GUI (và khi bấm `Kiểm tra kết nối` với một địa chỉ không trả lời) thứ tự là `127.0.0.1:11434` → server đã lưu →
+thủ công / `Tìm Ollama trong mạng LAN`. Ollama local có model → tự chọn, hiển thị `Server: 127.0.0.1`, `Port: 11434`,
+trạng thái `Ollama local: Sẵn sàng — qwen3:4b`, **không** quét LAN. Local chạy nhưng thiếu model →
+`Ollama local đang chạy nhưng không tìm thấy model qwen3:4b` + danh sách model đã cài (không tự đổi model). Local không
+chạy → thử server đã lưu (vd `192.168.1.60:11434`); cả hai không được → `Không kết nối được Ollama local hoặc server đã
+lưu.` và người dùng sửa Server/Port, `Kiểm tra kết nối` hoặc `Tìm Ollama trong mạng LAN`. Timeout thăm dò kết nối
+(`probe_timeout`, mặc định 3 s) tách riêng khỏi timeout suy luận Qwen (`request_timeout`, 180 s). IP LAN cũ đã lưu
+không bao giờ ngăn phát hiện Ollama local; `Lưu cấu hình` vẫn lưu đúng giá trị đang hiển thị.
+
 * GUI gồm 2 tab: `Xử lý báo cáo` (thư mục, file, thời gian xử lý, kết quả, tiến độ) và `Cấu hình & Ollama`.
 
 ### Danh sách file đã quét (kiểm tra trước khi xử lý)
