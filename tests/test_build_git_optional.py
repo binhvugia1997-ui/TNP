@@ -110,3 +110,102 @@ def test_build_metadata_and_artifact_validation_succeed_without_git(tmp_path, mo
     body = src.split("def main(")[1]
     assert "rev-parse" not in body and src.count('"rev-parse"') == 1
     assert "write_release_metadata(folder, version, build_id, name)" in body
+
+
+# ---------------------------------------------------------------- PROMPT-004F: validator vs dependency runtime resources
+def _portable_skeleton(tmp_path):
+    folder = tmp_path / "ReportExtractor_v1.0.3_Portable"
+    (folder / "_internal").mkdir(parents=True)
+    (folder / "ReportExtractor.exe").write_bytes(b"MZ")
+    for sub in ("Output", "logs", "config"):
+        (folder / sub).mkdir()
+    for f in ("README.txt", "FIRST_RUN.txt", "VERSION.txt", "Install_Ollama_Optional.bat"):
+        (folder / f).write_text("x", encoding="utf-8")
+    return folder
+
+
+def test_f1_python_pptx_default_template_is_allowed(tmp_path):
+    folder = _portable_skeleton(tmp_path)
+    tpl = folder / "_internal" / "pptx" / "templates" / "default.pptx"
+    tpl.parent.mkdir(parents=True)
+    tpl.write_bytes(b"PK")
+    assert bp.validate_artifact(folder) == []
+
+
+def test_f2_windows_and_posix_representations_are_allowed():
+    assert bp.is_allowed_dependency_resource("_internal/pptx/templates/default.pptx")
+    assert bp.is_allowed_dependency_resource("_internal\\pptx\\templates\\default.pptx")
+    assert bp.is_allowed_dependency_resource(Path("_internal", "pptx", "templates", "default.pptx"))
+    assert bp.is_allowed_dependency_resource("_INTERNAL\\PPTX\\Templates\\Default.PPTX")      # case-insensitive FS
+
+
+def test_f3_arbitrary_pptx_under_package_root_rejected(tmp_path):
+    folder = _portable_skeleton(tmp_path)
+    (folder / "default.pptx").write_bytes(b"PK")
+    (folder / "(CTMS)_20506_260918080-VOC_A185_Rear.pptx").write_bytes(b"PK")
+    problems = bp.validate_artifact(folder)
+    assert any("default.pptx" in p for p in problems) and any("260918080-VOC" in p for p in problems)
+
+
+def test_f4_report_pptx_under_real_data_rejected(tmp_path):
+    folder = _portable_skeleton(tmp_path)
+    for where in (folder / "real_data", folder / "_internal" / "real_data", folder / "_internal" / "September"):
+        where.mkdir(parents=True)
+        (where / "260925015_bao_cao.pptx").write_bytes(b"PK")
+    problems = bp.validate_artifact(folder)
+    assert len([p for p in problems if "260925015_bao_cao.pptx" in p]) == 3
+
+
+def test_f5_kiem_chung_and_result_xlsx_rejected(tmp_path):
+    folder = _portable_skeleton(tmp_path)
+    (folder / "Kiem_chung.xlsx").write_bytes(b"PK")
+    (folder / "Output" / "Kiem_chung_09_2026.xlsx").write_bytes(b"PK")
+    (folder / "_internal" / "Kiem_chung.xlsx").write_bytes(b"PK")
+    problems = bp.validate_artifact(folder)
+    assert len([p for p in problems if "Kiem_chung" in p]) == 3
+
+
+def test_f6_machine_config_logs_and_ollama_rejected(tmp_path):
+    folder = _portable_skeleton(tmp_path)
+    (folder / "config" / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "_internal" / "ollama.exe").write_bytes(b"x")
+    (folder / "_internal" / "qwen3-4b.gguf").write_bytes(b"x")
+    problems = bp.validate_artifact(folder)
+    assert any("config/config.json" in p for p in problems) and any("config.json của máy dev" in p for p in problems)
+    assert any("ollama.exe" in p for p in problems) and any(".gguf" in p for p in problems)
+    # log / cache / pyc dev artefacts stay forbidden as before
+    (folder / "_internal" / "__pycache__").mkdir()
+    (folder / "_internal" / "__pycache__" / "x.pyc").write_bytes(b"x")
+    (folder / "tests").mkdir()
+    problems = bp.validate_artifact(folder)
+    assert any("__pycache__" in p for p in problems) and any("tests" in p for p in problems)
+
+
+def test_f7_genuine_dev_user_data_next_to_the_allowed_template_still_caught(tmp_path):
+    folder = _portable_skeleton(tmp_path)
+    tdir = folder / "_internal" / "pptx" / "templates"
+    tdir.mkdir(parents=True)
+    (tdir / "default.pptx").write_bytes(b"PK")                 # allowed
+    (tdir / "report.pptx").write_bytes(b"PK")                  # NOT allowed – same folder, different file
+    (folder / "_internal" / "pptx" / "default.pptx").write_bytes(b"PK")   # NOT allowed – different folder
+    (folder / "_internal" / "sample_data" / "x").mkdir(parents=True)
+    problems = bp.validate_artifact(folder)
+    assert not any(str(Path("_internal", "pptx", "templates", "default.pptx")) in p for p in problems)
+    assert any("report.pptx" in p for p in problems)
+    assert any(str(Path("_internal", "pptx", "default.pptx")) in p for p in problems)
+    assert any("sample_data" in p for p in problems)
+
+
+def test_f8_no_broad_internal_pptx_exemption(tmp_path):
+    assert bp.ALLOWED_DEPENDENCY_RESOURCES == (("_internal", "pptx", "templates", "default.pptx"),)
+    assert not bp.is_allowed_dependency_resource("_internal/anything.pptx")
+    assert not bp.is_allowed_dependency_resource("_internal/pptx/templates/other.pptx")
+    assert not bp.is_allowed_dependency_resource("_internal/pptx/templates/default.pptx/extra.pptx")
+    assert not bp.is_allowed_dependency_resource("pptx/templates/default.pptx")
+    folder = _portable_skeleton(tmp_path)
+    n = 0
+    for name in ("a.pptx", "b.ppt", "c.xlsx"):
+        (folder / "_internal" / name).write_bytes(b"PK")
+        n += 1
+    assert len([p for p in bp.validate_artifact(folder) if "dữ liệu mẫu/dev" in p]) == n

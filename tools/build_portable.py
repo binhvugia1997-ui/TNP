@@ -30,6 +30,12 @@ ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_PYTHON = ((3, 10), (3, 11), (3, 12), (3, 13))   # explicit tuples, identical to setup.bat policy
 FORBIDDEN_IN_ARTIFACT = ("tests", ".venv", ".venv-build", ".git", ".pytest_cache", "sample_data", "__pycache__")
 FORBIDDEN_SUFFIXES = (".pptx", ".ppt", ".xlsx", ".pyc")
+# Narrow allowlist of dependency RUNTIME resources that legitimately carry a forbidden suffix.  Compared as
+# lower-cased path-component tuples (platform independent).  python-pptx needs its default template to build a
+# Presentation(); it is not project/user/sample data.  Nothing else under _internal is exempt.
+ALLOWED_DEPENDENCY_RESOURCES = (
+    ("_internal", "pptx", "templates", "default.pptx"),
+)
 DOCS_DIR = ROOT / "release_docs"
 
 
@@ -133,6 +139,12 @@ def write_release_metadata(folder: Path, version: str, build_id: str, name: str,
     return git_rev
 
 
+def is_allowed_dependency_resource(rel: Path | str) -> bool:
+    """True only for the exact allow-listed dependency runtime files (relative to the portable folder)."""
+    parts = tuple(x.lower() for x in Path(str(rel).replace("\\", "/")).parts)
+    return parts in ALLOWED_DEPENDENCY_RESOURCES
+
+
 def validate_artifact(folder: Path, exe_name: str = "ReportExtractor.exe") -> list[str]:
     problems: list[str] = []
     if not (folder / exe_name).exists() and not (folder / "ReportExtractor").exists():
@@ -151,7 +163,7 @@ def validate_artifact(folder: Path, exe_name: str = "ReportExtractor.exe") -> li
         if parts & set(FORBIDDEN_IN_ARTIFACT):
             problems.append(f"file phát triển trong gói: {rel}")
             continue
-        if p.is_file() and p.suffix.lower() in FORBIDDEN_SUFFIXES:
+        if p.is_file() and p.suffix.lower() in FORBIDDEN_SUFFIXES and not is_allowed_dependency_resource(rel):
             problems.append(f"dữ liệu mẫu/dev trong gói: {rel}")
         if p.is_file() and (p.name.lower() == "ollama.exe" or p.suffix.lower() == ".gguf"):
             problems.append(f"gói không được chứa Ollama/model: {rel}")

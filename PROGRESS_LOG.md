@@ -62,3 +62,10 @@
            `Git: unavailable`); also fixed latent `render_doc(name=…)` keyword collision in the same step.
            tests/test_build_git_optional.py (12 tests) ............................ done, 602 passed
            Windows portable build rerun ........................................... NOT possible in Linux sandbox
+
+- PROMPT-004F Portable validator false positive: python-pptx runtime resource _internal/pptx/templates/default.pptx
+           was flagged as sample data.  Narrow allowlist ALLOWED_DEPENDENCY_RESOURCES (exact component tuple,
+           case/separator independent) via is_allowed_dependency_resource(); every other .pptx/.ppt/.xlsx,
+           real_data/September reports, Kiem_chung.xlsx, config.json, ollama/gguf, tests/__pycache__ stay
+           rejected.  8 regression tests in tests/test_build_git_optional.py .......... done, 610 passed
+           Windows portable build rerun ........................................... NOT possible in Linux sandbox
