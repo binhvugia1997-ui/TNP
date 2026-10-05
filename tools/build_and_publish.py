@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
+from console_safe import child_env, configure_console, safe_text  # noqa: E402
 import publish_update  # noqa: E402
 
 RC_OK, RC_GIT, RC_BUILD, RC_PUBLISH, RC_REFUSED = 0, 2, 1, 3, 4
@@ -58,7 +59,8 @@ class SyncResult:
 
 def _git(args: List[str], cwd: Path, check: bool = True, timeout: float = 120.0) -> str:
     try:
-        cp = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+        cp = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=timeout, env=child_env())
     except FileNotFoundError as e:
         raise SyncError("Không tìm thấy lệnh git. Cài Git for Windows (https://git-scm.com) rồi chạy lại.") from e
     except subprocess.TimeoutExpired as e:
@@ -158,7 +160,7 @@ class Tee:
         self.path = log_path
 
     def __call__(self, msg: str = "") -> None:
-        print(msg, flush=True)
+        print(safe_text(msg, stream=sys.stdout), flush=True)
         self.fh.write(msg + "\n")
         self.fh.flush()
 
@@ -184,7 +186,7 @@ def build_command(py: str, args: argparse.Namespace) -> List[str]:
 
 def run_streamed(cmd: List[str], say: Callable[[str], None], cwd: Path = ROOT) -> int:
     proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            encoding="utf-8", errors="replace", bufsize=1)
+                            encoding="utf-8", errors="replace", bufsize=1, env=child_env())
     assert proc.stdout is not None
     for line in proc.stdout:
         say(line.rstrip("\n"))
@@ -192,6 +194,7 @@ def run_streamed(cmd: List[str], say: Callable[[str], None], cwd: Path = ROOT) -
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    configure_console()
     ap = argparse.ArgumentParser(description="ONE-CLICK: git pull → test/build/validate → ZIP+version.json → publish LAN")
     ap.add_argument("--python", default=sys.executable, help="Python dùng để tạo .venv-build")
     ap.add_argument("--branch", default=None, help="nhánh phát hành bắt buộc (mặc định: nhánh hiện tại / RE_BUILD_BRANCH)")

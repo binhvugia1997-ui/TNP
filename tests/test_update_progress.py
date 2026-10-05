@@ -244,4 +244,4 @@ def test_labels_and_build_011():
     p = UpdateProgress(stage="COPYING", bytes_copied=int(58.4 * (1 << 20)), total_bytes=int(87.1 * (1 << 20)),
                        percent=67.0, speed_bps=11.2 * (1 << 20))
     assert p.bytes_text == "58.4 MB / 87.1 MB" and p.speed_text == "Tốc độ: 11.2 MB/s"
-    assert app.__version__ == "1.2.1" and app.BUILD_NUMBER == 12 and app.BUILD_LABEL == "Build 012"
+    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_LABEL == "Build 015"

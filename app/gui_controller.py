@@ -487,6 +487,23 @@ class GuiController:
             return MSG_MODEL_UNAVAILABLE
         return lrn.content.status_text()
 
+    def learning_model_status_text(self) -> str:
+        """Compact status for the separate learning tab; image/content models stay independent."""
+        lrn = self.learning
+        if lrn is None:
+            return "Mô hình ảnh và nội dung: không khả dụng."
+
+        def state_text(model, state: str) -> str:
+            if model is not None:
+                return f"đã huấn luyện ({model.n_examples} mẫu)"
+            if state in ("corrupt", "incompatible"):
+                return "không khả dụng — dùng quy tắc hiện tại"
+            return "chưa huấn luyện — dùng quy tắc hiện tại"
+
+        content = lrn.content
+        return (f"Mô hình ảnh: {state_text(lrn.model, lrn.model_status)}.  "
+                f"Mô hình nội dung: {state_text(content.model, content.model_status)}.")
+
     # ---- PROMPT-006B content review -------------------------------------------------------------
     def review_content_candidates(self) -> list:
         """Reviewable text blocks of the LAST finished batch (hard-excluded title/sidebar/footer never offered)."""

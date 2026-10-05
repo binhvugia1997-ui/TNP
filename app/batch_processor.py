@@ -427,6 +427,8 @@ class BatchProcessor:
                                  learning=self.learning)
             fr.image_candidates = list(rec.image_candidates)
             fr.content_candidates = list(rec.content_candidates)
+            for diagnostic in getattr(rec, "cause_diagnostics", []):
+                LOG.info("%s: %s", path.name, diagnostic)
             fr.management_number = rec.management_number
             fr.after_picture_slides = list(rec.after_picture_slides)
             fr.vendor = rec.vendor
@@ -476,7 +478,8 @@ class BatchProcessor:
                 if self.opts.force_reprocess:
                     # explicit user request: rewrite every extractor-managed field
                     conflicts = writer.update_record(row, rec, qpn_png, imp_jpg,
-                                                     fill_temporary=self.opts.fill_temporary_column)
+                                                     fill_temporary=self.opts.fill_temporary_column,
+                                                     clear_missing_images=True)
                 else:
                     # auto fill: ONLY the blank fields, populated cells are preserved
                     conflicts = writer.fill_missing_fields(row, rec, missing, qpn_png, imp_jpg)

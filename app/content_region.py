@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .classifier import is_heading_like, section_kind_of_heading
 from .pptx_parser import Block, SlideData, norm_key, strip_accents
@@ -67,6 +67,14 @@ class BlockRole:
     @property
     def text(self) -> str:
         return self.block.text
+
+
+@dataclass
+class StructuralCauseRegion:
+    """Body text structurally owned by a separate left-side cause marker."""
+    marker: BlockRole
+    body: List[BlockRole]
+    excluded: List[Tuple[BlockRole, str]]
 
 
 def _rel(v: int, total: int) -> float:
@@ -179,6 +187,75 @@ def classify_blocks(slide: SlideData) -> List[BlockRole]:
 
         roles.append(BlockRole(b, ROLE_CONTENT))
     return roles
+
+
+def _is_separate_cause_marker(role: BlockRole, W: int) -> bool:
+    text = norm_key(role.text).strip(" .:;,-")
+    if text not in {"nguyen nhan", "phan tich nguyen nhan", "root cause", "cause analysis"}:
+        return False
+    b = role.block
+    # A separate marker is a narrow left label/sidebar, not a sentence in the body.
+    return role.role == ROLE_SIDEBAR or (b.left / max(1, W) <= 0.25 and b.width / max(1, W) <= 0.25)
+
+
+def _cause_candidate_exclusion(role: BlockRole) -> Optional[str]:
+    """Return why an adjacent block cannot be a root-cause body."""
+    b = role.block
+    first = _first_line(b)
+    key = norm_key(first)
+    if not key:
+        return "empty body"
+    if key.strip(" .:;,-") in {"nguyen nhan", "phan tich nguyen nhan", "root cause", "cause analysis"}:
+        return "marker label, not body"
+    if (b.kind == "title" or (role.role == ROLE_TITLE and is_slide_level_heading(first))
+            or re.search(r"\b(bao cao|report)\b", key)):
+        return "slide/report title"
+    kind = section_kind_of_heading(first) if is_heading_like(first, b.bold, b.size_pt) else None
+    if kind and kind != "cause":
+        return f"non-cause section heading ({kind})"
+    if re.search(r"\b(hien trang|current status|temporary action|xu ly tam thoi)\b", key):
+        return "current-state or temporary-action text"
+    return None
+
+
+def cause_sidebar_regions(slide: SlideData) -> List[StructuralCauseRegion]:
+    """Detect separate left-side ``Nguyên nhân`` markers and assign adjacent body text by geometry.
+
+    Ownership uses relative horizontal adjacency and vertical affinity, then excludes titles,
+    furniture, current-state, temporary, and improvement section blocks. Grouped shapes and
+    table blocks already carry absolute slide geometry from :mod:`pptx_parser`.
+    """
+    W, H = slide.width or 1, slide.height or 1
+    roles = classify_blocks(slide)
+    markers = [r for r in roles if _is_separate_cause_marker(r, W)]
+    regions: List[StructuralCauseRegion] = []
+    for marker in markers:
+        mb = marker.block
+        body: List[BlockRole] = []
+        excluded: List[Tuple[BlockRole, str]] = []
+        for candidate in roles:
+            b = candidate.block
+            if b is mb or not b.text.strip():
+                continue
+            if candidate.role not in (ROLE_CONTENT, ROLE_TITLE):
+                continue
+            # Body must be to the marker's right (small overlaps are tolerated for rounded sidebars).
+            if b.right <= mb.left or b.left < mb.left - 0.02 * W:
+                continue
+            xgap = max(0, b.left - mb.right) / W
+            if xgap > 0.16 or b.width / W < 0.20:
+                continue
+            ygap = max(0, max(mb.top, b.top) - min(mb.bottom, b.bottom)) / H
+            if ygap > 0.40:
+                continue
+            reason = _cause_candidate_exclusion(candidate)
+            if reason:
+                excluded.append((candidate, reason))
+            else:
+                body.append(candidate)
+        body.sort(key=lambda r: (r.block.order, r.block.top, r.block.left))
+        regions.append(StructuralCauseRegion(marker=marker, body=body, excluded=excluded))
+    return regions
 
 
 def content_blocks(slide: SlideData) -> List[Block]:

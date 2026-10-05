@@ -99,6 +99,13 @@ class ImageCandidate:
     decision_source: str = "rules"            # rules | model | user
     user_label: str = UNLABELED
     thumbnail: str = ""
+    temporal_role: str = "UNKNOWN"
+    semantic_role: str = "OTHER"
+    logical_item_owner: str = ""
+    owner_heading: str = ""
+    confident_owner: bool = False
+    excel_output_eligible: bool = False
+    eligibility_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -292,7 +299,18 @@ def build_candidates(report: ReportData, slide_numbers: Sequence[int], sel: Pict
             nearby, cap_txt, color = _nearby_text(p, roles, W, H)
             ref = decided.get((n, id(p)))
             kind = ref.kind if ref else ("excluded" if deco else "ambiguous")
-            how = (ref.anchor or ref.reason) if ref else (deco or "")
+            how = (ref.anchor or ref.reason or ref.exclusion_reason) if ref else (deco or "")
+            semantic_owner_ok = bool(ref and ref.semantic_role == "PRODUCTION_IMPROVEMENT"
+                                     and ref.confident_owner and ref.owner_id and ref.kind != "excluded")
+            eligible = bool(ref and ref.excel_output_eligible and ref.temporal_role == "AFTER" and semantic_owner_ok)
+            if not semantic_owner_ok:
+                eligibility_reason = ((ref.exclusion_reason if ref else "no deterministic picture reference") or
+                                      "semantic/item ownership is not confidently production improvement")
+            elif not eligible:
+                eligibility_reason = ((ref.exclusion_reason if ref else "") or
+                                      f"temporal role is {ref.temporal_role if ref else 'UNKNOWN'}")
+            else:
+                eligibility_reason = ""
             feats: Dict[str, float] = {
                 "relative_x": _rel(p.left, W), "relative_y": _rel(p.top, H),
                 "relative_width": _rel(p.width, W), "relative_height": _rel(p.height, H),
@@ -323,7 +341,13 @@ def build_candidates(report: ReportData, slide_numbers: Sequence[int], sel: Pict
                 bounds=(p.left, p.top, p.width, p.height), slide_size=(W, H), block_bounds=(bx, by, bw, bh),
                 features=feats, nearby_text=nearby, nearest_heading=title_text(s)[:80], nearest_caption=cap_txt,
                 nearest_text_color=color, deterministic_kind=kind, deterministic_how=how,
-                hard_excluded=bool(deco), hard_reason=deco or "", confidence=conf, evidence=ev)
+                hard_excluded=bool(deco), hard_reason=deco or "",
+                confidence=conf, evidence=ev,
+                temporal_role=ref.temporal_role if ref else "UNKNOWN",
+                semantic_role=ref.semantic_role if ref else "OTHER",
+                logical_item_owner=ref.owner_id if ref else "", owner_heading=ref.owner_heading if ref else "",
+                confident_owner=bool(ref and ref.confident_owner), excel_output_eligible=eligible,
+                eligibility_reason=eligibility_reason)
             out.append(c)
     return out
 
@@ -646,6 +670,12 @@ def explain(c: ImageCandidate) -> str:
              + (f", mô hình {c.learned_probability:.2f}" if c.learned_probability is not None else "") + ")",
              "Bằng chứng:"]
     lines += [f"- {e}" for e in c.evidence] or ["- (không có)"]
+    if c.logical_item_owner:
+        lines.append(f"Mục sở hữu: {c.owner_heading or c.logical_item_owner}"
+                     + (" (đã xác nhận)" if c.confident_owner else " (chưa chắc chắn)"))
+    eligibility = ("đủ điều kiện" if c.excel_output_eligible else
+                   f"chưa đủ điều kiện — {c.eligibility_reason or 'cần xác nhận độc lập'}")
+    lines.append(f"Điều kiện đưa ảnh vào Excel: {eligibility}")
     if c.nearby_text:
         lines.append(f"Chữ gần ảnh: {c.nearby_text[:80]}")
     return "\n".join(lines)
@@ -740,10 +770,19 @@ def select_with_learning(report: ReportData, slide_numbers: Sequence[int], sel: 
         r = by_key.get((c.slide, c.picture_id))
         if r is None:
             continue
-        if c.decision == "include":
+        semantic_gate = bool(r.semantic_role == "PRODUCTION_IMPROVEMENT" and r.confident_owner and r.owner_id
+                             and r.kind != "excluded" and r.excel_output_eligible)
+        temporal_gate = r.temporal_role == "AFTER"
+        if c.decision == "include" and semantic_gate and temporal_gate:
             how = r.anchor if c.decision_source == "rules" else (
                 "mô hình học" if c.decision_source == "model" else "người dùng xác nhận")
-            refs.append(PictureRef(r.slide, r.block, "after", "", how))
+            refs.append(PictureRef(
+                r.slide, r.block, "after", "", how, owner_id=r.owner_id, owner_heading=r.owner_heading,
+                source_order=r.source_order, temporal_role="AFTER", semantic_role=r.semantic_role,
+                confident_owner=r.confident_owner, excel_output_eligible=True))
+        elif c.decision == "include":
+            reason = c.eligibility_reason or r.exclusion_reason or "temporal/semantic eligibility is not established"
+            reasons.append(f"Ảnh slide {c.slide} (#{c.picture_id}) có nhãn Sau nhưng không đủ điều kiện Excel: {reason}")
         elif c.decision_source == "model" and c.decision == "exclude":
             reasons.append(f"Ảnh slide {c.slide} (#{c.picture_id}) bị loại theo mô hình học – kiểm tra nếu cần")
     refs.sort(key=lambda x: (x.slide, x.block.order))

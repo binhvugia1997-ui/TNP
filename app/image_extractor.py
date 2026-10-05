@@ -16,7 +16,7 @@ from typing import List, Optional, Sequence, Tuple
 from PIL import Image, ImageDraw
 
 from .pptx_parser import ReportData
-from .improvement_pictures import PictureRef
+from .improvement_pictures import PictureRef, group_refs
 from .qpn_renderer import SlideRenderer, get_font
 
 LOG = logging.getLogger("report_extractor.images")
@@ -154,33 +154,52 @@ def build_after_pictures_image(report: ReportData, refs: Sequence["PictureRef"],
     return target_jpg, problems
 
 
+class GroupedImagePaths(list):
+    """Flat path list for API compatibility, plus logical-item rows for grouped Excel placement."""
+    def __init__(self, groups: Sequence[Sequence[Path]], owners: Optional[Sequence[str]] = None):
+        self.groups = [list(group) for group in groups if group]
+        self.owners = list(owners or [])[:len(self.groups)]
+        super().__init__(path for group in self.groups for path in group)
+
+
 def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_dir: Path
                           ) -> Tuple[List[Path], List[str]]:
-    """Save every selected "Sau cải tiến" picture as its OWN PNG (source order) – each becomes an
-    independent Excel image object.  Returns (paths, problems for 'Cần kiểm tra')."""
+    """Save eligible After pictures as independent PNGs, grouped by logical defect in source order."""
     problems: List[str] = []
     paths: List[Path] = []
+    path_groups: List[List[Path]] = []
+    owners: List[str] = []
     out_dir.mkdir(parents=True, exist_ok=True)
-    for i, ref in enumerate(refs, start=1):
-        blob = ref.block.image_blob
-        ext = (ref.block.image_ext or "").lower()
-        if not blob:
-            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không đọc được dữ liệu – cần bổ sung thủ công")
-            continue
-        if ext in ("emf", "wmf"):
-            (out_dir / f"after{i:02d}_slide{ref.slide:02d}.{ext}").write_bytes(blob)
-            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} ở định dạng {ext.upper()} không chèn được – "
-                            f"cần bổ sung thủ công")
-            continue
-        try:
-            im = Image.open(BytesIO(blob))
-            im.load()
-            im = im.convert("RGB")
-        except Exception as e:  # noqa: BLE001
-            problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không giải mã được ({type(e).__name__}) – "
-                            f"cần bổ sung thủ công")
-            continue
-        target = out_dir / f"after{i:02d}_slide{ref.slide:02d}.png"
-        im.save(target, "PNG", optimize=True)
-        paths.append(target)
-    return paths, problems
+    groups = group_refs(refs)
+    ordered = sorted(groups.items(), key=lambda kv: min(r.source_order for r in kv[1]))
+    i = 0
+    for owner, group in ordered:
+        saved_group: List[Path] = []
+        for ref in group:
+            i += 1
+            blob = ref.block.image_blob
+            ext = (ref.block.image_ext or "").lower()
+            if not blob:
+                problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không đọc được dữ liệu – cần bổ sung thủ công")
+                continue
+            if ext in ("emf", "wmf"):
+                (out_dir / f"after{i:02d}_slide{ref.slide:02d}.{ext}").write_bytes(blob)
+                problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} ở định dạng {ext.upper()} không chèn được – "
+                                f"cần bổ sung thủ công")
+                continue
+            try:
+                im = Image.open(BytesIO(blob))
+                im.load()
+                im = im.convert("RGB")
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"Ảnh Sau cải tiến tại slide {ref.slide} không giải mã được ({type(e).__name__}) – "
+                                f"cần bổ sung thủ công")
+                continue
+            target = out_dir / f"after{i:02d}_slide{ref.slide:02d}.png"
+            im.save(target, "PNG", optimize=True)
+            saved_group.append(target)
+        if saved_group:
+            owners.append(owner)
+            path_groups.append(saved_group)
+            paths.extend(saved_group)
+    return GroupedImagePaths(path_groups, owners), problems

@@ -137,9 +137,9 @@ def _norm(s: str) -> str:
 
 # ------------------------------------------------------------------ versioning
 def test_single_canonical_version():
-    assert app.__version__ == "1.2.1" and app.BUILD_NUMBER == 12 and app.BUILD_ID == "012"
-    assert app.APP_TITLE == "Report Extractor v1.2.1" and app.BUILD_LABEL == "Build 012"
-    assert app.VERSION_LINE == "version=1.2.1 build=012"
+    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_ID == "015"
+    assert app.APP_TITLE == "Report Extractor v1.3.2" and app.BUILD_LABEL == "Build 015"
+    assert app.VERSION_LINE == "version=1.3.2 build=015"
     src = Path(app.__file__).parent
     hits = [p for p in src.glob("*.py") if p.name != "__init__.py" and "1.0.2" in p.read_text(encoding="utf-8")]
     assert hits == [], f"version string duplicated in {hits}"
@@ -399,5 +399,6 @@ def test_production_pictures_follow_the_same_segmentation(real_prod_deck):
     assert len(before) == 2 and all(p.block.left == Inches(7.5) for p in before)
     assert not any("followup section block" in (p.reason or "") for p in sel.rejected if p.slide == 4)
     insp = [p for p in sel.rejected if p.slide == 5]
-    assert insp and all(p.reason == "inspection/control improvement slide" for p in insp)
+    assert insp and all(p.semantic_role == "INSPECTION_CONTROL" for p in insp)
+    assert all(not p.excel_output_eligible for p in insp)
     assert not sel.reasons

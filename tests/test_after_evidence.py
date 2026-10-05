@@ -278,6 +278,7 @@ def test_blue_logo_text_ignored(tmp_path):
 def test_blue_inspection_text_does_not_make_control_pictures_after(tmp_path):
     def slide(s, W):
         _prod_head(s, W)
+        _tb(s, "Cải tiến máy móc", 1.7, 0.65, 5, 0.35, 12)
         _tb_colored(s, [("+ Sau: Bọc silicon 2mm", "blue")], 1.7, 1.0, 5, 0.4)
         _pics(s, ["#c8e6c9"], 1.7, 1.5)
         _tb_colored(s, [("Cải tiến trong kiểm tra:", None), ("Bổ sung tiêu chuẩn kiểm tra ngoại quan", "blue")],

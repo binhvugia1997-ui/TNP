@@ -16,7 +16,8 @@ from app.config import AppConfig
 from tests.test_gui_redesign import _install_fake_tk
 
 SRC = Path(app.__file__).with_name("gui.py").read_text(encoding="utf-8")
-CFG_TAB = SRC[SRC.index("def _build_cfg_tab("):SRC.index("def _bind_shortcuts(")]
+CFG_TAB = SRC[SRC.index("def _build_cfg_tab("):SRC.index("def _build_learning_tab(")]
+LEARNING_TAB = SRC[SRC.index("def _build_learning_tab("):SRC.index("def _bind_shortcuts(")]
 RUN_TAB = SRC[SRC.index("def _build_run_tab("):SRC.index("def _build_cfg_tab(")]
 
 
@@ -106,33 +107,42 @@ def test_update_card_body_exists_and_is_mapped(monkeypatch, tmp_path):
     assert a.btn_check_update.pack_info_ and a.btn_install_update.pack_info_
 
 
-def test_learning_card_body_exists_and_is_mapped(monkeypatch, tmp_path):
+def test_learning_cards_are_on_their_own_tab_and_mapped(monkeypatch, tmp_path):
     gui, a, reg = _app(monkeypatch, tmp_path)
-    body = a.cfg_cards["learning"]
-    assert body.grid_info_.get("sticky") == "nsew"
-    kids = _children(reg, body)
-    assert a.lbl_learning in kids and a.lbl_learning_content in kids and a.lbl_review_summary in kids
-    assert all(k.grid_info_ or k.pack_info_ for k in kids)
+    assert a.learning_canvas is _page(a, "learning")["canvas"]
+    assert "learning" not in a.cfg_cards
+    data = a.learning_cards["data"]
+    review = a.learning_cards["review"]
+    assert data.grid_info_.get("sticky") == "nsew" and review.grid_info_.get("sticky") == "nsew"
+    assert a.lbl_learning in _children(reg, data) and a.lbl_learning_content in _children(reg, data)
+    assert a.lbl_review_summary in _children(reg, review) and a.lbl_review_content_summary in _children(reg, review)
+    assert a.lbl_learning_model in _children(reg, a.learning_cards["models"])
+    assert a.lbl_reapply_pending in _children(reg, a.learning_cards["apply"])
+    assert all(k.grid_info_ or k.pack_info_ for card in a.learning_cards.values() for k in _children(reg, card))
+    settings = _descendants(reg, a.cfg_page)
+    assert all(w not in settings for w in (a.btn_review_content, a.btn_review_images, a.btn_train_images,
+                                           a.btn_reapply_saved))
 
 
-def test_all_learning_buttons_exist(monkeypatch, tmp_path):
+def test_all_learning_buttons_exist_only_on_learning_tab(monkeypatch, tmp_path):
     gui, a, reg = _app(monkeypatch, tmp_path)
     Button = reg["classes"]["Button"]
-    texts = {w.cfg.get("text") for w in _descendants(reg, a.cfg_cards["learning"]) if isinstance(w, Button)}
-    assert texts == {"Kiểm tra nội dung cải tiến", "Kiểm tra ảnh cải tiến", "Cập nhật mô hình học",
+    texts = {w.cfg.get("text") for w in _descendants(reg, a.learning_page) if isinstance(w, Button)}
+    assert texts == {"Kiểm tra nội dung cải tiến", "Kiểm tra hình ảnh cải tiến", "Cập nhật mô hình học",
                      "Mở thư mục dữ liệu học", "Xuất dữ liệu học", "Cập nhật Excel từ nhãn đã lưu"}
-    assert a.btn_review_content.pack_info_ and a.btn_review_images.pack_info_ and a.btn_train_images.pack_info_
+    assert a.btn_review_content.pack_info_ and a.btn_review_images.pack_info_ and a.btn_train_images.grid_info_
 
 
 def test_cards_take_their_height_from_children(monkeypatch, tmp_path):
     gui, a, reg = _app(monkeypatch, tmp_path)
-    for name in ("ollama", "options", "update", "learning", "log"):
-        assert len(_children(reg, a.cfg_cards[name])) >= 1                      # a body with real content
+    for name in ("ollama", "options", "update", "log"):
+        assert len(_children(reg, a.cfg_cards[name])) >= 1                      # a settings body with real content
+    assert all(len(_children(reg, a.learning_cards[name])) >= 1 for name in a.learning_cards)
     card_src = SRC[SRC.index("def _card("):SRC.index("def _make_table(")]
     assert "height=" not in card_src and "propagate" not in card_src              # no fixed card heights
     assert "grid_propagate(False)" not in SRC and "pack_propagate(False)" not in SRC
     # settings page: only the log row is weighted (Build 007 weighted the update card -> header-only collapse)
-    assert a.cfg_page.row_weights == {4: 1}
+    assert a.cfg_page.row_weights == {3: 1}
     assert a.cfg_cards["log"].row_weights.get(0) == 1 and a.txt_log.grid_info_["sticky"] == "nsew"
 
 
@@ -148,7 +158,7 @@ def test_settings_inner_frame_may_exceed_viewport_height(monkeypatch, tmp_path):
 
 def test_canvas_scrollregion_follows_content(monkeypatch, tmp_path):
     gui, a, reg = _app(monkeypatch, tmp_path)
-    for name in ("cfg", "run"):
+    for name in ("cfg", "run", "learning"):
         sp = _page(a, name)
         sp["canvas"].bbox_ = (0, 0, 700, 2300)
         sp["inner"].bindings["<Configure>"](Ev(700, 2300))
@@ -166,6 +176,23 @@ def test_inner_frame_width_follows_viewport_width(monkeypatch, tmp_path):
     assert _last_item(sp["canvas"], sp["win"])["height"] == 900                 # content taller than 700 viewport
     sp["canvas"].bindings["<Configure>"](Ev(1900, 1200))
     assert _last_item(sp["canvas"], sp["win"])["height"] == 1200                # fills a tall viewport
+
+
+def test_learning_page_resizes_and_pending_status_refreshes(monkeypatch, tmp_path):
+    gui, a, reg = _app(monkeypatch, tmp_path, inner_req_height=1100)
+    sp = _page(a, "learning")
+    for width, height in ((520, 420), (980, 700), (1600, 1200)):
+        sp["canvas"].bindings["<Configure>"](Ev(width, height))
+        assert _last_item(sp["canvas"], sp["win"])["width"] == width
+        assert a.lbl_learning.cfg["wraplength"] == max(gui.WRAP_MIN, width - 6 * gui.L)
+    a.ctl.pending_content_reapply = ["row-a", "row-b"]
+    a._render_learning()
+    assert a.btn_reapply_saved.cfg["state"] == "normal"
+    assert a.lbl_reapply_pending.cfg["text"].startswith("Đang chờ cập nhật Excel: 2 mục")
+    a.ctl.pending_content_reapply = []
+    a._render_learning()
+    assert a.btn_reapply_saved.cfg["state"] == "disabled"
+    assert a.lbl_reapply_pending.cfg["text"] == "Không có lần cập nhật Excel nào đang chờ."
 
 
 # ------------------------------------------------------------------ 8-9 shrinking / enlarging
@@ -269,11 +296,11 @@ def test_repeated_resize_events_create_no_widgets(monkeypatch, tmp_path):
     gui, a, reg = _app(monkeypatch, tmp_path)
     n = len(reg["widgets"])
     for i in range(40):
-        for name in ("cfg", "run"):
+        for name in ("cfg", "run", "learning"):
             sp = _page(a, name)
             sp["canvas"].bindings["<Configure>"](Ev(600 + i * 20, 300 + i * 15))
             sp["inner"].bindings["<Configure>"](Ev(600 + i * 20, 1500))
-    assert len(reg["widgets"]) == n and len(a._scroll_pages) == 2
+    assert len(reg["widgets"]) == n and len(a._scroll_pages) == 3
 
 
 # ------------------------------------------------------------------ mouse wheel routing / geometry audit
@@ -301,7 +328,8 @@ def test_no_pack_grid_mixing_in_same_parent(monkeypatch, tmp_path):
     assert all(len(v) == 1 for v in by_parent.values())
 
 
-def test_version_and_build_008():
-    assert app.__version__ == "1.2.1" and app.BUILD_NUMBER == 12 and app.BUILD_LABEL == "Build 012"
-    assert not re.search(r"wraplength=900\)", CFG_TAB)                           # no fixed 900px wrap left on tab 2
+def test_version_and_build_prompt017():
+    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_LABEL == "Build 015"
+    assert not re.search(r"wraplength=900\)", CFG_TAB + LEARNING_TAB)              # no fixed 900px wrap on either tab
     assert "self._scroll_page(self.tab_cfg" in CFG_TAB and "self._scroll_page(self.tab_run" in RUN_TAB
+    assert "self._scroll_page(self.tab_learning" in LEARNING_TAB

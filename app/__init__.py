@@ -5,8 +5,8 @@ Single canonical source of the application version / build number (never duplica
 ("Build 004").  A Git revision – when available – is internal diagnostic metadata only, never the build number.
 """
 
-__version__ = "1.2.1"
-BUILD_NUMBER = 12
+__version__ = "1.3.2"
+BUILD_NUMBER = 15
 
 
 def format_build(n) -> str:

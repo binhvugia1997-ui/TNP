@@ -19,6 +19,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Inches, Pt
 
+from app.batch_processor import BatchOptions, BatchProcessor
 from app.classifier import heuristic_classify
 from app.content_learning import build_content_candidates, decide_content, rebuild_improvement_text
 from app.content_region import ROLE_CONTENT, classify_blocks
@@ -68,7 +69,7 @@ def _move_group(g, left, top, scale=1.0):
     ext.set("cy", str(int(int(ext.get("cy")) * scale)))
 
 
-def make_group_deck(path: Path, nested=True, table=True, dup_ids=False, scale=1.0) -> Path:
+def make_group_deck(path: Path, nested=True, table=True, dup_ids=False, scale=1.0, cause_sidebar=False) -> Path:
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
     W = prs.slide_width
@@ -78,7 +79,28 @@ def make_group_deck(path: Path, nested=True, table=True, dup_ids=False, scale=1.
     _tb(s, f"Model: A253\nItem: Front\nManagement No: {MGMT}", 0.5, 2.5, 6, 2, 16)
     s = prs.slides.add_slide(blank)
     _tb(s, "1. NGUYÊN NHÂN", 0.5, 0.3, 8, 0.7, 24, True)
-    _tb(s, "- Bụi bám trên bề mặt trước khi dán tape", 1.7, 1.1, 11, 1.5, 13)
+    if cause_sidebar:
+        _shape(s, MSO_SHAPE.OVAL, "Nguyên nhân", 0.15, 2.5, 1.3, 1.3)
+        group = s.shapes.add_group_shape()
+        _grp_tb(group, "Vấn đề trong sản xuất:\n- Bụi tích tụ do bề mặt khay bị mòn.\nHiện trạng: phát hiện ở đầu ca.",
+                0.0, 0.0, 8.0, 1.1, 12)
+        nested_cause = group.shapes.add_group_shape()
+        _grp_tb(nested_cause, "Vấn đề trong kiểm tra:\n- Thiết bị đo không được hiệu chuẩn đúng chu kỳ.",
+                0.0, 1.3, 8.0, 0.9, 12)
+        if table:
+            cause_table = s.shapes.add_table(2, 2, Inches(0), Inches(2.3), Inches(6.0), Inches(0.8))
+            cause_table.table.cell(0, 0).text = "Công đoạn"
+            cause_table.table.cell(0, 1).text = "Quan sát"
+            cause_table.table.cell(1, 0).text = "Sản xuất"
+            cause_table.table.cell(1, 1).text = "Bề mặt khay mòn"
+            group._element.append(cause_table._element)
+        _move_group(group, 1.7, 1.1)
+        _tb(s, "Cải tiến trong kiểm tra:\n- Thêm tiêu chuẩn tham chiếu.", 1.7, 4.2, 11, 0.8, 12)
+        _tb(s, "Xử lý tạm thời:\n- Sàng lọc lô tồn.", 1.7, 5.0, 11, 0.8, 12)
+        _tb(s, FOOTER, 0.3, 7.05, 4, 0.35, 8)
+        _tb(s, "▶", 0.2, 0.35, 0.4, 0.4, 14)
+    else:
+        _tb(s, "- Bụi bám trên bề mặt trước khi dán tape", 1.7, 1.1, 11, 1.5, 13)
     s = prs.slides.add_slide(blank)
     _tb(s, "2. XỬ LÝ TẠM THỜI", 0.5, 0.3, 8, 0.7, 24, True)
     _shape(s, MSO_SHAPE.OVAL, "Xử lý tạm thời", 0.15, 2.5, 1.3, 1.3)
@@ -206,6 +228,43 @@ def test_source_order_follows_slide_layout(tmp_path):
     assert order == sorted(order)
     tops = [c.bounds[1] for c in cands if c.decision == "include"]
     assert tops == sorted(tops)
+
+
+def test_sidebar_cause_fallback_owns_grouped_nested_and_table_body_and_writes_excel(
+        tmp_path, template, caplog):
+    """A separate sidebar owns the adjacent grouped cause body, even with no literal cause label in the body."""
+    deck = make_group_deck(tmp_path / DECK, cause_sidebar=True, nested=True, table=True)
+    report = parse_pptx(deck)
+    cls = heuristic_classify(report)
+    assert cls.cause_slides == [2]
+    caplog.set_level("INFO", logger="report_extractor.extractor")
+    rec = extract_record(report, cls)
+    expected = ("Vấn đề trong sản xuất:\n- Bụi tích tụ do bề mặt khay bị mòn.\n\n"
+                "Vấn đề trong kiểm tra:\n- Thiết bị đo không được hiệu chuẩn đúng chu kỳ.\n\n"
+                "Công đoạn | Quan sát\nSản xuất | Bề mặt khay mòn")
+    assert rec.root_cause == expected
+    assert rec.root_cause.index("Vấn đề trong sản xuất") < rec.root_cause.index("Vấn đề trong kiểm tra")
+    for excluded in ("Nguyên nhân\n", "1. NGUYÊN NHÂN", "Hiện trạng", "Cải tiến trong kiểm tra",
+                     "Xử lý tạm thời", "CTMS"):
+        assert excluded not in rec.root_cause
+    assert any(d.startswith("CAUSE_MARKER S2") for d in rec.cause_diagnostics)
+    assert sum(d.startswith("CAUSE_SELECTED S2") for d in rec.cause_diagnostics) == 3
+    assert any("reason=slide/report title" in d for d in rec.cause_diagnostics)
+    assert any("reason=non-cause section heading (improvement)" in d for d in rec.cause_diagnostics)
+    assert any("reason=non-cause section heading (temporary)" in d for d in rec.cause_diagnostics)
+    assert any("reason=current-state line" in d for d in rec.cause_diagnostics)
+    assert "CAUSE_MARKER S2" in caplog.text and "CAUSE_SELECTED S2" in caplog.text
+
+    out = tmp_path / "out" / "result.xlsx"
+    opts = BatchOptions(files=[deck], template=template, output_file=out, use_ollama=False,
+                        learning_dir=tmp_path / "learning")
+    proc = BatchProcessor(opts)
+    summary = proc.run()
+    # The synthetic deck has no QPN, so it is successfully written but correctly needs review.
+    assert summary.needs_review == 1 and summary.failed == 0 and not summary.errors
+    saved = load_workbook(out)
+    written = saved[saved.sheetnames[0]].cell(row=4, column=COL["cause"]).value
+    assert written == expected
 
 
 # ------------------------------------------------------------------ duplicate shape ids

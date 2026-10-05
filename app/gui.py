@@ -5,10 +5,9 @@ event handling live in the controller (headless, unit-tested); this module only 
 clicks and renders controller state.  Processing is the same production ``BatchProcessor`` used by the CLI,
 on a worker thread; the GUI thread only drains the controller's event queue every 100 ms.
 
-Layout (tab "Xử lý báo cáo", responsive grid inside one vertical page scroller):
-    header  →  Nguồn dữ liệu  →  Thời gian xử lý  →  Danh sách báo cáo (toolbar + table, grows with the window)
-            →  Xử lý (Start / Stop, progress, summary cards)  →  Kết quả xử lý (table)
-Tab "Cấu hình & Ollama": Ollama connection, processing options, log viewer, system diagnostics.
+Layout uses three responsive, vertically scrollable tabs: Danh sách báo cáo, Cài đặt, and Học cải tiến.
+The learning tab keeps existing image/content labels, reviews, training, and Excel re-apply workflows separate
+from application configuration; the business logic remains in :class:`app.gui_controller.GuiController`.
 Only ``tkinter`` / ``ttk`` are used (optional ``tkinterdnd2`` drag & drop kept); styling is centralised in
 :func:`configure_styles`.
 """
@@ -369,7 +368,7 @@ class ReportExtractorApp:
         self.discovery_tree = None
         self._discovery_items: Dict[str, Any] = {}
         self._search_placeholder = True
-        self._scroll_pages: List[Dict[str, Any]] = []   # responsive canvas pages (tab 1 / tab 2)
+        self._scroll_pages: List[Dict[str, Any]] = []   # responsive canvas pages (reports / settings / learning)
         self._wrap_labels: List = []                     # long labels whose wraplength follows the page width
         self._build()
         self._bind_shortcuts()
@@ -531,15 +530,18 @@ class ReportExtractorApp:
         self.lbl_build = ttk.Label(hdr, text=BUILD_LABEL, style="Version.TLabel")
         self.lbl_build.grid(row=1, column=1, sticky="e")
 
-        # ---- two tabs --------------------------------------------------------------------------------
+        # ---- primary tabs (stable order: report list, settings, learning) -------------------------------
         self.nb = ttk.Notebook(r)
         self.nb.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 0))
         self.tab_run = ttk.Frame(self.nb, style="App.TFrame")
         self.tab_cfg = ttk.Frame(self.nb, style="App.TFrame")
-        self.nb.add(self.tab_run, text="  ▶  Xử lý báo cáo  ")
-        self.nb.add(self.tab_cfg, text="  ⚙  Cấu hình & Ollama  ")
+        self.tab_learning = ttk.Frame(self.nb, style="App.TFrame")
+        self.nb.add(self.tab_run, text="  Danh sách báo cáo  ")
+        self.nb.add(self.tab_cfg, text="  Cài đặt  ")
+        self.nb.add(self.tab_learning, text="  Học cải tiến  ")
         self._build_run_tab()
         self._build_cfg_tab()
+        self._build_learning_tab()
 
     def _build_run_tab(self) -> None:
         # ---- whole-page vertical scroll layer: sections scroll, tables scroll internally ------------
@@ -847,40 +849,8 @@ class ReportExtractorApp:
                          style="Secondary.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(XS, 0))
         self.var_update_path.trace_add("write", lambda *_: self._on_update_path_edited())
 
-        # ---- Dữ liệu học ảnh cải tiến (PROMPT-006: local labels + tiny local model; no Ollama) ----------
-        lf = self._card(page, "Dữ liệu học cải tiến", 3)
-        self.cfg_cards["learning"] = lf
-        self.lbl_learning = self._wrap_label(lf, text="Ảnh:  " + self.ctl.learning_status_text(), style="Card.TLabel")
-        self.lbl_learning.grid(row=0, column=0, sticky="w", pady=(0, XS))
-        self.lbl_learning_content = self._wrap_label(lf, text="Nội dung:  " + self.ctl.content_status_text(),
-                                                     style="Card.TLabel")
-        self.lbl_learning_content.grid(row=4, column=0, sticky="w", pady=(0, XS))
-        lbtns = ttk.Frame(lf, style="Card.TFrame")
-        lbtns.grid(row=1, column=0, sticky="w", pady=(S, XS))
-        self.btn_review_content = ttk.Button(lbtns, text="Kiểm tra nội dung cải tiến", command=self.open_content_review,
-                                             style="Primary.TButton")
-        self.btn_review_content.pack(side="left", padx=(0, XS))
-        self.btn_review_images = ttk.Button(lbtns, text="Kiểm tra ảnh cải tiến", command=self.open_image_review,
-                                            style="Primary.TButton")
-        self.btn_review_images.pack(side="left", padx=(0, XS))
-        self.btn_train_images = ttk.Button(lbtns, text="Cập nhật mô hình học", command=self.train_models)
-        self.btn_train_images.pack(side="left", padx=(0, XS))
-        ttk.Button(lbtns, text="Mở thư mục dữ liệu học", command=self.open_learning_folder).pack(side="left", padx=(0, XS))
-        ttk.Button(lbtns, text="Xuất dữ liệu học", command=self.export_learning_data).pack(side="left")
-        self.btn_reapply_saved = ttk.Button(lbtns, text="Cập nhật Excel từ nhãn đã lưu", command=self.reapply_saved_content)
-        self.btn_reapply_saved.pack(side="left", padx=(XS, 0))
-        self.lbl_review_summary = self._wrap_label(lf, text=self.ctl.review_summary_text(), style="Secondary.TLabel")
-        self.lbl_review_summary.grid(row=2, column=0, sticky="w")
-        self.lbl_review_content_summary = self._wrap_label(lf, text=self.ctl.content_review_summary_text(),
-                                                           style="Secondary.TLabel")
-        self.lbl_review_content_summary.grid(row=5, column=0, sticky="w")
-        self._wrap_label(lf, text="Nhãn xác nhận được lưu trong learning_data/ cạnh chương trình (giữ nguyên khi cập "
-                                  "nhật). Mô hình chỉ dùng đặc trưng bố cục slide, không gửi dữ liệu đi đâu; nhãn người "
-                                  "dùng luôn được ưu tiên.", style="Secondary.TLabel").grid(row=3, column=0, sticky="w",
-                                                                                            pady=(XS, 0))
-
         # ---- Nhật ký xử lý (GUI copy of the log stream; clearing never touches app.log) --------------
-        lg = self._card(page, "Nhật ký xử lý", 4, weight=1)      # the ONLY weighted row of the settings page
+        lg = self._card(page, "Nhật ký xử lý", 3, weight=1)      # the ONLY weighted row of the settings page
         self.cfg_cards["log"] = lg
         lbtn = ttk.Frame(lg.head, style="Card.TFrame")
         lbtn.grid(row=0, column=2, sticky="e")
@@ -901,6 +871,68 @@ class ReportExtractorApp:
 
         self._config_widgets.extend([e4, e5, b5, b6, b7, self.cb_model, c2, self.btn_discover, e8, b8,
                                      self.btn_check_update, self.chk_auto_update])
+
+    def _build_learning_tab(self) -> None:
+        """Learning-only controls on a responsive scroll page; settings remain unrelated to learning."""
+        sp = self._scroll_page(self.tab_learning, "learning")
+        self.learning_canvas, self.learning_vsb = sp["canvas"], sp["vsb"]
+        self.learning_page, self._learning_win = sp["inner"], sp["win"]
+        page = self.learning_page
+        self.learning_cards: Dict[str, Any] = {}
+
+        data = self._card(page, "Dữ liệu học", 0)
+        self.learning_cards["data"] = data
+        self.lbl_learning = self._wrap_label(data, text="Hình ảnh:  " + self.ctl.learning_status_text(),
+                                             style="Card.TLabel")
+        self.lbl_learning.grid(row=0, column=0, sticky="w", pady=(0, XS))
+        self.lbl_learning_content = self._wrap_label(data, text="Nội dung:  " + self.ctl.content_status_text(),
+                                                     style="Card.TLabel")
+        self.lbl_learning_content.grid(row=1, column=0, sticky="w", pady=(0, XS))
+        dbtns = ttk.Frame(data, style="Card.TFrame")
+        dbtns.grid(row=2, column=0, sticky="w", pady=(S, 0))
+        ttk.Button(dbtns, text="Mở thư mục dữ liệu học", command=self.open_learning_folder).pack(side="left", padx=(0, XS))
+        ttk.Button(dbtns, text="Xuất dữ liệu học", command=self.export_learning_data).pack(side="left")
+
+        review = self._card(page, "Kiểm tra dữ liệu", 1)
+        self.learning_cards["review"] = review
+        rbtns = ttk.Frame(review, style="Card.TFrame")
+        rbtns.grid(row=0, column=0, sticky="w", pady=(0, XS))
+        self.btn_review_images = ttk.Button(rbtns, text="Kiểm tra hình ảnh cải tiến", command=self.open_image_review,
+                                            style="Primary.TButton")
+        self.btn_review_images.pack(side="left", padx=(0, XS))
+        self.btn_review_content = ttk.Button(rbtns, text="Kiểm tra nội dung cải tiến", command=self.open_content_review,
+                                             style="Primary.TButton")
+        self.btn_review_content.pack(side="left")
+        self.lbl_review_summary = self._wrap_label(review, text=self.ctl.review_summary_text(), style="Secondary.TLabel")
+        self.lbl_review_summary.grid(row=1, column=0, sticky="w", pady=(XS, 0))
+        self.lbl_review_content_summary = self._wrap_label(review, text=self.ctl.content_review_summary_text(),
+                                                           style="Secondary.TLabel")
+        self.lbl_review_content_summary.grid(row=2, column=0, sticky="w", pady=(XS, 0))
+
+        models = self._card(page, "Mô hình học", 2)
+        self.learning_cards["models"] = models
+        self.lbl_learning_model = self._wrap_label(models, text=self.ctl.learning_model_status_text(),
+                                                   style="Card.TLabel")
+        self.lbl_learning_model.grid(row=0, column=0, sticky="w", pady=(0, XS))
+        self.btn_train_images = ttk.Button(models, text="Cập nhật mô hình học", command=self.train_models,
+                                           style="Primary.TButton")
+        self.btn_train_images.grid(row=1, column=0, sticky="w", pady=(S, 0))
+
+        apply = self._card(page, "Áp dụng dữ liệu đã học", 3)
+        self.learning_cards["apply"] = apply
+        self.btn_reapply_saved = ttk.Button(apply, text="Cập nhật Excel từ nhãn đã lưu",
+                                            command=self.reapply_saved_content)
+        self.btn_reapply_saved.grid(row=0, column=0, sticky="w")
+        self.lbl_reapply_pending = self._wrap_label(apply, text="", style="Secondary.TLabel")
+        self.lbl_reapply_pending.grid(row=1, column=0, sticky="w", pady=(XS, 0))
+
+        info = self._card(page, "Thông tin", 4)
+        self.learning_cards["info"] = info
+        self._wrap_label(info, text=("Nhãn xác nhận được lưu trong learning_data/ cạnh chương trình và được giữ lại "
+                                     "khi cập nhật. Hình ảnh, nội dung và mô hình học dùng dữ liệu cục bộ; nhãn cũ "
+                                     "không làm thay đổi quy tắc ngữ nghĩa của hình ảnh đưa vào Excel."),
+                         style="Secondary.TLabel").grid(row=0, column=0, sticky="w")
+        self._render_learning()
 
     def _bind_shortcuts(self) -> None:
         """Safe conveniences: Ctrl+F focuses the search box, F5 rescans only while idle."""
@@ -1958,10 +1990,16 @@ class ReportExtractorApp:
     # ------------------------------------------------------------------ PROMPT-006 image review / learning
     def _render_learning(self) -> None:
         if hasattr(self, "lbl_learning"):
-            self.lbl_learning.configure(text="Ảnh:  " + self.ctl.learning_status_text())
+            self.lbl_learning.configure(text="Hình ảnh:  " + self.ctl.learning_status_text())
             self.lbl_review_summary.configure(text=self.ctl.review_summary_text())
             self.lbl_learning_content.configure(text="Nội dung:  " + self.ctl.content_status_text())
             self.lbl_review_content_summary.configure(text=self.ctl.content_review_summary_text())
+        if hasattr(self, "lbl_learning_model"):
+            self.lbl_learning_model.configure(text=self.ctl.learning_model_status_text())
+        if hasattr(self, "lbl_reapply_pending"):
+            count = self.ctl.content_reapply_pending
+            self.lbl_reapply_pending.configure(text=(f"Đang chờ cập nhật Excel: {count} mục (có thể thử lại)." if count
+                                                      else "Không có lần cập nhật Excel nào đang chờ."))
         if hasattr(self, "btn_reapply_saved"):
             self.btn_reapply_saved.configure(state="normal" if self.ctl.content_reapply_pending else "disabled")
 
