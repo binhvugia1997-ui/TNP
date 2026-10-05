@@ -218,3 +218,11 @@
   chờ (`pending_content_reapply`), `retry_content_reapply()` chỉ làm lại Excel; GUI: hộp [Thử lại] [Để sau] + nút
   "Cập nhật Excel từ nhãn đã lưu". Log: CONTENT_REAPPLY_START / PREPARED / COMMIT_OK / COMMIT_FAILED.
 - Test: `tests/test_excel_lock_retry.py` (13). Tổng 804 passed.
+
+## PROMPT-012 — BUILD_AND_PUBLISH.bat (v1.2.1 / Build 012)
+- `app/__init__.py`: 1.2.1 / BUILD_NUMBER 12 (gói `ReportExtractor_1.2.1.zip`). Fixture "bản mới hơn" → 1.2.2 / Build 013+.
+- `tools/build_and_publish.py`: `git_sync` (fetch + pull --ff-only; dừng khi dirty/ahead/diverged/detached/sai nhánh;
+  không reset/stash/force), `check_not_already_published` (so với version.json đang phát hành), chạy
+  `tools/build_portable.py` (stream + log `logs/build_and_publish_*.log`), mã thoát 0/1/2/3/4.
+- `BUILD_AND_PUBLISH.bat` ở gốc repo: tìm Python 3.10–3.13 + git, gọi orchestrator, báo kết quả tiếng Việt.
+- Test: `tests/test_build_and_publish.py` (19, dùng git thật trên repo tạm). Tổng 823 passed. Chưa build Portable.

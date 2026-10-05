@@ -410,6 +410,16 @@ Checklist smoke test Windows: (A) máy sạch không Python/Ollama → winget c�
 * Phát hành: `build_portable.bat` tạo `release\ReportExtractor_<version>.zip`, `release\SHA256SUMS.txt` và
   `release\version.json` (SHA256 của đúng file ZIP). Xuất bản = copy ZIP vào thư mục Update **trước**, copy
   `version.json` **sau cùng**.
+* **Một cú nhấp (PROMPT-012, v1.2.1 / Build 012): `BUILD_AND_PUBLISH.bat`** ở gốc repo trên máy build:
+  1. `git fetch` + `git pull --ff-only` an toàn (dừng nếu có sửa đổi chưa commit, commit cục bộ chưa push, nhánh phân
+     nhánh, detached HEAD, sai nhánh khi đặt `--branch`/`RE_BUILD_BRANCH`); không bao giờ reset/stash/force;
+  2. kiểm tra số Build sắp phát hành so với `version.json` đang có trong thư mục cập nhật (trùng/cũ hơn → dừng, `--force`
+     để xuất bản lại);
+  3. `tools\build_portable.py` (pyflakes, pytest, PyInstaller, kiểm tra gói, ZIP, SHA256SUMS.txt, version.json);
+  4. xuất bản vào `D:\ReportExtractor_Update` (ZIP trước, version.json sau cùng) → máy làm việc tự phát hiện.
+  Mã thoát: 0 xong, 2 dừng ở Git, 4 Build đã xuất bản, 3 build xong nhưng xuất bản lỗi, 1 build lỗi. Nhật ký:
+  `logs\build_and_publish_<timestamp>.log`. Tuỳ chọn: `--dry-run`, `--no-sync`, `--no-publish`, `--skip-tests`,
+  `--publish-dir`, `--branch`.
 
 
 ## Học & sửa ảnh cải tiến (PROMPT-006 – thử nghiệm, v1.1.0-beta / Build 006)

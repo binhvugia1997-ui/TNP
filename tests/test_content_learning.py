@@ -92,7 +92,7 @@ def _synthetic(n_inc=12, n_exc=12, schema=CONTENT_FEATURE_SCHEMA):
 
 # ================================================================== §21 features / hard exclusions / baseline
 def test_version_build_007():
-    assert app.__version__ == "1.2.0" and app.BUILD_NUMBER == 11 and app.BUILD_ID == "011"
+    assert app.__version__ == "1.2.1" and app.BUILD_NUMBER == 12 and app.BUILD_ID == "012"
     init = (Path(__file__).resolve().parent.parent / "backup" / "ReportExtractor_v1.0.4_Build004_STABLE" / "app"
             / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "1.0.4"' in init and "BUILD_NUMBER = 4" in init

@@ -15,7 +15,7 @@ from tests.test_updater import make_portable, make_release_zip
 
 SRC = Path(app.__file__).with_name("gui.py").read_text(encoding="utf-8")
 CTL_SRC = Path(app.__file__).with_name("gui_controller.py").read_text(encoding="utf-8")
-NEW_V, NEW_B = "1.2.1", app.BUILD_NUMBER + 1
+NEW_V, NEW_B = "1.2.2", app.BUILD_NUMBER + 1
 
 
 def _big_update_folder(tmp_path, size_mb=3, sha=True):
@@ -244,4 +244,4 @@ def test_labels_and_build_011():
     p = UpdateProgress(stage="COPYING", bytes_copied=int(58.4 * (1 << 20)), total_bytes=int(87.1 * (1 << 20)),
                        percent=67.0, speed_bps=11.2 * (1 << 20))
     assert p.bytes_text == "58.4 MB / 87.1 MB" and p.speed_text == "Tốc độ: 11.2 MB/s"
-    assert app.__version__ == "1.2.0" and app.BUILD_NUMBER == 11 and app.BUILD_LABEL == "Build 011"
+    assert app.__version__ == "1.2.1" and app.BUILD_NUMBER == 12 and app.BUILD_LABEL == "Build 012"
