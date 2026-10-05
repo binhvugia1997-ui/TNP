@@ -120,6 +120,16 @@ def confidence_band(c: float) -> str:
     return "low"
 
 
+def lookup_override(overrides: Dict[str, str], candidate_id: str) -> Optional[str]:
+    """Exact id first; else the unambiguous label stored for the same ``report|S<slide>|SH<shape>`` (the reading-
+    order suffix of ids recorded before the group-geometry fix may differ; the shape identity is stable)."""
+    if candidate_id in overrides:
+        return overrides[candidate_id]
+    prefix = candidate_id.rsplit("|", 1)[0] + "|"
+    hits = {v for k, v in overrides.items() if k.startswith(prefix)}
+    return hits.pop() if len(hits) == 1 else None
+
+
 def candidate_id_for(report_key: str, slide: int, shape_id: int, order: int) -> str:
     return f"{report_key}|S{slide}|#{shape_id}|{order}"
 
@@ -595,7 +605,7 @@ def decide(cands: Sequence[ImageCandidate], model: Optional[ImageModel] = None,
     overrides = overrides or {}
     for c in cands:
         c.evidence = [e for e in c.evidence if not e.startswith("mô hình học") and not e.startswith("người dùng")]
-        lbl = overrides.get(c.candidate_id, UNLABELED)
+        lbl = lookup_override(overrides, c.candidate_id) or UNLABELED
         c.user_label = lbl if lbl in LABELS else UNLABELED
         if c.hard_excluded:                                              # logos / arrows / icons: never inserted
             c.decision, c.decision_source = "exclude", "rules"

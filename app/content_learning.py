@@ -25,7 +25,7 @@ from .classifier import INSPECTION_WORDS_RE, is_heading_like
 from .content_region import (ROLE_CAPTION, ROLE_CONTENT, ROLE_FURNITURE, ROLE_SIDEBAR, ROLE_TITLE, classify_blocks,
                              inline_anchor_kind, title_text)
 from .image_learning import (CONFIDENCE_VI, ImageModel, LabelStore, TrainingError, confidence_band, load_model,
-                             save_model, train_model)
+                             lookup_override, save_model, train_model)
 from .improvement_pictures import is_blue, is_decorative_picture
 from .pptx_parser import Block, ReportData, clean_text, norm_key
 
@@ -299,7 +299,7 @@ def decide_content(cands: Sequence[ContentCandidate], model: Optional[ImageModel
     overrides = overrides or {}
     for c in cands:
         c.evidence = [e for e in c.evidence if not e.startswith("mô hình học") and not e.startswith("người dùng")]
-        lbl = overrides.get(c.candidate_id, CONTENT_UNLABELED)
+        lbl = lookup_override(overrides, c.candidate_id) or CONTENT_UNLABELED
         c.user_label = lbl if lbl in CONTENT_LABELS else CONTENT_UNLABELED
         c.learned_probability = None
         if c.hard_excluded:                                              # 1. hard structural exclusions

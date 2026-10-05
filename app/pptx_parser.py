@@ -6,6 +6,7 @@ reading order matches the slide layout.
 """
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -15,8 +16,10 @@ from typing import Any, Iterator, List, Optional, Tuple
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+LOG = logging.getLogger("report_extractor.pptx_parser")
 EMU_PER_INCH = 914400
 _NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
 
 
 # ----------------------------------------------------------------------------
@@ -170,16 +173,70 @@ def _paragraph_text(paragraph) -> str:
     return "".join(r.text for r in paragraph.runs) if paragraph.runs else paragraph.text
 
 
-def _iter_shapes(shapes, offset=(0, 0)) -> Iterator[Tuple[Any, Tuple[int, int]]]:
-    """Yield (shape, absolute_offset) flattening groups."""
+class GroupXform:
+    """Affine map from a group's CHILD coordinate space to absolute slide EMU.
+
+    DrawingML stores every child of ``p:grpSp`` in the group's child space (``a:chOff`` / ``a:chExt``) which is
+    mapped onto the group's own ``a:off`` / ``a:ext``.  python-pptx returns the raw child values, so once a group
+    has been moved or resized (``chOff != off`` – the normal case in real decks) the raw numbers point at the
+    wrong place on the slide.  Nested groups compose their transforms.
+    """
+    __slots__ = ("ox", "oy", "sx", "sy", "chx", "chy")
+
+    def __init__(self, ox=0, oy=0, sx=1.0, sy=1.0, chx=0, chy=0):
+        self.ox, self.oy, self.sx, self.sy, self.chx, self.chy = ox, oy, sx, sy, chx, chy
+
+    IDENTITY: "GroupXform"
+
+    def child(self, group) -> "GroupXform":
+        """Transform for the children of ``group`` (itself positioned through *self*)."""
+        try:
+            xfrm = group._element.find("{%s}grpSpPr/{%s}xfrm" % (_NS_P, _NS_A))
+            off = xfrm.find("{%s}off" % _NS_A)
+            ext = xfrm.find("{%s}ext" % _NS_A)
+            ch_off = xfrm.find("{%s}chOff" % _NS_A)
+            ch_ext = xfrm.find("{%s}chExt" % _NS_A)
+            gx, gy = int(off.get("x", 0)), int(off.get("y", 0))
+            gw, gh = int(ext.get("cx", 0)), int(ext.get("cy", 0))
+            chx = int(ch_off.get("x", 0)) if ch_off is not None else gx
+            chy = int(ch_off.get("y", 0)) if ch_off is not None else gy
+            chw = int(ch_ext.get("cx", 0)) if ch_ext is not None else gw
+            chh = int(ch_ext.get("cy", 0)) if ch_ext is not None else gh
+        except Exception:
+            return self
+        sx = (gw / chw) if (chw and gw) else 1.0
+        sy = (gh / chh) if (chh and gh) else 1.0
+        # the group's own box is expressed in the parent's space -> map it first
+        ax, ay, aw, ah = self.apply(gx, gy, gw, gh)
+        sx *= (aw / gw) if gw else 1.0
+        sy *= (ah / gh) if gh else 1.0
+        return GroupXform(ax, ay, sx, sy, chx, chy)
+
+    def apply(self, left, top, width, height) -> Tuple[int, int, int, int]:
+        left, top, width, height = int(left or 0), int(top or 0), int(width or 0), int(height or 0)
+        return (int(round(self.ox + (left - self.chx) * self.sx)), int(round(self.oy + (top - self.chy) * self.sy)),
+                int(round(width * self.sx)), int(round(height * self.sy)))
+
+
+GroupXform.IDENTITY = GroupXform()
+
+
+def shape_geometry(shape, offset) -> Tuple[int, int, int, int]:
+    """Absolute (left, top, width, height) of ``shape``; ``offset`` is a :class:`GroupXform` or a legacy (dx, dy)."""
+    if isinstance(offset, GroupXform):
+        return offset.apply(shape.left, shape.top, shape.width, shape.height)
+    dx, dy = offset
+    return int(shape.left or 0) + dx, int(shape.top or 0) + dy, int(shape.width or 0), int(shape.height or 0)
+
+
+def _iter_shapes(shapes, offset=None) -> Iterator[Tuple[Any, GroupXform]]:
+    """Yield (shape, GroupXform) flattening groups recursively (nested groups compose their transforms)."""
+    xf = offset if isinstance(offset, GroupXform) else GroupXform.IDENTITY
     for shape in shapes:
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            # child coordinates are relative to group's child offset; python-pptx
-            # already stores absolute-like coordinates for most decks, so we keep
-            # a simple approach: use child coordinates directly.
-            yield from _iter_shapes(shape.shapes, offset)
+            yield from _iter_shapes(shape.shapes, xf.child(shape))
         else:
-            yield shape, offset
+            yield shape, xf
 
 
 _THEME_SLOTS = {"TEXT_1": "dk1", "DARK_1": "dk1", "BACKGROUND_1": "lt1", "LIGHT_1": "lt1", "TEXT_2": "dk2",
@@ -289,8 +346,8 @@ def arrow_block(shape, offset, prst: str, rotation: float) -> Optional[Block]:
             direction = _rotate_dir(d, rotation, False, False)
         else:
             return None
-        b = Block(kind="arrow", left=int(shape.left or 0) + offset[0], top=int(shape.top or 0) + offset[1],
-                  width=int(shape.width or 0), height=int(shape.height or 0), shape_id=shape.shape_id,
+        a_left, a_top, a_w, a_h = shape_geometry(shape, offset)
+        b = Block(kind="arrow", left=a_left, top=a_top, width=a_w, height=a_h, shape_id=shape.shape_id,
                   shape_name=shape.name, prst=prst, rotation=rotation, direction=direction)
         return b
     except Exception:
@@ -324,10 +381,7 @@ def _frame_blocks(shape, offset, is_title: bool, theme: Optional[dict] = None) -
     theme = theme or {}
     tf = shape.text_frame
     colors: List[str] = []
-    left = int(shape.left or 0) + offset[0]
-    top = int(shape.top or 0) + offset[1]
-    width = int(shape.width or 0)
-    height = int(shape.height or 0)
+    left, top, width, height = shape_geometry(shape, offset)
     lines: List[Tuple[str, int, bool, Optional[float]]] = []
     for i, p in enumerate(tf.paragraphs):
         txt = clean_text(_paragraph_text(p))
@@ -385,14 +439,15 @@ def _table_block(shape, offset) -> Optional[Block]:
             lines.append(" | ".join(non_empty))
     if not lines:
         return None
+    left, top, width, height = shape_geometry(shape, offset)
     return Block(
         kind="table",
         text="\n".join(lines),
         rows=rows,
-        left=int(shape.left or 0) + offset[0],
-        top=int(shape.top or 0) + offset[1],
-        width=int(shape.width or 0),
-        height=int(shape.height or 0),
+        left=left,
+        top=top,
+        width=width,
+        height=height,
         shape_id=shape.shape_id,
         shape_name=shape.name,
     )
@@ -412,18 +467,38 @@ def _picture_block(shape, offset) -> Optional[Block]:
             descr = " ".join(filter(None, [cnv[0].get("descr", ""), cnv[0].get("title", "")]))
     except Exception:
         pass
+    left, top, width, height = shape_geometry(shape, offset)
     return Block(
         kind="picture",
-        left=int(shape.left or 0) + offset[0],
-        top=int(shape.top or 0) + offset[1],
-        width=int(shape.width or 0),
-        height=int(shape.height or 0),
+        left=left,
+        top=top,
+        width=width,
+        height=height,
         shape_id=shape.shape_id,
         shape_name=shape.name,
         image_blob=blob,
         image_ext=ext,
         alt_text=descr.strip(),
     )
+
+
+def _dedupe_shape_ids(blocks: List[Block], slide_no: int = 0) -> None:
+    """Make ``shape_id`` unique per slide for text/table/picture blocks.
+
+    Copy-pasted (grouped) shapes may carry the same ``cNvPr id``; downstream, sections, candidates and learning
+    labels are keyed by ``(slide, shape_id)``, so a collision silently attaches one shape's evidence to another
+    shape's text.  The first occurrence keeps its id; later ones get fresh ids above the slide maximum.
+    """
+    used = set()
+    next_id = max([b.shape_id for b in blocks] + [0]) + 1
+    for b in blocks:
+        if b.kind == "arrow":
+            continue
+        if b.shape_id in used:
+            LOG.debug("slide %s: duplicate shape id %s (%r) -> %s", slide_no, b.shape_id, b.text[:30], next_id)
+            b.shape_id = next_id
+            next_id += 1
+        used.add(b.shape_id)
 
 
 def reading_order(blocks: List[Block], slide_height: int) -> List[Block]:
@@ -644,6 +719,7 @@ def parse_pptx(path: str | Path) -> ReportData:
             sd.xml_stats = xml_inventory(slide)
         except Exception:
             sd.xml_stats = {}
+        _dedupe_shape_ids(blocks, idx)
         sd.blocks = reading_order(blocks, report.slide_height)
         sd.arrows = sorted(arrows, key=lambda a: (a.top, a.left))
         try:

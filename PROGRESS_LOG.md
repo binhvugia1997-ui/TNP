@@ -194,3 +194,14 @@
 - Test nhận dạng hiện tại cập nhật sang 1.2.0; fixture "bản mới hơn" dùng 1.2.1 / Build 012+; tham chiếu lịch sử giữ nguyên.
 - Dọn các file do một lần chạy nhầm trình cập nhật ngoài để lại ở gốc repo (ReportExtractor.exe, VERSION.txt, README.txt,
   _internal/) — đã bỏ khỏi Git, thêm vào .gitignore; conftest chặn mọi test spawn trình cập nhật thật. Tổng 779 passed.
+
+## BUGFIX — khối chữ trong GROUP: cửa sổ "Kiểm tra nội dung cải tiến" chỉ hiện "Massage"
+- Nguyên nhân gốc (`app/pptx_parser.py`): shape con của `p:grpSp` được lưu theo toạ độ con (`a:chOff/a:chExt`); parser
+  dùng thẳng giá trị thô → khi group đã bị kéo/thu phóng, mọi textbox trong group bị đặt sai vị trí (rơi vào dải tiêu đề /
+  cột sidebar) nên tiêu đề/nội dung mục cải tiến bị loại trừ cứng hoặc đổi thứ tự, còn nhãn nhỏ "Massage" giữ bằng chứng
+  vùng. Kèm theo: shape copy-paste trong group có thể trùng `cNvPr id` → sections/candidates/nhãn bị gán chéo theo
+  `(slide, shape_id)`.
+- Sửa: `GroupXform` (off/ext ↔ chOff/chExt, lồng nhau, có scale) cho textbox/bảng/ảnh/mũi tên; `_dedupe_shape_ids`
+  mỗi slide; `lookup_override` giữ nhãn cũ theo `report|S|SH` khi thứ tự đọc đổi (chỉ khi không mơ hồ).
+- Không đổi quy tắc nghiệp vụ trích xuất; không đổi version/build (1.2.0 / Build 011).
+- Test: `tests/test_content_group_candidates.py` (12). Tổng 791 passed.
