@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 import shutil
 from copy import copy
@@ -262,6 +263,49 @@ def _alias_score(cell_key: str, field: str) -> int:
 
 class TemplateError(RuntimeError):
     pass
+
+
+class ExcelLockedError(TemplateError):
+    """The destination workbook could not be replaced because another process (typically Microsoft Excel) holds
+    it open.  ``path`` is the locked file; ``original`` the technical exception (logged, never shown as the primary
+    GUI message)."""
+
+    def __init__(self, path: Path, original: BaseException):
+        self.path = Path(path)
+        self.original = original
+        super().__init__(locked_file_message(self.path))
+
+
+def locked_file_message(path: Path) -> str:
+    return ("Không thể cập nhật file Excel vì file đang được sử dụng.\n\nFile:\n" + str(path)
+            + "\n\nHãy đóng file Excel hoặc chương trình đang sử dụng file, sau đó thử lại.")
+
+
+_LOCK_WINERRORS = (32, 33)        # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+_LOCK_TEXT_RE = re.compile(r"WinError (32|33)\b|being used by another process|sharing violation|lock violation",
+                           re.IGNORECASE)
+
+
+def is_sharing_violation(err: BaseException) -> bool:
+    """True only for Windows sharing/lock violations – a plain ``PermissionError`` (read-only folder, ACL) is NOT
+    a lock and must not get the 'file is in use' message."""
+    if not isinstance(err, OSError):
+        return False
+    if getattr(err, "winerror", None) in _LOCK_WINERRORS:
+        return True
+    return bool(_LOCK_TEXT_RE.search(str(err)))
+
+
+def probe_writable(path: Path) -> Optional[BaseException]:
+    """Best-effort preflight: can ``path`` be opened for writing right now?  Returns the exception when it cannot
+    (never raises).  A file may still become locked afterwards – the commit boundary stays the real guard."""
+    try:
+        if Path(path).exists():
+            with open(path, "r+b"):
+                pass
+        return None
+    except OSError as e:
+        return e
 
 
 BACKUP_DIR_NAME = "backup"
@@ -1062,10 +1106,31 @@ class ExcelWriter:
         if problems:                                   # never persist an overflowing picture (#39)
             raise TemplateError("Ảnh vượt ra ngoài ô đích: " + "; ".join(problems))
         self._refresh_images()
-        self.wb.save(tmp)
-        shutil.move(str(tmp), str(self.output))
+        try:
+            self.wb.save(tmp)                           # openpyxl closes the ZipFile it writes
+        except OSError as e:
+            self._discard_tmp(tmp)
+            if is_sharing_violation(e):
+                raise ExcelLockedError(tmp, e) from e
+            raise
+        try:
+            os.replace(tmp, self.output)                # atomic on the same volume; the master is never half-written
+        except OSError as e:
+            self._discard_tmp(tmp)                      # the original master stays valid, backup stays valid
+            if is_sharing_violation(e):
+                LOG.warning("EXCEL_COMMIT_LOCKED target=%s error=%r", self.output, e)
+                raise ExcelLockedError(self.output, e) from e
+            raise
         self._dirty = False
         return self.output
+
+    @staticmethod
+    def _discard_tmp(tmp: Path) -> None:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
     def close(self) -> None:
         try:

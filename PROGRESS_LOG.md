@@ -205,3 +205,16 @@
   mỗi slide; `lookup_override` giữ nhãn cũ theo `report|S|SH` khi thứ tự đọc đổi (chỉ khi không mơ hồ).
 - Không đổi quy tắc nghiệp vụ trích xuất; không đổi version/build (1.2.0 / Build 011).
 - Test: `tests/test_content_group_candidates.py` (12). Tổng 791 passed.
+
+## PROMPT-011B — Content learning: Excel bị khoá (WinError 32) sau khi lưu nhãn (v1.2.0 / Build 011)
+- Nguyên nhân gốc: `reapply_content_labels` thêm dòng vào `updated_rows` ngay khi sửa ô trong bộ nhớ, rồi mới
+  `writer.save()`; `save()` ghi `master.saving.xlsx` và `shutil.move` đè lên master → Excel đang mở master
+  (khoá ngoài, không phải handle của app) → WinError 32 tại bước đổi tên; ngoại lệ bị gộp vào `errors` nên GUI báo
+  "đã cập nhật 7 dòng" + "Lỗi WinError 32" cùng lúc; file `.saving.xlsx` bị bỏ lại.
+- Sửa: `ExcelWriter.save()` → `os.replace` nguyên tử, dọn temp, `ExcelLockedError(path)` chỉ khi là sharing/lock
+  violation (`is_sharing_violation`: WinError 32/33), PermissionError khác giữ nguyên; `ReapplyResult` tách
+  `prepared_rows` / `updated_rows` (= committed) / `locked_path` / `technical_error`, commit chung `_commit()` cho cả
+  ảnh và nội dung; controller: nhãn là giao dịch riêng (`CONTENT_REVIEW_LABELS_SAVED`), Excel lỗi → giữ danh sách
+  chờ (`pending_content_reapply`), `retry_content_reapply()` chỉ làm lại Excel; GUI: hộp [Thử lại] [Để sau] + nút
+  "Cập nhật Excel từ nhãn đã lưu". Log: CONTENT_REAPPLY_START / PREPARED / COMMIT_OK / COMMIT_FAILED.
+- Test: `tests/test_excel_lock_retry.py` (13). Tổng 804 passed.

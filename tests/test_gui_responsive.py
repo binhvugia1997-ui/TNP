@@ -120,7 +120,7 @@ def test_all_learning_buttons_exist(monkeypatch, tmp_path):
     Button = reg["classes"]["Button"]
     texts = {w.cfg.get("text") for w in _descendants(reg, a.cfg_cards["learning"]) if isinstance(w, Button)}
     assert texts == {"Kiểm tra nội dung cải tiến", "Kiểm tra ảnh cải tiến", "Cập nhật mô hình học",
-                     "Mở thư mục dữ liệu học", "Xuất dữ liệu học"}
+                     "Mở thư mục dữ liệu học", "Xuất dữ liệu học", "Cập nhật Excel từ nhãn đã lưu"}
     assert a.btn_review_content.pack_info_ and a.btn_review_images.pack_info_ and a.btn_train_images.pack_info_
 
 

@@ -297,6 +297,20 @@ class ScanRow:
 
 
 @dataclass
+class ContentReviewOutcome:
+    """Separate counters of the content-review workflow (labels vs Excel) – never report prepared as committed."""
+    labels_saved: int = 0
+    excel_rows_prepared: int = 0
+    excel_rows_committed: int = 0
+    locked_path: Optional[str] = None
+    excel_error: str = ""
+
+    @property
+    def excel_pending(self) -> bool:
+        return self.excel_rows_prepared > 0 and self.excel_rows_committed == 0 and bool(self.excel_error)
+
+
+@dataclass
 class UiEvent:
     kind: str                      # row | progress | log | done | ollama | models | discovery_*
     payload: Any = None
@@ -443,6 +457,8 @@ class GuiController:
         self.review_index = 0
         self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
         self.pending_content_labels: Dict[str, str] = {}   # PROMPT-006B content review (separate dataset)
+        self.pending_content_reapply: list = []              # candidates whose Excel re-apply is still owed (locked)
+        self.last_content_review = ContentReviewOutcome()
         self.review_content_index = 0
 
     # ------------------------------------------------------------------ PROMPT-006 image learning
@@ -495,6 +511,9 @@ class GuiController:
         self.pending_content_labels[cand.candidate_id] = label
 
     def save_content_confirmations(self, cands) -> Tuple[bool, str]:
+        """Two independent transactions: (1) labels -> content_labels.jsonl (committed first, never rolled back);
+        (2) Excel re-apply, which may fail (e.g. the master is open in Excel) without touching (1).  A failed
+        Excel step keeps the touched candidates in ``pending_content_reapply`` so *Thử lại* only redoes Excel."""
         lrn = self.learning
         if lrn is None:
             return False, "Không ghi được dữ liệu học (thư mục learning_data không khả dụng)."
@@ -510,16 +529,57 @@ class GuiController:
                 written += 1
             touched.append(c)
         self.pending_content_labels.clear()
+        LOG.info("CONTENT_REVIEW_LABELS_SAVED count=%d", written)
+        self.last_content_review = ContentReviewOutcome(labels_saved=written)
         msg = f"Đã lưu {written} nhãn nội dung."
+        # merge rows still waiting from an earlier locked attempt (labels already on disk)
+        for c in self.pending_content_reapply:
+            if c.candidate_id not in {t.candidate_id for t in touched}:
+                touched.append(c)
+        self.pending_content_reapply = []
         if touched and self.template and self.output and Path(self.output).exists():
-            from .image_review import reapply_content_labels
-            res = reapply_content_labels(Path(self.template), Path(self.output), touched, lrn)
-            if res.updated_rows:
-                msg += f" Đã cập nhật nội dung cải tiến cho {len(res.updated_rows)} dòng Excel."
-            if res.errors:
-                msg += " Lỗi: " + "; ".join(res.errors)
-            self.log_lines.extend(res.messages + res.errors)
+            msg = self._content_reapply(touched, msg)
         return True, msg
+
+    def _content_reapply(self, touched, msg: str) -> str:
+        from .image_review import reapply_content_labels
+        res = reapply_content_labels(Path(self.template), Path(self.output), touched, self.learning)
+        out = self.last_content_review
+        out.excel_rows_prepared = len(res.prepared_rows)
+        out.excel_rows_committed = len(res.updated_rows)
+        out.locked_path = res.locked_path
+        out.excel_error = "; ".join(res.errors)
+        self.log_lines.extend(res.messages + res.errors)
+        if res.technical_error:
+            self.log_lines.append(f"Chi tiết kỹ thuật: {res.technical_error}")
+        if res.updated_rows:
+            msg += f" Đã cập nhật nội dung cải tiến cho {len(res.updated_rows)} dòng Excel."
+        if res.locked:
+            self.pending_content_reapply = list(touched)          # retry = Excel only, labels stay saved
+            n = len(res.prepared_rows)
+            msg += (f"\n\nChưa thể cập nhật {n} dòng Excel vì file đang được sử dụng:\n\n{res.locked_path}"
+                    "\n\nHãy đóng file rồi thử lại.")
+        elif res.errors:
+            self.pending_content_reapply = list(touched)
+            msg += "\n\nChưa cập nhật được Excel: " + "; ".join(res.errors)
+        return msg
+
+    def retry_content_reapply(self) -> Tuple[bool, str]:
+        """*Thử lại*: Excel transaction only – uses the labels already saved, no review, no re-labelling."""
+        touched = list(self.pending_content_reapply)
+        if not touched:
+            return False, "Không có dòng Excel nào đang chờ cập nhật."
+        if self.learning is None or not (self.template and self.output and Path(self.output).exists()):
+            return False, "Chưa có file Excel kết quả để cập nhật."
+        self.pending_content_reapply = []
+        saved = self.last_content_review.labels_saved
+        self.last_content_review = ContentReviewOutcome(labels_saved=saved)
+        msg = self._content_reapply(touched, f"Nhãn nội dung đã lưu trước đó ({saved} nhãn) được dùng lại.")
+        return self.last_content_review.excel_rows_committed > 0 or not self.last_content_review.excel_error, msg
+
+    @property
+    def content_reapply_pending(self) -> int:
+        return len(self.pending_content_reapply)
 
     def train_models(self) -> Tuple[bool, str]:
         """'Cập nhật mô hình học': image and content models independently, two result lines."""
@@ -598,8 +658,11 @@ class GuiController:
             res = reapply_labels(Path(self.template), Path(self.output), touched, lrn)
             if res.updated_rows:
                 msg += f" Đã cập nhật ảnh cải tiến cho {len(res.updated_rows)} dòng Excel ({res.pictures} ảnh)."
-            if res.errors:
-                msg += " Lỗi: " + "; ".join(res.errors)
+            if res.locked:
+                msg += (f"\n\nChưa thể cập nhật {len(res.prepared_rows)} dòng Excel vì file đang được sử dụng:"
+                        f"\n\n{res.locked_path}\n\nHãy đóng file rồi lưu xác nhận lại.")
+            elif res.errors:
+                msg += "\n\nChưa cập nhật được Excel: " + "; ".join(res.errors)
             self.log_lines.extend(res.messages + res.errors)
         return True, msg
 

@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Sequence
 
 from .classifier import heuristic_classify
 from .content_learning import ContentCandidate, select_content_with_learning
-from .excel_writer import ExcelWriter
+from .excel_writer import ExcelLockedError, ExcelWriter
 from .extractor import collect_sections, join_sections
 from .image_extractor import export_after_pictures
 from .image_learning import ImageCandidate, ImageLearning, select_with_learning
@@ -26,14 +26,56 @@ LOG = logging.getLogger("report_extractor.image_review")
 
 @dataclass
 class ReapplyResult:
-    updated_rows: List[int] = field(default_factory=list)
+    """Transaction view of an Excel re-apply.
+
+    ``prepared_rows`` are rows modified in memory; ``updated_rows`` (== committed rows) is filled ONLY after the
+    workbook has been written and atomically moved onto the target.  A locked target leaves ``updated_rows`` empty,
+    sets ``locked_path`` and keeps the friendly message in ``errors`` (technical detail in ``technical_error`` +
+    log)."""
+    updated_rows: List[int] = field(default_factory=list)          # committed rows
+    prepared_rows: List[int] = field(default_factory=list)
     pictures: int = 0
     messages: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    locked_path: Optional[str] = None
+    technical_error: str = ""
 
     @property
     def ok(self) -> bool:
         return not self.errors
+
+    @property
+    def committed_rows(self) -> List[int]:
+        return self.updated_rows
+
+    @property
+    def locked(self) -> bool:
+        return self.locked_path is not None
+
+
+def _commit(writer: ExcelWriter, res: ReapplyResult, kind: str) -> None:
+    """Commit boundary shared by both re-apply flows: rows become 'updated' only after a successful save."""
+    target = str(writer.output)
+    LOG.info("%s_REAPPLY_PREPARED rows=%d target=%s", kind, len(res.prepared_rows), target)
+    if not res.prepared_rows:
+        return
+    try:
+        writer.save()
+    except ExcelLockedError as e:
+        res.locked_path = str(e.path)
+        res.technical_error = repr(e.original)
+        res.errors.append(str(e))
+        LOG.error("%s_REAPPLY_COMMIT_FAILED target=%s prepared_rows=%d error=%r", kind, e.path,
+                  len(res.prepared_rows), e.original)
+        return
+    except Exception as e:  # noqa: BLE001
+        res.technical_error = repr(e)
+        res.errors.append(f"Lỗi khi lưu Excel: {e}")
+        LOG.error("%s_REAPPLY_COMMIT_FAILED target=%s prepared_rows=%d error=%r", kind, target,
+                  len(res.prepared_rows), e)
+        return
+    res.updated_rows = list(res.prepared_rows)
+    LOG.info("%s_REAPPLY_COMMIT_OK rows=%d target=%s", kind, len(res.updated_rows), target)
 
 
 def group_by_file(cands: Sequence[ImageCandidate]) -> Dict[str, List[ImageCandidate]]:
@@ -55,6 +97,7 @@ def reapply_labels(template: Path, output: Path, cands: Sequence[ImageCandidate]
         res.messages.append("Không có ảnh nào cần cập nhật.")
         return res
     own_writer = writer is None
+    LOG.info("IMAGE_REAPPLY_START target=%s files=%d", output, len(groups))
     try:
         if writer is None:
             writer = ExcelWriter(Path(template), Path(output))
@@ -84,7 +127,7 @@ def reapply_labels(template: Path, output: Path, cands: Sequence[ImageCandidate]
             except Exception as e:  # noqa: BLE001
                 res.errors.append(f"{Path(src).name}: không ghi được ảnh vào dòng {row} ({e})")
                 continue
-            res.updated_rows.append(row)
+            res.prepared_rows.append(row)
             res.pictures += n
             res.messages.append(f"{Path(src).name}: dòng {row} – {n} ảnh Sau cải tiến"
                                 + (f" ({'; '.join(problems)})" if problems else ""))
@@ -95,10 +138,10 @@ def reapply_labels(template: Path, output: Path, cands: Sequence[ImageCandidate]
                 if nc is not None:
                     c.decision, c.decision_source, c.user_label = nc.decision, nc.decision_source, nc.user_label
                     c.evidence = list(nc.evidence)
-        if res.updated_rows:
-            writer.save()
+        _commit(writer, res, "IMAGE")
     except Exception as e:  # noqa: BLE001
-        res.errors.append(f"Lỗi khi lưu Excel: {e}")
+        res.technical_error = repr(e)
+        res.errors.append(f"Lỗi khi cập nhật Excel: {e}")
     finally:
         if own_writer:
             writer.close()
@@ -126,6 +169,7 @@ def reapply_content_labels(template: Path, output: Path, cands: Sequence[Content
         return res
     content = getattr(learning, "content", learning)
     own_writer = writer is None
+    LOG.info("CONTENT_REAPPLY_START target=%s files=%d", output, len(groups))
     try:
         if writer is None:
             writer = ExcelWriter(Path(template), Path(output))
@@ -157,19 +201,19 @@ def reapply_content_labels(template: Path, output: Path, cands: Sequence[Content
             except Exception as e:  # noqa: BLE001
                 res.errors.append(f"{Path(src).name}: không ghi được nội dung vào dòng {row} ({e})")
                 continue
-            res.updated_rows.append(row)
+            res.prepared_rows.append(row)
             res.messages.append(f"{Path(src).name}: dòng {row} – nội dung cải tiến "
-                                + ("đã cập nhật" if changed else "không thay đổi"))
+                                + ("đã chuẩn bị" if changed else "không thay đổi"))
             by_id = {c.candidate_id: c for c in new_cands}
             for c in group:
                 nc = by_id.get(c.candidate_id)
                 if nc is not None:
                     c.decision, c.decision_source, c.user_label = nc.decision, nc.decision_source, nc.user_label
                     c.evidence = list(nc.evidence)
-        if res.updated_rows:
-            writer.save()
+        _commit(writer, res, "CONTENT")
     except Exception as e:  # noqa: BLE001
-        res.errors.append(f"Lỗi khi lưu Excel: {e}")
+        res.technical_error = repr(e)
+        res.errors.append(f"Lỗi khi cập nhật Excel: {e}")
     finally:
         if own_writer:
             writer.close()

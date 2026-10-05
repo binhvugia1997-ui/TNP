@@ -867,6 +867,8 @@ class ReportExtractorApp:
         self.btn_train_images.pack(side="left", padx=(0, XS))
         ttk.Button(lbtns, text="Mở thư mục dữ liệu học", command=self.open_learning_folder).pack(side="left", padx=(0, XS))
         ttk.Button(lbtns, text="Xuất dữ liệu học", command=self.export_learning_data).pack(side="left")
+        self.btn_reapply_saved = ttk.Button(lbtns, text="Cập nhật Excel từ nhãn đã lưu", command=self.reapply_saved_content)
+        self.btn_reapply_saved.pack(side="left", padx=(XS, 0))
         self.lbl_review_summary = self._wrap_label(lf, text=self.ctl.review_summary_text(), style="Secondary.TLabel")
         self.lbl_review_summary.grid(row=2, column=0, sticky="w")
         self.lbl_review_content_summary = self._wrap_label(lf, text=self.ctl.content_review_summary_text(),
@@ -1960,6 +1962,8 @@ class ReportExtractorApp:
             self.lbl_review_summary.configure(text=self.ctl.review_summary_text())
             self.lbl_learning_content.configure(text="Nội dung:  " + self.ctl.content_status_text())
             self.lbl_review_content_summary.configure(text=self.ctl.content_review_summary_text())
+        if hasattr(self, "btn_reapply_saved"):
+            self.btn_reapply_saved.configure(state="normal" if self.ctl.content_reapply_pending else "disabled")
 
     def train_models(self) -> None:
         ok, msg = self.ctl.train_models()
@@ -2072,6 +2076,66 @@ class ReportExtractorApp:
         self.log(msg)
         self._render_learning()
         self._creview_render()
+        if ok and self.ctl.last_content_review.excel_pending:
+            self._open_excel_retry(msg)                 # labels are saved; only the Excel step is owed
+            return
+        (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
+
+    # ---- Excel re-apply retry ([Thử lại] [Để sau]) ---------------------------------------------------------------
+    def _open_excel_retry(self, msg: str) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Chưa cập nhật được Excel")
+        win.resizable(True, True)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        self.excel_retry_win = win
+        self.lbl_excel_retry = ttk.Label(win, text=msg, wraplength=560, justify="left")
+        self.lbl_excel_retry.grid(row=0, column=0, sticky="nsew", padx=M, pady=M)
+        btns = ttk.Frame(win)
+        btns.grid(row=1, column=0, sticky="e", padx=M, pady=(0, M))
+        self.btn_excel_retry = ttk.Button(btns, text="Thử lại", style="Primary.TButton", command=self._excel_retry)
+        self.btn_excel_retry.pack(side="left", padx=(0, XS))
+        self.btn_excel_later = ttk.Button(btns, text="Để sau", command=self._excel_retry_later)
+        self.btn_excel_later.pack(side="left")
+        try:
+            win.protocol("WM_DELETE_WINDOW", self._excel_retry_later)
+        except Exception:
+            pass
+
+    def _excel_retry(self) -> None:
+        ok, msg = self.ctl.retry_content_reapply()
+        self.log(msg)
+        self._render_learning()
+        if self.ctl.last_content_review.excel_pending:
+            self.lbl_excel_retry.configure(text=msg)    # still locked: keep the dialog, labels still safe
+            return
+        self._close_excel_retry()
+        (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
+
+    def _excel_retry_later(self) -> None:
+        n = self.ctl.content_reapply_pending
+        self._close_excel_retry()
+        self.log(f"Để sau: nhãn nội dung đã được lưu; {n} mục còn chờ cập nhật Excel – "
+                 "sẽ cập nhật ở lần 'Lưu xác nhận' tiếp theo hoặc qua nút 'Cập nhật Excel từ nhãn đã lưu'.")
+        self._render_learning()
+
+    def _close_excel_retry(self) -> None:
+        win = getattr(self, "excel_retry_win", None)
+        self.excel_retry_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def reapply_saved_content(self) -> None:
+        """Button on the learning card: redo the owed Excel update from labels already on disk."""
+        ok, msg = self.ctl.retry_content_reapply()
+        self.log(msg)
+        self._render_learning()
+        if self.ctl.last_content_review.excel_pending:
+            self._open_excel_retry(msg)
+            return
         (messagebox.showinfo if ok else messagebox.showwarning)(APP_NAME, msg)
 
     def open_learning_folder(self) -> None:
