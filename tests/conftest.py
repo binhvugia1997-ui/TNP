@@ -19,6 +19,18 @@ def _isolated_learning_dir(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _never_spawn_real_updater(monkeypatch):
+    """Safety net: no test may launch the real external updater (it would apply a fake release onto the repository,
+    which is the dev portable_root).  Tests that need a spawn pass their own recorder; a default spawn fails loudly."""
+    import app.updater as up
+
+    def _forbidden(cmd, **kwargs):
+        raise AssertionError(f"test tried to spawn the real updater: {cmd}")
+    monkeypatch.setattr(up.launch_updater, "__defaults__", (_forbidden,))
+    yield
+
+
 @pytest.fixture(scope="session")
 def sample_tree(tmp_path_factory):
     root = tmp_path_factory.mktemp("sample")

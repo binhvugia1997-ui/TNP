@@ -22,3 +22,9 @@ config/
 update_staging/
 update_backup/
 learning_data/
+# artefacts a mis-run updater would drop into the repository root (dev portable_root)
+/ReportExtractor.exe
+/VERSION.txt
+/README.txt
+/_internal/
+/SHA256SUMS.txt

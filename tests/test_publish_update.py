@@ -19,7 +19,7 @@ BUILD_SRC = (ROOT / "tools" / "build_portable.py").read_text(encoding="utf-8")
 BAT = (ROOT / "build_portable.bat").read_text(encoding="utf-8")
 
 
-def _release(tmp_path, version="1.1.0-beta", build=10, payload=b"ZIP" * 5000, name="release"):
+def _release(tmp_path, version="1.2.0", build=11, payload=b"ZIP" * 5000, name="release"):
     rel = tmp_path / name
     rel.mkdir(parents=True, exist_ok=True)
     zip_path = rel / f"ReportExtractor_{version}.zip"
@@ -261,4 +261,4 @@ def test_destination_is_centralised_and_configurable(monkeypatch):
 
 
 def test_build_010_identity():
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 11 and app.BUILD_LABEL == "Build 011"
+    assert app.__version__ == "1.2.0" and app.BUILD_NUMBER == 11 and app.BUILD_LABEL == "Build 011"

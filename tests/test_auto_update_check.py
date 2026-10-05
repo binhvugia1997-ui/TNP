@@ -52,7 +52,7 @@ def test_auto_check_enabled_by_default_and_persists(tmp_path):
 
 
 def test_disabled_setting_prevents_startup_check_but_not_manual(tmp_path):
-    folder = make_update_folder(tmp_path / "Update", version="1.1.0-beta", build=CUR + 1)
+    folder = make_update_folder(tmp_path / "Update", version="1.2.1", build=CUR + 1)
     c = _ctl(tmp_path, str(folder), extra={AUTO_UPDATE_CHECK_KEY: False})
     assert not c.check_update_async(startup=True) and c.update_check is None and not c.update_busy
     assert c.check_update_async()                                       # manual still works
@@ -115,7 +115,7 @@ def test_build_comparison_008_009_scenarios(tmp_path):
 
 
 def test_version_check_reads_only_manifest_and_never_copies_zip(tmp_path, monkeypatch):
-    folder = make_update_folder(tmp_path / "Update", version="1.1.0-beta", build=CUR + 1)
+    folder = make_update_folder(tmp_path / "Update", version="1.2.1", build=CUR + 1)
     zip_path = next(folder.glob("*.zip"))
     reads = []
     real_open = Path.open
@@ -177,7 +177,7 @@ def test_manual_check_still_reports_explicit_errors(monkeypatch, tmp_path):
 
 # ------------------------------------------------------------------ 12-14 notification once / Để sau / Cập nhật ngay
 def _gui_with_update(monkeypatch, tmp_path, build=CUR + 1):
-    folder = make_update_folder(tmp_path / "Update", version="1.1.0-beta", build=build)
+    folder = make_update_folder(tmp_path / "Update", version="1.2.1", build=build)
     cfg = AppConfig(update_path=str(folder))
     monkeypatch.setattr("tests.test_gui_redesign.AppConfig", lambda **k: cfg)
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
@@ -189,8 +189,8 @@ def test_startup_detects_newer_build_and_offers_once(monkeypatch, tmp_path):
     offers = []
     monkeypatch.setattr(a, "_confirm_update", lambda label: offers.append(label) or False)   # user: Để sau
     _startup(a)
-    assert offers == ["1.1.0-beta — Build 012"]
-    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.1.0-beta — Build 012"
+    assert offers == ["1.2.1 — Build 012"]
+    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.2.1 — Build 012"
     assert a.btn_install_update.cfg["state"] == "normal"
     for _ in range(3):                                                  # polls / re-renders: no repeated popup
         a._poll()
@@ -198,13 +198,13 @@ def test_startup_detects_newer_build_and_offers_once(monkeypatch, tmp_path):
     a.check_update()                                                    # manual check of the same build
     _join(a.ctl)
     a._poll()
-    assert offers == ["1.1.0-beta — Build 012"] and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
+    assert offers == ["1.2.1 — Build 012"] and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
     # a NEWER remote build published later in the same session is announced again (once)
-    make_update_folder(folder, version="1.1.0-beta", build=CUR + 2)
+    make_update_folder(folder, version="1.2.1", build=CUR + 2)
     a.check_update()
     _join(a.ctl)
     a._poll()
-    assert offers == ["1.1.0-beta — Build 012", "1.1.0-beta — Build 013"]
+    assert offers == ["1.2.1 — Build 012", "1.2.1 — Build 013"]
 
 
 def test_same_or_older_build_is_not_offered(monkeypatch, tmp_path):
@@ -247,7 +247,7 @@ def test_unc_and_local_paths_accepted(tmp_path):
     for p in (r"\\BUILD-PC\ReportExtractor_Update", r"\\192.168.1.50\ReportExtractor_Update", r"I:\QPn"):
         c.set_update_path(p)
         assert c.update_path == p and c.check_update().status in ("inaccessible", "no_permission", "no_manifest")
-    folder = make_update_folder(tmp_path / "local", version="1.1.0-beta", build=CUR + 1)
+    folder = make_update_folder(tmp_path / "local", version="1.2.1", build=CUR + 1)
     c.set_update_path(str(folder))
     assert c.check_update().status == "available"
     c.save_settings()
@@ -261,8 +261,8 @@ def test_update_card_layout_and_build_009(monkeypatch, tmp_path):
     body = a.cfg_cards["update"]
     rows = {w.grid_info_.get("row") for w in reg["widgets"] if getattr(w, "master", None) is body and w.grid_info_}
     assert rows == {0, 1, 2, 3, 4, 5} and a.chk_auto_update.grid_info_["row"] == 2 < a.lbl_update.grid_info_["row"]
-    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.1.0-beta — Build 011"
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 11 and app.BUILD_LABEL == "Build 011"
+    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.2.0 — Build 011"
+    assert app.__version__ == "1.2.0" and app.BUILD_NUMBER == 11 and app.BUILD_LABEL == "Build 011"
     assert a.cfg_page.row_weights == {4: 1}                             # responsive settings page unchanged
 
 
@@ -283,3 +283,18 @@ def test_pending_vs_finished_state_contract(monkeypatch, tmp_path):
     assert c.update_check_done.wait(10)
     assert c.update_check is not None and c.update_check.status == "inaccessible" and not c.update_busy
     assert c.update_dirty and c.update_status_text() == AUTO_CHECK_FAILED_VI
+
+
+def test_legacy_beta_client_sees_1_2_0_build_011_as_normal_update(tmp_path):
+    """Compatibility: a 1.1.0-beta / Build 010 client must treat 1.2.0 / Build 011 as an ordinary update
+    (numeric build authoritative; the version-string change is irrelevant for ordering)."""
+    folder = make_update_folder(tmp_path / "Update", version="1.2.0", build=11)
+    manifest = json.loads((folder / "version.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == "1.2.0" and manifest["build"] == 11 and manifest["package"] == "ReportExtractor_1.2.0.zip"
+    r = up.check_for_update(str(folder), current_build=10, current_version="1.1.0-beta")
+    assert r.status == "available" and r.message == "Có phiên bản mới: 1.2.0 — Build 011"
+    assert up.check_for_update(str(folder), current_build=11, current_version="1.2.0").status == "latest"
+    assert up.check_for_update(str(folder), current_build=12, current_version="1.2.1").status == "older"
+    assert up.version_label() == "1.2.0 — Build 011"
+    import build_portable as bp
+    assert bp.package_name(app.__version__) == "ReportExtractor_1.2.0.zip" and bp._version() == ("1.2.0", "011")

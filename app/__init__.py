@@ -5,7 +5,7 @@ Single canonical source of the application version / build number (never duplica
 ("Build 004").  A Git revision – when available – is internal diagnostic metadata only, never the build number.
 """
 
-__version__ = "1.1.0-beta"
+__version__ = "1.2.0"
 BUILD_NUMBER = 11
 
 

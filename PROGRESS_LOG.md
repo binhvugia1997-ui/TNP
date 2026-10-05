@@ -186,3 +186,11 @@
   chỉ ẩn; sau khi gói đã kiểm tra 100% hiển thị "Gói cập nhật đã sẵn sàng. Đang khởi động trình cài đặt..." rồi mới
   bàn giao cho trình cập nhật ngoài (EXE đang chạy không bao giờ tự ghi đè; backup/rollback/khởi động lại giữ nguyên).
 - Kiểm thử: `tests/test_update_progress.py` (10); test_15 discovery được làm tất định (gate thay vì sleep). Tổng 778 passed.
+
+## Phiên bản 1.2.0 / Build 011 — rời chuỗi 1.1.0-beta
+- `app/__init__.py`: `__version__ = "1.2.0"`, `BUILD_NUMBER = 11` (hiển thị v1.2.0 / Build 011). Gói: `ReportExtractor_1.2.0.zip`;
+  `version.json`: `"version": "1.2.0", "build": 11`. Số Build vẫn là tiêu chí sắp xếp cập nhật → máy đang chạy
+  1.1.0-beta / Build 010 nhận 1.2.0 / Build 011 là bản cập nhật bình thường (test `test_legacy_beta_client_sees_1_2_0_build_011_as_normal_update`).
+- Test nhận dạng hiện tại cập nhật sang 1.2.0; fixture "bản mới hơn" dùng 1.2.1 / Build 012+; tham chiếu lịch sử giữ nguyên.
+- Dọn các file do một lần chạy nhầm trình cập nhật ngoài để lại ở gốc repo (ReportExtractor.exe, VERSION.txt, README.txt,
+  _internal/) — đã bỏ khỏi Git, thêm vào .gitignore; conftest chặn mọi test spawn trình cập nhật thật. Tổng 779 passed.
