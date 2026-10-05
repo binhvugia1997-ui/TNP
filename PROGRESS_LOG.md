@@ -161,3 +161,8 @@
 - Kiểm tra phiên bản chỉ đọc version.json (+ `is_file()` gói); ZIP chỉ được copy khi người dùng bấm Cập nhật ngay.
 - Kiểm thử: `tests/test_auto_update_check.py` (15), cập nhật `test_updater.py` (startup thất bại mềm, độ trễ 2–5 s). Tổng 752 passed.
 - Chưa build Portable.
+- Sửa blocker Windows (test `test_unavailable_path_does_not_crash_and_shows_soft_status`): phân giải tên UNC thật trên
+  Windows có thể mất hàng chục giây nên `join(10)` hết hạn trước khi worker công bố kết quả (race trong test, không phải lỗi
+  production). Thêm `update_check_done` (threading.Event) vào controller — chỉ set SAU khi `update_check` được gán; test chờ
+  event này và phân biệt "đang chạy" với "đã xong = inaccessible"; hai trường hợp UNC dùng stand-in offline tất định,
+  thư mục cục bộ thiếu vẫn đi qua updater thật. +1 test hợp đồng trạng thái. Tổng 753 passed.

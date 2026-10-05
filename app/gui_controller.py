@@ -339,6 +339,8 @@ class GuiController:
         self.update_check_startup: bool = False  # last check was the automatic start-up one (soft failure text)
         self.offered_update_builds: set = set()  # remote builds already announced in this session
         self._update_thread: Optional[threading.Thread] = None
+        self.update_check_done = threading.Event()   # set when a check has COMPLETED (result published); cleared at start
+        self.update_check_done.set()
         self.prescan: Optional[PreScanResult] = None
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # reviewed scan list (before Start): real pre-scan result + manual exclusions
@@ -1613,9 +1615,10 @@ class GuiController:
         except Exception as e:  # noqa: BLE001 – infrastructure problem must never crash the GUI
             LOG.exception("UPDATE_CHECK unexpected error")
             res = UpdateCheck("inaccessible", f"{updater.MSG['inaccessible']} ({type(e).__name__})", self.update_path)
-        self.update_check = res
+        self.update_check = res                      # result published BEFORE busy=False / done event (state contract)
         self.update_busy = False
         self.update_dirty = True
+        self.update_check_done.set()
         return res
 
     def check_update_async(self, startup: bool = False) -> bool:
@@ -1626,6 +1629,7 @@ class GuiController:
             return False
         self.update_busy = True
         self.update_dirty = True
+        self.update_check_done.clear()
         self._update_thread = threading.Thread(target=self.check_update, args=(startup,), name="update-check",
                                                daemon=True)
         self._update_thread.start()

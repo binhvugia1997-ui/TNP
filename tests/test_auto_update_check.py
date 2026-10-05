@@ -22,9 +22,13 @@ def _ctl(tmp_path, path="", extra=None):
     return GuiController(AppConfig(update_path=path, extra=dict(extra or {})), config_path=tmp_path / "cfg" / "config.json")
 
 
-def _join(c):
+def _join(c, timeout=30):
+    """Deterministic completion wait: the controller's done-event is set only after the result is published, so a
+    None result can never be mistaken for a finished check."""
     if c._update_thread:
-        c._update_thread.join(10)
+        c._update_thread.join(timeout)
+    assert c.update_check_done.wait(timeout), "update worker did not complete"
+    assert not c.update_busy
 
 
 def _startup(a):
@@ -83,6 +87,7 @@ def test_startup_gui_not_blocked_by_slow_unc_check(monkeypatch, tmp_path):
     fn = next(fn for ms, fn in a.root.scheduled if fn == a._startup_update_check)
     fn()
     assert time.monotonic() - t0 < 3.0 and a.ctl.update_busy           # worker started, Tk thread free
+    assert not a.ctl.update_check_done.is_set() and a.ctl.update_check is None   # "pending", not "failed"
     assert a.lbl_update.cfg["text"] == "Đang kiểm tra cập nhật…"
     gate.set()
     _join(a.ctl)
@@ -131,6 +136,18 @@ def test_version_check_reads_only_manifest_and_never_copies_zip(tmp_path, monkey
 
 # ------------------------------------------------------------------ 9-10 unavailable build PC
 def test_unavailable_path_does_not_crash_and_shows_soft_status(monkeypatch, tmp_path):
+    """Build PC off / LAN down.  Real UNC name resolution on Windows can take tens of seconds (that is exactly why
+    the check runs in a worker), so the two UNC cases use a deterministic offline stand-in for the read-only
+    check; the local missing folder exercises the real updater code path."""
+    real_check = up.check_for_update
+    seen = []
+
+    def offline_check(path, *a, **k):
+        seen.append(path)
+        if str(path).startswith("\\\\"):
+            return up.UpdateCheck("inaccessible", up.MSG["inaccessible"], path)
+        return real_check(path, *a, **k)
+    monkeypatch.setattr(up, "check_for_update", offline_check)
     for path in (r"\\BUILD-PC\ReportExtractor_Update", r"\\192.168.1.50\ReportExtractor_Update",
                  str(tmp_path / "missing_share")):
         cfg = AppConfig(update_path=path)
@@ -139,8 +156,11 @@ def test_unavailable_path_does_not_crash_and_shows_soft_status(monkeypatch, tmp_
         gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
         monkeypatch.setattr(gui.messagebox, "showerror", lambda *x, **k: popups.append(x))
         monkeypatch.setattr(gui.messagebox, "showwarning", lambda *x, **k: popups.append(x))
+        assert a.ctl.update_check is None and a.ctl.update_check_done.is_set()      # not started yet (not "pending")
         _startup(a)
+        assert a.ctl.update_check is not None, "worker finished but published no result"
         assert a.ctl.update_check.status in ("inaccessible", "no_permission", "no_manifest")
+        assert seen[-1] == path
         assert a.lbl_update.cfg["text"] == AUTO_CHECK_FAILED_VI and a.lbl_update.cfg["style"] == "Secondary.TLabel"
         assert popups == [] and a.btn_check_update.cfg["state"] == "normal"
         assert a.btn_install_update.cfg["state"] == "disabled" and a.ctl.update_path == path    # UNC kept
@@ -242,3 +262,22 @@ def test_update_card_layout_and_build_009(monkeypatch, tmp_path):
     assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.1.0-beta — Build 009"
     assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 9 and app.BUILD_LABEL == "Build 009"
     assert a.cfg_page.row_weights == {4: 1}                             # responsive settings page unchanged
+
+
+def test_pending_vs_finished_state_contract(monkeypatch, tmp_path):
+    """None result + done-event cleared = still running; done-event set => update_check is a completed result."""
+    gate = threading.Event()
+
+    def slow(path, *a, **k):
+        gate.wait(5)
+        return up.UpdateCheck("inaccessible", up.MSG["inaccessible"], path)
+    monkeypatch.setattr(up, "check_for_update", slow)
+    c = _ctl(tmp_path, r"\\BUILD-PC\ReportExtractor_Update")
+    assert c.update_check_done.is_set() and c.update_check is None             # idle, never checked
+    assert c.check_update_async(startup=True)
+    assert not c.update_check_done.is_set() and c.update_busy and c.update_check is None   # pending
+    assert not c.check_update_async()                                           # one worker at a time
+    gate.set()
+    assert c.update_check_done.wait(10)
+    assert c.update_check is not None and c.update_check.status == "inaccessible" and not c.update_busy
+    assert c.update_dirty and c.update_status_text() == AUTO_CHECK_FAILED_VI
