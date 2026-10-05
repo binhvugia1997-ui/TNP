@@ -261,4 +261,4 @@ def test_destination_is_centralised_and_configurable(monkeypatch):
 
 
 def test_build_010_identity():
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 10 and app.BUILD_LABEL == "Build 010"
+    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 11 and app.BUILD_LABEL == "Build 011"

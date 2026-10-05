@@ -174,3 +174,15 @@
 - `tools/build_portable.py`: bước 12 chỉ chạy sau toàn bộ kiểm tra; `--no-publish`, `--publish-dir`; mã thoát 3 =
   build OK nhưng PUBLISH FAILED (bat hiển thị riêng). Không đổi updater runtime.
 - Kiểm thử: `tests/test_publish_update.py` (15). Tổng 768 passed. Chưa build Portable.
+
+## PROMPT-011 — Cửa sổ tiến trình cập nhật (v1.1.0-beta / Build 011)
+- `app/updater.py`: `copy_with_progress()` copy theo khối 1 MB, callback `(bytes_copied, total_bytes, percent)` tính từ
+  byte thật (không timer); `stage_update(progress=)` phát PREPARING → COPYING → VERIFYING → READY từ thread gọi.
+- `app/gui_controller.py`: `UpdateProgress` (snapshot bất biến, tốc độ = bytes/elapsed monotonic), `UPDATE_STAGES_VI`,
+  `install_update_async()` (worker `update-install`, một lần duy nhất, `update_installing` khoá nút), sự kiện
+  `update_progress` / `update_done`; `install_update()` đồng bộ vẫn giữ cho CLI/test; lỗi → stage ERROR, dọn staging.
+- `app/gui.py`: cửa sổ "Đang cập nhật Report Extractor / Build X → Build Y" (resizable), Progressbar determinate khi copy,
+  "58.4 MB / 87.1 MB  67%", "Tốc độ: 11.2 MB/s"; mọi cập nhật widget qua `_poll` (Tk thread); đóng cửa sổ khi đang copy
+  chỉ ẩn; sau khi gói đã kiểm tra 100% hiển thị "Gói cập nhật đã sẵn sàng. Đang khởi động trình cài đặt..." rồi mới
+  bàn giao cho trình cập nhật ngoài (EXE đang chạy không bao giờ tự ghi đè; backup/rollback/khởi động lại giữ nguyên).
+- Kiểm thử: `tests/test_update_progress.py` (10); test_15 discovery được làm tất định (gate thay vì sleep). Tổng 778 passed.

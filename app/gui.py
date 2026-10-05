@@ -29,7 +29,7 @@ from . import APP_NAME, APP_TITLE, BUILD_LABEL, __version__
 from .config import AppConfig
 from .diagnostics import format_diagnostics, run_diagnostics
 from .gui_controller import (DEFAULT_OUTPUT_NAME, FINAL_STATUSES, PERIOD_MODE_VI, DEFAULT_SCAN_FILTER_VI, SCAN_FILTERS_VI, USER_EXCLUDED,
-                             GuiController, default_output_path)
+                             UPDATE_STAGES_VI, GuiController, default_output_path)
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD,
                       ACTION_PROCESS, ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE)
 from .scanner import parse_dnd_paths
@@ -1590,7 +1590,8 @@ class ReportExtractorApp:
             style = "Warning.TLabel"
         self.lbl_update.configure(text=text, style=style)
         self.btn_install_update.configure(state="normal" if (c.update_available() and not c.is_running()) else "disabled")
-        self.btn_check_update.configure(state="disabled" if (c.update_busy or c.is_running()) else "normal")
+        self.btn_check_update.configure(state="disabled" if (c.update_busy or c.is_running() or c.update_installing)
+                                        else "normal")
         offer = c.pending_update_offer()
         if offer is not None and not c.is_running():
             self._offer_update(offer)
@@ -1667,16 +1668,111 @@ class ReportExtractorApp:
             return
         if not confirmed and not self._confirm_update(c.update_check.info.label()):
             return
+        if c.update_installing:
+            return                                       # double click / second entry point: one install at a time
         self._push_to_controller()
         self._remember_window_geometry()
         c.save_settings()
-        ok, msg = c.install_update()
+        target = c.update_target_text()
+        if not c.install_update_async():                 # LAN copy / verify / extract run in the worker thread
+            self._render_update()
+            return
+        self._open_update_progress(target)
+        self._render_update()                            # buttons disabled while the install runs
+        self.log(f"UPDATE_INSTALL start {target}")
+
+    # ---- PROMPT-011 update progress window (all widget work here runs on the Tk thread via _poll) ------------
+    def _open_update_progress(self, target: str) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Đang cập nhật Report Extractor")
+        win.geometry("520x260")
+        win.minsize(420, 220)
+        win.resizable(True, True)
+        try:
+            win.transient(self.root)
+        except Exception:  # noqa: BLE001
+            pass
+        win.protocol("WM_DELETE_WINDOW", self._on_update_progress_close)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(5, weight=1)
+        body = ttk.Frame(win, style="Card.TFrame", padding=(L, M, L, M))
+        body.grid(row=0, column=0, rowspan=7, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        ttk.Label(body, text="Đang cập nhật Report Extractor", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text=target, style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=(0, S))
+        self.lbl_upd_stage = ttk.Label(body, text=UPDATE_STAGES_VI["PREPARING"], style="Card.TLabel")
+        self.lbl_upd_stage.grid(row=2, column=0, sticky="w")
+        self.pb_update = ttk.Progressbar(body, orient="horizontal", mode="indeterminate", maximum=100)
+        self.pb_update.grid(row=3, column=0, sticky="ew", pady=(XS, XS))
+        self.lbl_upd_bytes = ttk.Label(body, text="", style="Secondary.TLabel")
+        self.lbl_upd_bytes.grid(row=4, column=0, sticky="w")
+        self.lbl_upd_speed = ttk.Label(body, text="", style="Secondary.TLabel")
+        self.lbl_upd_speed.grid(row=5, column=0, sticky="nw")
+        self.btn_upd_close = ttk.Button(body, text="Đóng", command=self._on_update_progress_close, state="disabled")
+        self.btn_upd_close.grid(row=6, column=0, sticky="e", pady=(S, 0))
+        self.update_progress_win = win
+        try:
+            self.pb_update.start(12)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_update_progress_close(self) -> None:
+        """While the worker copies/verifies: hide only (the staging continues safely); afterwards: destroy."""
+        win = getattr(self, "update_progress_win", None)
+        if win is None:
+            return
+        if self.ctl.update_installing and self.ctl.update_progress.stage not in ("ERROR",):
+            try:
+                win.withdraw()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            win.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        self.update_progress_win = None
+
+    def _render_update_progress(self, p) -> None:
+        """Tk thread only: paint one UpdateProgress snapshot (real bytes – no timer-based percentages)."""
+        if getattr(self, "update_progress_win", None) is None:
+            return
+        self.lbl_upd_stage.configure(text=p.label if p.stage != "ERROR" else f"{p.label}: {p.error}",
+                                     style="Error.TLabel" if p.stage == "ERROR" else "Card.TLabel")
+        if p.determinate:
+            if self.pb_update["mode"] != "determinate":
+                try:
+                    self.pb_update.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.pb_update.configure(mode="determinate")
+            self.pb_update["value"] = p.percent
+            self.lbl_upd_bytes.configure(text=(f"{p.bytes_text}   {p.percent:.0f}%").strip())
+        else:
+            self.lbl_upd_bytes.configure(text=p.bytes_text)
+        self.lbl_upd_speed.configure(text=p.speed_text)
+        if p.stage == "ERROR":
+            try:
+                self.pb_update.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.btn_upd_close.configure(state="normal")
+            try:
+                self.update_progress_win.deiconify()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_update_done(self, ok: bool, msg: str) -> None:
         self.log(msg)
         if not ok:
             self.lbl_update.configure(text=msg, style="Error.TLabel")
-            messagebox.showerror(APP_NAME, msg)
+            self._render_update()                        # buttons re-enabled; staging already cleaned by the worker
+            messagebox.showerror(APP_NAME, f"Cập nhật thất bại\n{msg}")
             return
         self.lbl_update.configure(text=msg, style="Success.TLabel")
+        if getattr(self, "update_progress_win", None) is not None:
+            self.lbl_upd_stage.configure(text=UPDATE_STAGES_VI["HANDOFF"])
+            self.pb_update["value"] = 100
         self.root.after(300, self.root.destroy)         # updater waits for this process to exit, then replaces files
 
     def _render_event(self, ev) -> None:
@@ -1691,6 +1787,11 @@ class ReportExtractorApp:
                 row = self.ctl.rows[i]
                 self.lbl_stage.configure(text=f"{row.status_vi} {p.current_detail}".strip())
                 self.lbl_file.configure(text=row.path.name)
+        elif ev.kind == "update_progress":
+            self._render_update_progress(ev.payload)
+        elif ev.kind == "update_done":
+            ok, msg = ev.payload
+            self._on_update_done(ok, msg)
         elif ev.kind == "progress":
             self._render_progress()
             self._render_counts()

@@ -15,7 +15,7 @@ from tests.test_gui_redesign import _make_app
 from tests.test_updater import make_update_folder
 
 SRC = Path(app.__file__).with_name("gui.py").read_text(encoding="utf-8")
-CUR = app.BUILD_NUMBER                      # 10
+CUR = app.BUILD_NUMBER                      # 11
 
 
 def _ctl(tmp_path, path="", extra=None):
@@ -189,8 +189,8 @@ def test_startup_detects_newer_build_and_offers_once(monkeypatch, tmp_path):
     offers = []
     monkeypatch.setattr(a, "_confirm_update", lambda label: offers.append(label) or False)   # user: Để sau
     _startup(a)
-    assert offers == ["1.1.0-beta — Build 011"]
-    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.1.0-beta — Build 011"
+    assert offers == ["1.1.0-beta — Build 012"]
+    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.1.0-beta — Build 012"
     assert a.btn_install_update.cfg["state"] == "normal"
     for _ in range(3):                                                  # polls / re-renders: no repeated popup
         a._poll()
@@ -198,13 +198,13 @@ def test_startup_detects_newer_build_and_offers_once(monkeypatch, tmp_path):
     a.check_update()                                                    # manual check of the same build
     _join(a.ctl)
     a._poll()
-    assert offers == ["1.1.0-beta — Build 011"] and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
+    assert offers == ["1.1.0-beta — Build 012"] and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
     # a NEWER remote build published later in the same session is announced again (once)
     make_update_folder(folder, version="1.1.0-beta", build=CUR + 2)
     a.check_update()
     _join(a.ctl)
     a._poll()
-    assert offers == ["1.1.0-beta — Build 011", "1.1.0-beta — Build 012"]
+    assert offers == ["1.1.0-beta — Build 012", "1.1.0-beta — Build 013"]
 
 
 def test_same_or_older_build_is_not_offered(monkeypatch, tmp_path):
@@ -220,14 +220,16 @@ def test_update_now_routes_into_existing_installer(monkeypatch, tmp_path):
     gui, a, reg, folder = _gui_with_update(monkeypatch, tmp_path)
     monkeypatch.setattr(a, "_confirm_update", lambda label: True)       # user: Cập nhật ngay
     calls = []
-    monkeypatch.setattr(a.ctl, "install_update", lambda *x, **k: calls.append(1) or (True, "Đang cài đặt"))
+    monkeypatch.setattr(a.ctl, "install_update_async", lambda *x, **k: calls.append(1) or True)
     _startup(a)
     assert calls == [1]                                                 # existing updater path (stage/verify/apply)
-    assert a.lbl_update.cfg["text"] == "Đang cài đặt"
+    assert a.update_progress_win is not None                            # PROMPT-011 progress window opened
     confirm_src = SRC[SRC.index("def _confirm_update("):SRC.index("def install_update(")]
     assert '"Cập nhật ngay"' in confirm_src and '"Để sau"' in confirm_src and "Phiên bản hiện tại" in confirm_src
-    inst = SRC[SRC.index("def install_update("):SRC.index("def _render_event(")]
-    assert "c.install_update()" in inst and "self.root.after(300, self.root.destroy)" in inst
+    inst = SRC[SRC.index("def install_update("):SRC.index("def _open_update_progress(")]
+    assert "c.install_update_async()" in inst
+    done = SRC[SRC.index("def _on_update_done("):SRC.index("def _render_event(")]
+    assert "self.root.after(300, self.root.destroy)" in done
 
 
 def test_notification_never_auto_installs(monkeypatch, tmp_path):
@@ -259,8 +261,8 @@ def test_update_card_layout_and_build_009(monkeypatch, tmp_path):
     body = a.cfg_cards["update"]
     rows = {w.grid_info_.get("row") for w in reg["widgets"] if getattr(w, "master", None) is body and w.grid_info_}
     assert rows == {0, 1, 2, 3, 4, 5} and a.chk_auto_update.grid_info_["row"] == 2 < a.lbl_update.grid_info_["row"]
-    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.1.0-beta — Build 010"
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 10 and app.BUILD_LABEL == "Build 010"
+    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.1.0-beta — Build 011"
+    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 11 and app.BUILD_LABEL == "Build 011"
     assert a.cfg_page.row_weights == {4: 1}                             # responsive settings page unchanged
 
 

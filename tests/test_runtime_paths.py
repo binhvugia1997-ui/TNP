@@ -126,7 +126,7 @@ def test_startup_error_log_written_next_to_exe(monkeypatch, tmp_path):
         target = m.record_startup_error(e)
     assert target == exe_dir / "logs" / "startup_error.log"
     text = target.read_text(encoding="utf-8")
-    assert "boom at startup" in text and "version=1.1.0-beta build=010" in text
+    assert "boom at startup" in text and "version=1.1.0-beta build=011" in text
     assert "startup_error.log" in m.STARTUP_ERROR_VI and "Không thể khởi động Report Extractor" in m.STARTUP_ERROR_VI
 
 
@@ -157,5 +157,5 @@ def test_startup_logging_writes_startup_env_line(monkeypatch, tmp_path):
         except Exception:  # noqa: BLE001
             pass
     text = (exe_dir / "logs" / "app.log").read_text(encoding="utf-8")
-    assert "STARTUP version=1.1.0-beta build=010 packaged=true" in text and f"portable_root={exe_dir}" in text
+    assert "STARTUP version=1.1.0-beta build=011 packaged=true" in text and f"portable_root={exe_dir}" in text
     assert os.sep in text

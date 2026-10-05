@@ -181,11 +181,11 @@ def test_14_progress_callback_monotonic_and_reaches_total():
 
 
 def test_15_cancel_stops_early_and_reports_partial():
-    started = threading.Event()
+    started, released = threading.Event(), threading.Event()
 
-    def probe(host, port, timeout):
+    def probe(host, port, timeout):                  # deterministic: probes block until the test cancels
         started.set()
-        time.sleep(0.01)
+        released.wait(5)
         return False
     d = OllamaDiscovery(probe=probe, verifier=lambda *a: None, interfaces=lambda: [LocalInterface("10.1.1.1", 24)],
                         max_workers=2)
@@ -195,9 +195,10 @@ def test_15_cancel_stops_early_and_reports_partial():
         out["res"] = d.run()
     t = threading.Thread(target=work)
     t.start()
-    started.wait(2)
+    started.wait(5)
     d.cancel()
-    t.join(5)
+    released.set()
+    t.join(20)
     assert not t.is_alive() and out["res"] == [] and d.cancelled
     assert d.checked < d.total                                   # really stopped early
 

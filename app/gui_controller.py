@@ -302,6 +302,57 @@ class UiEvent:
     payload: Any = None
 
 
+UPDATE_STAGES_VI = {                      # PROMPT-011 progress window texts (stage -> label)
+    "PREPARING": "Đang chuẩn bị cập nhật...",
+    "COPYING": "Đang sao chép bản cập nhật...",
+    "VERIFYING": "Đang kiểm tra tính toàn vẹn...",
+    "READY": "Gói cập nhật đã được kiểm tra và sẵn sàng.",
+    "APPLYING": "Đang chuẩn bị cài đặt...",
+    "BACKUP": "Đang sao lưu phiên bản hiện tại...",      # performed by the external updater (after this GUI exits)
+    "INSTALLING": "Đang cài đặt...",                       # idem – never shown with an invented percentage here
+    "HANDOFF": "Gói cập nhật đã sẵn sàng.\nĐang khởi động trình cài đặt...",
+    "COMPLETE": "Cập nhật hoàn tất — đang khởi động lại...",
+    "ERROR": "Cập nhật thất bại",
+}
+
+
+def format_bytes(n: float) -> str:
+    n = float(n or 0)
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.2f} GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.1f} MB"
+    if n >= 1 << 10:
+        return f"{n / (1 << 10):.0f} KB"
+    return f"{int(n)} B"
+
+
+@dataclass
+class UpdateProgress:
+    """Snapshot published by the install worker (immutable per event; rendered on the Tk thread)."""
+    stage: str = ""
+    bytes_copied: int = 0
+    total_bytes: int = 0
+    percent: float = 0.0
+    speed_bps: float = 0.0
+    error: str = ""
+    determinate: bool = False
+
+    @property
+    def label(self) -> str:
+        return UPDATE_STAGES_VI.get(self.stage, self.stage)
+
+    @property
+    def bytes_text(self) -> str:
+        if self.stage in ("COPYING", "VERIFYING", "READY", "HANDOFF", "COMPLETE") and self.total_bytes:
+            return f"{format_bytes(self.bytes_copied)} / {format_bytes(self.total_bytes)}"
+        return ""
+
+    @property
+    def speed_text(self) -> str:
+        return f"Tốc độ: {format_bytes(self.speed_bps)}/s" if self.stage == "COPYING" and self.speed_bps > 0 else ""
+
+
 class GuiController:
     """State machine + adapter between the GUI widgets and the production pipeline."""
 
@@ -341,6 +392,10 @@ class GuiController:
         self._update_thread: Optional[threading.Thread] = None
         self.update_check_done = threading.Event()   # set when a check has COMPLETED (result published); cleared at start
         self.update_check_done.set()
+        self.update_installing: bool = False         # PROMPT-011: one install at a time (buttons disabled meanwhile)
+        self.update_progress = UpdateProgress()
+        self._install_thread: Optional[threading.Thread] = None
+        self._install_lock = threading.Lock()
         self.prescan: Optional[PreScanResult] = None
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # reviewed scan list (before Start): real pre-scan result + manual exclusions
@@ -1604,7 +1659,14 @@ class GuiController:
         return chk
 
     def update_available(self) -> bool:
-        return bool(self.update_check and self.update_check.available) and not self.update_busy
+        return bool(self.update_check and self.update_check.available) and not self.update_busy \
+            and not self.update_installing
+
+    def update_target_text(self) -> str:
+        """'Build 010 → Build 011' for the progress window header."""
+        cur = updater.format_build(updater.BUILD_NUMBER)
+        new = updater.format_build(self.update_check.info.build) if self.update_check and self.update_check.info else "?"
+        return f"Build {cur} → Build {new}"
 
     def check_update(self, startup: bool = False) -> UpdateCheck:
         """Synchronous read-only check – reads version.json only, never copies the ZIP (worker thread / tests)."""
@@ -1650,18 +1712,78 @@ class GuiController:
         return self.update_notice
 
     def install_update(self, spawn=None) -> Tuple[bool, str]:
-        """Stage + verify + launch the external updater.  On success the caller must close the application."""
+        """Synchronous stage + verify + launch of the external updater (tests / CLI).  The GUI uses
+        install_update_async(); both share _install_work.  On success the caller must close the application."""
         if self.is_running():
             return False, "Đang xử lý báo cáo – hãy đợi xong rồi cập nhật."
         if not self.update_available():
             return False, "Không có bản cập nhật để cài."
+        with self._install_lock:
+            if self.update_installing:
+                return False, "Đang cập nhật – vui lòng đợi."
+            self.update_installing = True
         try:
-            staged = updater.stage_update(self.update_check, portable_root())
+            return self._install_work(spawn, emit=False)
+        finally:
+            if not (self.update_progress.stage == "HANDOFF"):
+                self.update_installing = False
+
+    def install_update_async(self, spawn=None) -> bool:
+        """Start the install worker (LAN copy / verify / extract off the Tk thread); False when one is already
+        running, nothing is available or a batch is processing.  Progress -> UiEvent('update_progress'),
+        result -> UiEvent('update_done', (ok, msg))."""
+        if self.is_running() or not self.update_available():
+            return False
+        with self._install_lock:
+            if self.update_installing or (self._install_thread and self._install_thread.is_alive()):
+                return False
+            self.update_installing = True
+        self.update_progress = UpdateProgress(stage="PREPARING")
+        self.update_dirty = True
+
+        def work():
+            ok, msg = self._install_work(spawn, emit=True)
+            if not ok:
+                self.update_installing = False
+                self.update_dirty = True
+            self._queue.put(UiEvent("update_done", (ok, msg)))
+        self._install_thread = threading.Thread(target=work, name="update-install", daemon=True)
+        self._install_thread.start()
+        return True
+
+    def _publish_update_progress(self, stage: str, done: int, total: int, pct: float, emit: bool,
+                                 t0: List[float]) -> None:
+        """Worker-side: build an immutable snapshot and queue it (NO widget access here)."""
+        now = self._clock()
+        if stage == "COPYING" and t0[0] <= 0:
+            t0[0] = now
+        elapsed = now - t0[0] if t0[0] > 0 else 0.0
+        speed = (done / elapsed) if (stage == "COPYING" and elapsed > 0 and done) else 0.0
+        snap = UpdateProgress(stage=stage, bytes_copied=int(done), total_bytes=int(total), percent=float(pct),
+                              speed_bps=speed, determinate=(stage in ("COPYING", "VERIFYING", "READY", "HANDOFF",
+                                                                      "COMPLETE")))
+        self.update_progress = snap
+        if emit:
+            self._queue.put(UiEvent("update_progress", snap))
+
+    def _install_work(self, spawn, emit: bool) -> Tuple[bool, str]:
+        t0 = [0.0]
+        try:
+            staged = updater.stage_update(self.update_check, portable_root(),
+                                          progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p,
+                                                                                                     emit, t0))
+            size = Path(staged.zip_path).stat().st_size
+            self._publish_update_progress("HANDOFF", size, size, 100.0, emit, t0)   # verified: 100%, then hand off
             cmd = updater.launch_updater(staged, spawn) if spawn else updater.launch_updater(staged)
         except Exception as e:  # noqa: BLE001
             msg = str(e) or type(e).__name__
             LOG.error("UPDATE_INSTALL failed: %s", msg)
             updater.cleanup_staging(portable_root())
+            prev = self.update_progress
+            self.update_progress = UpdateProgress(stage="ERROR", bytes_copied=prev.bytes_copied,
+                                                  total_bytes=prev.total_bytes, percent=prev.percent, error=msg)
+            if emit:
+                self._queue.put(UiEvent("update_progress", self.update_progress))
             return False, msg
         LOG.info("UPDATE_INSTALL updater launched: %s", cmd)
         return True, f"Đang cài đặt {self.update_check.info.label()} – ứng dụng sẽ tự khởi động lại."

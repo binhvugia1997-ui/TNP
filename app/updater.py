@@ -264,23 +264,67 @@ def _clear_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def stage_update(check: UpdateCheck, portable_root: Path) -> StagedUpdate:
-    """network/local source -> local staging -> validation -> extraction.  Raises RuntimeError (Vietnamese)."""
+# stages reported by stage_update(progress=...) – the GUI maps them to Vietnamese texts (PROMPT-011)
+STAGE_PREPARING, STAGE_COPYING, STAGE_VERIFYING, STAGE_READY = "PREPARING", "COPYING", "VERIFYING", "READY"
+COPY_CHUNK = 1 << 20
+
+
+def copy_with_progress(src: Path, dst: Path, progress: Optional[Callable[[int, int, float], None]] = None,
+                       chunk: int = COPY_CHUNK) -> int:
+    """Chunked copy (LAN -> local) reporting REAL bytes: progress(bytes_copied, total_bytes, percent).
+
+    Percent is derived from the bytes actually written (never from time); the last callback is always 100%.
+    Returns the number of bytes copied (== source size)."""
+    src, dst = Path(src), Path(dst)
+    total = src.stat().st_size
+    copied = 0
+    if progress:
+        progress(0, total, 0.0)
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        while True:
+            block = fi.read(chunk)
+            if not block:
+                break
+            fo.write(block)
+            copied += len(block)
+            if progress:
+                progress(copied, total, (copied * 100.0 / total) if total else 100.0)
+    if copied != total:
+        raise OSError(f"copied {copied} of {total} bytes")
+    if progress and total == 0:
+        progress(0, 0, 100.0)
+    return copied
+
+
+def stage_update(check: UpdateCheck, portable_root: Path,
+                 progress: Optional[Callable[[str, int, int, float], None]] = None) -> StagedUpdate:
+    """network/local source -> local staging -> validation -> extraction.  Raises RuntimeError (Vietnamese).
+
+    ``progress(stage, bytes_copied, total_bytes, percent)`` is invoked from the CALLING thread (worker) for
+    PREPARING -> COPYING (real bytes) -> VERIFYING -> READY; it must never touch Tk widgets."""
     if not check.available or not check.info or not check.package_path:
         raise RuntimeError("Không có bản cập nhật để cài.")
     info = check.info
+
+    def emit(stage: str, done: int = 0, total: int = 0, pct: float = 0.0) -> None:
+        if progress:
+            progress(stage, done, total, pct)
     portable_root = Path(portable_root)
     staging = portable_root / STAGING_DIR
+    emit(STAGE_PREPARING)
     _log_file(portable_root, f"UPDATE_STAGE start current={version_label()} remote={info.label()} "
                              f"source={check.package_path}")
     _clear_dir(staging)
     local_zip = staging / info.package
     try:
-        shutil.copyfile(check.package_path, local_zip)
+        copied = copy_with_progress(Path(check.package_path), local_zip,
+                                    lambda done, total, pct: emit(STAGE_COPYING, done, total, pct))
     except PermissionError as e:
         raise RuntimeError(MSG["no_permission"]) from e
     except OSError as e:
         raise RuntimeError(f"Không sao chép được gói cập nhật về máy ({e})") from e
+    _log_file(portable_root, f"UPDATE_STAGE copied bytes={copied}")
+    emit(STAGE_VERIFYING, copied, copied, 100.0)
     ok, msg = verify_package(local_zip, info)
     _log_file(portable_root, f"UPDATE_STAGE verify={'ok' if ok else 'failed'} detail={msg}")
     if not ok:
@@ -297,6 +341,7 @@ def stage_update(check: UpdateCheck, portable_root: Path) -> StagedUpdate:
         (d for d in new_dir.iterdir() if d.is_dir() and (d / APP_EXE).exists()), None)
     if source_root is None:
         raise RuntimeError(f"{MSG['bad_package']} (không có {APP_EXE} sau khi giải nén)")
+    emit(STAGE_READY, copied, copied, 100.0)
     manifest = staging / STAGED_MANIFEST
     payload = {"version": info.version, "build": info.build, "package": info.package, "sha256": info.sha256,
                "source_root": str(source_root), "target_root": str(portable_root), "old_pid": os.getpid(),
