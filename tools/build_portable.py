@@ -10,6 +10,8 @@ Steps (fail fast, clear Vietnamese message on error):
      Install_Ollama_Optional.bat
   7. validate artifact (no tests/.venv/.git/sample data/dev config inside; exe present)
   8. ZIP + SHA256SUMS.txt → release/
+  9. publish to the LAN update folder (tools/publish_update.py) – ONLY after every step above succeeded;
+     ZIP first (verified), version.json LAST, obsolete ReportExtractor_*.zip removed afterwards (--no-publish to skip)
 The script never bundles Ollama or any model and never writes a developer config into the artifact.
 """
 from __future__ import annotations
@@ -28,6 +30,10 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import publish_update  # noqa: E402  (centralised update-folder configuration + safe publisher)
+
+PUBLISH_FAILED_RC = 3          # build succeeded, publishing did not (distinct from build failures = 1)
 SUPPORTED_PYTHON = ((3, 10), (3, 11), (3, 12), (3, 13))   # explicit tuples, identical to setup.bat policy
 FORBIDDEN_IN_ARTIFACT = ("tests", ".venv", ".venv-build", ".git", ".pytest_cache", "sample_data", "__pycache__",
                          "update_staging", "update_backup", "release", "learning_data")
@@ -208,6 +214,9 @@ def main() -> int:
     ap.add_argument("--skip-tests", action="store_true", help="không chạy pytest (chỉ dùng khi đã chạy riêng)")
     ap.add_argument("--no-venv", action="store_true", help="dùng interpreter hiện tại thay vì .venv-build")
     ap.add_argument("--allow-non-windows", action="store_true", help="cho phép chạy trên Linux/macOS (chỉ thử nghiệm)")
+    ap.add_argument("--no-publish", action="store_true", help="không tự động xuất bản vào thư mục cập nhật LAN")
+    ap.add_argument("--publish-dir", default=None,
+                    help=f"thư mục cập nhật cục bộ (mặc định {publish_update.update_folder()})")
     args = ap.parse_args()
 
     version, build_id = _version()
@@ -291,11 +300,26 @@ def main() -> int:
     manifest = write_version_manifest(release, version, build_number(), zip_path)
     print(f"   version.json: {manifest.read_text(encoding='utf-8').strip()}")
 
-    step(11, "Hoàn tất")
+    step(11, "Hoàn tất build")
     print(f"   Thư mục portable: {folder}\n   ZIP: {zip_path}\n   SHA256SUMS: {release / 'SHA256SUMS.txt'}\n"
-          f"   version.json: {manifest}\n"
-          f"   Phát hành: copy {zip_path.name} vào thư mục Update TRƯỚC, sau đó copy version.json SAU CÙNG.")
-    return 0
+          f"   version.json: {manifest}")
+
+    if args.no_publish:
+        print(f"   (bỏ qua xuất bản theo --no-publish) Phát hành thủ công: copy {zip_path.name} vào thư mục Update "
+              f"TRƯỚC, sau đó copy version.json SAU CÙNG.")
+        return 0
+    step(12, "Xuất bản vào thư mục cập nhật LAN (ZIP trước – version.json SAU CÙNG)")
+    return publish_step(release, args.publish_dir)
+
+
+def publish_step(release: Path, publish_dir: str | None = None) -> int:
+    """Runs only after a fully successful build; a publish failure never masquerades as a build failure."""
+    res = publish_update.publish_release(release, publish_dir)
+    if res.ok:
+        return 0
+    print(f"BUILD THÀNH CÔNG nhưng PUBLISH FAILED: {res.error}\n   Gói build vẫn nằm trong {release}; "
+          f"có thể chạy lại: python tools\\publish_update.py")
+    return PUBLISH_FAILED_RC
 
 
 if __name__ == "__main__":

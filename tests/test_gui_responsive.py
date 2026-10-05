@@ -302,6 +302,6 @@ def test_no_pack_grid_mixing_in_same_parent(monkeypatch, tmp_path):
 
 
 def test_version_and_build_008():
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 9 and app.BUILD_LABEL == "Build 009"
+    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 10 and app.BUILD_LABEL == "Build 010"
     assert not re.search(r"wraplength=900\)", CFG_TAB)                           # no fixed 900px wrap left on tab 2
     assert "self._scroll_page(self.tab_cfg" in CFG_TAB and "self._scroll_page(self.tab_run" in RUN_TAB

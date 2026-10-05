@@ -34,12 +34,18 @@ del "%TEMP%\re_build_py.txt" >nul 2>nul
 %PY% tools\build_portable.py --python "%PYEXE%" %*
 set "RC=%ERRORLEVEL%"
 echo.
+if "%RC%"=="3" (
+    echo BUILD THANH CONG nhung PUBLISH FAILED ^(xem [PUBLISH] phia tren^). Goi nam trong release\.
+    echo   Xuat ban lai: %PY% tools\publish_update.py
+    pause
+    exit /b %RC%
+)
 if not "%RC%"=="0" (
     echo BUILD THAT BAI ^(ma %RC%^). Xem thong bao phia tren.
     pause
     exit /b %RC%
 )
-echo BUILD THANH CONG.
+echo BUILD THANH CONG va DA XUAT BAN vao thu muc cap nhat LAN.
 echo   Thu muc: dist\ReportExtractor_v^<version^>_Portable
 echo   ZIP + SHA256SUMS.txt: release\
 pause

@@ -166,3 +166,11 @@
   production). Thêm `update_check_done` (threading.Event) vào controller — chỉ set SAU khi `update_check` được gán; test chờ
   event này và phân biệt "đang chạy" với "đã xong = inaccessible"; hai trường hợp UNC dùng stand-in offline tất định,
   thư mục cục bộ thiếu vẫn đi qua updater thật. +1 test hợp đồng trạng thái. Tổng 753 passed.
+
+## Build 010 — Tự động xuất bản vào thư mục cập nhật LAN (v1.1.0-beta / Build 010)
+- `tools/publish_update.py` (mới, tập trung đích xuất bản): ZIP → .tmp → kiểm tra size + SHA256 → đổi tên; version.json
+  qua .tmp + os.replace SAU CÙNG; xoá ZIP cũ sau khi bản mới đã sống; thất bại giữ nguyên bản cũ, không để manifest trỏ tới
+  ZIP thiếu; có CLI để xuất bản lại.
+- `tools/build_portable.py`: bước 12 chỉ chạy sau toàn bộ kiểm tra; `--no-publish`, `--publish-dir`; mã thoát 3 =
+  build OK nhưng PUBLISH FAILED (bat hiển thị riêng). Không đổi updater runtime.
+- Kiểm thử: `tests/test_publish_update.py` (15). Tổng 768 passed. Chưa build Portable.

@@ -488,3 +488,15 @@ Cửa sổ kiểm tra ảnh/nội dung cải tiến thay đổi được kích t
   vẫn báo lỗi rõ như trước.
 * **Quy trình xuất bản trên máy build (không cần server/dịch vụ):** copy `ReportExtractor_<version>.zip` vào thư mục chia
   sẻ **TRƯỚC**, đợi copy xong, rồi mới copy `version.json` **SAU CÙNG** — máy làm việc chỉ thấy bản mới khi gói đã đầy đủ.
+
+### Tự động xuất bản vào thư mục cập nhật LAN (Build 010)
+`build_portable.bat` / `tools/build_portable.py` sau khi **mọi** bước thành công (pyflakes, pytest, PyInstaller, kiểm tra
+gói, ZIP, version.json) sẽ chạy bước 12 — `tools/publish_update.py`:
+1. copy `release\ReportExtractor_<version>.zip` → `D:\ReportExtractor_Update\<tên>.zip.tmp`, kiểm tra kích thước + SHA256
+   theo `release\version.json`, rồi đổi tên thành ZIP chính thức;
+2. **chỉ sau đó** ghi `version.json.tmp` và thay thế nguyên tử `version.json` (manifest luôn SAU CÙNG);
+3. xoá các `ReportExtractor_*.zip` cũ (không đụng file khác trong thư mục).
+Thất bại ở bất kỳ bước nào → in `[PUBLISH] FAILED`, giữ nguyên gói/manifest cũ, build vẫn thành công (mã thoát 3);
+xuất bản lại thủ công: `python tools\publish_update.py`. Đường dẫn đích tập trung trong `tools/publish_update.py`
+(`D:\ReportExtractor_Update`, chia sẻ LAN `\\192.168.103.11\ReportExtractor_Update`), ghi đè bằng biến môi trường
+`RE_UPDATE_FOLDER` / `RE_UPDATE_LAN_PATH` hoặc `--publish-dir`; `--no-publish` để bỏ qua.
