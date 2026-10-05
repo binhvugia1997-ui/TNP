@@ -141,3 +141,13 @@
 - Danh sách báo cáo giữ 6 cột gọn; Treeview có thanh cuộn dọc + ngang riêng.
 - Kiểm thử: `tests/test_gui_responsive.py` (17) với fake-tk ghi lại Canvas/Toplevel; tổng 733 passed. Chưa build Portable;
   cần kiểm tra thủ công trên Windows (A–F, 100/125/150 %).
+
+## Build 008 blocker — autoconnect không được ghi đè server LAN đã xác nhận (v1.1.0-beta / Build 008, không đổi build)
+- Nguyên nhân: `auto_connect()` chạy trong thread nền từ lúc khởi động và ghi thẳng `host/port` (= 127.0.0.1) vào
+  controller khi probe xong; trên Windows probe local chậm hơn nên kết thúc SAU khi người dùng xác nhận server tìm được
+  trong LAN → ghi đè lựa chọn mới (`DISCOVERY_APPLY` rồi `OLLAMA_AUTOCONNECT source=local`).
+- Sửa (deterministic, không sleep): `endpoint_epoch` tăng mỗi khi người dùng chọn endpoint (gõ host/port, xác nhận
+  discovery); autoconnect chụp epoch khi bắt đầu và chỉ được ghi kết quả / phát sự kiện GUI nếu epoch không đổi; kết quả cũ
+  bị bỏ qua (`OLLAMA_AUTOCONNECT ignored=stale`, đếm `autoconnect_stale`). Ưu tiên: lựa chọn người dùng > autoconnect.
+- Kiểm thử: +4 trong `tests/test_gui_discovery.py` (autoconnect bắt đầu trước → discovery xác nhận → callback cũ đến sau;
+  server gõ tay; khởi động bình thường vẫn chọn local; kịch bản GUI). Tổng 737 passed.

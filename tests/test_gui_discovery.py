@@ -342,3 +342,89 @@ def test_build_validator_rejects_dev_files(tmp_path):
     problems = bp.validate_artifact(folder)
     assert any("config.json" in p for p in problems) and any("tests" in p for p in problems)
     assert any("sample.pptx" in p for p in problems) and any("ollama.exe" in p for p in problems)
+
+
+# ------------------------------------------------------------------ Build 008 blocker: stale autoconnect vs discovery
+class GatedLocalClient(FakeClient):
+    """Local probe blocks until ``release`` is set – deterministic 'autoconnect finishes AFTER discovery' ordering."""
+    release = threading.Event()
+
+    def test_connection(self):
+        if self.server.startswith("http://127.0.0.1"):
+            GatedLocalClient.release.wait(5)
+        return super().test_connection()
+
+
+def _autoconnect_thread():
+    return next((t for t in threading.enumerate() if t.name == "ollama-autoconnect"), None)
+
+
+def test_stale_autoconnect_does_not_overwrite_confirmed_discovery(tmp_path):
+    GatedLocalClient.release = threading.Event()
+    FakeClient.models_by_server = {"http://127.0.0.1:11434": ["qwen3:4b", "llama3:8b", "x"],
+                                   "http://192.168.1.50:11434": ["qwen3:4b"]}
+    ctl, _ = _ctl(tmp_path)
+    ctl._client_factory = GatedLocalClient
+    ctl.auto_connect_async()                                          # 1. autoconnect starts first (blocked)
+    t = _autoconnect_thread()
+    assert t is not None and t.is_alive()
+    res = OllamaDiscoveryResult("192.168.1.50", 11434, ["qwen3:4b"], 9)
+    ok, msg = ctl.apply_discovered_server(res)                        # 2. user confirms the LAN server
+    assert ok and ctl.host == "192.168.1.50"
+    GatedLocalClient.release.set()                                    # 3. the old autoconnect answers afterwards
+    t.join(5)
+    assert ctl.host == "192.168.1.50" and ctl.port == 11434           # 4. LAN server remains selected
+    assert ctl.server == "http://192.168.1.50:11434" and ctl.ollama_source != "local"
+    assert ctl.autoconnect_stale == 1 and ctl.autoconnect_runs == 1
+    assert [e.kind for e in ctl.pump()] == []                         # no stale 'autoconnect' event reaches the GUI
+
+
+def test_typed_server_outranks_pending_autoconnect(tmp_path):
+    GatedLocalClient.release = threading.Event()
+    FakeClient.models_by_server = {"http://127.0.0.1:11434": ["qwen3:4b"], "http://10.0.0.7:11434": ["qwen3:4b"]}
+    ctl, _ = _ctl(tmp_path)
+    ctl._client_factory = GatedLocalClient
+    ctl.auto_connect_async()
+    t = _autoconnect_thread()
+    assert ctl.set_endpoint("10.0.0.7", 11434) == ""                   # explicit manual choice while probing
+    GatedLocalClient.release.set()
+    t.join(5)
+    assert ctl.host == "10.0.0.7" and ctl.autoconnect_stale == 1 and ctl.pump() == []
+
+
+def test_startup_autoconnect_still_selects_local_without_user_choice(tmp_path):
+    FakeClient.models_by_server = {"http://127.0.0.1:11434": ["qwen3:4b"]}
+    ctl, _ = _ctl(tmp_path)
+    ctl.auto_connect_async()
+    _autoconnect_thread() and _autoconnect_thread().join(5)
+    assert ctl.host == "127.0.0.1" and ctl.ollama_source == "local" and ctl.ollama_ok
+    assert ctl.autoconnect_stale == 0 and [e.kind for e in ctl.pump()] == ["autoconnect"]
+    # a later, unrelated model edit does not make the epoch move (only host/port changes count)
+    e = ctl.endpoint_epoch
+    assert ctl.set_endpoint("127.0.0.1", 11434, "qwen3:4b") == "" and ctl.endpoint_epoch == e
+
+
+def test_view_confirmed_discovery_survives_late_autoconnect(monkeypatch, tmp_path):
+    """GUI-level reproduction of the Windows failure: the start-up autoconnect thread finishes after the user
+    confirmed the discovered LAN server; the widgets must keep 192.168.1.50."""
+    GatedLocalClient.release = threading.Event()
+    res = OllamaDiscoveryResult("192.168.1.50", 11434, ["qwen3:4b"], 9)
+    gui, a, reg = _app(monkeypatch, tmp_path, [res])
+    t0 = _autoconnect_thread()
+    if t0 is not None:
+        t0.join(5)                                                    # settle the constructor's own autoconnect
+    FakeClient.models_by_server = {"http://127.0.0.1:11434": ["qwen3:4b"], "http://192.168.1.50:11434": ["qwen3:4b"]}
+    a.ctl._client_factory = GatedLocalClient
+    a.ctl.auto_connect_async()                                        # a slow local autoconnect is in flight
+    t = _autoconnect_thread()
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *args, **k: True)
+    a.discover_ollama()
+    _finish(a)
+    a.discovery_tree.selection_set(next(iter(a.discovery_tree.items)))
+    a.use_discovered_server(a.discovery_window)
+    assert a.ctl.host == "192.168.1.50" and a.var_host.get() == "192.168.1.50"
+    GatedLocalClient.release.set()
+    t.join(5)
+    a._poll()                                                         # drain whatever the worker queued
+    assert a.ctl.host == "192.168.1.50" and a.var_host.get() == "192.168.1.50" and a.var_port.get() == "11434"
+    assert "192.168.1.50:11434" in a.lbl_conn.cfg["text"] and a.ctl.autoconnect_stale == 1

@@ -342,6 +342,8 @@ class GuiController:
         self.ollama_ok: Optional[bool] = None
         self.ollama_source: str = ""                 # "" | local | saved | none  (how the endpoint was chosen)
         self.autoconnect_runs = 0
+        self.autoconnect_stale = 0                   # autoconnect results dropped because the user chose a server
+        self.endpoint_epoch = 0                      # bumped by every explicit endpoint choice (typed / discovery)
         self.log_lines: List[str] = []
         self.started_at: Optional[float] = None      # time.monotonic() when the batch really started
         self.finished_at: Optional[float] = None
@@ -574,6 +576,8 @@ class GuiController:
         problem = endpoint_problem(host, port_s or 11434)
         if problem:
             return problem
+        if (host, int(port_s or 11434)) != (self.host, self.port):
+            self.endpoint_epoch += 1                 # explicit user choice outranks any in-flight autoconnect
         self.host, self.port = host, int(port_s or 11434)
         if model is not None:
             self.model = model.strip()
@@ -974,6 +978,15 @@ class GuiController:
             return None, self._classify_ollama_error(e)
         return list((info or {}).get("models", []) or []), ""
 
+    def _autoconnect_stale(self, epoch: int) -> bool:
+        """True when the user picked a server (typed / confirmed discovery) while this autoconnect was probing:
+        the stale result must not overwrite the newer explicit selection."""
+        if epoch != self.endpoint_epoch:
+            self.autoconnect_stale += 1
+            LOG.info("OLLAMA_AUTOCONNECT ignored=stale server=%s (user selection took precedence)", self.endpoint_label)
+            return True
+        return False
+
     def _select_local(self, models: List[str]) -> Tuple[bool, str]:
         """Local Ollama answered: show 127.0.0.1 / 11434 in the controls; never switch to an unrelated model."""
         self.host, self.port = split_endpoint(LOCAL_OLLAMA)
@@ -996,13 +1009,18 @@ class GuiController:
         (manual Server/Port, "Kiểm tra kết nối", "Tìm Ollama trong mạng LAN" stay available).  Never starts a LAN
         scan; every probe uses the short probe timeout so GUI start-up never waits for the inference timeout."""
         self.autoconnect_runs += 1
+        epoch = self.endpoint_epoch                  # explicit selections made after this point take precedence
         models, _kind = self._probe(LOCAL_OLLAMA)
+        if self._autoconnect_stale(epoch):
+            return bool(self.ollama_ok), self.ollama_status
         if models is not None:
             return self._select_local(models)
         saved = self.server
         saved_label = self.endpoint_label
         if saved and not is_local_host(self.host) and not endpoint_problem(self.host, self.port):
             models, _kind = self._probe(saved)
+            if self._autoconnect_stale(epoch):
+                return bool(self.ollama_ok), self.ollama_status
             if models is not None:
                 self.ollama_source = "saved"
                 if models:
@@ -1022,12 +1040,16 @@ class GuiController:
 
     def auto_connect_async(self) -> None:
         def work():
+            epoch = self.endpoint_epoch
             try:
                 ok, msg = self.auto_connect()
             except Exception as e:  # noqa: BLE001
                 LOG.exception("auto_connect crashed")
                 ok, msg = False, f"Không kết nối được Ollama local hoặc server đã lưu. ({type(e).__name__})"
-                self.ollama_ok, self.ollama_status, self.ollama_source = False, msg, "none"
+                if epoch == self.endpoint_epoch:
+                    self.ollama_ok, self.ollama_status, self.ollama_source = False, msg, "none"
+            if epoch != self.endpoint_epoch:
+                return                               # stale: the GUI already shows the user's newer selection
             self._queue.put(UiEvent("autoconnect", (ok, msg)))
         threading.Thread(target=work, daemon=True, name="ollama-autoconnect").start()
 
@@ -1156,6 +1178,7 @@ class GuiController:
         problem = self.set_endpoint(result.host, result.port)
         if problem:
             return False, problem
+        self.endpoint_epoch += 1                     # confirmed discovery always wins over a pending autoconnect
         self.ollama_ok, self.ollama_status = None, ""
         self.save_ollama_settings()
         ok, msg, models = self.refresh_models(timeout=timeout)
