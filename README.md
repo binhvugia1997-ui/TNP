@@ -471,3 +471,20 @@ thay đổi. Quét lại cùng thư mục giữ nguyên các dòng đã loại.
 Cả hai tab đều là trang cuộn dọc (Canvas + thanh cuộn): cửa sổ nhỏ hoặc DPI cao → cuộn, không card nào bị thu về tiêu đề;
 cửa sổ lớn → bảng báo cáo và nhật ký nở theo. Con lăn chuột cuộn trang đang trỏ vào; bảng và log vẫn tự cuộn.
 Cửa sổ kiểm tra ảnh/nội dung cải tiến thay đổi được kích thước. Kích thước tối thiểu 880×540.
+
+### Tự động kiểm tra cập nhật qua LAN (PROMPT-009, Build 009)
+* Khi khởi động, GUI mở trước; sau ~3 giây chương trình đọc **chỉ** `version.json` trong *Đường dẫn cập nhật* đã lưu
+  (thư mục cục bộ, ổ mạng ánh xạ như `I:\QPn`, hoặc UNC như `\\BUILD-PC\ReportExtractor_Update`) trong một thread nền —
+  không copy ZIP, không tính SHA256 qua mạng, không chặn Tkinter. Máy làm việc không cần Python/Git/Internet/pip.
+* Tuỳ chọn **☑ Tự động kiểm tra cập nhật khi khởi động** (mặc định bật) nằm trong thẻ *Cập nhật phần mềm*, được lưu trong
+  `config.json` (`auto_update_check`). Tắt → không kiểm tra lúc khởi động; nút *Kiểm tra cập nhật* / *Cập nhật ngay* vẫn dùng được.
+* So sánh theo **số Build**: 008 → 009 có bản mới; 009 → 009 mới nhất; 009 → 008 không hạ cấp (chuỗi phiên bản có thể
+  trùng `1.1.0-beta`).
+* Có bản mới → hộp thoại *Có bản cập nhật mới* (phiên bản hiện tại / phiên bản mới) với **[Cập nhật ngay] [Để sau]**;
+  chỉ hiện **một lần cho mỗi build** trong một phiên; *Cập nhật ngay* đi qua đúng luồng cập nhật hiện có (copy ZIP về
+  `update_staging`, kiểm tra SHA256/ZIP, backup, áp dụng, rollback, khởi động lại). Không bao giờ tự cài hay tự khởi động lại.
+* Máy build tắt / mất LAN / không có quyền / thiếu `version.json` → chỉ ghi log và hiện dòng trạng thái nhẹ
+  *"Không thể kiểm tra cập nhật tự động — chương trình vẫn hoạt động bình thường."*; không popup lỗi; kiểm tra thủ công
+  vẫn báo lỗi rõ như trước.
+* **Quy trình xuất bản trên máy build (không cần server/dịch vụ):** copy `ReportExtractor_<version>.zip` vào thư mục chia
+  sẻ **TRƯỚC**, đợi copy xong, rồi mới copy `version.json` **SAU CÙNG** — máy làm việc chỉ thấy bản mới khi gói đã đầy đủ.

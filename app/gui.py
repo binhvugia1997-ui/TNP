@@ -70,7 +70,8 @@ MIN_GEOMETRY = (880, 540)    # only prevents a nonsensical window; smaller scree
 WRAP_MIN = 320               # smallest wraplength of long explanatory labels (narrow window / high DPI)
 SCAN_TREE_ROWS = 12      # visible rows of "Danh sách báo cáo"; more rows scroll inside the table
 RESULT_TREE_ROWS = 9     # visible rows of "Kết quả xử lý"
-REVIEW_MIN_GEOMETRY = (640, 420)   # learning review Toplevels: resizable, scroll inside, never smaller than this
+REVIEW_MIN_GEOMETRY = (640, 420)
+STARTUP_UPDATE_DELAY_MS = 3000     # automatic LAN update check starts ~3 s after the GUI is up (never blocks start-up)   # learning review Toplevels: resizable, scroll inside, never smaller than this
 
 # scanned-file table: (key, title, width, stretch)
 # compact operational list (PROMPT-006B addendum): the full path / note stay in ScanRow and in the details dialog
@@ -376,7 +377,7 @@ class ReportExtractorApp:
         self.lbl_conn.configure(text="● Đang kiểm tra Ollama local (127.0.0.1:11434)…", style="Secondary.TLabel")
         self.ctl.auto_connect_async()                 # local → saved server; short probe timeout, no LAN scan
         self._show_update_notice()
-        self.root.after(1500, self._startup_update_check)   # lightweight, asynchronous, only when a path is set
+        self.root.after(STARTUP_UPDATE_DELAY_MS, self._startup_update_check)   # GUI first; version.json read in a worker
         self.root.after(100, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -826,19 +827,24 @@ class ReportExtractorApp:
         e8.grid(row=1, column=1, sticky="ew", pady=XS)
         b8 = ttk.Button(uf, text="Chọn...", command=self.pick_update_path)
         b8.grid(row=1, column=2, sticky="w", padx=(S, 0))
+        self.var_auto_update = tk.BooleanVar(value=self.ctl.auto_update_check)
+        self.chk_auto_update = ttk.Checkbutton(uf, text="Tự động kiểm tra cập nhật khi khởi động",
+                                               variable=self.var_auto_update, style="Card.TCheckbutton",
+                                               command=self._on_auto_update_toggled)
+        self.chk_auto_update.grid(row=2, column=0, columnspan=3, sticky="w", pady=(XS, 0))
         ubtns = ttk.Frame(uf, style="Card.TFrame")
-        ubtns.grid(row=2, column=0, columnspan=3, sticky="w", pady=(S, XS))
+        ubtns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(S, XS))
         self.btn_check_update = ttk.Button(ubtns, text="Kiểm tra cập nhật", command=self.check_update)
         self.btn_check_update.pack(side="left", padx=(0, XS))
         self.btn_install_update = ttk.Button(ubtns, text="Cập nhật ngay", command=self.install_update,
                                              state="disabled", style="Primary.TButton")
         self.btn_install_update.pack(side="left")
         self.lbl_update = self._wrap_label(uf, text=self.ctl.update_status_text(), style="Secondary.TLabel")
-        self.lbl_update.grid(row=3, column=0, columnspan=3, sticky="w")
+        self.lbl_update.grid(row=4, column=0, columnspan=3, sticky="w")
         self._wrap_label(uf, text="Thư mục cục bộ hoặc mạng (vd. D:\\ReportExtractor_Update hoặc "
                                   "\\\\SERVER\\ReportExtractor\\Update) chứa version.json và gói ZIP. Dùng quyền truy cập "
                                   "Windows hiện có; không lưu mật khẩu.",
-                         style="Secondary.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(XS, 0))
+                         style="Secondary.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(XS, 0))
         self.var_update_path.trace_add("write", lambda *_: self._on_update_path_edited())
 
         # ---- Dữ liệu học ảnh cải tiến (PROMPT-006: local labels + tiny local model; no Ollama) ----------
@@ -892,7 +898,7 @@ class ReportExtractorApp:
         self.txt_log.configure(yscrollcommand=log_vsb.set)
 
         self._config_widgets.extend([e4, e5, b5, b6, b7, self.cb_model, c2, self.btn_discover, e8, b8,
-                                     self.btn_check_update])
+                                     self.btn_check_update, self.chk_auto_update])
 
     def _bind_shortcuts(self) -> None:
         """Safe conveniences: Ctrl+F focuses the search box, F5 rescans only while idle."""
@@ -1561,13 +1567,19 @@ class ReportExtractorApp:
         self.ctl.set_update_path(self.var_update_path.get())
         self._render_update()
 
+    def _on_auto_update_toggled(self) -> None:
+        self.ctl.set_auto_update_check(bool(self.var_auto_update.get()))
+
     def _render_update(self) -> None:
+        """Runs on the Tk thread only (poll loop / button handlers); the worker merely sets controller state."""
         c = self.ctl
         c.update_dirty = False
         text = c.update_status_text()
         chk = c.update_check
         if c.update_busy:
             style = "Secondary.TLabel"
+        elif c.update_check_startup and chk is not None and chk.status not in ("available", "latest", "older"):
+            style = "Secondary.TLabel"                     # soft, non-alarming start-up failure
         elif chk is None or chk.status == "latest":
             style = "Secondary.TLabel" if chk is None else "Success.TLabel"
         elif chk.status == "available":
@@ -1579,6 +1591,16 @@ class ReportExtractorApp:
         self.lbl_update.configure(text=text, style=style)
         self.btn_install_update.configure(state="normal" if (c.update_available() and not c.is_running()) else "disabled")
         self.btn_check_update.configure(state="disabled" if (c.update_busy or c.is_running()) else "normal")
+        offer = c.pending_update_offer()
+        if offer is not None and not c.is_running():
+            self._offer_update(offer)
+
+    def _offer_update(self, chk) -> None:
+        """Newer build announced once per session: 'Cập nhật ngay' routes into the normal (confirmed) installer,
+        'Để sau' just leaves the status text + button; never installs or restarts by itself."""
+        self.log(f"UPDATE_AVAILABLE {chk.info.label()}")
+        if self._confirm_update(chk.info.label()):
+            self.install_update(confirmed=True)
 
     def _show_update_notice(self) -> None:
         try:
@@ -1616,15 +1638,18 @@ class ReportExtractorApp:
             win.resizable(False, False)
             body = ttk.Frame(win, style="Card.TFrame", padding=(L, M, L, M))
             body.grid(row=0, column=0, sticky="nsew")
-            ttk.Label(body, text=f"Có phiên bản mới {label}.", style="Card.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-            ttk.Label(body, text="Bạn có muốn cập nhật ngay không?", style="Card.TLabel").grid(row=1, column=0, columnspan=2,
-                                                                                               sticky="w", pady=(XS, M))
+            ttk.Label(body, text="Có bản cập nhật mới", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+            ttk.Label(body, text=f"Phiên bản hiện tại:\n{self.ctl.current_version_text().split(': ', 1)[-1]}",
+                      style="Card.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(S, XS))
+            ttk.Label(body, text=f"Phiên bản mới:\n{label}", style="Card.TLabel").grid(row=2, column=0, columnspan=2,
+                                                                                     sticky="w", pady=(0, M))
 
             def _yes():
                 result["ok"] = True
                 win.destroy()
-            ttk.Button(body, text="Cập nhật", style="Primary.TButton", command=_yes).grid(row=2, column=0, sticky="e", padx=(0, S))
-            ttk.Button(body, text="Để sau", command=win.destroy).grid(row=2, column=1, sticky="w")
+            ttk.Button(body, text="Cập nhật ngay", style="Primary.TButton", command=_yes).grid(row=3, column=0, sticky="e",
+                                                                                               padx=(0, S))
+            ttk.Button(body, text="Để sau", command=win.destroy).grid(row=3, column=1, sticky="w")
             win.grab_set()
             self.root.wait_window(win)
         except Exception as e:  # noqa: BLE001 – fall back to a standard dialog
@@ -1632,7 +1657,7 @@ class ReportExtractorApp:
             return bool(messagebox.askyesno(APP_NAME, f"Có phiên bản mới {label}.\nBạn có muốn cập nhật ngay không?"))
         return result["ok"]
 
-    def install_update(self) -> None:
+    def install_update(self, confirmed: bool = False) -> None:
         c = self.ctl
         if not c.update_available():
             self._render_update()
@@ -1640,7 +1665,7 @@ class ReportExtractorApp:
         if c.is_running():
             messagebox.showinfo(APP_NAME, "Đang xử lý báo cáo – hãy đợi xong rồi cập nhật.")
             return
-        if not self._confirm_update(c.update_check.info.label()):
+        if not confirmed and not self._confirm_update(c.update_check.info.label()):
             return
         self._push_to_controller()
         self._remember_window_geometry()

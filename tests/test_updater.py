@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(app.__file__).resolve().parent.parent / "tools"))
 import build_portable as bp  # noqa: E402
 
 V_NEW, B_NEW = "1.0.5", 5
-V_NEWER, B_NEWER = "1.1.0", 9            # newer than the 1.1.0-beta / Build 008 dev app (controller / GUI tests)
+V_NEWER, B_NEWER = "1.1.0", 10           # newer than the 1.1.0-beta / Build 009 dev app (controller / GUI tests)
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -88,16 +88,16 @@ def _ctl(tmp_path, update_path=""):
 
 # ---------------------------------------------------------------------------- version identity (§21/§23)
 def test_numeric_build_display_and_constants():
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 8
-    assert app.BUILD_ID == "008" and app.BUILD_LABEL == "Build 008" and app.APP_TITLE == "Report Extractor v1.1.0-beta"
+    assert app.__version__ == "1.1.0-beta" and app.BUILD_NUMBER == 9
+    assert app.BUILD_ID == "009" and app.BUILD_LABEL == "Build 009" and app.APP_TITLE == "Report Extractor v1.1.0-beta"
     assert app.format_build(4) == "004" and app.format_build(5) == "005" and app.format_build(12) == "012"
     assert app.format_build(1234) == "1234"
-    assert up.version_label() == "1.1.0-beta — Build 008" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
+    assert up.version_label() == "1.1.0-beta — Build 009" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
     assert "git" not in app.BUILD_ID.lower() and app.BUILD_ID.isdigit()
 
 
 def test_build_script_uses_the_same_constants():
-    assert bp._version() == ("1.1.0-beta", "008") and bp.build_number() == 8
+    assert bp._version() == ("1.1.0-beta", "009") and bp.build_number() == 9
     assert bp.package_name("1.0.5") == "ReportExtractor_1.0.5.zip"
 
 
@@ -453,11 +453,11 @@ def test_update_path_persisted_in_config(tmp_path):
 def test_controller_check_async_and_status_texts(tmp_path):
     folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     c = _ctl(tmp_path, str(folder))
-    assert c.current_version_text() == "Phiên bản hiện tại: 1.1.0-beta — Build 008"
+    assert c.current_version_text() == "Phiên bản hiện tại: 1.1.0-beta — Build 009"
     assert c.update_status_text() == "Chưa kiểm tra cập nhật."
     assert c.check_update_async(startup=True)
     c._update_thread.join(10)
-    assert c.update_status_text() == "Có phiên bản mới: 1.1.0 — Build 009" and c.update_available()
+    assert c.update_status_text() == "Có phiên bản mới: 1.1.0 — Build 010" and c.update_available()
     # offline share: a status line, never an exception, processing stays available
     c.set_update_path(str(tmp_path / "offline_share"))
     assert c.update_check is None and c.check_update_async()
@@ -480,6 +480,10 @@ def test_startup_check_is_non_blocking(tmp_path, monkeypatch):
     assert time.monotonic() - t0 < 1.0 and c.update_busy and c.update_status_text() == "Đang kiểm tra cập nhật…"
     gate.set()
     c._update_thread.join(10)
+    # PROMPT-009: automatic start-up failure is soft (status kept internally, no alarming text)
+    assert c.update_check.status == "inaccessible"
+    assert c.update_status_text() == "Không thể kiểm tra cập nhật tự động — chương trình vẫn hoạt động bình thường."
+    c.check_update()                                                   # manual check keeps the explicit message
     assert c.update_status_text() == "Không truy cập được thư mục cập nhật."
 
 
@@ -493,7 +497,7 @@ def test_install_update_requires_confirmation_and_idle_state(tmp_path, monkeypat
     c.check_update()
     spawned = []
     ok, msg = c.install_update(spawn=lambda cmd, **kw: spawned.append(cmd))
-    assert ok and msg.startswith("Đang cài đặt 1.1.0 — Build 009")
+    assert ok and msg.startswith("Đang cài đặt 1.1.0 — Build 010")
     assert spawned and "--apply-update" in spawned[0] and spawned[0][-1].endswith("update.json")
     assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"                    # files untouched until the updater runs
     # downgrade / latest never install
@@ -509,17 +513,17 @@ def test_gui_update_card_controls(monkeypatch, tmp_path):
     btn_texts = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Button"}
     assert {"Chọn...", "Kiểm tra cập nhật", "Cập nhật ngay"} <= btn_texts
     labels = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Label"}
-    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.1.0-beta — Build 008" in labels
-    assert a.lbl_build.cfg["text"] == "Build 008"
+    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.1.0-beta — Build 009" in labels
+    assert a.lbl_build.cfg["text"] == "Build 009"
     assert a.btn_install_update.cfg["state"] == "disabled"
     # startup check scheduled asynchronously (after), not inline
-    assert any(ms == 1500 for ms, _ in a.root.scheduled)
+    assert any(ms == gui.STARTUP_UPDATE_DELAY_MS for ms, _ in a.root.scheduled) and 2000 <= gui.STARTUP_UPDATE_DELAY_MS <= 5000
     # user enters a path and checks
     a.var_update_path.set(str(folder))
     a.check_update()
     a.ctl._update_thread.join(10)
     a._poll()
-    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.1.0 — Build 009"
+    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.1.0 — Build 010"
     assert a.btn_install_update.cfg["state"] == "normal"
     assert a.ctl.update_path == str(folder) and a.ctl.cfg.update_path == str(folder)     # persisted via save_settings
     # "Để sau" (dialog closed without confirming) -> nothing happens

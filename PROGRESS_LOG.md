@@ -151,3 +151,13 @@
   bị bỏ qua (`OLLAMA_AUTOCONNECT ignored=stale`, đếm `autoconnect_stale`). Ưu tiên: lựa chọn người dùng > autoconnect.
 - Kiểm thử: +4 trong `tests/test_gui_discovery.py` (autoconnect bắt đầu trước → discovery xác nhận → callback cũ đến sau;
   server gõ tay; khởi động bình thường vẫn chọn local; kịch bản GUI). Tổng 737 passed.
+
+## PROMPT-009 — Tự động kiểm tra cập nhật LAN + thông báo (v1.1.0-beta / Build 009)
+- Controller: `auto_update_check` (cfg.extra, mặc định bật), `check_update(startup)`, `check_update_async(startup)` tôn trọng
+  tuỳ chọn, `update_status_text()` trả thông báo nhẹ khi kiểm tra tự động thất bại, `pending_update_offer()` (một lần/build/phiên).
+- GUI: checkbox trong thẻ Cập nhật phần mềm; `_startup_update_check` sau `STARTUP_UPDATE_DELAY_MS` = 3000 ms; worker chỉ đặt
+  cờ `update_dirty`, `_poll` (Tk thread) render + gọi `_offer_update` → hộp thoại [Cập nhật ngay]/[Để sau];
+  `install_update(confirmed=True)` đi vào luồng cập nhật hiện có. Thẻ không đổi chiều cao cố định, vẫn nằm trong trang cuộn 008.
+- Kiểm tra phiên bản chỉ đọc version.json (+ `is_file()` gói); ZIP chỉ được copy khi người dùng bấm Cập nhật ngay.
+- Kiểm thử: `tests/test_auto_update_check.py` (15), cập nhật `test_updater.py` (startup thất bại mềm, độ trễ 2–5 s). Tổng 752 passed.
+- Chưa build Portable.

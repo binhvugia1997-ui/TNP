@@ -56,6 +56,17 @@ PRESCAN_STATUSES = ("outside_period", "source_duplicate", "fast_skip")
 FINAL_STATUSES = ("completed", "completed_new", "needs_review", "not_written", "error", "skipped") + PRESCAN_STATUSES
 PERIOD_MODES = ("auto", "month", "range", "all")
 # scanned-file list: Vietnamese label of each pre-scan decision + the manual exclusion
+AUTO_UPDATE_CHECK_KEY = "auto_update_check"            # cfg.extra key (persisted; default enabled)
+AUTO_CHECK_FAILED_VI = "Không thể kiểm tra cập nhật tự động — chương trình vẫn hoạt động bình thường."
+UPDATE_RESULT_STATUSES = ("available", "latest", "older")   # real comparisons; everything else = not reachable
+
+
+def _as_bool(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
 USER_EXCLUDED = "USER_EXCLUDED"
 SCAN_LABELS_VI: Dict[str, str] = {
     ACTION_PROCESS: "Sẽ xử lý — cần bổ sung dữ liệu",
@@ -322,6 +333,11 @@ class GuiController:
         self.update_busy: bool = False
         self.update_dirty: bool = False          # GUI refreshes the update card when set
         self.update_notice: str = ""             # one-shot "Cập nhật thành công lên phiên bản X."
+        # PROMPT-009: automatic LAN check on start-up (persisted in cfg.extra – no schema change), soft failures,
+        # one notification per remote build per session
+        self.auto_update_check: bool = _as_bool((self.cfg.extra or {}).get(AUTO_UPDATE_CHECK_KEY, True))
+        self.update_check_startup: bool = False  # last check was the automatic start-up one (soft failure text)
+        self.offered_update_builds: set = set()  # remote builds already announced in this session
         self._update_thread: Optional[threading.Thread] = None
         self.prescan: Optional[PreScanResult] = None
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
@@ -1566,14 +1582,32 @@ class GuiController:
             return "Đang kiểm tra cập nhật…"
         if self.update_check is None:
             return "Chưa kiểm tra cập nhật." if self.update_path else updater.MSG["no_path"]
+        if self.update_check_startup and self.update_check.status not in UPDATE_RESULT_STATUSES:
+            return AUTO_CHECK_FAILED_VI                   # start-up check: never alarming, app keeps working
         return self.update_check.message
+
+    def set_auto_update_check(self, enabled: bool) -> None:
+        self.auto_update_check = bool(enabled)
+        self.cfg.extra[AUTO_UPDATE_CHECK_KEY] = self.auto_update_check
+        self.save_settings()
+
+    def pending_update_offer(self) -> Optional[UpdateCheck]:
+        """The newer remote build to announce now, at most ONCE per remote build per session (None otherwise)."""
+        chk = self.update_check
+        if not (chk and chk.available and chk.info) or self.update_busy:
+            return None
+        if chk.info.build in self.offered_update_builds:
+            return None
+        self.offered_update_builds.add(chk.info.build)
+        return chk
 
     def update_available(self) -> bool:
         return bool(self.update_check and self.update_check.available) and not self.update_busy
 
-    def check_update(self) -> UpdateCheck:
-        """Synchronous read-only check (used by the worker thread and by tests)."""
+    def check_update(self, startup: bool = False) -> UpdateCheck:
+        """Synchronous read-only check – reads version.json only, never copies the ZIP (worker thread / tests)."""
         self.update_busy = True
+        self.update_check_startup = bool(startup)
         try:
             res = updater.check_for_update(self.update_path)
         except Exception as e:  # noqa: BLE001 – infrastructure problem must never crash the GUI
@@ -1588,11 +1622,12 @@ class GuiController:
         """Non-blocking check; the startup variant silently does nothing when no path is configured."""
         if self._update_thread and self._update_thread.is_alive():
             return False
-        if startup and not self.update_path:
+        if startup and (not self.update_path or not self.auto_update_check):
             return False
         self.update_busy = True
         self.update_dirty = True
-        self._update_thread = threading.Thread(target=self.check_update, name="update-check", daemon=True)
+        self._update_thread = threading.Thread(target=self.check_update, args=(startup,), name="update-check",
+                                               daemon=True)
         self._update_thread.start()
         return True
 
