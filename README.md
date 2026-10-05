@@ -466,3 +466,8 @@ Bảng gọn: **STT · Management Number · Ngày phát sinh · Vendor · Tên f
 thủ công (luôn ở cuối)**. Loại thủ công (chuột phải / Delete) không xoá file, không quét lại, dòng xuống cuối với trạng thái
 `Đã loại thủ công` và không vào hàng đợi; `Khôi phục` đưa dòng về đúng nhóm. STT là thứ tự hiển thị, được tính lại sau mỗi
 thay đổi. Quét lại cùng thư mục giữ nguyên các dòng đã loại.
+
+### Giao diện co giãn (PROMPT-007A, Build 008)
+Cả hai tab đều là trang cuộn dọc (Canvas + thanh cuộn): cửa sổ nhỏ hoặc DPI cao → cuộn, không card nào bị thu về tiêu đề;
+cửa sổ lớn → bảng báo cáo và nhật ký nở theo. Con lăn chuột cuộn trang đang trỏ vào; bảng và log vẫn tự cuộn.
+Cửa sổ kiểm tra ảnh/nội dung cải tiến thay đổi được kích thước. Kích thước tối thiểu 880×540.

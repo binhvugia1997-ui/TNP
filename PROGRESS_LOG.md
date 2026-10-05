@@ -123,3 +123,21 @@
   mới xoá danh sách này. Bộ lọc mới "File đã loại thủ công"; "File cần xử lý" không hiện dòng đã loại.
 - Danh sách chỉ sắp xếp lại khi một báo cáo đạt trạng thái cuối hoặc khi kết thúc batch (không nhảy dòng khi đang xử lý).
 - Kiểm thử: `tests/test_scan_list_compact.py` (13) — tổng 716 passed. Chưa build lại Portable.
+
+## PROMPT-007A — Giao diện co giãn + cuộn dọc (v1.1.0-beta / Build 008)
+- Nguyên nhân Build 007 "card chỉ còn tiêu đề": tab Cấu hình là một grid phẳng, không có lớp cuộn, và
+  `page.rowconfigure(2, weight=1)` đặt trọng số vào hàng card *Cập nhật phần mềm* (cộng với hàng log). Khi tổng chiều cao
+  yêu cầu vượt cửa sổ (màn hình nhỏ / DPI 125–150 %), grid thu các hàng có trọng số về 0 → thân card bị cắt, card sau
+  đè lên card trước.
+- Sửa: helper `_scroll_page()` (Canvas + Scrollbar dọc + Frame trong) dùng chung cho cả hai tab; frame trong luôn rộng bằng
+  viewport và cao = max(viewport, chiều cao yêu cầu) → cửa sổ thấp thì cuộn, cửa sổ cao thì bảng/log nở ra; chỉ hàng log
+  có trọng số ở tab 2; không card nào có chiều cao cố định; không tạo lại widget khi resize.
+- Nhãn giải thích dài bám theo bề rộng trang (`_wrap_label` / `_refit_wrap_labels`, tối thiểu 320 px) thay vì 900 px cố định;
+  ô Server / Đường dẫn cập nhật / Thư mục báo cáo / File kiểm chứng / Kết quả dãn ngang (`sticky="ew"`); nút giữ bề rộng tự nhiên.
+- Con lăn chuột: một handler, định tuyến theo widget dưới con trỏ tới đúng trang cuộn; Treeview/Text/Combobox/Spinbox tự cuộn;
+  cửa sổ khác không bị chiếm.
+- Kích thước tối thiểu cửa sổ 880×540 (cuộn là phương án dự phòng); cửa sổ kiểm tra ảnh / nội dung cải tiến: resizable,
+  minsize 640×420, vùng chữ có thanh cuộn riêng, hàng nút nhãn / điều hướng không có trọng số nên luôn còn trong tầm với.
+- Danh sách báo cáo giữ 6 cột gọn; Treeview có thanh cuộn dọc + ngang riêng.
+- Kiểm thử: `tests/test_gui_responsive.py` (17) với fake-tk ghi lại Canvas/Toplevel; tổng 733 passed. Chưa build Portable;
+  cần kiểm tra thủ công trên Windows (A–F, 100/125/150 %).

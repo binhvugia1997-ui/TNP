@@ -168,16 +168,16 @@ def _scan_tree_names(app_):
 
 # ------------------------------------------------------------------ 1 version
 def test_canonical_version_prompt002():
-    assert app.__version__ == "1.1.0-beta" and app.BUILD_ID == "007" and app.BUILD_LABEL == "Build 007"
-    assert app.APP_TITLE == "Report Extractor v1.1.0-beta" and app.VERSION_LINE == "version=1.1.0-beta build=007"
-    assert "1.1.0-beta" not in SRC and "Build 007" not in SRC.split('"""', 2)[2]   # header imports the constants
+    assert app.__version__ == "1.1.0-beta" and app.BUILD_ID == "008" and app.BUILD_LABEL == "Build 008"
+    assert app.APP_TITLE == "Report Extractor v1.1.0-beta" and app.VERSION_LINE == "version=1.1.0-beta build=008"
+    assert "1.1.0-beta" not in SRC and "Build 008" not in SRC.split('"""', 2)[2]   # header imports the constants
 
 
 def test_window_title_and_header_use_constants(monkeypatch, tmp_path):
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
     assert a.root.title_.startswith("Report Extractor v1.1.0-beta")
-    assert a.lbl_version.cfg["text"] == "v1.1.0-beta" and a.lbl_build.cfg["text"] == "Build 007"   # numeric build only
-    assert a.root.geometry_ == "1400x850" and a.root.minsize_ == (1100, 700)
+    assert a.lbl_version.cfg["text"] == "v1.1.0-beta" and a.lbl_build.cfg["text"] == "Build 008"   # numeric build only
+    assert a.root.geometry_ == "1400x850" and a.root.minsize_ == (880, 540)
 
 
 # ------------------------------------------------------------------ 2 tabs, 3 source, 4 period
@@ -235,7 +235,7 @@ def test_resize_grid_weights_make_tables_expandable(monkeypatch, tmp_path):
         assert holder.col_weights.get(0) == 1 and holder.row_weights.get(0) == 1
     assert a.scan_tree.columns_["file"]["stretch"] and not a.scan_tree.columns_["mgmt"]["stretch"]
     assert a.tree.columns_["note"]["stretch"] and a.tree.columns_["file"]["stretch"]
-    assert a.txt_log.grid_info_["sticky"] == "nsew" and a.tab_cfg.row_weights.get(2) == 1
+    assert a.txt_log.grid_info_["sticky"] == "nsew" and a.cfg_page.row_weights.get(4) == 1 and a.cfg_page.row_weights.get(2) in (None, 0)   # only the log row grows
 
 
 # ------------------------------------------------------------------ 7–11 running-state controls
@@ -460,7 +460,7 @@ def test_window_geometry_persistence_is_validated(monkeypatch, tmp_path):
     assert a.root.geometry_ == "1250x760"
     gui2, b, reg2, _ = _make_app(monkeypatch, tmp_path, cfg_extra={"window_width": 99999, "window_height": 10})
     assert b.root.geometry_ == "1400x850"                                    # invalid persisted size ignored
-    assert gui.valid_geometry(1100, 700, 1920, 1080) and not gui.valid_geometry(1000, 700, 1920, 1080)
+    assert gui.valid_geometry(880, 540, 1920, 1080) and not gui.valid_geometry(800, 540, 1920, 1080)
     b._remember_window_geometry()
     assert (b.ctl.cfg.extra["window_width"], b.ctl.cfg.extra["window_height"]) == (1400, 850)
 

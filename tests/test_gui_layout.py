@@ -65,13 +65,14 @@ def test_file_list_columns():
 
 
 def test_whole_page_scroll_layer():
-    assert "self.page_canvas = tk.Canvas(self.tab_run" in RUN_TAB
-    assert "command=self.page_canvas.yview" in RUN_TAB and "yscrollcommand=self.page_vsb.set" in RUN_TAB
-    assert "create_window((0, 0), window=self.page" in RUN_TAB
-    wheel = SRC[SRC.index("def _on_page_wheel("):SRC.index("# ------------------------------------------------------------------ controller <-> widgets")]
-    assert "ttk.Treeview" in wheel and "tk.Text" in wheel and "self.tab_cfg" in wheel
-    resize = SRC[SRC.index("def _on_canvas_configure("):SRC.index("def _on_page_wheel(")]
-    assert "max(event.height, req_h)" in resize                          # tables grow with the window
+    helper = SRC[SRC.index("def _scroll_page("):SRC.index("def _wrap_label(")]
+    assert "canvas = tk.Canvas(tab" in helper and "command=canvas.yview" in helper and "yscrollcommand=vsb.set" in helper
+    assert "create_window((0, 0), window=inner" in helper
+    assert 'self._scroll_page(self.tab_run, "run")' in RUN_TAB                 # tab 1 uses the shared scroll page
+    wheel = SRC[SRC.index("def _scroll_page_for("):SRC.index("# ------------------------------------------------------------------ controller <-> widgets")]
+    assert "ttk.Treeview" in wheel and "tk.Text" in wheel and "_scroll_pages" in wheel
+    resize = SRC[SRC.index("def _fit_scroll_page("):SRC.index("def _refit_wrap_labels(")]
+    assert "max(height, req_h)" in resize                                  # tables grow with the window, never clipped
 
 
 def test_styling_is_centralised():

@@ -66,9 +66,11 @@ PALETTE = {
     "selection": "#dbe7ff",
 }
 DEFAULT_GEOMETRY = (1400, 850)
-MIN_GEOMETRY = (1100, 700)
+MIN_GEOMETRY = (880, 540)    # only prevents a nonsensical window; smaller screens scroll (PROMPT-007A)
+WRAP_MIN = 320               # smallest wraplength of long explanatory labels (narrow window / high DPI)
 SCAN_TREE_ROWS = 12      # visible rows of "Danh sách báo cáo"; more rows scroll inside the table
 RESULT_TREE_ROWS = 9     # visible rows of "Kết quả xử lý"
+REVIEW_MIN_GEOMETRY = (640, 420)   # learning review Toplevels: resizable, scroll inside, never smaller than this
 
 # scanned-file table: (key, title, width, stretch)
 # compact operational list (PROMPT-006B addendum): the full path / note stay in ScanRow and in the details dialog
@@ -366,6 +368,8 @@ class ReportExtractorApp:
         self.discovery_tree = None
         self._discovery_items: Dict[str, Any] = {}
         self._search_placeholder = True
+        self._scroll_pages: List[Dict[str, Any]] = []   # responsive canvas pages (tab 1 / tab 2)
+        self._wrap_labels: List = []                     # long labels whose wraplength follows the page width
         self._build()
         self._bind_shortcuts()
         self._load_from_controller()
@@ -410,6 +414,36 @@ class ReportExtractorApp:
             pass
 
     # ------------------------------------------------------------------ small layout helpers
+    def _scroll_page(self, tab, name: str):
+        """Responsive page: Canvas + vertical Scrollbar + embedded inner Frame (PROMPT-007A).
+
+        The inner frame is always as wide as the canvas viewport and never shorter than its requested height
+        (so it may exceed the viewport -> vertical scrolling); when the viewport is taller than the content the
+        frame fills it and weighted rows (tables / log) absorb the extra space.  Nothing is recreated on resize.
+        """
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(tab, highlightthickness=0, borderwidth=0, background=PALETTE["bg"])
+        vsb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        inner = ttk.Frame(canvas, style="App.TFrame", padding=(0, M, 0, S))
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.columnconfigure(0, weight=1)
+        sp = {"name": name, "canvas": canvas, "vsb": vsb, "inner": inner, "win": win, "viewport": (0, 0)}
+        self._scroll_pages.append(sp)
+        inner.bind("<Configure>", lambda _e, sp=sp: self._on_scroll_inner_configure(sp))
+        canvas.bind("<Configure>", lambda e, sp=sp: self._on_scroll_canvas_configure(sp, e))
+        return sp
+
+    def _wrap_label(self, parent, **kw):
+        """Secondary explanatory label whose wraplength follows the page width (no 900px assumption)."""
+        kw.setdefault("wraplength", 900)
+        lbl = ttk.Label(parent, **kw)
+        self._wrap_labels.append(lbl)
+        return lbl
+
     def _card(self, parent, title: str, row: int, *, weight: int = 0):
         """White card with a 1px border and a section title; returns the inner body frame (grid-managed)."""
         border = ttk.Frame(parent, style="CardBorder.TFrame")
@@ -457,6 +491,28 @@ class ReportExtractorApp:
         parent.rowconfigure(0, weight=1)
         return tree, vsb, hsb
 
+    @staticmethod
+    def _scrolled_text(parent, *, row: int, column: int, height: int, font, padx=0, pady=0):
+        """Read-only review text with its own vertical scrollbar; the frame grows with its grid cell."""
+        holder = ttk.Frame(parent)
+        holder.grid(row=row, column=column, sticky="nsew", padx=padx, pady=pady)
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(0, weight=1)
+        txt = tk.Text(holder, height=height, width=40, wrap="word", font=font)
+        txt.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(holder, orient="vertical", command=txt.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        txt.configure(yscrollcommand=vsb.set)
+        return txt
+
+    @staticmethod
+    def _follow_width(container, label, *, margin: int) -> None:
+        """Label wraplength follows the container width (review windows at any size / DPI)."""
+        def _on_cfg(event, _c=container, _l=label):
+            if getattr(event, "widget", _c) is _c and int(getattr(event, "width", 0) or 0) > 0:
+                _l.configure(wraplength=max(WRAP_MIN, int(event.width) - margin))
+        container.bind("<Configure>", _on_cfg, add="+")
+
     # ------------------------------------------------------------------ layout
     def _build(self) -> None:
         r = self.root
@@ -486,21 +542,12 @@ class ReportExtractorApp:
 
     def _build_run_tab(self) -> None:
         # ---- whole-page vertical scroll layer: sections scroll, tables scroll internally ------------
-        self.tab_run.columnconfigure(0, weight=1)
-        self.tab_run.rowconfigure(0, weight=1)
-        self.page_canvas = tk.Canvas(self.tab_run, highlightthickness=0, borderwidth=0, background=PALETTE["bg"])
-        self.page_vsb = ttk.Scrollbar(self.tab_run, orient="vertical", command=self.page_canvas.yview)
-        self.page_canvas.configure(yscrollcommand=self.page_vsb.set)
-        self.page_canvas.grid(row=0, column=0, sticky="nsew")
-        self.page_vsb.grid(row=0, column=1, sticky="ns")
-        self.page = ttk.Frame(self.page_canvas, style="App.TFrame", padding=(0, M, 0, S))
-        self._page_win = self.page_canvas.create_window((0, 0), window=self.page, anchor="nw")
-        self.page.bind("<Configure>", self._on_page_configure)
-        self.page_canvas.bind("<Configure>", self._on_canvas_configure)
+        sp = self._scroll_page(self.tab_run, "run")
+        self.page_canvas, self.page_vsb, self.page, self._page_win = sp["canvas"], sp["vsb"], sp["inner"], sp["win"]
+        # one wheel handler for every scroll page; routed by the widget under the pointer (never hijacks tables)
         self.page_canvas.bind_all("<MouseWheel>", self._on_page_wheel, add="+")
         self.page_canvas.bind_all("<Button-4>", self._on_page_wheel, add="+")
         self.page_canvas.bind_all("<Button-5>", self._on_page_wheel, add="+")
-        self.page.columnconfigure(0, weight=1)
         r = self.page
 
         # ---- Nguồn dữ liệu ---------------------------------------------------------------------------
@@ -702,16 +749,22 @@ class ReportExtractorApp:
                                      self.btn_restore, self.cb_scan_filter])
 
     def _build_cfg_tab(self) -> None:
-        page = self.tab_cfg
-        page.columnconfigure(0, weight=1)
-        page.rowconfigure(2, weight=1)
+        # Build 007 collapse: the tab was a plain grid with page.rowconfigure(2, weight=1) and no scroll layer, so
+        # when the window (or DPI-scaled widgets) got taller than the viewport, grid shrank the weighted rows to
+        # their header and the next card painted over the previous one.  Now: Canvas + inner Frame + Scrollbar;
+        # only the log card row is weighted; cards take their height from their children.
+        sp = self._scroll_page(self.tab_cfg, "cfg")
+        self.cfg_canvas, self.cfg_vsb, self.cfg_page, self._cfg_win = sp["canvas"], sp["vsb"], sp["inner"], sp["win"]
+        page = self.cfg_page
+        self.cfg_cards: Dict[str, Any] = {}
         # ---- Kết nối Ollama (editable configuration lives ONLY here) ---------------------------------
         of = self._card(page, "Kết nối Ollama", 0)
+        self.cfg_cards["ollama"] = of
         of.columnconfigure(1, weight=1)
         ttk.Label(of, text="Server", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, M), pady=XS)
         self.var_host = tk.StringVar()
         e4 = ttk.Entry(of, textvariable=self.var_host, width=34)
-        e4.grid(row=0, column=1, sticky="w", pady=XS)
+        e4.grid(row=0, column=1, sticky="ew", pady=XS)                 # grows with the window
         ttk.Label(of, text="host, host:port hoặc http://host:port", style="Secondary.TLabel").grid(
             row=0, column=2, sticky="w", padx=(M, 0))
         ttk.Label(of, text="Port", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, M), pady=XS)
@@ -745,23 +798,25 @@ class ReportExtractorApp:
         self.btn_discover_results = ttk.Button(dbtns, text="Xem kết quả", command=self.show_discovery_results,
                                                state="disabled")
         self.btn_discover_results.pack(side="left")
-        self.lbl_discovery = ttk.Label(of, text="Chỉ quét cổng 11434 trong mạng LAN nội bộ khi bạn bấm nút; "
-                                                "không tự động đổi server.", style="Secondary.TLabel", wraplength=900)
+        self.lbl_discovery = self._wrap_label(of, text="Chỉ quét cổng 11434 trong mạng LAN nội bộ khi bạn bấm nút; "
+                                                       "không tự động đổi server.", style="Secondary.TLabel")
         self.lbl_discovery.grid(row=7, column=0, columnspan=3, sticky="w")
         for var in (self.var_host, self.var_port, self.var_model):
             var.trace_add("write", lambda *_: self._on_endpoint_edited())
 
         # ---- Tùy chọn xử lý (existing persisted settings only) --------------------------------------
         xf = self._card(page, "Tùy chọn xử lý", 1)
+        self.cfg_cards["options"] = xf
         c2 = ttk.Checkbutton(xf, text="Xử lý lại dữ liệu đã có (ghi đè các trường tự động – tương đương --force)",
                              variable=self.var_force, style="Card.TCheckbutton")
         c2.grid(row=0, column=0, sticky="w")
-        ttk.Label(xf, text="Thời gian xử lý, thư mục và file được chọn trên tab “Xử lý báo cáo”; mọi thiết lập được lưu "
-                           "vào config.json khi thay đổi hoặc khi đóng chương trình.", style="Secondary.TLabel",
-                  wraplength=900).grid(row=1, column=0, sticky="w", pady=(XS, 0))
+        self._wrap_label(xf, text="Thời gian xử lý, thư mục và file được chọn trên tab “Xử lý báo cáo”; mọi thiết lập "
+                                  "được lưu vào config.json khi thay đổi hoặc khi đóng chương trình.",
+                         style="Secondary.TLabel").grid(row=1, column=0, sticky="w", pady=(XS, 0))
 
         # ---- Cập nhật phần mềm (PROMPT-005: offline/LAN folder, optional infrastructure) ---------------
         uf = self._card(page, "Cập nhật phần mềm", 2)
+        self.cfg_cards["update"] = uf
         uf.columnconfigure(1, weight=1)
         self.lbl_cur_version = ttk.Label(uf, text=self.ctl.current_version_text(), style="Card.TLabel")
         self.lbl_cur_version.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, XS))
@@ -778,20 +833,21 @@ class ReportExtractorApp:
         self.btn_install_update = ttk.Button(ubtns, text="Cập nhật ngay", command=self.install_update,
                                              state="disabled", style="Primary.TButton")
         self.btn_install_update.pack(side="left")
-        self.lbl_update = ttk.Label(uf, text=self.ctl.update_status_text(), style="Secondary.TLabel", wraplength=900)
+        self.lbl_update = self._wrap_label(uf, text=self.ctl.update_status_text(), style="Secondary.TLabel")
         self.lbl_update.grid(row=3, column=0, columnspan=3, sticky="w")
-        ttk.Label(uf, text="Thư mục cục bộ hoặc mạng (vd. D:\\ReportExtractor_Update hoặc \\\\SERVER\\ReportExtractor\\Update) "
-                           "chứa version.json và gói ZIP. Dùng quyền truy cập Windows hiện có; không lưu mật khẩu.",
-                  style="Secondary.TLabel", wraplength=900).grid(row=4, column=0, columnspan=3, sticky="w", pady=(XS, 0))
+        self._wrap_label(uf, text="Thư mục cục bộ hoặc mạng (vd. D:\\ReportExtractor_Update hoặc "
+                                  "\\\\SERVER\\ReportExtractor\\Update) chứa version.json và gói ZIP. Dùng quyền truy cập "
+                                  "Windows hiện có; không lưu mật khẩu.",
+                         style="Secondary.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(XS, 0))
         self.var_update_path.trace_add("write", lambda *_: self._on_update_path_edited())
 
         # ---- Dữ liệu học ảnh cải tiến (PROMPT-006: local labels + tiny local model; no Ollama) ----------
-        lf = self._card(page, "Dữ liệu học ảnh cải tiến", 3)
-        self.lbl_learning = ttk.Label(lf, text="Ảnh:  " + self.ctl.learning_status_text(), style="Card.TLabel",
-                                      wraplength=900)
+        lf = self._card(page, "Dữ liệu học cải tiến", 3)
+        self.cfg_cards["learning"] = lf
+        self.lbl_learning = self._wrap_label(lf, text="Ảnh:  " + self.ctl.learning_status_text(), style="Card.TLabel")
         self.lbl_learning.grid(row=0, column=0, sticky="w", pady=(0, XS))
-        self.lbl_learning_content = ttk.Label(lf, text="Nội dung:  " + self.ctl.content_status_text(),
-                                              style="Card.TLabel", wraplength=900)
+        self.lbl_learning_content = self._wrap_label(lf, text="Nội dung:  " + self.ctl.content_status_text(),
+                                                     style="Card.TLabel")
         self.lbl_learning_content.grid(row=4, column=0, sticky="w", pady=(0, XS))
         lbtns = ttk.Frame(lf, style="Card.TFrame")
         lbtns.grid(row=1, column=0, sticky="w", pady=(S, XS))
@@ -805,19 +861,19 @@ class ReportExtractorApp:
         self.btn_train_images.pack(side="left", padx=(0, XS))
         ttk.Button(lbtns, text="Mở thư mục dữ liệu học", command=self.open_learning_folder).pack(side="left", padx=(0, XS))
         ttk.Button(lbtns, text="Xuất dữ liệu học", command=self.export_learning_data).pack(side="left")
-        self.lbl_review_summary = ttk.Label(lf, text=self.ctl.review_summary_text(), style="Secondary.TLabel",
-                                            wraplength=900)
+        self.lbl_review_summary = self._wrap_label(lf, text=self.ctl.review_summary_text(), style="Secondary.TLabel")
         self.lbl_review_summary.grid(row=2, column=0, sticky="w")
-        self.lbl_review_content_summary = ttk.Label(lf, text=self.ctl.content_review_summary_text(),
-                                                    style="Secondary.TLabel", wraplength=900)
+        self.lbl_review_content_summary = self._wrap_label(lf, text=self.ctl.content_review_summary_text(),
+                                                           style="Secondary.TLabel")
         self.lbl_review_content_summary.grid(row=5, column=0, sticky="w")
-        ttk.Label(lf, text="Nhãn xác nhận được lưu trong learning_data/ cạnh chương trình (giữ nguyên khi cập nhật). "
-                           "Mô hình chỉ dùng đặc trưng bố cục slide, không gửi dữ liệu đi đâu; nhãn người dùng luôn "
-                           "được ưu tiên.", style="Secondary.TLabel", wraplength=900).grid(row=3, column=0, sticky="w",
-                                                                                             pady=(XS, 0))
+        self._wrap_label(lf, text="Nhãn xác nhận được lưu trong learning_data/ cạnh chương trình (giữ nguyên khi cập "
+                                  "nhật). Mô hình chỉ dùng đặc trưng bố cục slide, không gửi dữ liệu đi đâu; nhãn người "
+                                  "dùng luôn được ưu tiên.", style="Secondary.TLabel").grid(row=3, column=0, sticky="w",
+                                                                                            pady=(XS, 0))
 
         # ---- Nhật ký xử lý (GUI copy of the log stream; clearing never touches app.log) --------------
-        lg = self._card(page, "Nhật ký xử lý", 4, weight=1)
+        lg = self._card(page, "Nhật ký xử lý", 4, weight=1)      # the ONLY weighted row of the settings page
+        self.cfg_cards["log"] = lg
         lbtn = ttk.Frame(lg.head, style="Card.TFrame")
         lbtn.grid(row=0, column=2, sticky="e")
         ttk.Button(lbtn, text="Mở file log", command=self.open_log).pack(side="left", padx=(0, XS))
@@ -828,7 +884,7 @@ class ReportExtractorApp:
         lg.rowconfigure(0, weight=1)
         logf.columnconfigure(0, weight=1)
         logf.rowconfigure(0, weight=1)
-        self.txt_log = tk.Text(logf, height=12, wrap="word", state="disabled", font=(MONO_FAMILY, 9),
+        self.txt_log = tk.Text(logf, height=10, wrap="word", state="disabled", font=(MONO_FAMILY, 9),
                                relief="flat", background=PALETTE["card"], foreground=PALETTE["text"])
         self.txt_log.grid(row=0, column=0, sticky="nsew")
         log_vsb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview)
@@ -861,35 +917,81 @@ class ReportExtractorApp:
 
     # ------------------------------------------------------------------ scroll helpers (layout only)
     def _on_page_configure(self, _event=None) -> None:
-        bbox = self.page_canvas.bbox("all")
-        if bbox:
-            self.page_canvas.configure(scrollregion=bbox)
+        """Run-tab inner frame changed size -> scrollregion follows the content (kept for compatibility)."""
+        for sp in self._scroll_pages:
+            if sp["inner"] is self.page:
+                self._on_scroll_inner_configure(sp)
 
     def _on_canvas_configure(self, event) -> None:
-        """Inner page always as wide as the canvas; as tall as the canvas when the content fits (so the tables
-        grow with the window) and as tall as the content otherwise (page scrolls)."""
+        """Run-tab viewport changed (compat wrapper): inner page = viewport width, max(event.height, req_h) tall."""
+        for sp in self._scroll_pages:
+            if sp["canvas"] is self.page_canvas:
+                self._on_scroll_canvas_configure(sp, event)
+
+    def _on_scroll_inner_configure(self, sp) -> None:
+        """Inner frame requested size changed: scrollregion = bbox('all'); re-fit the height (DPI/font/wrap)."""
+        canvas = sp["canvas"]
         try:
-            req_h = int(self.page.winfo_reqheight() or 0)
-            self.page_canvas.itemconfigure(self._page_win, width=event.width, height=max(event.height, req_h))
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+            vw, vh = sp["viewport"]
+            if vw and vh:
+                self._fit_scroll_page(sp, vw, vh)
         except Exception:  # noqa: BLE001
             pass
 
+    def _on_scroll_canvas_configure(self, sp, event) -> None:
+        """Viewport resized: inner frame width tracks the canvas width; height = max(viewport, requested).
+
+        The requested height is never clamped to the viewport, so a short window scrolls instead of collapsing
+        cards; a tall window lets the weighted rows (tables / log) use the extra space."""
+        try:
+            sp["viewport"] = (int(event.width), int(event.height))
+            self._fit_scroll_page(sp, int(event.width), int(event.height))
+            self._refit_wrap_labels(int(event.width))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fit_scroll_page(self, sp, width: int, height: int) -> None:
+        req_h = int(sp["inner"].winfo_reqheight() or 0)
+        sp["canvas"].itemconfigure(sp["win"], width=width, height=max(height, req_h))
+
+    def _refit_wrap_labels(self, page_width: int) -> None:
+        """Long explanatory labels wrap at the current page width (minus card paddings), never a fixed 900px."""
+        wrap = max(WRAP_MIN, int(page_width) - 6 * L)
+        for lbl in self._wrap_labels:
+            try:
+                lbl.configure(wraplength=wrap)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _scroll_page_for(self, widget):
+        """The scroll page whose inner frame contains ``widget`` (None over tables/logs that scroll themselves)."""
+        w = widget
+        while w is not None:
+            if isinstance(w, (ttk.Treeview, tk.Text, ttk.Combobox, ttk.Spinbox)):
+                return None
+            for sp in self._scroll_pages:
+                if w is sp["inner"] or w is sp["canvas"]:
+                    return sp
+            w = getattr(w, "master", None)
+        return None
+
     def _on_page_wheel(self, event) -> None:
-        """Page scroll only when the pointer is NOT over a table/log (those scroll themselves) or on tab 2."""
+        """Wheel scrolls the scroll page under the pointer only; ttk.Treeview / tk.Text keep their own scrolling
+        and unrelated windows (dialogs, review Toplevels) are never hijacked."""
         try:
             w = event.widget if not isinstance(event.widget, str) else self.root.nametowidget(event.widget)
         except Exception:  # noqa: BLE001
             return
-        while w is not None:
-            if isinstance(w, (ttk.Treeview, tk.Text, ttk.Combobox, ttk.Spinbox)):
-                return
-            if w is self.tab_cfg:
-                return
-            w = getattr(w, "master", None)
+        sp = self._scroll_page_for(w)
+        if sp is None:
+            return
         if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
-            self.page_canvas.yview_scroll(-1, "units")
+            sp["canvas"].yview_scroll(-1, "units")
         elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
-            self.page_canvas.yview_scroll(1, "units")
+            sp["canvas"].yview_scroll(1, "units")
 
     # ------------------------------------------------------------------ controller <-> widgets
     def _load_from_controller(self) -> None:
@@ -1754,11 +1856,14 @@ class ReportExtractorApp:
         win = tk.Toplevel(self.root)
         win.title("Kiểm tra nội dung cải tiến")
         win.geometry("900x640")
+        win.minsize(*REVIEW_MIN_GEOMETRY)
+        win.resizable(True, True)
         win.columnconfigure(0, weight=1)
-        win.rowconfigure(1, weight=1)
+        win.rowconfigure(1, weight=1)                       # only the text area is weighted: buttons stay reachable
         self.creview_win, self.creview_cands = win, cands
         self.creview_head = ttk.Label(win, text="", font=(FONT_FAMILY, 10, "bold"), wraplength=860)
         self.creview_head.grid(row=0, column=0, sticky="w", padx=M, pady=(M, XS))
+        self._follow_width(win, self.creview_head, margin=2 * M)
         body = ttk.Frame(win)
         body.grid(row=1, column=0, sticky="nsew", padx=M)
         body.columnconfigure(0, weight=3)
@@ -1766,10 +1871,8 @@ class ReportExtractorApp:
         body.rowconfigure(1, weight=1)
         ttk.Label(body, text="Nội dung khối chữ (nguyên văn):").grid(row=0, column=0, sticky="w")
         ttk.Label(body, text="Kết quả / bằng chứng / ngữ cảnh:").grid(row=0, column=1, sticky="w", padx=(M, 0))
-        self.creview_text = tk.Text(body, height=16, wrap="word", font=(FONT_FAMILY, 10))
-        self.creview_text.grid(row=1, column=0, sticky="nsew")
-        self.creview_info = tk.Text(body, height=16, wrap="word", font=(MONO_FAMILY, 9))
-        self.creview_info.grid(row=1, column=1, sticky="nsew", padx=(M, 0))
+        self.creview_text = self._scrolled_text(body, row=1, column=0, height=8, font=(FONT_FAMILY, 10))
+        self.creview_info = self._scrolled_text(body, row=1, column=1, height=8, font=(MONO_FAMILY, 9), padx=(M, 0))
         lab = ttk.Frame(win)
         lab.grid(row=2, column=0, sticky="w", padx=M, pady=(S, 0))
         self.creview_label_buttons = {}
@@ -1870,8 +1973,10 @@ class ReportExtractorApp:
         win = tk.Toplevel(self.root)
         win.title("Kiểm tra ảnh cải tiến")
         win.geometry("860x620")
+        win.minsize(*REVIEW_MIN_GEOMETRY)
+        win.resizable(True, True)
         win.columnconfigure(1, weight=1)
-        win.rowconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)                       # preview/details grow; label + nav rows keep their size
         self.review_win, self.review_cands = win, cands
         self.review_thumb = ttk.Label(win, text="(không có ảnh xem trước)", anchor="center")
         self.review_thumb.grid(row=0, column=0, sticky="nsew", padx=M, pady=M)
@@ -1881,8 +1986,8 @@ class ReportExtractorApp:
         info.rowconfigure(1, weight=1)
         self.review_head = ttk.Label(info, text="", font=(FONT_FAMILY, 10, "bold"), wraplength=480)
         self.review_head.grid(row=0, column=0, sticky="w")
-        self.review_text = tk.Text(info, height=18, wrap="word", font=(MONO_FAMILY, 9))
-        self.review_text.grid(row=1, column=0, sticky="nsew", pady=(S, 0))
+        self._follow_width(info, self.review_head, margin=M)
+        self.review_text = self._scrolled_text(info, row=1, column=0, height=8, font=(MONO_FAMILY, 9), pady=(S, 0))
         lab = ttk.Frame(win)
         lab.grid(row=1, column=0, columnspan=2, sticky="w", padx=M)
         self.review_label_buttons = {}

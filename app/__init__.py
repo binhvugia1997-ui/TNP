@@ -6,7 +6,7 @@ Single canonical source of the application version / build number (never duplica
 """
 
 __version__ = "1.1.0-beta"
-BUILD_NUMBER = 7
+BUILD_NUMBER = 8
 
 
 def format_build(n) -> str:
