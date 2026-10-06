@@ -3,14 +3,16 @@
 Renderer chain (first one that works wins):
   1. Microsoft PowerPoint COM automation (Windows, PowerPoint installed)
   2. LibreOffice headless  (pptx -> pdf -> png via PyMuPDF if available)
-  3. Built-in Pillow renderer (draws pictures, tables and text boxes at their
-     original positions).  Always available, lower fidelity but never fails.
+  3. Built-in Pillow renderer (draws pictures, common vector shapes, tables and text boxes
+     from PPTX geometry). Always available; effects, SmartArt, complex freeforms, theme transforms,
+     advanced typography and some grouped-shape details remain lower fidelity than Office renderers.
 
 Nothing here is sent to the cloud.  Source PPTX files are opened read-only.
 """
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -213,34 +215,141 @@ def render_builtin(report: ReportData, slide: SlideData, width_px: int = 1920) -
     sw = report.slide_width or 12192000
     sh = report.slide_height or 6858000
     scale = width_px / sw
-    height_px = int(sh * scale)
+    height_px = max(1, int(sh * scale))
     img = Image.new("RGB", (width_px, height_px), "white")
     draw = ImageDraw.Draw(img)
     px = lambda emu: int(emu * scale)  # noqa: E731
 
-    # pictures first (background), then tables & text
-    for b in slide.blocks:
-        if b.kind != "picture" or not b.image_blob:
+    # Preserve PPTX drawing order. Shape fills/strokes are drawn before the text frame belonging to that shape.
+    events = []
+    serial = 0
+    for block in slide.annotations:
+        events.append((block.z_order if block.z_order >= 0 else 10**9, 0, serial, "visual", block))
+        serial += 1
+    for block in slide.blocks:
+        if block.kind == "picture":
+            priority, kind = 1, "picture"
+        elif block.kind == "table":
+            priority, kind = 2, "table"
+        elif block.kind in ("paragraph", "title"):
+            priority, kind = 3, "text"
+        else:
             continue
-        try:
-            pic = Image.open(BytesIO(b.image_blob))
-            pic = pic.convert("RGBA") if pic.mode in ("P", "LA", "RGBA") else pic.convert("RGB")
-            w, h = max(1, px(b.width)), max(1, px(b.height))
-            pic = pic.resize((w, h), Image.LANCZOS)
-            if pic.mode == "RGBA":
-                img.paste(pic, (px(b.left), px(b.top)), pic)
-            else:
-                img.paste(pic, (px(b.left), px(b.top)))
-        except Exception as e:  # noqa: BLE001
-            LOG.debug("picture render failed: %s", e)
-            draw.rectangle([px(b.left), px(b.top), px(b.right), px(b.bottom)], outline="gray")
-
-    for b in slide.blocks:
-        if b.kind == "table" and b.rows:
-            _draw_table(draw, b, px)
-        elif b.kind in ("paragraph", "title") and b.text.strip():
-            _draw_text(draw, b, px, scale)
+        events.append((block.z_order if block.z_order >= 0 else 10**9, priority, serial, kind, block))
+        serial += 1
+    arrow_by_z = {arrow.z_order: arrow for arrow in slide.arrows if arrow.z_order >= 0}
+    for _z, _priority, _serial, kind, block in sorted(events, key=lambda event: event[:3]):
+        if kind == "visual":
+            _draw_visual_shape(draw, block, px, scale, arrow_by_z.get(block.z_order))
+        elif kind == "picture":
+            _draw_picture(img, draw, block, px)
+        elif kind == "table" and block.rows:
+            _draw_table(draw, block, px)
+        elif kind == "text" and block.text.strip():
+            _draw_text(draw, block, px, scale)
     return img
+
+
+def _draw_picture(canvas: Image.Image, draw: ImageDraw.ImageDraw, block: Block, px) -> None:
+    if not block.image_blob:
+        return
+    try:
+        with Image.open(BytesIO(block.image_blob)) as source:
+            pic = source.convert("RGBA") if source.mode in ("P", "LA", "RGBA") else source.convert("RGB")
+        width, height = max(1, px(block.width)), max(1, px(block.height))
+        pic = pic.resize((width, height), Image.LANCZOS)
+        x, y = px(block.left), px(block.top)
+        if pic.mode == "RGBA":
+            canvas.paste(pic, (x, y), pic)
+        else:
+            canvas.paste(pic, (x, y))
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("picture render failed: %s", exc)
+        draw.rectangle([px(block.left), px(block.top), px(block.right), px(block.bottom)], outline="gray")
+
+
+def _rotate_points(points, cx: float, cy: float, rotation: float):
+    if not rotation:
+        return points
+    theta = math.radians(rotation)
+    cosine, sine = math.cos(theta), math.sin(theta)
+    return [(cx + (x - cx) * cosine - (y - cy) * sine,
+             cy + (x - cx) * sine + (y - cy) * cosine) for x, y in points]
+
+
+def _visual_polygon(block: Block, px):
+    x0, y0, x1, y1 = px(block.left), px(block.top), px(block.right), px(block.bottom)
+    width, height = max(1, x1 - x0), max(1, y1 - y0)
+    prst = (block.prst or "rect").lower()
+    if prst in ("ellipse", "oval", "donut"):
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        points = [(cx + width / 2 * math.cos(2 * math.pi * i / 64),
+                   cy + height / 2 * math.sin(2 * math.pi * i / 64)) for i in range(64)]
+    elif "arrow" in prst:
+        if "left" in prst:
+            raw = [(x1, y0 + height * .25), (x0 + width * .4, y0 + height * .25),
+                   (x0 + width * .4, y0), (x0, cy := (y0 + y1) / 2),
+                   (x0 + width * .4, y1), (x0 + width * .4, y0 + height * .75),
+                   (x1, y0 + height * .75)]
+        elif "up" in prst:
+            raw = [(x0 + width * .25, y1), (x0 + width * .25, y0 + height * .4),
+                   (x0, y0 + height * .4), ((x0 + x1) / 2, y0),
+                   (x1, y0 + height * .4), (x0 + width * .75, y0 + height * .4),
+                   (x0 + width * .75, y1)]
+        elif "down" in prst:
+            raw = [(x0 + width * .25, y0), (x0 + width * .75, y0),
+                   (x0 + width * .75, y0 + height * .6), (x1, y0 + height * .6),
+                   ((x0 + x1) / 2, y1), (x0, y0 + height * .6),
+                   (x0 + width * .25, y0 + height * .6)]
+        else:
+            raw = [(x0, y0 + height * .25), (x0 + width * .6, y0 + height * .25),
+                   (x0 + width * .6, y0), (x1, (y0 + y1) / 2),
+                   (x0 + width * .6, y1), (x0 + width * .6, y0 + height * .75),
+                   (x0, y0 + height * .75)]
+        points = raw
+    elif "triangle" in prst:
+        points = [(x0, y1), ((x0 + x1) / 2, y0), (x1, y1)]
+    elif prst in ("diamond",):
+        points = [((x0 + x1) / 2, y0), (x1, (y0 + y1) / 2),
+                  ((x0 + x1) / 2, y1), (x0, (y0 + y1) / 2)]
+    elif "chevron" in prst:
+        points = [(x0, y0), (x0 + width * .62, y0), (x1, (y0 + y1) / 2),
+                  (x0 + width * .62, y1), (x0, y1), (x0 + width * .38, (y0 + y1) / 2)]
+    else:
+        points = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    return _rotate_points(points, cx, cy, block.rotation)
+
+
+def _draw_line_arrowhead(draw: ImageDraw.ImageDraw, tip: Tuple[float, float], direction: str,
+                         size: int, color) -> None:
+    vectors = {"right": (1, 0), "left": (-1, 0), "down": (0, 1), "up": (0, -1)}
+    dx, dy = vectors.get(direction or "", (1, 0))
+    bx, by = tip[0] - dx * size, tip[1] - dy * size
+    half = max(2, size * .55)
+    points = [tip, (bx - dy * half, by + dx * half), (bx + dy * half, by - dx * half)]
+    draw.polygon(points, fill=color)
+
+
+def _draw_visual_shape(draw: ImageDraw.ImageDraw, block: Block, px, scale: float, arrow=None) -> None:
+    line_color = block.line_color or ("#000000" if block.line_visible else None)
+    fill_color = block.fill_color or ("#4f81bd" if block.fill_visible else None)
+    stroke = max(1, int(round((block.line_width or 12700) * scale))) if block.line_visible else 0
+    if block.line_endpoints:
+        x0, y0, x1, y1 = block.line_endpoints
+        start, end = (px(x0), px(y0)), (px(x1), px(y1))
+        draw.line((start, end), fill=line_color or fill_color or "#000000", width=stroke or 1)
+        if arrow is not None and arrow.direction:
+            direction = arrow.direction
+            tip = max((start, end), key=lambda p: p[0]) if direction == "right" else \
+                min((start, end), key=lambda p: p[0]) if direction == "left" else \
+                max((start, end), key=lambda p: p[1]) if direction == "down" else \
+                min((start, end), key=lambda p: p[1])
+            _draw_line_arrowhead(draw, tip, direction, max(5, stroke * 5), line_color or "#000000")
+        return
+    points = _visual_polygon(block, px)
+    if block.fill_visible or block.line_visible:
+        draw.polygon(points, fill=fill_color, outline=line_color, width=stroke or 1)
 
 
 def _draw_text(draw: ImageDraw.ImageDraw, b: Block, px, scale: float) -> None:
@@ -258,8 +367,9 @@ def _draw_text(draw: ImageDraw.ImageDraw, b: Block, px, scale: float) -> None:
         lines = _wrap(b.text, font, box_w, draw)
         line_h = int(size * 1.25)
     y = y0 + 3
-    for ln in lines:
-        draw.text((x0 + 4, y), ln, fill="black", font=font)
+    for i, ln in enumerate(lines):
+        color = b.line_colors[i] if i < len(b.line_colors) and b.line_colors[i] else "black"
+        draw.text((x0 + 4, y), ln, fill=color, font=font)
         y += line_h
 
 

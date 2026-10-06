@@ -309,7 +309,17 @@ def test_incremental_fill_uses_new_rules(template, tmp_path):
     assert "+ Sau: Tool miết đầu tròn R3" in imp and "3. CẢI TIẾN" not in imp and "Sau cải tiến" not in imp
     assert ws.cell(row=4, column=COL["defect"]).value == "MẺ XƯỚC (nhập tay)"                        # preserved
     assert ws.cell(row=4, column=COL["vendor"]).value == "Doaltech" and ws.cell(row=4, column=COL["qpn"]).value == "QPN nhập tay"
-    assert len(_images_at(ws, 4, COL["image"])) == 5                                                  # 5 independent After images
+    images = _images_at(ws, 4, COL["image"])
+    assert len(images) == 2  # two logical defects, one complete crop per item
+    for image in images:
+        with Image.open(BytesIO(image._data())) as crop:
+            pixels = crop.convert("RGB").tobytes()
+        def has_color(rgb):
+            return any(all(abs(pixels[i + channel] - rgb[channel]) <= 4 for channel in range(3))
+                       for i in range(0, len(pixels), 3))
+
+        assert has_color((200, 230, 201)) and not has_color((255, 224, 178))
+        assert not has_color((153, 153, 153))  # center transition arrow excluded
     assert len(fr.after_pictures) == 5 and fr.after_picture_slides == [4]
     assert all(ws.cell(row=4, column=k).value == "OK" for k in range(12, 20))
     # complete row now (qpn cell has text but no picture -> qpn image still missing -> processed again, nothing rewritten)
@@ -318,7 +328,7 @@ def test_incremental_fill_uses_new_rules(template, tmp_path):
     ws2 = load_workbook(out)[SHEET]
     assert [ws2.cell(row=4, column=c).value for c in range(1, 20)] == before
     assert "root_cause" not in proc2.results[0].filled_fields and "improvement" not in proc2.results[0].filled_fields
-    assert len(_images_at(ws2, 4, COL["image"])) == 5                                                  # not duplicated
+    assert len(_images_at(ws2, 4, COL["image"])) == 2  # reprocessing does not duplicate either item crop
 
 
 def test_complete_row_still_skipped_and_duplicates_marked(template, tmp_path):

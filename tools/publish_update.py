@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from console_safe import configure_console, safe_text
+
 DEFAULT_UPDATE_FOLDER = r"D:\ReportExtractor_Update"
 DEFAULT_LAN_PATH = r"\\192.168.103.11\ReportExtractor_Update"
 MANIFEST_NAME = "version.json"
@@ -63,7 +65,11 @@ class PublishResult:
 
 
 def _log(say: Callable[[str], None], msg: str) -> None:
-    say(f"{TAG} {msg}")
+    text = f"{TAG} {msg}"
+    try:
+        say(text)
+    except UnicodeEncodeError:  # external callbacks may be strict legacy-codepage streams
+        say(safe_text(text, encoding="ascii"))
 
 
 def _cleanup(path: Path) -> None:
@@ -154,7 +160,11 @@ def publish_release(release_dir: Path, folder: Optional[str] = None, *, say: Cal
         for stale in sorted(dest.glob(PACKAGE_GLOB + ".tmp")):
             _cleanup(stale)
         _log(say, "SUCCESS")
-        say(f"\nLocal update folder:\n    {dest}\n\nLAN update path:\n    {lan}\n")
+        success_text = f"\nLocal update folder:\n    {dest}\n\nLAN update path:\n    {lan}\n"
+        try:
+            say(success_text)
+        except UnicodeEncodeError:
+            say(safe_text(success_text, encoding="ascii"))
         return PublishResult(True, dest, pkg_name, removed)
     except Exception as e:  # noqa: BLE001 – build stays successful; publishing is reported separately
         if tmp_zip is not None:
@@ -169,6 +179,7 @@ def publish_release(release_dir: Path, folder: Optional[str] = None, *, say: Cal
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Manual re-publish of an already built release: python tools\\publish_update.py [--release DIR] [--dest DIR]"""
+    configure_console()
     import argparse
     ap = argparse.ArgumentParser(description="Publish release/ to the LAN update folder (ZIP first, version.json last)")
     ap.add_argument("--release", default=str(Path(__file__).resolve().parent.parent / "release"))

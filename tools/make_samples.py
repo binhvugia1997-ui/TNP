@@ -8,6 +8,7 @@ import sys
 from io import BytesIO
 from pathlib import Path
 
+from console_safe import configure_console
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from PIL import Image, ImageDraw
@@ -244,6 +245,7 @@ def make_sample_tree(root: Path) -> dict:
 
 
 if __name__ == "__main__":
+    configure_console()
     target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("sample_data")
     info = make_sample_tree(target)
     print("Created:")

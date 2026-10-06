@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from console_safe import configure_console  # noqa: E402
 from openpyxl import load_workbook  # noqa: E402
 
 from app.excel_writer import ExcelWriter, validate_template  # noqa: E402
@@ -79,8 +80,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(2)
-    from app.main import force_utf8_stdio, write_utf8_report
-    force_utf8_stdio()
+    from app.main import write_utf8_report
+    configure_console()
     text = inspect_template(Path(sys.argv[1]))
     print(text)
     print(f"\n[Đã ghi UTF-8: {write_utf8_report(text, Path('inspect_template.txt')).resolve()}]")

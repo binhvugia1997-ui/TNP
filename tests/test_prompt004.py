@@ -33,6 +33,13 @@ MGMT = "260920045-VOC"
 DECK_NAME = "(CTMS)_20601_260920045-VOC_ Đối sách LỖI MẺ XƯỚC, BONG SƠN 24.9.2026 SEV.pptx"
 
 
+def _image_contains_rgb(image, rgb, tolerance=3):
+    with Image.open(image.ref) as pil:
+        pixels = pil.convert("RGB").tobytes()
+    return any(all(abs(pixels[i + channel] - rgb[channel]) <= tolerance for channel in range(3))
+               for i in range(0, len(pixels), 3))
+
+
 def _run(files, template, out, **kw):
     events = []
     opts = BatchOptions(files=[Path(f) for f in files], template=template, output_file=out, use_ollama=False, **kw)
@@ -222,10 +229,9 @@ def test_before_pictures_never_reach_excel(template, tmp_path):
     s, ev, proc = _run([deck], template, out)
     ws = load_workbook(out)[SHEET]
     imgs = _images_at(ws, 4, COL["image"])
-    assert len(imgs) == 3
-    for im in imgs:                                                              # every inserted picture is green (After)
-        with Image.open(im.ref) as pil:
-            assert pil.convert("RGB").getpixel((5, 5)) == (0xC8, 0xE6, 0xC9)
+    assert len(imgs) == 1  # the three After pictures of this defect share one visual-region crop
+    assert _image_contains_rgb(imgs[0], (0xC8, 0xE6, 0xC9))
+    assert not _image_contains_rgb(imgs[0], (0xFF, 0xE0, 0xB2))
 
 
 # ================================================================== §11-§17 fixed master
@@ -278,7 +284,7 @@ def test_partial_row_fills_only_missing_and_preserves_populated(template, tmp_pa
     assert len(_images_at(ws, 4, COL["qpn"])) == 1                                     # existing QPN untouched
     with Image.open(_images_at(ws, 4, COL["qpn"])[0].ref) as pil:
         assert pil.convert("RGB").getpixel((2, 2)) == (255, 0, 0)
-    assert len(_images_at(ws, 4, COL["image"])) == 5                                   # After-only rule
+    assert len(_images_at(ws, 4, COL["image"])) == 2  # one complete rendered crop per production defect
     assert all(ws.cell(row=4, column=k).value == "OK" for k in range(12, 20))
 
 
@@ -297,7 +303,7 @@ def test_manually_cleared_field_is_refilled(template, tmp_path):
     assert proc2.results[0].filled_fields == ["root_cause"]
     ws2 = load_workbook(out)[SHEET]
     assert ws2.cell(row=4, column=COL["cause"]).value == cause
-    assert len(_images_at(ws2, 4, COL["image"])) == 5                             # existing images not re-inserted
+    assert len(_images_at(ws2, 4, COL["image"])) == 2  # existing defect crops are not re-inserted
 
 
 def test_existing_improvement_images_preserved_when_only_text_missing(template, tmp_path):
@@ -334,7 +340,7 @@ def test_duplicate_rows_topmost_updated_extras_red_values_unchanged(template, tm
     assert "Dòng sử dụng       : 5" in diag and "Management Number bị trùng tại dòng: 7, 8" in diag
     assert "Đã đánh dấu đỏ các dòng trùng." in diag
     ws = load_workbook(out)[SHEET]
-    assert ws.cell(row=5, column=COL["cause"]).value and len(_images_at(ws, 5, COL["image"])) == 5
+    assert ws.cell(row=5, column=COL["cause"]).value and len(_images_at(ws, 5, COL["image"])) == 2
     for r in (7, 8):
         assert ws.cell(row=r, column=COL["mgmt"]).fill.fgColor.rgb.endswith("FFC7CE")
         assert len(_images_at(ws, r, COL["image"])) == 0

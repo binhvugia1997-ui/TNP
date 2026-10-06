@@ -67,8 +67,9 @@ def test_sharing_violation_classification():
     assert not is_sharing_violation(PermissionError(13, "Permission denied"))     # read-only folder / ACL
     assert not is_sharing_violation(FileNotFoundError(2, "missing"))
     assert not is_sharing_violation(RuntimeError(WIN32))
-    msg = locked_file_message(Path("D:/x/master.xlsx"))
-    assert msg.startswith("Không thể cập nhật file Excel vì file đang được sử dụng.") and "D:/x/master.xlsx" in msg
+    locked_path = Path("D:/x/master.xlsx")
+    msg = locked_file_message(locked_path)
+    assert msg.startswith("Không thể cập nhật file Excel vì file đang được sử dụng.") and str(locked_path) in msg
     assert "Hãy đóng file Excel hoặc chương trình đang sử dụng file, sau đó thử lại." in msg
 
 

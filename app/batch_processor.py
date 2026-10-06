@@ -427,6 +427,8 @@ class BatchProcessor:
                                  learning=self.learning)
             fr.image_candidates = list(rec.image_candidates)
             fr.content_candidates = list(rec.content_candidates)
+            for diagnostic in getattr(rec, "cause_diagnostics", []):
+                LOG.info("%s: %s", path.name, diagnostic)
             fr.management_number = rec.management_number
             fr.after_picture_slides = list(rec.after_picture_slides)
             fr.vendor = rec.vendor
@@ -455,15 +457,16 @@ class BatchProcessor:
                     rec.review_reasons.append(f"Không render được QPN: {e}")
 
             # --- 5. improvement images: ONLY "Sau cải tiến" pictures -----------
-            imp_jpg: List[Path] = []           # one PNG per After picture -> independent Excel images
+            imp_jpg: List[Path] = []           # one rendered After-region crop per eligible logical item
             fr.after_pictures = [r.label for r in rec.after_pictures]
             fr.picture_notes = list(rec.picture_notes)
             fr.excluded_sections = list(rec.excluded_sections)
             if rec.after_pictures:
                 self.on_file(idx, "extracting_images", f"{len(rec.after_pictures)} ảnh Sau cải tiến")
                 try:
-                    imp_jpg, problems = export_after_pictures(report, rec.after_pictures,
-                                                              assets / f"{prefix}_IMPROVEMENT_pics")
+                    imp_jpg, problems = export_after_pictures(
+                        report, rec.after_pictures, assets / f"{prefix}_IMPROVEMENT_regions",
+                        renderer=renderer, management_number=rec.management_number)
                     rec.review_reasons.extend(problems)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("%s: improvement image failed: %s", path.name, e)
@@ -476,7 +479,8 @@ class BatchProcessor:
                 if self.opts.force_reprocess:
                     # explicit user request: rewrite every extractor-managed field
                     conflicts = writer.update_record(row, rec, qpn_png, imp_jpg,
-                                                     fill_temporary=self.opts.fill_temporary_column)
+                                                     fill_temporary=self.opts.fill_temporary_column,
+                                                     clear_missing_images=True)
                 else:
                     # auto fill: ONLY the blank fields, populated cells are preserved
                     conflicts = writer.fill_missing_fields(row, rec, missing, qpn_png, imp_jpg)
