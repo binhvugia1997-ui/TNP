@@ -779,7 +779,8 @@ def select_with_learning(report: ReportData, slide_numbers: Sequence[int], sel: 
             refs.append(PictureRef(
                 r.slide, r.block, "after", "", how, owner_id=r.owner_id, owner_heading=r.owner_heading,
                 source_order=r.source_order, temporal_role="AFTER", semantic_role=r.semantic_role,
-                confident_owner=r.confident_owner, excel_output_eligible=True))
+                confident_owner=r.confident_owner, excel_output_eligible=True,
+                report_scope_id=r.report_scope_id))
         elif c.decision == "include":
             reason = c.eligibility_reason or r.exclusion_reason or "temporal/semantic eligibility is not established"
             reasons.append(f"Ảnh slide {c.slide} (#{c.picture_id}) có nhãn Sau nhưng không đủ điều kiện Excel: {reason}")

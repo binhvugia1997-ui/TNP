@@ -171,9 +171,11 @@ def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_
     owners: List[str] = []
     out_dir.mkdir(parents=True, exist_ok=True)
     groups = group_refs(refs)
-    ordered = sorted(groups.items(), key=lambda kv: min(r.source_order for r in kv[1]))
+    ordered = sorted(groups.items(),
+                     key=lambda kv: (min((r.source_order, r.slide, r.block.order) for r in kv[1]),
+                                    kv[0][0], kv[0][1]))
     i = 0
-    for owner, group in ordered:
+    for (_report_scope, owner), group in ordered:
         saved_group: List[Path] = []
         for ref in group:
             i += 1

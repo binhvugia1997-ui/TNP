@@ -20,6 +20,7 @@ from .image_extractor import export_after_pictures
 from .image_learning import ImageCandidate, ImageLearning, select_with_learning
 from .improvement_pictures import select_after_pictures
 from .pptx_parser import parse_pptx
+from .report_identity import report_scope_key
 
 LOG = logging.getLogger("report_extractor.image_review")
 
@@ -121,7 +122,9 @@ def reapply_labels(template: Path, output: Path, cands: Sequence[ImageCandidate]
                 res.errors.append(f"{Path(src).name}: không tìm thấy dòng Management Number {mn!r} trong Excel")
                 continue
             row = rows[0]                                             # canonical = topmost (PROMPT-004 rule)
-            paths, problems = export_after_pictures(report, refs, assets_dir / f"{Path(src).stem}_IMPROVEMENT_pics")
+            scope = report_scope_key(src)
+            report_assets = assets_dir / f"{Path(src).stem}_{scope}_IMPROVEMENT_pics"
+            paths, problems = export_after_pictures(report, refs, report_assets)
             try:
                 n = writer.replace_improvement_images(row, paths)
             except Exception as e:  # noqa: BLE001

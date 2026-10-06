@@ -792,7 +792,10 @@ class ExcelWriter:
             items = [(x, y, max(1, int(w * shrink)), max(1, int(h * shrink))) for (x, y, w, h) in plan["items"]]
         assert_image_inside_area(items, area_w, area_h)      # raises on a genuine layout bug instead of writing it
         for p, (x, y, w, h) in zip(planned["paths"], items):
-            img = XLImage(str(p))
+            # Snapshot image bytes at insertion time. XLImage(path) defers reading until workbook.save(); if a later
+            # report reuses/replaces that temporary asset path before the transaction commits, the earlier row would
+            # silently embed the later report's pixels. BytesIO gives each target row its own immutable evidence.
+            img = XLImage(BytesIO(Path(p).read_bytes()))
             img.width, img.height = max(1, w), max(1, h)
             marker = AnchorMarker(col=cell.column - 1, colOff=px_to_emu(x), row=cell.row - 1, rowOff=px_to_emu(y))
             img.anchor = OneCellAnchor(_from=marker, ext=XDRPositiveSize2D(cx=px_to_emu(img.width), cy=px_to_emu(img.height)))

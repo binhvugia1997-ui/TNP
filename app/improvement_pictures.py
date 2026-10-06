@@ -26,6 +26,7 @@ from .classifier import improvement_subkind, is_heading_like, section_kind_of_he
 from .content_region import (ROLE_CAPTION, ROLE_CONTENT, ROLE_FURNITURE, ROLE_SIDEBAR, ROLE_TITLE, BlockRole,
                              classify_blocks, inline_anchor_kind, title_text)
 from .pptx_parser import Block, ReportData, SlideData, norm_key
+from .report_identity import report_scope_key
 
 AMBIGUOUS_REASON = "Cần kiểm tra: Không xác định chắc chắn ảnh Sau cải tiến tại slide {n}"
 
@@ -154,6 +155,7 @@ class PictureRef:
     confident_owner: bool = False
     excel_output_eligible: bool = False
     exclusion_reason: str = ""
+    report_scope_id: str = ""       # transient source-report scope; never used to generalize learning
 
     @property
     def label(self) -> str:
@@ -357,14 +359,19 @@ def owner_of(picture: Block, items: Sequence[ItemRegion], W: Optional[int] = Non
     return OwnerResult(region, True, "unique nearby production defect/improvement heading", region.semantic_role)
 
 
-def group_refs(refs: Sequence["PictureRef"]) -> Dict[str, List["PictureRef"]]:
-    """Eligible pictures grouped by logical defect owner in deterministic source order."""
-    groups: Dict[str, List[PictureRef]] = {}
-    for ref in sorted(refs, key=lambda x: (x.source_order, x.slide, x.block.order)):
+def group_refs(refs: Sequence["PictureRef"]) -> Dict[Tuple[str, str], List["PictureRef"]]:
+    """Eligible pictures grouped by (source report, logical defect owner) in deterministic source order.
+
+    ``owner_id`` intentionally contains only the logical item identity within a report. Keeping the report scope in
+    the grouping key means identical headings/shape IDs in separately parsed reports cannot merge if a caller passes
+    a multi-report collection. Empty scopes remain compatible for manually constructed, report-local refs.
+    """
+    groups: Dict[Tuple[str, str], List[PictureRef]] = {}
+    for ref in sorted(refs, key=lambda x: (x.source_order, x.slide, x.block.order, x.report_scope_id)):
         if (not ref.excel_output_eligible or ref.temporal_role != "AFTER"
                 or ref.semantic_role != SEMANTIC_PRODUCTION or not ref.confident_owner or not ref.owner_id):
             continue
-        groups.setdefault(ref.owner_id, []).append(ref)
+        groups.setdefault((ref.report_scope_id, ref.owner_id), []).append(ref)
     return groups
 
 
@@ -820,6 +827,9 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
         if any(r.slide == n and r.excel_output_eligible for r in sel.after):
             sel.slides_with_after.append(n)
 
+    scope_id = report_scope_key(report.path)
+    for ref in sel.after + sel.rejected:
+        ref.report_scope_id = scope_id
     for ref in sorted(sel.after + sel.rejected, key=lambda r: (r.slide, r.block.order)):
         status = "eligible" if ref.excel_output_eligible else "excluded"
         detail = ref.exclusion_reason or ref.anchor or ""
