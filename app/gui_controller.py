@@ -1832,12 +1832,12 @@ class GuiController:
         return True
 
     def _publish_update_progress(self, stage: str, done: int, total: int, pct: float, emit: bool,
-                                 t0: List[float]) -> None:
+                                 t0: List[Optional[float]]) -> None:
         """Worker-side: build an immutable snapshot and queue it (NO widget access here)."""
         now = self._clock()
-        if stage == "COPYING" and t0[0] <= 0:
+        if stage == "COPYING" and t0[0] is None:
             t0[0] = now
-        elapsed = now - t0[0] if t0[0] > 0 else 0.0
+        elapsed = now - t0[0] if t0[0] is not None else 0.0
         speed = (done / elapsed) if (stage == "COPYING" and elapsed > 0 and done) else 0.0
         snap = UpdateProgress(stage=stage, bytes_copied=int(done), total_bytes=int(total), percent=float(pct),
                               speed_bps=speed, determinate=(stage in ("COPYING", "VERIFYING", "READY", "HANDOFF",
@@ -1847,7 +1847,7 @@ class GuiController:
             self._queue.put(UiEvent("update_progress", snap))
 
     def _install_work(self, spawn, emit: bool) -> Tuple[bool, str]:
-        t0 = [0.0]
+        t0: List[Optional[float]] = [None]
         try:
             staged = updater.stage_update(self.update_check, portable_root(),
                                           progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p,
