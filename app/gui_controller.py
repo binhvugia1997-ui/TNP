@@ -456,6 +456,7 @@ class GuiController:
         self._learning = None
         self.review_index = 0
         self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
+        self.pending_image_reapply: list = []         # saved image labels whose region-crop Excel reapply is still owed
         self.pending_content_labels: Dict[str, str] = {}   # PROMPT-006B content review (separate dataset)
         self.pending_content_reapply: list = []              # candidates whose Excel re-apply is still owed (locked)
         self.last_content_review = ContentReviewOutcome()
@@ -486,6 +487,23 @@ class GuiController:
             from .content_learning import MSG_MODEL_UNAVAILABLE
             return MSG_MODEL_UNAVAILABLE
         return lrn.content.status_text()
+
+    def learning_model_status_text(self) -> str:
+        """Compact status for the separate learning tab; image/content models stay independent."""
+        lrn = self.learning
+        if lrn is None:
+            return "Mô hình ảnh và nội dung: không khả dụng."
+
+        def state_text(model, state: str) -> str:
+            if model is not None:
+                return f"đã huấn luyện ({model.n_examples} mẫu)"
+            if state in ("corrupt", "incompatible"):
+                return "không khả dụng — dùng quy tắc hiện tại"
+            return "chưa huấn luyện — dùng quy tắc hiện tại"
+
+        content = lrn.content
+        return (f"Mô hình ảnh: {state_text(lrn.model, lrn.model_status)}.  "
+                f"Mô hình nội dung: {state_text(content.model, content.model_status)}.")
 
     # ---- PROMPT-006B content review -------------------------------------------------------------
     def review_content_candidates(self) -> list:
@@ -636,7 +654,7 @@ class GuiController:
         self.pending_labels[cand.candidate_id] = label
 
     def save_confirmations(self, cands) -> Tuple[bool, str]:
-        """Persist the pending labels, then re-apply them to the Excel result (improvement-image cells only)."""
+        """Persist labels first, then re-apply region crops to the Excel image cells."""
         lrn = self.learning
         if lrn is None:
             return False, "Không ghi được dữ liệu học (thư mục learning_data không khả dụng)."
@@ -652,19 +670,54 @@ class GuiController:
                 written += 1
             touched.append(c)
         self.pending_labels.clear()
+        # Include reports owed from a previous locked attempt; the label JSONL stays the source of truth.
+        by_touched_id = {c.candidate_id: c for c in self.pending_image_reapply}
+        by_touched_id.update({c.candidate_id: c for c in touched})
+        touched = list(by_touched_id.values())
+        self.pending_image_reapply = []
         msg = f"Đã lưu {written} nhãn xác nhận."
-        if touched and self.template and self.output and Path(self.output).exists():
-            from .image_review import reapply_labels
-            res = reapply_labels(Path(self.template), Path(self.output), touched, lrn)
-            if res.updated_rows:
-                msg += f" Đã cập nhật ảnh cải tiến cho {len(res.updated_rows)} dòng Excel ({res.pictures} ảnh)."
-            if res.locked:
-                msg += (f"\n\nChưa thể cập nhật {len(res.prepared_rows)} dòng Excel vì file đang được sử dụng:"
-                        f"\n\n{res.locked_path}\n\nHãy đóng file rồi lưu xác nhận lại.")
-            elif res.errors:
-                msg += "\n\nChưa cập nhật được Excel: " + "; ".join(res.errors)
-            self.log_lines.extend(res.messages + res.errors)
+        if touched:
+            if self.template and self.output and Path(self.output).exists():
+                msg = self._image_reapply(touched, lrn, msg)
+            else:
+                self.pending_image_reapply = list(touched)
+                msg += "\n\nNhãn đã lưu; chưa có file Excel kết quả để tạo lại ảnh, có thể thử lại sau."
         return True, msg
+
+    def _image_reapply(self, touched, learning, msg: str) -> str:
+        from .image_review import reapply_labels
+        try:
+            res = reapply_labels(Path(self.template), Path(self.output), touched, learning)
+        except Exception as exc:  # noqa: BLE001 – saved labels remain safe; the Excel step is retryable
+            self.pending_image_reapply = list(touched)
+            self.log_lines.append(f"IMAGE_REAPPLY_FAILED: {exc}")
+            return msg + f"\n\nChưa cập nhật được Excel: {exc} (có thể thử lại từ nhãn đã lưu)."
+        self.log_lines.extend(res.messages + res.errors)
+        if res.updated_rows:
+            msg += f" Đã cập nhật ảnh cải tiến cho {len(res.updated_rows)} dòng Excel ({res.pictures} ảnh)."
+        if res.locked:
+            self.pending_image_reapply = list(touched)     # labels are already saved; retry re-renders region crops
+            msg += (f"\n\nChưa thể cập nhật {len(res.prepared_rows)} dòng Excel vì file đang được sử dụng:"
+                    f"\n\n{res.locked_path}\n\nĐóng file rồi chọn 'Thử lại cập nhật ảnh đã lưu'.")
+        elif res.errors:
+            self.pending_image_reapply = list(touched)
+            msg += "\n\nChưa cập nhật được Excel: " + "; ".join(res.errors)
+        return msg
+
+    def retry_image_reapply(self) -> Tuple[bool, str]:
+        """Retry a saved-label Excel transaction; re-parses PPTX and regenerates visual-region evidence."""
+        touched = list(self.pending_image_reapply)
+        if not touched:
+            return False, "Không có ảnh Excel nào đang chờ cập nhật."
+        if self.learning is None or not (self.template and self.output and Path(self.output).exists()):
+            return False, "Chưa có file Excel kết quả để cập nhật."
+        self.pending_image_reapply = []
+        msg = self._image_reapply(touched, self.learning, "Nhãn ảnh đã lưu được dùng lại.")
+        return not bool(self.pending_image_reapply), msg
+
+    @property
+    def image_reapply_pending(self) -> int:
+        return len(self.pending_image_reapply)
 
     def train_image_model(self) -> Tuple[bool, str]:
         lrn = self.learning
@@ -1815,12 +1868,12 @@ class GuiController:
         return True
 
     def _publish_update_progress(self, stage: str, done: int, total: int, pct: float, emit: bool,
-                                 t0: List[float]) -> None:
+                                 t0: List[Optional[float]]) -> None:
         """Worker-side: build an immutable snapshot and queue it (NO widget access here)."""
         now = self._clock()
-        if stage == "COPYING" and t0[0] <= 0:
+        if stage == "COPYING" and t0[0] is None:
             t0[0] = now
-        elapsed = now - t0[0] if t0[0] > 0 else 0.0
+        elapsed = now - t0[0] if t0[0] is not None else 0.0
         speed = (done / elapsed) if (stage == "COPYING" and elapsed > 0 and done) else 0.0
         snap = UpdateProgress(stage=stage, bytes_copied=int(done), total_bytes=int(total), percent=float(pct),
                               speed_bps=speed, determinate=(stage in ("COPYING", "VERIFYING", "READY", "HANDOFF",
@@ -1830,7 +1883,7 @@ class GuiController:
             self._queue.put(UiEvent("update_progress", snap))
 
     def _install_work(self, spawn, emit: bool) -> Tuple[bool, str]:
-        t0 = [0.0]
+        t0: List[Optional[float]] = [None]
         try:
             staged = updater.stage_update(self.update_check, portable_root(),
                                           progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p,

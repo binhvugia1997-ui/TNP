@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
+from console_safe import child_env, configure_console
+
 ROOT = Path(__file__).resolve().parent.parent
 
 PYTHON_MIN = (3, 10)                 # `X | Y` annotations, dataclass features, current wheels (PyMuPDF, pywin32)
@@ -119,7 +121,7 @@ def installed_models() -> List[str]:
         return []
     try:
         out = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=30, encoding="utf-8",
-                             errors="replace")
+                             errors="replace", env=child_env())
         return parse_ollama_list(out.stdout) if out.returncode == 0 else []
     except Exception:  # noqa: BLE001
         return []
@@ -170,6 +172,7 @@ def cmd_summary() -> int:
 
 
 def main(argv: List[str]) -> int:
+    configure_console()
     if not argv:
         print(__doc__)
         return 2

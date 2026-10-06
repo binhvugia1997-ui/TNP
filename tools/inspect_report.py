@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from console_safe import configure_console  # noqa: E402
 from app.classifier import (SYSTEM_PROMPT, build_prompt, heuristic_classify,  # noqa: E402
                             merge_llm_with_heuristic, normalize_llm_response)
 from app.extractor import extract_record  # noqa: E402
@@ -140,8 +141,8 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="")
     ap.add_argument("--short", action="store_true", help="truncate slide text")
     a = ap.parse_args()
-    from app.main import force_utf8_stdio, write_utf8_report
-    force_utf8_stdio()
+    from app.main import write_utf8_report
+    configure_console()
     text = inspect_report(Path(a.pptx), Path(a.template) if a.template else None, a.server, a.model, not a.short)
     print(text)
     print(f"\n[Đã ghi UTF-8: {write_utf8_report(text, Path('inspect_report.txt')).resolve()}]")

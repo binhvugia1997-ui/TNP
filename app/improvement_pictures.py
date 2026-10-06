@@ -22,9 +22,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .content_region import (ROLE_CAPTION, ROLE_CONTENT, BlockRole, classify_blocks, inline_anchor_kind,
-                             title_text)
+from .classifier import improvement_subkind, is_heading_like, section_kind_of_heading
+from .content_region import (ROLE_CAPTION, ROLE_CONTENT, ROLE_FURNITURE, ROLE_SIDEBAR, ROLE_TITLE, BlockRole,
+                             classify_blocks, inline_anchor_kind, title_text)
 from .pptx_parser import Block, ReportData, SlideData, norm_key
+from .report_identity import report_scope_key
 
 AMBIGUOUS_REASON = "Cần kiểm tra: Không xác định chắc chắn ảnh Sau cải tiến tại slide {n}"
 
@@ -39,6 +41,18 @@ TIE_TOLERANCE = 0.008
 ANCHOR_TOLERANCE = 0.02
 
 _INSPECTION_RE = re.compile(r"kiem tra|kiem soat|inspection|control|quan ly|tieu chuan kiem")
+_TEMPORARY_RE = re.compile(r"xu ly tam thoi|temporary action|temporary countermeasure|containment|tam thoi")
+_VERIFICATION_RE = re.compile(r"kiem chung|xac nhan hieu qua|hieu qua (?:cai tien|doi sach|sau)|verification|effectiveness|"
+                              r"theo doi|monitoring|audit|sustain|duy tri|giam sat|follow[- ]?up|"
+                              r"kiem tra thuong xuyen")
+_CONTROL_ONLY_RE = re.compile(r"kiem soat|doi sach kiem soat|phuong phap kiem tra|tieu chuan kiem tra|"
+                              r"kiem tra|inspection|control|verification|kiem chung")
+
+SEMANTIC_PRODUCTION = "PRODUCTION_IMPROVEMENT"
+SEMANTIC_INSPECTION = "INSPECTION_CONTROL"
+SEMANTIC_TEMPORARY = "TEMPORARY_ACTION"
+SEMANTIC_VERIFICATION = "VERIFICATION"
+SEMANTIC_OTHER = "OTHER"
 
 # PROMPT-004C evidence thresholds (fractions of slide size)
 ARROW_CORRIDOR = 0.12           # picture must overlap the arrow's axis band (± this much of the slide) to be on a side
@@ -73,12 +87,75 @@ class Anchor:
 
 
 @dataclass
+class ItemRegion:
+    """A structural production item or semantic section on a slide."""
+    slide: int
+    owner_id: str
+    heading: str
+    bounds: Tuple[int, int, int, int]
+    source_order: int
+    semantic_role: str
+    confident_defect_ownership: bool
+    region_kind: str = "item"   # item | section
+
+    @property
+    def left(self) -> int:
+        return self.bounds[0]
+
+    @property
+    def top(self) -> int:
+        return self.bounds[1]
+
+    @property
+    def width(self) -> int:
+        return self.bounds[2]
+
+    @property
+    def height(self) -> int:
+        return self.bounds[3]
+
+    @property
+    def right(self) -> int:
+        return self.left + self.width
+
+    @property
+    def bottom(self) -> int:
+        return self.top + self.height
+
+
+@dataclass
+class OwnerResult:
+    region: Optional[ItemRegion]
+    confident: bool
+    reason: str
+    semantic_role: str = SEMANTIC_OTHER
+
+    @property
+    def owner_id(self) -> str:
+        return self.region.owner_id if self.region else ""
+
+    @property
+    def heading(self) -> str:
+        return self.region.heading if self.region else ""
+
+
+@dataclass
 class PictureRef:
     slide: int
     block: Block
     kind: str                   # "after" | "before" | "ambiguous" | "excluded"
     reason: str = ""
     anchor: str = ""            # how it was decided
+    owner_id: str = ""
+    owner_heading: str = ""
+    source_order: int = 0
+    temporal_role: str = "UNKNOWN"       # BEFORE | AFTER | UNKNOWN
+    semantic_role: str = SEMANTIC_OTHER
+    confident_owner: bool = False
+    excel_output_eligible: bool = False
+    exclusion_reason: str = ""
+    report_scope_id: str = ""       # transient source-report scope; never used to generalize learning
+    confidence: Optional[float] = None  # deterministic/model candidate confidence; absent when not measured
 
     @property
     def label(self) -> str:
@@ -101,6 +178,201 @@ def _overlap(a1: int, a2: int, b1: int, b2: int) -> int:
 def _gap(a1: int, a2: int, b1: int, b2: int) -> int:
     """Distance between two 1-D intervals (0 when overlapping)."""
     return max(0, max(a1, b1) - min(a2, b2))
+
+
+def semantic_role_for_heading(text: str) -> str:
+    """Structural meaning of a section/item heading, independent of Before/After wording."""
+    key = norm_key(text)
+    if not key:
+        return SEMANTIC_OTHER
+    if _TEMPORARY_RE.search(key):
+        return SEMANTIC_TEMPORARY
+    kind = section_kind_of_heading(text)
+    if kind in ("verify", "followup") or _VERIFICATION_RE.search(key):
+        return SEMANTIC_VERIFICATION
+    if kind == "improvement":
+        subkind = improvement_subkind(text)
+        if subkind == "inspection":
+            return SEMANTIC_INSPECTION
+        if subkind == "followup":
+            return SEMANTIC_VERIFICATION
+        return SEMANTIC_PRODUCTION
+    if _CONTROL_ONLY_RE.search(key):
+        return SEMANTIC_INSPECTION
+    if kind == "standard":
+        return SEMANTIC_PRODUCTION
+    return SEMANTIC_OTHER
+
+
+def _generic_production_heading(text: str) -> bool:
+    key = re.sub(r"^(?:\d+\s+)+", "", norm_key(text)).strip(" .:;-_")
+    return key in {
+        "cai tien", "cai tien san xuat", "cai tien trong san xuat", "production improvement",
+        "improvement", "process improvement", "doi sach", "doi sach cai tien", "countermeasure",
+        "corrective action", "san xuat", "production", "process",
+    }
+
+
+def _line_box(block: Block, index: int, n_lines: int) -> Tuple[int, int, int, int]:
+    line_h = max(1, int(block.height / max(1, n_lines)))
+    return block.left, int(block.top + index * line_h), block.width, line_h
+
+
+def slide_items(slide: SlideData) -> List[ItemRegion]:
+    """Find item/section headings and estimate their line-level regions in absolute slide geometry.
+
+    Section headings establish local semantics. A specific production heading such as "Cải tiến lỗi A"
+    or a short item heading below a production section becomes a confident logical owner. Generic slide
+    headings alone never count as a defect owner.
+    """
+    roles = sorted(classify_blocks(slide), key=lambda r: (r.block.order, r.block.top, r.block.left))
+    items: List[ItemRegion] = []
+    current_semantic = SEMANTIC_OTHER
+    duplicates: Dict[str, int] = {}
+    for role in roles:
+        if role.role not in (ROLE_TITLE, ROLE_CONTENT, ROLE_SIDEBAR):
+            continue
+        block = role.block
+        lines = [line for line in block.text.splitlines()]
+        n_lines = max(1, len(lines))
+        for i, raw in enumerate(lines):
+            text = raw.strip()
+            if not text:
+                continue
+            key = norm_key(text)
+            if re.match(r"^[\-+•·*▪➢►→>]+", text):
+                continue
+            heading_like = is_heading_like(text, block.bold if i == 0 else False,
+                                           block.size_pt if i == 0 else None)
+            kind = section_kind_of_heading(text) if heading_like else None
+            semantic = semantic_role_for_heading(text) if (heading_like or i == 0) else SEMANTIC_OTHER
+
+            # Recognized section headings (including inspection/control, temporary, verification) update
+            # the context before subsequent item/body headings are inspected.
+            if semantic != SEMANTIC_OTHER:
+                if role.role == ROLE_SIDEBAR and semantic == SEMANTIC_PRODUCTION:
+                    current_semantic = SEMANTIC_PRODUCTION
+                    continue                       # a generic production sidebar is context, not an image owner
+                logical = semantic == SEMANTIC_PRODUCTION and not _generic_production_heading(text)
+                region_kind = "item" if logical else "section"
+                if semantic == SEMANTIC_PRODUCTION:
+                    current_semantic = SEMANTIC_PRODUCTION
+                elif semantic in (SEMANTIC_INSPECTION, SEMANTIC_TEMPORARY, SEMANTIC_VERIFICATION):
+                    current_semantic = semantic
+                line_key = norm_key(text).strip(" .:;-_")
+                occurrence = duplicates.get(line_key, 0) + 1
+                duplicates[line_key] = occurrence
+                owner = f"item:{line_key}" if logical else f"section:S{slide.number}:{block.order}:{i}"
+                if logical and occurrence > 1:
+                    owner += f":{occurrence}"
+                bounds = ((block.left, block.top, block.width, block.height)
+                          if logical and i == 0 else _line_box(block, i, n_lines))
+                items.append(ItemRegion(slide.number, owner, text, bounds,
+                                        block.order * 100 + i, semantic, logical, region_kind))
+                continue
+
+            # A defect heading may omit the words "cải tiến" while remaining under an explicit
+            # production section. Use block starts/defect headings only; never turn body bullets into owners.
+            if (current_semantic == SEMANTIC_PRODUCTION and heading_like and
+                    (i == 0 or kind == "defect") and not re.search(
+                        r"\b(hien trang|truoc|sau|before|after|nguyen nhan|temporary|tam thoi)\b", key)):
+                if kind in ("cause", "temporary", "verify", "standard", "improvement", "qpn"):
+                    continue
+                line_key = key.strip(" .:;-_")
+                if not line_key or _generic_production_heading(text):
+                    continue
+                occurrence = duplicates.get(line_key, 0) + 1
+                duplicates[line_key] = occurrence
+                owner = f"item:{line_key}" + (f":{occurrence}" if occurrence > 1 else "")
+                bounds = (block.left, block.top, block.width, block.height) if i == 0 else _line_box(block, i, n_lines)
+                items.append(ItemRegion(slide.number, owner, text, bounds,
+                                        block.order * 100 + i, SEMANTIC_PRODUCTION, True, "item"))
+    items.sort(key=lambda item: (item.source_order, item.bounds[1], item.bounds[0]))
+    # An item's content often continues well below its title (inline +Sau rows, grouped paragraphs, or
+    # picture tables). Extend only confident item regions to the next logical item or non-production
+    # section; a broad production slide title/sidebar is context, not an ownership boundary.
+    slide_bottom = int(slide.height or max((item.bottom for item in items), default=1))
+    footer_tops = [role.block.top for role in roles
+                   if role.role == ROLE_FURNITURE and role.block.top / max(1, slide_bottom) >= 0.75]
+    if footer_tops:
+        slide_bottom = min(slide_bottom, min(footer_tops))
+    boundaries = [item for item in items
+                  if item.region_kind == "item" or item.semantic_role != SEMANTIC_PRODUCTION]
+    for item in items:
+        if not item.confident_defect_ownership:
+            continue
+        following = [other.top for other in boundaries
+                     if other.source_order > item.source_order and other.top > item.top]
+        x, y, width, _height = item.bounds
+        if following:
+            # A later heading inside the same text box divides the original box; clip at that line
+            # even when the first-line block geometry spans the rest of the paragraph group.
+            bottom = max(y + 1, min(slide_bottom, min(following)))
+        else:
+            bottom = max(y + 1, slide_bottom)
+        item.bounds = (x, y, width, bottom - y)
+    return items
+
+
+def _region_distance(point_block: Block, region: ItemRegion, W: int, H: int) -> float:
+    cx, cy = point_block.left + point_block.width / 2, point_block.top + point_block.height / 2
+    dx = _gap(int(cx), int(cx), region.left, region.right) / max(1, W)
+    dy = _gap(int(cy), int(cy), region.top, region.bottom) / max(1, H)
+    return dx + 1.25 * dy
+
+
+def owner_of(picture: Block, items: Sequence[ItemRegion], W: Optional[int] = None,
+             H: Optional[int] = None) -> OwnerResult:
+    """Resolve a picture's nearest structural section/item owner; fail closed on ties or weak evidence."""
+    if not items:
+        return OwnerResult(None, False, "no item/section heading", SEMANTIC_OTHER)
+    W = int(W or max([picture.right, *(i.right for i in items), 1]))
+    H = int(H or max([picture.bottom, *(i.bottom for i in items), 1]))
+    ranked = sorted(((_region_distance(picture, region, W, H), region) for region in items),
+                    key=lambda pair: (pair[0], pair[1].source_order))
+    score, region = ranked[0]
+    if score > 0.42:
+        return OwnerResult(None, False, f"nearest heading is too far ({score:.3f})", SEMANTIC_OTHER)
+    if region.semantic_role == SEMANTIC_PRODUCTION and not region.confident_defect_ownership:
+        # A generic production slide heading is context, not an item owner. Prefer a nearby specific child
+        # heading when it is spatially comparable to that broad section title.
+        specific = [(d, item) for d, item in ranked[1:]
+                    if item.semantic_role == SEMANTIC_PRODUCTION and item.confident_defect_ownership
+                    and d - score <= 0.12]
+        if specific:
+            score, region = specific[0]
+    competing = [(d, item) for d, item in ranked[1:]
+                 if item.owner_id != region.owner_id and d - score <= 0.025
+                 and (item.confident_defect_ownership or item.semantic_role != region.semantic_role)]
+    if competing:
+        other = competing[0][1]
+        return OwnerResult(None, False, f"ambiguous ownership: {region.heading!r} vs {other.heading!r}", SEMANTIC_OTHER)
+    if region.semantic_role != SEMANTIC_PRODUCTION:
+        return OwnerResult(region, False, f"section semantic role is {region.semantic_role}", region.semantic_role)
+    if not region.confident_defect_ownership:
+        return OwnerResult(region, False, "only a generic production section is known", region.semantic_role)
+    # A second production item at nearly the same distance is not a confident owner.
+    other_items = [(d, item) for d, item in ranked[1:]
+                   if item.confident_defect_ownership and item.owner_id != region.owner_id]
+    if other_items and other_items[0][0] - score <= 0.04:
+        return OwnerResult(None, False, f"ambiguous logical item owner near {region.heading!r}", SEMANTIC_OTHER)
+    return OwnerResult(region, True, "unique nearby production defect/improvement heading", region.semantic_role)
+
+
+def group_refs(refs: Sequence["PictureRef"]) -> Dict[Tuple[str, str], List["PictureRef"]]:
+    """Eligible pictures grouped by (source report, logical defect owner) in deterministic source order.
+
+    ``owner_id`` intentionally contains only the logical item identity within a report. Keeping the report scope in
+    the grouping key means identical headings/shape IDs in separately parsed reports cannot merge if a caller passes
+    a multi-report collection. Empty scopes remain compatible for manually constructed, report-local refs.
+    """
+    groups: Dict[Tuple[str, str], List[PictureRef]] = {}
+    for ref in sorted(refs, key=lambda x: (x.source_order, x.slide, x.block.order, x.report_scope_id)):
+        if (not ref.excel_output_eligible or ref.temporal_role != "AFTER"
+                or ref.semantic_role != SEMANTIC_PRODUCTION or not ref.confident_owner or not ref.owner_id):
+            continue
+        groups.setdefault((ref.report_scope_id, ref.owner_id), []).append(ref)
+    return groups
 
 
 def is_decorative_picture(p: Block, W: int, H: int) -> Optional[str]:
@@ -416,64 +688,199 @@ def classify_picture(p: Block, captions: Sequence[Anchor], inlines: Sequence[Anc
     return "ambiguous", "no Trước/Sau anchor, blue After text or Before→After arrow for this picture"
 
 
+def _caption_owner_for_picture(picture: Block, after_pictures: Sequence[Block],
+                               claims: Dict[int, List[Anchor]], items: Sequence[ItemRegion],
+                               W: int, H: int) -> Optional[OwnerResult]:
+    """Propagate an explicit After-caption owner across its adjacent same-row picture group.
+
+    The caption detector gives each caption one closest picture. Remaining pictures in that authored row still belong
+    to the same visual item, even when a later item heading is geometrically closer. If a row component is anchored by
+    multiple item captions, ownership stays ambiguous rather than merging defects.
+    """
+    direct_anchors = [anchor for anchor in claims.get(id(picture), []) if anchor.kind == "after"]
+    anchored_owners: List[OwnerResult] = [owner_of(anchor, items, W, H) for anchor in direct_anchors]
+    if not anchored_owners:
+        component = {id(picture)}
+        changed = True
+        while changed:
+            changed = False
+            members = [candidate for candidate in after_pictures if id(candidate) in component]
+            for candidate in after_pictures:
+                if id(candidate) in component:
+                    continue
+                if any(_same_row_adjacent(candidate, member, W, H) for member in members):
+                    component.add(id(candidate))
+                    changed = True
+        for anchor_picture in after_pictures:
+            if id(anchor_picture) not in component:
+                continue
+            anchors = [anchor for anchor in claims.get(id(anchor_picture), []) if anchor.kind == "after"]
+            anchored_owners.extend(owner_of(anchor, items, W, H) for anchor in anchors)
+    if not anchored_owners:
+        return None
+    owner_keys = {owner.owner_id or f"unresolved:{owner.reason}" for owner in anchored_owners}
+    if len(owner_keys) > 1:
+        return OwnerResult(None, False, "ambiguous ownership between nearby After-caption groups", SEMANTIC_OTHER)
+    return anchored_owners[0]
+
+
+def _attach_owner(ref: PictureRef, slide: SlideData, items: Sequence[ItemRegion],
+                  slide_is_inspection: bool, W: int, H: int, after_pictures: Sequence[Block] = (),
+                  claims: Optional[Dict[int, List[Anchor]]] = None) -> None:
+    result = owner_of(ref.block, items, W, H)
+    if ref.temporal_role == "AFTER":
+        caption_owner = _caption_owner_for_picture(ref.block, after_pictures, claims or {}, items, W, H)
+        if caption_owner is not None:
+            caption_is_ambiguous = not caption_owner.confident and "ambiguous" in caption_owner.reason
+            if not (caption_is_ambiguous and result.confident and result.region is not None):
+                result = caption_owner
+    ref.owner_id = result.owner_id
+    ref.owner_heading = result.heading
+    ref.confident_owner = result.confident and not slide_is_inspection
+    ref.semantic_role = (SEMANTIC_INSPECTION if slide_is_inspection else
+                         result.semantic_role if result.region is not None else SEMANTIC_OTHER)
+    ref.source_order = int(ref.slide) * 1_000_000 + int(ref.block.order)
+    if ref.temporal_role == "UNKNOWN":
+        ref.temporal_role = {"after": "AFTER", "before": "BEFORE"}.get(ref.kind, "UNKNOWN")
+    if slide_is_inspection:
+        ref.exclusion_reason = "slide title identifies inspection/control content"
+    elif result.region is None:
+        ref.exclusion_reason = result.reason
+    elif not result.confident:
+        ref.exclusion_reason = result.reason
+
+
+def _finalize_picture(ref: PictureRef, slide: SlideData, items: Sequence[ItemRegion],
+                      slide_is_inspection: bool, W: int, H: int, sel: PictureSelection,
+                      after_pictures: Sequence[Block] = (), claims: Optional[Dict[int, List[Anchor]]] = None) -> None:
+    _attach_owner(ref, slide, items, slide_is_inspection, W, H, after_pictures, claims)
+    if ref.kind == "excluded":
+        ref.exclusion_reason = ref.reason or ref.exclusion_reason
+        sel.rejected.append(ref)
+        return
+    if ref.temporal_role == "BEFORE":
+        ref.kind = "before"
+        ref.exclusion_reason = ref.reason or "Before image"
+        sel.rejected.append(ref)
+        return
+
+    eligible = (ref.temporal_role == "AFTER" and ref.semantic_role == SEMANTIC_PRODUCTION
+                and ref.confident_owner and bool(ref.owner_id))
+    ref.excel_output_eligible = bool(eligible)
+    if eligible:
+        ref.kind = "after"
+        ref.exclusion_reason = ""
+        sel.after.append(ref)
+        return
+
+    # Known non-production semantics are definite exclusions. Weak ownership or semantics remain
+    # ambiguous for review, but neither can enter the final workbook.
+    if ref.semantic_role in (SEMANTIC_INSPECTION, SEMANTIC_TEMPORARY, SEMANTIC_VERIFICATION):
+        ref.kind = "excluded"
+        default_reason = {
+            SEMANTIC_INSPECTION: "inspection/control content",
+            SEMANTIC_TEMPORARY: "temporary-action content",
+            SEMANTIC_VERIFICATION: "verification/follow-up content",
+        }[ref.semantic_role]
+        ref.exclusion_reason = ref.exclusion_reason or default_reason
+        ref.reason = ref.reason or ref.exclusion_reason
+    else:
+        ref.kind = "ambiguous"
+        reasons = []
+        if ref.temporal_role != "AFTER":
+            reasons.append("temporal role is unknown")
+        if ref.semantic_role != SEMANTIC_PRODUCTION:
+            reasons.append(f"semantic role is {ref.semantic_role}")
+        if not ref.confident_owner:
+            reasons.append(ref.exclusion_reason or "no confident logical item owner")
+        ref.exclusion_reason = "; ".join(dict.fromkeys(reasons)) or "not confidently eligible for Excel"
+        generic = AMBIGUOUS_REASON.format(n=ref.slide)
+        if generic not in sel.reasons:
+            sel.reasons.append(generic)
+    sel.rejected.append(ref)
+
+
 def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> PictureSelection:
-    """After-only pictures of the given improvement slides, in slide/reading order."""
+    """Only confidently owned After + production-improvement pictures are Excel eligible."""
     sel = PictureSelection()
     W, H = report.slide_width or 1, report.slide_height or 1
     for n in sorted(set(int(x) for x in slide_numbers)):
-        s: Optional[SlideData] = report.slide(n)
-        if s is None or not s.pictures:
+        slide: Optional[SlideData] = report.slide(n)
+        if slide is None or not slide.pictures:
             continue
-        roles = classify_blocks(s)
-        head = norm_key(title_text(s))
-        if head and _INSPECTION_RE.search(head) and not re.search(r"san xuat|production|process|cong doan", head):
-            for p in s.pictures:
-                sel.rejected.append(PictureRef(n, p, "excluded", "inspection/control improvement slide"))
-            sel.notes.append(f"S{n}: ảnh thuộc cải tiến kiểm tra/kiểm soát – không chèn")
-            continue
+        roles = classify_blocks(slide)
+        items = slide_items(slide)
+        head = norm_key(title_text(slide))
+        slide_is_inspection = bool(head and _INSPECTION_RE.search(head) and
+                                   not re.search(r"san xuat|production|process|cong doan", head))
         captions = _caption_anchors(roles)
         inlines, inspection_ranges = _inline_anchors(roles)
         from .extractor import excluded_bands                      # lazy: extractor imports this module
-        bands = excluded_bands(s, H)
-        content_pics = [p for p in s.pictures if not is_decorative_picture(p, W, H)]
+        bands = excluded_bands(slide, H)
+        content_pics = [p for p in slide.pictures if not is_decorative_picture(p, W, H)]
         claims = _claims(content_pics, captions, W, H)
         blue = _blue_anchors(roles, inspection_ranges)
         blue = [a for a in blue if not any(y0 <= a.cy < y1 for y0, y1, _k in bands)]
-        arrows = [a for a in getattr(s, "arrows", []) if _arrow_usable(a, W, H, bands, inspection_ranges, roles)]
+        arrows = [a for a in getattr(slide, "arrows", [])
+                  if _arrow_usable(a, W, H, bands, inspection_ranges, roles)]
         votes = _arrow_votes(content_pics, arrows, W, H)
+
+        # Keep temporal classification independent, then apply semantic/item eligibility after row
+        # neighbours have had a chance to inherit a caption's Before/After label.
+        working = PictureSelection()
         ambiguous = False
-        for p in sorted(s.pictures, key=lambda b: b.order):
-            why = is_decorative_picture(p, W, H)
+        for picture in sorted(slide.pictures, key=lambda b: b.order):
+            why = is_decorative_picture(picture, W, H)
             if why:
-                sel.rejected.append(PictureRef(n, p, "excluded", why))
+                working.rejected.append(PictureRef(n, picture, "excluded", why,
+                                                   temporal_role="UNKNOWN"))
                 continue
-            cy = p.top + p.height / 2
+            cy = picture.top + picture.height / 2
             band = next((k for y0, y1, k in bands if y0 <= cy < y1), None)
-            if band:                                                # PROMPT-001: excluded section block -> zero pictures
-                sel.rejected.append(PictureRef(n, p, "excluded", f"{band} section block (mid-slide heading)"))
+            if band:
+                band_label = "inspection/control" if band == "inspection" else band
+                band_kind, band_anchor = classify_picture(picture, captions, inlines, W, H, claims, blue, votes)
+                band_temporal = {"after": "AFTER", "before": "BEFORE"}.get(band_kind, "UNKNOWN")
+                working.rejected.append(PictureRef(
+                    n, picture, "excluded", f"{band_label} section block (mid-slide heading)", band_anchor,
+                    temporal_role=band_temporal))
                 continue
             if any(y0 <= cy < y1 for y0, y1 in inspection_ranges) and not captions:
-                sel.rejected.append(PictureRef(n, p, "excluded", "inspection/control item"))
+                working.rejected.append(PictureRef(n, picture, "excluded", "inspection/control item"))
                 continue
-            kind, how = classify_picture(p, captions, inlines, W, H, claims, blue, votes)
+            kind, how = classify_picture(picture, captions, inlines, W, H, claims, blue, votes)
+            temporal = {"after": "AFTER", "before": "BEFORE"}.get(kind, "UNKNOWN")
             if kind == "after":
-                sel.after.append(PictureRef(n, p, "after", "", how))
+                working.after.append(PictureRef(n, picture, "after", "", how, temporal_role=temporal))
             elif kind == "before":
-                sel.rejected.append(PictureRef(n, p, "before", "Before picture", how))
+                working.rejected.append(PictureRef(n, picture, "before", "Before picture", how,
+                                                   temporal_role=temporal))
             else:
                 ambiguous = True
-                sel.rejected.append(PictureRef(n, p, "ambiguous", how))
-        # pictures grouped in the same row next to a caption-labelled picture share its caption
-        # (a caption button usually labels the whole group of pictures beside it)
-        ambiguous = _propagate_row_neighbours(sel, n, W, H) if ambiguous else ambiguous
-        if ambiguous:
-            sel.reasons.append(AMBIGUOUS_REASON.format(n=n))
-        if any(r.slide == n for r in sel.after):
+                working.rejected.append(PictureRef(n, picture, "ambiguous", how, temporal_role=temporal))
+
+        ambiguous = _propagate_row_neighbours(working, n, W, H) if ambiguous else ambiguous
+        after_blocks = [candidate.block for candidate in working.after]
+        for candidate in sorted(working.after, key=lambda r: r.block.order):
+            _finalize_picture(candidate, slide, items, slide_is_inspection, W, H, sel, after_blocks, claims)
+        for rejected in sorted(working.rejected, key=lambda r: r.block.order):
+            # Prior exclusions (decorative/section/inspection) are still given explicit item semantics.
+            _finalize_picture(rejected, slide, items, slide_is_inspection, W, H, sel, after_blocks, claims)
+        generic = AMBIGUOUS_REASON.format(n=n)
+        if ambiguous and generic not in sel.reasons:
+            sel.reasons.append(generic)
+        if any(r.slide == n and r.excel_output_eligible for r in sel.after):
             sel.slides_with_after.append(n)
-    for r in sel.rejected:
-        sel.notes.append(f"{r.label}: {r.kind} – {r.reason or r.anchor}")
-    for r in sel.after:
-        sel.notes.append(f"{r.label}: after – {r.anchor}")
+
+    scope_id = report_scope_key(report.path)
+    for ref in sel.after + sel.rejected:
+        ref.report_scope_id = scope_id
+    for ref in sorted(sel.after + sel.rejected, key=lambda r: (r.slide, r.block.order)):
+        status = "eligible" if ref.excel_output_eligible else "excluded"
+        detail = ref.exclusion_reason or ref.anchor or ""
+        sel.notes.append(
+            f"{ref.label}: {status}; temporal={ref.temporal_role}; semantic={ref.semantic_role}; "
+            f"owner={ref.owner_id or 'unknown'} ({ref.owner_heading!r}); {detail}")
     return sel
 
 

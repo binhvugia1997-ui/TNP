@@ -31,6 +31,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from console_safe import child_env, configure_console, safe_text  # noqa: E402
 import publish_update  # noqa: E402  (centralised update-folder configuration + safe publisher)
 
 PUBLISH_FAILED_RC = 3          # build succeeded, publishing did not (distinct from build failures = 1)
@@ -80,24 +81,24 @@ def write_version_manifest(release_dir: Path, version: str, build: int, zip_path
 
 
 def step(n: int, title: str) -> None:
-    print(f"\n[{n:02d}] {title}", flush=True)
+    print(safe_text(f"\n[{n:02d}] {title}", stream=sys.stdout), flush=True)
 
 
 def fail(msg: str, code: int = 1) -> None:
-    print(f"\nLỖI BUILD: {msg}", file=sys.stderr, flush=True)
+    print(safe_text(f"\nLỖI BUILD: {msg}", stream=sys.stderr), file=sys.stderr, flush=True)
     sys.exit(code)
 
 
 def run(cmd: list[str], cwd: Path = ROOT) -> None:
-    print("   $", " ".join(str(c) for c in cmd), flush=True)
-    r = subprocess.run([str(c) for c in cmd], cwd=str(cwd))
+    print(safe_text("   $ " + " ".join(str(c) for c in cmd), stream=sys.stdout), flush=True)
+    r = subprocess.run([str(c) for c in cmd], cwd=str(cwd), env=child_env())
     if r.returncode != 0:
         fail(f"lệnh thất bại (mã {r.returncode}): {' '.join(str(c) for c in cmd)}", r.returncode or 1)
 
 
 def check_python(py: Path) -> None:
     out = subprocess.run([str(py), "-c", "import sys;print(sys.version_info[0],sys.version_info[1],sys.maxsize>2**32)"],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", env=child_env())
     if out.returncode != 0:
         fail(f"không chạy được {py}")
     major, minor, is64 = out.stdout.split()
@@ -121,7 +122,8 @@ def get_git_revision(root: Path = ROOT, timeout: float = 10.0) -> str:
     """
     try:
         r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(root), capture_output=True,
-                           text=True, timeout=timeout, check=True)
+                           text=True, encoding="utf-8", errors="replace", timeout=timeout, check=True,
+                           env=child_env())
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         print(f"[info] Git revision không khả dụng ({type(e).__name__}) – ghi '{GIT_UNAVAILABLE}' vào metadata")
         return GIT_UNAVAILABLE
@@ -209,6 +211,7 @@ def validate_artifact(folder: Path, exe_name: str = "ReportExtractor.exe") -> li
 
 
 def main() -> int:
+    configure_console()
     ap = argparse.ArgumentParser(description="Build Report Extractor Windows Portable")
     ap.add_argument("--python", default=sys.executable, help="Python interpreter used to create the build venv")
     ap.add_argument("--skip-tests", action="store_true", help="không chạy pytest (chỉ dùng khi đã chạy riêng)")
@@ -242,7 +245,7 @@ def main() -> int:
 
     step(4, "Kiểm tra mã nguồn (pyflakes) và test (pytest)")
     flakes = subprocess.run([str(py), "-m", "pyflakes", "app", "tools", "run.py"], cwd=str(ROOT),
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", env=child_env())
     # "imported but unused" lines are deliberate availability probes (win32com, fitz, tkinter …) – everything else fails
     real = [ln for ln in (flakes.stdout + flakes.stderr).splitlines() if ln.strip() and "imported but unused" not in ln]
     if real:
