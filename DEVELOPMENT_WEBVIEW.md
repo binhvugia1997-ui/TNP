@@ -10,42 +10,63 @@ The integration keeps Python authoritative for scanning, extraction, Excel, lear
 update state. The development updater's **install** action is deliberately disabled; the launcher must not update or
 replace this checkout.
 
+## Python compatibility
+
+Use **Python 3.12** for the Windows pywebview development environment. `requirements-webview.txt` pins pywebview 6.2.1
+and, on Windows, `pythonnet==3.0.5`; pip's `Requires-Python` metadata rejects the previously attempted Python 3.14
+combination. Install the declared requirements normally—do not use pip flags that bypass package metadata. Python 3.12
+has launched the integrated app on Windows.
+
+This is a narrower compatibility choice for the **Windows pywebview development frontend**, not a change to the backend
+or the ordinary source/Portable workflow. The backend/setup range remains Python 3.10 through 3.14 (`>=3.10,<3.15`),
+so Python 3.11 CI remains supported. No extra Python-version preflight is implemented; normal pip metadata is the
+compatibility gate for the pywebview environment.
+
 ## Exact Windows PowerShell commands
 
-Run from the repository root (replace the path with the local checkout path):
+Run from the repository root (replace the path with the local checkout path). If `.venv-webview` was created with a
+different interpreter, first confirm it contains no needed local data, then recreate it with Python 3.12. Do not try to
+repair an incompatible environment by bypassing pip's metadata checks.
 
 ```powershell
 Set-Location 'C:\path\to\TNP'
 
-py -3.14 -m venv .venv-webview
+py -3.12 -m venv .venv-webview
 & .\.venv-webview\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv-webview\Scripts\python.exe -m pip install -r requirements.txt
 & .\.venv-webview\Scripts\python.exe -m pip install -r requirements-webview.txt
 & .\.venv-webview\Scripts\python.exe -m pip install pytest pyflakes
 
 Push-Location frontend
-npm ci --ignore-scripts
-npm run build
+npm.cmd ci --ignore-scripts
+npm.cmd run typecheck
+npm.cmd run build
 Pop-Location
 
 & .\.venv-webview\Scripts\python.exe -m app.desktop --debug
 ```
 
-The target desktop has already verified Python 3.14.7, Node.js 24.21.0, pywebview 6.2.1, pythonnet 3.0.5, native
-window startup, HTML/JavaScript rendering, JavaScript-to-Python `ping()`, and the returned `Python bridge OK` value.
-The launcher selects pywebview's Edge Chromium backend on Windows. A WebView2 Runtime is required.
+The Windows launcher selects pywebview's Edge Chromium backend; a WebView2 Runtime is required. The prior, pre-PROMPT-023
+Windows run verified startup, Edge WebView2 and production React rendering, the JavaScript-to-Python bridge and returned
+Python response, native folder/PPTX pickers, scanning a real folder of six PPTX reports and one selected real PPTX,
+report DTO-to-React table rendering, Management Number and occurrence-date display, and selected-report details. Those
+checks were performed before the PROMPT-023 fixes; they are not post-patch verification.
 
-After changes, repeat the frontend build and relaunch. To run automated checks from the repository root:
+## Automated checks
+
+Run from the repository root after installing the development requirements:
 
 ```powershell
+& .\.venv-webview\Scripts\python.exe -m pytest -q tests/test_application_service.py tests/test_runtime_paths.py tests/test_updater.py
 & .\.venv-webview\Scripts\python.exe -m pytest -q
 & .\.venv-webview\Scripts\python.exe -m compileall -q app tests tools
 & .\.venv-webview\Scripts\python.exe -m pyflakes `
-  app/application_service.py app/bridge.py app/desktop.py `
+  app/application_service.py app/bridge.py app/desktop.py app/runtime_paths.py `
   app/batch_processor.py app/excel_writer.py app/gui_controller.py app/logger.py `
-  tests/test_application_service.py
+  tests/conftest.py tests/test_application_service.py tests/test_runtime_paths.py tests/test_updater.py
 Push-Location frontend
-npm run typecheck
-npm run build
+npm.cmd run typecheck
+npm.cmd run build
 Pop-Location
 git diff --check
 ```
@@ -53,30 +74,35 @@ git diff --check
 Do **not** run `BUILD_AND_PUBLISH.bat`, build Portable/EXE, publish an update/release ZIP, or edit production
 `version.json` for development acceptance.
 
-## Acceptance checklist and status vocabulary
+## Acceptance status
 
 | Status | Scope |
 |---|---|
-| **REAL CONNECTED — AUTOMATED TESTED** | The React bridge contract and JSON-safe DTOs; real Python report scanning/list/details; configuration and status mapping; manual Vendor/date persistence and Excel lock/retry; a production `GuiController` + `BatchProcessor` fixture run; worker progress/logs and stop-after-current lifecycle; image/content candidate review, label persistence, Excel reapply/retry, model-update dispatch, export, and fixed output actions. The synthetic worker test covers lifecycle only; it is not the processing integration test. |
-| **VERIFIED ON WINDOWS** | Target-machine checks listed above: native window startup, HTML/JavaScript rendering, JS-to-Python bridge invocation, and Python-to-JS `Python bridge OK` response. |
-| **IMPLEMENTED — WINDOWS ACCEPTANCE REQUIRED** | Actual user-selected native dialogs; the complete React page inside Edge WebView2 (not just the bridge ping); local real-world PPTX processing and rendered image evidence; Excel lock behavior under Microsoft Excel; output/open-folder actions; and 100%, 125%, and 150% DPI/window-size behavior. Linux automated tests do not substitute for these checks. |
+| **AUTOMATED TESTED — PROMPT-023** | 875 Python tests passed (82 targeted picker/runtime-isolation/updater tests); compileall and configured pyflakes passed; frontend typecheck and production build passed. The build emits a hashed local favicon referenced through `./assets/...`; `git diff --check` passed. The suite covers the bridge filter/cancel/path contracts, isolated persistent state, and prior extraction, evidence, learning, Excel safety/lock-retry, force-reprocessing, Ollama, and updater regressions. |
+| **WINDOWS VERIFIED BEFORE PROMPT-023** | The pre-patch checks listed above. They confirm the earlier integrated runtime, not the picker-filter or persistent-state fixes in this change. |
+| **WINDOWS RETEST REQUIRED AFTER PROMPT-023** | Native picker open/cancel behavior and all post-patch real-report processing, Excel edit/lock/retry, stop-after-current, rendered evidence, and batch checks in the checklist below. No Linux GUI feasibility check substitutes for Windows acceptance. |
 | **DISABLED WITH REASON** | Applying/installing updates is disabled in the development UI/service so no updater replaces or restarts the checkout. Update checking remains a read-only backend operation. |
-| **NOT IMPLEMENTED** | Hot-module-reload Vite server embedded directly in the pywebview window. The supported development flow is `npm run build`, then `python -m app.desktop`; opening Vite in a normal browser has no mock/demo bridge fallback. |
+| **NOT IMPLEMENTED** | Hot-module-reload Vite server embedded directly in the pywebview window. The supported development flow is `npm.cmd run build`, then `python -m app.desktop`; opening Vite in a normal browser has no mock/demo bridge fallback. |
 
-### Windows manual acceptance
+## Post-patch Windows manual acceptance
 
-1. Launch with the commands above and confirm version **1.3.2 — Build 015** and the connected Python state.
-2. Exercise folder selection, one-PPTX selection, template/output selection, cancellation, and the report scan. Confirm the
-   report table shows filenames and no absolute source paths.
-3. Open a report, edit Vendor and Occurrence date, reject an invalid date, save valid values, and confirm the other Excel
-   cells remain unchanged. With the result workbook open in Excel, verify the locked message and retry after closing it.
-4. Process a disposable copy of a representative PPTX with Ollama disabled. Observe real progress and logs; request stop
-   during a file and confirm that file completes while the next file is not started. Check extracted details, rendered
-   QPN/After evidence, Excel output, and the output-file/folder actions.
-5. Exercise Ollama connection/model refresh and read-only update check. Confirm the update-install button stays disabled.
-6. Review image and content candidates, save labels/notes, verify local persistence, test saved-label Excel retry while the
-   workbook is locked, and exercise model update/export.
-7. Repeat layout and native-dialog checks at Windows display scaling 100%, 125%, and 150%; verify the minimum window size.
+Use disposable copies of reports, templates, and output workbooks. Keep the test local; do not publish an update or release.
 
-Do not use production reports or the production output workbook for the manual run. Keep the run local; no LAN update
-publication or release package is part of this acceptance.
+1. Run the Python 3.12 setup sequence above, launch the app, and confirm version **1.3.2 — Build 015** and the connected
+   Python state.
+2. Exercise native folder, single-PPTX, XLSX template/open, XLSX output/save, learning-export, and update-folder pickers.
+   Test both choosing a valid path and cancelling each applicable dialog. Confirm XLSX/PPTX/ZIP extensions and verify
+   that cancelling leaves the current setting unchanged.
+3. Scan a real report folder and select one representative real PPTX. Process that one report first; confirm real progress,
+   QPN, structural cause, improvement text, the whole rendered “Sau cải tiến” crop, and the resulting Excel output.
+4. Edit Vendor and Occurrence date for that report, save valid values, reject an invalid date, and verify the intended Excel
+   cells changed without altering neighboring cells.
+5. With two disposable reports, test **Dừng sau báo cáo hiện tại** and verify the active report finishes while the next
+   report does not start. Open the result workbook in Excel, verify the lock/retry message, close Excel, retry, and confirm
+   the saved values are applied.
+6. Only after the single-report, manual-edit, stop, and lock/retry checks pass, run a small batch and confirm its report
+   order, progress, QPN/cause/improvement details, rendered whole “Sau cải tiến” crop, and consolidated Excel output.
+7. Exercise Ollama connection/model refresh and the read-only update check. Confirm update installation stays disabled.
+8. Review image/content learning candidates, save labels/notes, test the saved-label Excel retry while the workbook is
+   locked, and exercise the local learning-data export. Repeat layout and native-dialog checks at Windows display scaling
+   100%, 125%, and 150%; verify the minimum window size.

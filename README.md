@@ -18,7 +18,11 @@ management number returned by the LLM are only used when found verbatim in the P
 
 ## 1. Portable build (Windows) – v1.0.3 / PROMPT-003
 
-On the **development PC** (Python 3.10 – 3.13, 64-bit; the build refuses other versions):
+On the **development PC for the backend/source or Portable build** (Python 3.10 – 3.14, 64-bit; see `tools/setup_support.py`):
+
+> This backend range is separate from the Windows React + pywebview development environment, which uses Python 3.12
+> because the pinned `pythonnet==3.0.5` metadata rejects the previously attempted Python 3.14 environment. See
+> [`DEVELOPMENT_WEBVIEW.md`](DEVELOPMENT_WEBVIEW.md) for its exact setup; Python 3.11 backend CI remains supported.
 
 ```
 build_portable.bat
@@ -365,8 +369,9 @@ danh sách (bộ lọc mặc định `Tất cả file đã quét`; bộ lọc `F
 4. Nháy đúp run.bat.
 ```
 
-* **Python hỗ trợ: >= 3.10 và < 3.15, tức 3.10 – 3.14 (khuyến nghị 3.12)** – định nghĩa duy nhất trong `tools/setup_support.py`.
-  `setup.bat` thử `py -3.12 / -3.13 / -3.14 / -3.11 / -3.10 / -3` rồi `python`, kiểm tra phiên bản thật; nếu không có sẽ đề nghị
+* **Backend/source và Portable: Python >= 3.10 và < 3.15, tức 3.10 – 3.14 (khuyến nghị 3.12)** – định nghĩa duy nhất trong `tools/setup_support.py`.
+  Riêng môi trường phát triển React + pywebview trên Windows dùng Python 3.12 do metadata của `pythonnet==3.0.5`; giới hạn này
+  không đổi hỗ trợ backend/CI Python 3.11. `setup.bat` thử `py -3.12 / -3.13 / -3.14 / -3.11 / -3.10 / -3` rồi `python`, kiểm tra phiên bản thật; nếu không có sẽ đề nghị
   cài `Python.Python.3.12` qua **winget** (gói chính thức), không tải từ nguồn lạ. Không cần quyền Admin cho `.venv`/pip.
 * Môi trường ảo cục bộ `.venv` (đã có trong `.gitignore`): tạo nếu chưa có, dùng lại nếu lành, tạo lại nếu hỏng/sai phiên bản.
   Thư viện runtime từ `requirements.txt`; công cụ test/dev (`pytest`, …) trong `requirements-dev.txt` – hỏi `Cài thêm công cụ

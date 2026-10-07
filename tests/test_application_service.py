@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import threading
@@ -69,12 +70,58 @@ def _report_for(result, name):
     return next(report for report in result["reports"] if report["fileName"] == name)
 
 
+def test_default_service_persistent_state_stays_inside_disposable_pytest_root(tmp_path):
+    from app import runtime_paths
+
+    test_root = Path(os.environ[runtime_paths.TEST_RUNTIME_ROOT_ENV]).resolve()
+    service = ApplicationService()
+    assert runtime_paths.portable_root() == test_root
+    assert service._manual_fields_path == test_root / "config" / "manual_fields.json"
+    assert runtime_paths.logs_dir(create=False) == test_root / "logs"
+    assert runtime_paths.output_dir(create=False) == test_root / "Output"
+    assert runtime_paths.learning_dir(create=False) == test_root / "learning_data"
+
+    report_folder = tmp_path / "reports"
+    output_file = tmp_path / "output" / "result.xlsx"
+    service.controller.report_folder = str(report_folder)
+    service.controller.template = str(tmp_path / "template.xlsx")
+    service.controller.output = str(output_file)
+    service.controller.save_settings()
+    assert runtime_paths.config_file() == test_root / "config" / "config.json"
+    assert AppConfig.load().last_report_folder == str(report_folder)
+    assert AppConfig.load().last_output_file == str(output_file)
+
+    report_key = str((report_folder / "260901001-VOC_report.pptx").resolve())
+    service._manual_fields = {report_key: {"vendor": "Disposable Vendor"}}
+    service._pending_manual = {report_key: {"vendor": "Disposable Vendor"}}
+    service._save_manual_fields()
+    persisted = json.loads(service._manual_fields_path.read_text(encoding="utf-8"))
+    assert persisted["pending"] == [report_key]
+    assert service._manual_fields_path.is_relative_to(test_root)
+    reloaded = ApplicationService()
+    assert reloaded._pending_manual == {report_key: {"vendor": "Disposable Vendor"}}
+
+
 def test_desktop_bundle_url_is_relative_and_rooted_only_at_dist():
     app_root = Path(__file__).resolve().parents[1] / "app"
     assert FRONTEND_URL == "../frontend/dist/index.html"
     assert not FRONTEND_URL.startswith(("/", "file:", "http:"))
     assert (app_root / FRONTEND_URL).resolve() == FRONTEND_INDEX
     assert FRONTEND_INDEX.parent == FRONTEND_DIST
+
+
+def test_frontend_favicon_is_a_local_relative_vite_asset():
+    frontend = Path(__file__).resolve().parents[1] / "frontend"
+    html = (frontend / "index.html").read_text(encoding="utf-8")
+    match = re.search(r'<link rel="icon" type="image/svg\+xml" href="([^"]+)"', html)
+    assert match is not None
+    href = match.group(1)
+    assert not href.startswith(("/", "//", "http:", "https:"))
+    icon = (frontend / href).resolve()
+    assert icon.is_file() and icon.parent.is_relative_to((frontend / "src" / "assets").resolve())
+    assert "<svg" in icon.read_text(encoding="utf-8")
+    vite = (frontend / "vite.config.ts").read_text(encoding="utf-8")
+    assert "base: './'" in vite and "publicDir: false" in vite
 
 
 def test_bridge_required_contract_scan_details_and_status_keys(sample_tree, tmp_path):
@@ -232,6 +279,8 @@ def test_real_application_service_runs_production_batch_and_applies_manual_field
 
     output = Path(config["paths"]["output"])
     assert output.is_file()
+    history_path = output.parent / "logs" / "history.json"
+    assert history_path.is_file() and history_path.is_relative_to(tmp_path)
     workbook = load_workbook(output, data_only=True)
     try:
         sheet = workbook["Kiểm chứng"]
@@ -302,7 +351,10 @@ def test_bridge_native_selection_tokens_dto_validation_and_error_sanitizing(samp
     assert "token" in selected["data"] and "path" not in selected["data"]
     folder = bridge.choose_report_folder()
     assert folder["ok"] and Path(folder["data"]["path"]) == sample_tree["reports"].resolve()
-    assert [kind for kind, _ in window.calls] == ["OPEN_DIALOG", "FOLDER_DIALOG"]
+    assert window.calls == [
+        ("OPEN_DIALOG", {"file_types": ("PowerPoint presentation (*.pptx)",)}),
+        ("FOLDER_DIALOG", {}),
+    ]
 
     scanned = bridge.scan_reports(config, selected["data"]["token"])
     assert scanned["ok"] and len(scanned["data"]["reports"]) == 1
@@ -334,6 +386,102 @@ def test_bridge_native_selection_tokens_dto_validation_and_error_sanitizing(samp
     assert safe_error["ok"] is False and str(selected_file.resolve()) not in safe_error["error"]["message"]
     assert selected_file.name in safe_error["error"]["message"]
     assert not hasattr(bridge, "open_path")  # fixed backend-owned actions only; no arbitrary path endpoint
+
+
+def test_xlsx_and_learning_export_dialog_filters_paths_and_save_validation(sample_tree, tmp_path, monkeypatch):
+    service, _ = _make_service(sample_tree, tmp_path)
+    bridge = BridgeService(service)
+    folder = tmp_path / "native selections"
+    nested = folder / "nested"
+    nested.mkdir(parents=True)
+    template = folder / "Verification.xlsx"
+    template.write_bytes(b"xlsx")
+    output = folder / "Kiem_chung.xlsx"
+    export = folder / "learning_data_export.zip"
+    direct_export = folder / "learning_data_export_direct.zip"
+    raw_template = nested / ".." / template.name
+    raw_output = nested / ".." / output.name
+    raw_export = nested / ".." / export.name
+    raw_direct_export = nested / ".." / direct_export.name
+
+    class DialogWindow:
+        def __init__(self, choices):
+            self.choices = list(choices)
+            self.calls = []
+
+        def create_file_dialog(self, kind, **kwargs):
+            self.calls.append((kind, kwargs))
+            return self.choices.pop(0)
+
+    window = DialogWindow([[str(raw_template)], [str(raw_output)], [str(raw_export)], [str(raw_direct_export)]])
+    bridge.bind_window(window)
+    monkeypatch.setattr(bridge, "_webview_constant", lambda name: name)
+
+    template_result = bridge.choose_template_file()
+    output_result = bridge.choose_output_file()
+    export_result = bridge.choose_learning_export()
+    exported_paths = []
+    monkeypatch.setattr(service, "export_learning_data",
+                        lambda path: exported_paths.append(path) or {"saved": path})
+    direct_export_result = bridge.export_learning_data()
+
+    assert template_result == {"ok": True, "data": {"cancelled": False, "path": str(template.resolve()), "kind": "template"}}
+    assert output_result == {"ok": True, "data": {"cancelled": False, "path": str(output.resolve())}}
+    assert export_result == {"ok": True, "data": {"cancelled": False, "path": str(export.resolve())}}
+    assert direct_export_result == {"ok": True, "data": {"saved": str(direct_export.resolve())}}
+    assert exported_paths == [str(direct_export.resolve())]
+    assert window.calls == [
+        ("OPEN_DIALOG", {"file_types": ("Excel workbook (*.xlsx)",)}),
+        ("SAVE_DIALOG", {"save_filename": "Kiem_chung_Ket_qua.xlsx", "file_types": ("Excel workbook (*.xlsx)",)}),
+        ("SAVE_DIALOG", {"save_filename": "learning_data_export.zip", "file_types": ("ZIP archive (*.zip)",)}),
+        ("SAVE_DIALOG", {"save_filename": "learning_data_export.zip", "file_types": ("ZIP archive (*.zip)",)}),
+    ]
+
+    invalid_template = folder / "wrong.xlsm"
+    invalid_template.write_bytes(b"not-xlsx")
+    invalid_output = folder / "wrong.xlsm"
+    directory_with_xlsx_suffix = folder / "not-a-file.xlsx"
+    directory_with_xlsx_suffix.mkdir()
+    for method, chosen in (("choose_template_file", invalid_template),
+                           ("choose_template_file", folder / "missing.xlsx"),
+                           ("choose_output_file", invalid_output),
+                           ("choose_output_file", directory_with_xlsx_suffix)):
+        window.choices = [[str(chosen)]]
+        result = getattr(bridge, method)()
+        assert result["ok"] is False and result["error"]["code"] == "INVALID_SELECTION"
+
+
+@pytest.mark.parametrize("method,expected_call", [
+    ("choose_pptx_file", ("OPEN_DIALOG", {"file_types": ("PowerPoint presentation (*.pptx)",)})),
+    ("choose_template_file", ("OPEN_DIALOG", {"file_types": ("Excel workbook (*.xlsx)",)})),
+    ("choose_output_file", ("SAVE_DIALOG", {"save_filename": "Kiem_chung_Ket_qua.xlsx",
+                                               "file_types": ("Excel workbook (*.xlsx)",)})),
+    ("choose_learning_export", ("SAVE_DIALOG", {"save_filename": "learning_data_export.zip",
+                                                  "file_types": ("ZIP archive (*.zip)",)})),
+    ("export_learning_data", ("SAVE_DIALOG", {"save_filename": "learning_data_export.zip",
+                                                "file_types": ("ZIP archive (*.zip)",)})),
+    ("choose_report_folder", ("FOLDER_DIALOG", {})),
+    ("choose_update_folder", ("FOLDER_DIALOG", {})),
+])
+def test_native_picker_cancellation_is_normal_and_filters_are_single_label(sample_tree, tmp_path, monkeypatch,
+                                                                            method, expected_call):
+    service, _ = _make_service(sample_tree, tmp_path)
+    bridge = BridgeService(service)
+
+    class CancelWindow:
+        def __init__(self):
+            self.calls = []
+
+        def create_file_dialog(self, kind, **kwargs):
+            self.calls.append((kind, kwargs))
+            return None
+
+    window = CancelWindow()
+    bridge.bind_window(window)
+    monkeypatch.setattr(bridge, "_webview_constant", lambda name: name)
+    result = getattr(bridge, method)()
+    assert result == {"ok": True, "data": {"cancelled": True}}
+    assert window.calls == [expected_call]
 
 
 def test_manual_vendor_date_validation_lock_retry_and_persistence(sample_tree, tmp_path, monkeypatch):

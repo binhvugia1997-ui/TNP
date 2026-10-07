@@ -526,6 +526,11 @@ def test_gui_update_card_controls(monkeypatch, tmp_path):
     assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.3.3 — Build 016"
     assert a.btn_install_update.cfg["state"] == "normal"
     assert a.ctl.update_path == str(folder) and a.ctl.cfg.update_path == str(folder)     # persisted via save_settings
+    from app.runtime_paths import config_file, portable_root
+    test_root = Path(os.environ["TNP_TEST_RUNTIME_ROOT"]).resolve()
+    assert portable_root() == test_root and config_file() == test_root / "config" / "config.json"
+    assert config_file().is_file() and config_file().is_relative_to(tmp_path)
+    assert AppConfig.load().update_path == str(folder)                              # saved under disposable pytest state
     # "Để sau" (dialog closed without confirming) -> nothing happens
     a.install_update()
     assert a.btn_install_update.cfg["state"] == "normal" and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")

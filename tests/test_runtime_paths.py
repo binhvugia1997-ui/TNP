@@ -12,6 +12,12 @@ from app.config import AppConfig, app_base_dir
 ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _exercise_unoverridden_roots(monkeypatch):
+    """Most resolver tests verify real source/frozen behavior; the override gets its own explicit regression below."""
+    monkeypatch.delenv(rp.TEST_RUNTIME_ROOT_ENV, raising=False)
+
+
 def _freeze(monkeypatch, exe_dir: Path):
     exe_dir.mkdir(parents=True, exist_ok=True)
     internal = exe_dir / "_internal"
@@ -29,6 +35,29 @@ def test_source_mode_roots_are_project_root(monkeypatch):
     assert (rp.resource_root() / "assets" / "DejaVuSans.ttf").exists()
     assert rp.config_dir(create=False) == ROOT / "config"
     assert rp.logs_dir(create=False) == ROOT / "logs" and rp.output_dir(create=False) == ROOT / "Output"
+
+
+def test_pytest_runtime_root_redirects_all_default_writable_paths(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    disposable = tmp_path / "isolated-runtime"
+    monkeypatch.setenv(rp.TEST_RUNTIME_ROOT_ENV, str(disposable))
+    expected = disposable.resolve()
+
+    assert rp.resource_root() == ROOT                         # bundled/read-only assets are not redirected
+    assert rp.portable_root() == expected and app_base_dir() == expected
+    assert rp.config_dir(create=False) == expected / "config"
+    assert rp.logs_dir(create=False) == expected / "logs"
+    assert rp.output_dir(create=False) == expected / "Output"
+    assert rp.learning_dir(create=False) == expected / "learning_data"
+    assert all(path.is_relative_to(expected) for path in
+               (rp.config_dir(create=False), rp.logs_dir(create=False), rp.output_dir(create=False),
+                rp.learning_dir(create=False)))
+
+    cfg = AppConfig(last_report_folder=str(tmp_path / "reports"), last_output_file=str(tmp_path / "result.xlsx"))
+    saved = cfg.save()
+    assert saved == expected / "config" / "config.json"
+    assert AppConfig.load().last_report_folder == str(tmp_path / "reports")
+    assert AppConfig.load().last_output_file == str(tmp_path / "result.xlsx")
 
 
 def test_frozen_mode_separates_resource_and_portable_root(monkeypatch, tmp_path):

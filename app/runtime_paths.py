@@ -8,10 +8,12 @@ Two different roots must never be confused:
   packaged: the folder that contains ``ReportExtractor.exe``.  ``config/``, ``logs/`` and ``Output/`` are
   created there on demand.  Runtime state is NEVER written inside ``_internal`` and the current working
   directory is never used as a root (double-click, shortcuts, "Start in" folders, spaces and Vietnamese
-  characters in the path all resolve the same way).
+  characters in the path all resolve the same way). Under pytest, ``TNP_TEST_RUNTIME_ROOT`` can redirect only
+  the writable root to a disposable test directory; bundled resource lookup is unchanged.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -20,6 +22,7 @@ CONFIG_DIR_NAME = "config"
 LOGS_DIR_NAME = "logs"
 OUTPUT_DIR_NAME = "Output"
 INTERNAL_DIR_NAME = "_internal"
+TEST_RUNTIME_ROOT_ENV = "TNP_TEST_RUNTIME_ROOT"
 
 
 def is_packaged() -> bool:
@@ -40,8 +43,19 @@ def resource_root() -> Path:
     return _source_root()
 
 
+def _test_runtime_root() -> Optional[Path]:
+    """Explicit pytest-only writable root, used to keep tests away from developer/user state."""
+    if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+        return None
+    value = os.environ.get(TEST_RUNTIME_ROOT_ENV, "").strip()
+    return Path(value).expanduser().resolve() if value else None
+
+
 def portable_root() -> Path:
-    """Writable application directory (folder of the executable when packaged, project root in source mode)."""
+    """Writable app directory; pytest can explicitly redirect it without changing bundled resource lookup."""
+    test_root = _test_runtime_root()
+    if test_root is not None:
+        return test_root
     if is_packaged():
         return Path(sys.executable).resolve().parent
     return _source_root()

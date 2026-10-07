@@ -14,6 +14,9 @@ from .application_service import ApplicationService, ServiceError
 
 LOG = logging.getLogger("report_extractor.webview.bridge")
 MAX_DTO_BYTES = 1_000_000
+PPTX_FILTER = "PowerPoint presentation (*.pptx)"
+XLSX_FILTER = "Excel workbook (*.xlsx)"
+ZIP_FILTER = "ZIP archive (*.zip)"
 
 
 class BridgeService:
@@ -77,16 +80,16 @@ class BridgeService:
 
     # -------------------------------------------------------------- native dialogs for other configured paths
     def choose_template_file(self) -> dict:
-        return self._respond(lambda: self._choose_file("Excel workbook (*.xlsx)", "*.xlsx", "template"))
+        return self._respond(lambda: self._choose_file(XLSX_FILTER, ".xlsx", "template"))
 
     def choose_output_file(self) -> dict:
-        return self._respond(lambda: self._choose_save_file("Kiem_chung_Ket_qua.xlsx", "Excel workbook (*.xlsx)", "*.xlsx"))
+        return self._respond(lambda: self._choose_save_file("Kiem_chung_Ket_qua.xlsx", XLSX_FILTER, ".xlsx"))
 
     def choose_update_folder(self) -> dict:
         return self._respond(self._choose_report_folder)
 
     def choose_learning_export(self) -> dict:
-        return self._respond(lambda: self._choose_save_file("learning_data_export.zip", "ZIP archive (*.zip)", "*.zip"))
+        return self._respond(lambda: self._choose_save_file("learning_data_export.zip", ZIP_FILTER, ".zip"))
 
     # -------------------------------------------------------------- settings / Ollama / updates / diagnostics
     def check_ollama_connection(self, dto: Any) -> dict:
@@ -149,11 +152,10 @@ class BridgeService:
 
     def export_learning_data(self) -> dict:
         def call():
-            path = self._dialog_path(self._webview_constant("SAVE_DIALOG"), save_filename="learning_data_export.zip",
-                                     file_types=("ZIP archive (*.zip)",))
-            if not path:
-                return {"cancelled": True}
-            return self.service.export_learning_data(path)
+            selected = self._choose_save_file("learning_data_export.zip", ZIP_FILTER, ".zip")
+            if selected["cancelled"]:
+                return selected
+            return self.service.export_learning_data(selected["path"])
         return self._respond(call)
 
     # -------------------------------------------------------------- fixed backend-owned output actions
@@ -178,8 +180,7 @@ class BridgeService:
 
     # -------------------------------------------------------------- dialog internals
     def _choose_pptx_file(self) -> dict:
-        path = self._dialog_path(self._webview_constant("OPEN_DIALOG"),
-                                 file_types=("PowerPoint presentation (*.pptx)",))
+        path = self._dialog_path(self._webview_constant("OPEN_DIALOG"), file_types=(PPTX_FILTER,))
         if not path:
             return {"cancelled": True}
         selected = self.service.register_pptx_selection(path)
@@ -193,24 +194,24 @@ class BridgeService:
             raise ServiceError("Đường dẫn đã chọn không phải thư mục hiện có.", "INVALID_SELECTION")
         return {"cancelled": False, "path": str(Path(path).resolve())}
 
-    def _choose_file(self, label: str, pattern: str, name: str) -> dict:
-        path = self._dialog_path(self._webview_constant("OPEN_DIALOG"), file_types=(f"{label} ({pattern})",))
+    def _choose_file(self, file_type: str, expected_suffix: str, name: str) -> dict:
+        path = self._dialog_path(self._webview_constant("OPEN_DIALOG"), file_types=(file_type,))
         if not path:
             return {"cancelled": True}
         selected = Path(path)
-        if selected.suffix.lower() != ".xlsx" or not selected.is_file():
-            raise ServiceError("Chọn một file Excel .xlsx hiện có.", "INVALID_SELECTION")
-        return {"cancelled": False, "path": str(selected.resolve()), "kind": name}
+        if selected.suffix.lower() != expected_suffix.lower() or not selected.is_file():
+            raise ServiceError(f"Chọn một file {expected_suffix} hiện có.", "INVALID_SELECTION")
+        return {"cancelled": False, "path": str(selected), "kind": name}
 
-    def _choose_save_file(self, filename: str, label: str, pattern: str) -> dict:
+    def _choose_save_file(self, filename: str, file_type: str, expected_suffix: str) -> dict:
         path = self._dialog_path(self._webview_constant("SAVE_DIALOG"), save_filename=filename,
-                                 file_types=(f"{label} ({pattern})",))
+                                 file_types=(file_type,))
         if not path:
             return {"cancelled": True}
         selected = Path(path)
-        if selected.suffix.lower() != pattern.removeprefix("*.").lower():
-            raise ServiceError(f"Tên tệp phải có phần mở rộng {pattern.removeprefix('*')}.", "INVALID_SELECTION")
-        return {"cancelled": False, "path": str(selected.resolve())}
+        if selected.suffix.lower() != expected_suffix.lower() or selected.is_dir():
+            raise ServiceError(f"Tên tệp phải có phần mở rộng {expected_suffix}.", "INVALID_SELECTION")
+        return {"cancelled": False, "path": str(selected)}
 
     def _dialog_path(self, dialog_type: Any, **kwargs) -> str:
         if self.window is None:
@@ -224,7 +225,10 @@ class BridgeService:
             result = result[0]
         if not isinstance(result, (str, Path)):
             raise ServiceError("Hộp thoại trả về lựa chọn không hợp lệ.", "INVALID_SELECTION")
-        return str(result)
+        try:
+            return str(Path(result).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ServiceError("Hộp thoại trả về đường dẫn không hợp lệ.", "INVALID_SELECTION") from exc
 
     @staticmethod
     def _webview_constant(name: str):
