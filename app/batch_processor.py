@@ -478,6 +478,7 @@ class BatchProcessor:
             fr.after_pictures = [r.label for r in rec.after_pictures]
             fr.picture_notes = list(rec.picture_notes)
             fr.excluded_sections = list(rec.excluded_sections)
+            fr.improvement_items = [dict(item) for item in rec.improvement_items]
             if rec.after_pictures:
                 self.on_file(idx, "extracting_images", f"{len(rec.after_pictures)} ảnh Sau cải tiến")
                 try:

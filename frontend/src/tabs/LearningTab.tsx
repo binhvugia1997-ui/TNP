@@ -230,6 +230,14 @@ function ImageReview() {
           <div className="relative aspect-[16/9] w-full overflow-hidden rounded-sm2 border border-line bg-[#f4f7fb]">
             <div className="absolute inset-x-0 top-0 flex h-[26px] items-center gap-2 border-b border-line bg-white px-2 text-xs2 text-muted">
               <span className="font-medium text-header">Slide {cand.slide}</span>
+              {typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 && (
+                <>
+                  <span>·</span>
+                  <span className="rounded-[2px] bg-brand-50 px-1 font-medium text-brand-600">
+                    Mục #{cand.itemIndex + 1}
+                  </span>
+                </>
+              )}
               <span>·</span>
               <span>{cand.sourceFile}</span>
               <span className="ml-auto">Ảnh #{cand.pictureId}</span>

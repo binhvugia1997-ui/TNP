@@ -966,6 +966,9 @@ class ApplicationService:
                 "pictureId": str(candidate.picture_id), "src": src,
                 "bounds": {"x": round(x / bw * 100, 2), "y": round(y / bh * 100, 2),
                            "w": round(w / bw * 100, 2), "h": round(h / bh * 100, 2)},
+                # PROMPT-025: logical improvement-item identity for the per-item learning preview
+                "itemId": candidate.logical_item_owner, "itemIndex": candidate.item_index,
+                "itemHeading": candidate.owner_heading,
                 "decision": candidate.decision, "confidenceBand": candidate.confidence_band,
                 "confidence": float(candidate.confidence), "evidence": list(candidate.evidence),
                 "excelEligible": bool(candidate.excel_output_eligible),

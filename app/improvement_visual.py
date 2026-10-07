@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .content_region import (ROLE_CAPTION, ROLE_FURNITURE, ROLE_SIDEBAR, ROLE_TITLE, classify_blocks)
 from .improvement_pictures import (CAPTION_GAP_MAX, CAPTION_SIDE_GAP_MAX, COLUMN_HEADER_GAP_MAX,
-                                   SEMANTIC_PRODUCTION, PictureRef, group_refs)
+                                   SEMANTIC_PRODUCTION, PictureRef, group_refs, slide_items)
 from .pptx_parser import Block, ReportData
 from .report_identity import report_scope_key
 
@@ -22,11 +22,17 @@ BBox = Tuple[int, int, int, int]  # left, top, right, bottom; PPTX EMU coordinat
 # Padding and object association are relative to the slide, not report-specific coordinates.
 DEFAULT_SAFE_PADDING_FRACTION = 0.008
 DEFAULT_ASSOCIATION_GAP_FRACTION = 0.006
+# PROMPT-025: authored adjacency for clustering one item's After pictures into After blocks.
+CLUSTER_ROW_GAP_FRACTION = 0.08
+CLUSTER_COL_GAP_FRACTION = 0.08
 
 
 @dataclass
 class ImprovementVisualRegion:
-    """One logically owned After group, rendered and cropped from one source slide."""
+    """One logically owned After group, rendered and cropped from one source slide.
+
+    PROMPT-025: the region is ITEM-scoped (``improvement_item_id`` + ``item_index``), never slide-scoped.
+    ``after_block_index`` distinguishes multiple authored After groups of one item (§19)."""
 
     report_scope_id: str
     management_number: str
@@ -43,6 +49,8 @@ class ImprovementVisualRegion:
     pictures: List[PictureRef] = field(default_factory=list)
     included_objects: List[Block] = field(default_factory=list)
     excluded_objects: List[str] = field(default_factory=list)
+    item_index: int = -1
+    after_block_index: int = 0
 
     @property
     def width(self) -> int:
@@ -56,11 +64,65 @@ class ImprovementVisualRegion:
     def region_id(self) -> str:
         return f"{self.report_scope_id}:S{self.slide_index}:{self.improvement_item_id}"
 
+    @property
+    def block_id(self) -> str:
+        """Unique region identity; identical to ``region_id`` for the item's first After block."""
+        if self.after_block_index:
+            return f"{self.region_id}#A{self.after_block_index}"
+        return self.region_id
+
 
 def _eligible(ref: PictureRef) -> bool:
     """Reassert PROMPT-015 at the visual-evidence boundary; labels never bypass this gate."""
     return bool(ref.excel_output_eligible and ref.temporal_role == "AFTER"
                 and ref.semantic_role == SEMANTIC_PRODUCTION and ref.confident_owner and ref.owner_id)
+
+
+def cluster_after_pictures(pictures: Sequence[PictureRef], captions: Sequence[Block],
+                           slide_width: int, slide_height: int) -> List[List[PictureRef]]:
+    """PROMPT-025 §18: cluster one item's eligible After pictures into logical After blocks.
+
+    Pictures join one block when they are authored adjacently (same row / same column) or share a
+    common associated caption. Several pictures of one After group stay ONE block (never one
+    improvement per picture); an item with two separated After groups yields two blocks (§19).
+    """
+    W, H = max(1, slide_width), max(1, slide_height)
+    n = len(pictures)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    boxes = [_rotated_rect(ref.block) for ref in pictures]
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = boxes[i], boxes[j]
+            same_row = (_overlap_y(a, b) >= 0.5 * max(1, min(a[3] - a[1], b[3] - b[1]))
+                        and _gap_x(a, b) / W <= CLUSTER_ROW_GAP_FRACTION)
+            same_col = (_overlap_x(a, b) >= 0.5 * max(1, min(a[2] - a[0], b[2] - b[0]))
+                        and _gap_y(a, b) / H <= CLUSTER_COL_GAP_FRACTION)
+            if same_row or same_col:
+                union(i, j)
+    for caption in captions:
+        touched = [i for i, ref in enumerate(pictures)
+                   if _caption_distance(ref.block, caption, W, H) is not None]
+        for i in touched[1:]:
+            union(touched[0], i)
+    clusters: Dict[int, List[PictureRef]] = {}
+    for i, ref in enumerate(pictures):
+        clusters.setdefault(find(i), []).append(ref)
+    ordered = [sorted(members, key=lambda r: (r.source_order, r.block.order))
+               for _, members in sorted(clusters.items(),
+                                        key=lambda kv: min(r.source_order for r in kv[1]))]
+    return ordered
 
 
 def _rotated_rect(block: Block) -> BBox:
@@ -268,15 +330,30 @@ def build_improvement_visual_regions(report: ReportData, refs: Sequence[PictureR
         slide_width = int(report.slide_width or slide.width or 1)
         slide_height = int(report.slide_height or slide.height or 1)
         W, H = max(1, slide_width), max(1, slide_height)
-        picture_ids = {id(ref.block) for ref in pictures}
-        picture_boxes = [_rotated_rect(ref.block) for ref in pictures]
-        other_pictures = [pic for pic in slide.pictures if id(pic) not in picture_ids]
 
         roles = classify_blocks(slide)
         roles_by_z: Dict[int, list] = {}
         for role in roles:
             if role.block.z_order >= 0:
                 roles_by_z.setdefault(role.block.z_order, []).append(role)
+
+        # PROMPT-025: the item span (anchor .. next item/section boundary) bounds the final crop, so
+        # body text of the NEXT improvement item can never expand an After region (§15/§34).
+        item_regions = slide_items(slide)
+        item_region = next((it for it in item_regions if it.owner_id == owner_id), None)
+        item_index = -1
+        for index, it in enumerate([it for it in item_regions
+                                    if it.region_kind == "item"
+                                    and it.semantic_role == SEMANTIC_PRODUCTION]):
+            if it.owner_id == owner_id:
+                item_index = index
+                break
+        item_span = item_region.bounds if item_region is not None else None  # (left, top, width, height)
+        span_boundary = None
+        if item_span is not None:
+            span_bottom = item_span[1] + item_span[3]
+            span_boundary = next((it for it in item_regions
+                                  if it is not item_region and it.bounds[1] == span_bottom), None)
 
         # An After button/caption is assigned to the closest final-eligible owner on this slide, not
         # merely copied because it happens to be near a picture. This prevents a neighbouring Before label
@@ -313,147 +390,244 @@ def build_improvement_visual_regions(report: ReportData, refs: Sequence[PictureR
                 continue
             caption_owner[id(role.block)] = best_owner
 
-        captions = [role.block for role in roles
-                    if role.role == ROLE_CAPTION and role.caption_kind == "after"
-                    and caption_owner.get(id(role.block)) == owner_id]
-        core_boxes = picture_boxes + [_rotated_rect(caption) for caption in captions]
-        core = _union(core_boxes)
-        association_x = max(1, int(W * max(0.0, association_gap_fraction)))
-        association_y = max(1, int(H * max(0.0, association_gap_fraction)))
-        expanded_core = _expand(core, association_x, association_y)
+        owner_captions = [role.block for role in roles
+                          if role.role == ROLE_CAPTION and role.caption_kind == "after"
+                          and caption_owner.get(id(role.block)) == owner_id]
 
-        before_caption_z = {role.block.z_order for role in roles
-                            if role.role == ROLE_CAPTION and role.caption_kind == "before"}
-        selected_caption_z = {caption.z_order for caption in captions if caption.z_order >= 0}
-        arrow_z = {arrow.z_order for arrow in slide.arrows if arrow.z_order >= 0 and arrow.direction}
-        included: List[Block] = []
-        excluded: List[str] = [
-            f"picture SH{pic.shape_id} bbox={_rotated_rect(pic)} reason=not-owned-by-this-item"
-            for pic in other_pictures
-        ]
-
-        # Every child yielded from a PPTX group retains absolute geometry and z-order in annotations.
-        for obj in slide.annotations:
-            obj_role = _role_for_block(obj, roles_by_z)
-            if obj.z_order in before_caption_z or (obj_role is not None and obj_role.role == ROLE_CAPTION
-                                                   and obj_role.caption_kind == "before"):
-                excluded.append(_describe(obj) + " reason=before-caption")
-                continue
-            if obj_role is not None and obj_role.role == ROLE_CAPTION and obj_role.caption_kind == "after":
-                if obj_role.block.z_order in selected_caption_z:
-                    included.append(obj)
-                else:
-                    excluded.append(_describe(obj) + " reason=other-after-owner")
-                continue
-            visible = bool(obj.fill_visible or obj.line_visible or (obj.text or "").strip())
-            if not visible:
-                continue
-            if obj_role is not None and obj_role.role in (ROLE_TITLE, ROLE_SIDEBAR, ROLE_FURNITURE):
-                excluded.append(_describe(obj) + f" reason={obj_role.role}")
-                continue
-            if not _object_intersects_core(obj, core, expanded_core, arrow_z, picture_boxes):
-                if _is_arrow(obj, arrow_z):
-                    excluded.append(_describe(obj) + " reason=outside-after-core-transition-or-decoration")
-                continue
-            obj_box = _rotated_rect(obj)
-            obj_area = _area(obj_box)
-            core_area = max(1, _area(core))
-            slide_area = W * H
-            other_centres = _centres_inside(obj_box, other_pictures)
-            if other_centres and (obj_area > core_area * 1.5 or len(other_centres) > 0):
-                excluded.append(_describe(obj) + " reason=spans-nonselected-picture")
-                continue
-            if obj_area > max(core_area * 6, int(slide_area * 0.40)) and not obj.line_endpoints:
-                excluded.append(_describe(obj) + " reason=oversized-neighbouring-background")
-                continue
-            included.append(obj)
-
-        # Text boxes are semantic blocks, so include them separately from vector styling records. Captions
-        # other than the selected After caption, headings, page furniture and side labels never trigger a crop.
-        selected_caption_ids = {id(caption) for caption in captions}
-        for block in slide.blocks:
-            if block.kind in ("picture", "visual") or not block.is_text:
-                continue
-            role = _role_for_block(block, roles_by_z)
-            if role is not None and role.role == ROLE_CAPTION:
-                if role.caption_kind == "after" and id(block) in selected_caption_ids:
-                    included.append(block)
-                elif role.caption_kind == "before":
-                    excluded.append(_describe(block) + " reason=before-caption")
-                continue
-            if role is not None and role.role in (ROLE_TITLE, ROLE_SIDEBAR, ROLE_FURNITURE):
-                continue
-            if not _object_intersects_core(block, core, expanded_core, arrow_z, picture_boxes):
-                continue
-            block_box = _rotated_rect(block)
-            block_area = _area(block_box)
-            if any(_centres_inside(block_box, other_pictures)):
-                excluded.append(_describe(block) + " reason=text-over-nonselected-picture")
-                continue
-            if block_area > max(_area(core) * 6, int(slide_area * 0.40)):
-                excluded.append(_describe(block) + " reason=oversized-neighbouring-text")
-                continue
-            included.append(block)
-
-        # De-duplicate the style record and its text block for diagnostics/bounds while keeping both when
-        # they provide different geometry (e.g. a caption inside a rounded button).
-        unique: List[Block] = []
-        seen = set()
-        for obj in included:
-            key = (obj.kind, obj.z_order, obj.shape_id, obj.left, obj.top, obj.width, obj.height, obj.text)
-            if key not in seen:
-                seen.add(key)
-                unique.append(obj)
-        included = unique
-
-        bounds = picture_boxes + [_rotated_rect(obj) for obj in included]
-        unpadded = _union(bounds)
-        max_stroke = max((int(obj.line_width or 0) for obj in included), default=0)
-        pad_x = max(int(W * max(0.0, safe_padding_fraction)), max_stroke // 2)
-        pad_y = max(int(H * max(0.0, safe_padding_fraction)), max_stroke // 2)
-        included_ids = {id(obj) for obj in included}
-        obstacle_boxes = [_rotated_rect(pic) for pic in other_pictures]
-        for obj in [*slide.annotations, *slide.blocks]:
-            if obj.kind == "picture" or id(obj) in included_ids:
-                continue
-            if obj.fill_visible or obj.line_visible or (obj.text or "").strip():
-                obstacle_boxes.append(_rotated_rect(obj))
-        padding = _safe_padding(unpadded, obstacle_boxes, pad_x, pad_y, W, H)
-        padded = (unpadded[0] - padding[0], unpadded[1] - padding[1],
-                  unpadded[2] + padding[2], unpadded[3] + padding[3])
-        bbox = (max(0, padded[0]), max(0, padded[1]), min(slide_width, padded[2]), min(slide_height, padded[3]))
-        heading = next((ref.owner_heading for ref in pictures if ref.owner_heading), owner_id)
-        confidences = [ref.confidence for ref in pictures if ref.confidence is not None]
-        confidence = min(confidences) if confidences else None
-        anchor_text = " | ".join(dict.fromkeys(" ".join(c.text.split()) for c in captions if c.text.strip()))
-        region = ImprovementVisualRegion(
-            report_scope_id=scope_id, management_number=management_number, slide_index=slide_number,
-            improvement_item_id=owner_id, improvement_heading=heading,
-            semantic_role=SEMANTIC_PRODUCTION, temporal_role="AFTER", bbox=bbox,
-            source_order=min((ref.source_order for ref in pictures), default=0), confidence=confidence,
-            excel_output_eligible=True, anchor_text=anchor_text, pictures=list(pictures),
-            included_objects=included, excluded_objects=excluded,
-        )
-        regions.append(region)
-        LOG.info("REGION_ITEM MN=%s report=%s scope=%s slide=%s item=%s heading=%r semantic=%s temporal=%s "
-                 "eligible=%s confidence=%s pictures=%s",
-                 management_number or "-", report.filename, scope_id, slide_number, owner_id, heading,
-                 region.semantic_role, region.temporal_role, region.excel_output_eligible, region.confidence,
-                 [ref.label for ref in pictures])
-        LOG.info("REGION_ANCHOR MN=%s report=%s scope=%s slide=%s item=%s anchor=%r",
-                 management_number or "-", report.filename, scope_id, slide_number, owner_id,
-                 anchor_text or "(none)")
-        for obj in included:
-            LOG.info("REGION_OBJECT MN=%s report=%s scope=%s slide=%s item=%s included=%s",
-                     management_number or "-", report.filename, scope_id, slide_number, owner_id, _describe(obj))
-        for detail in excluded:
-            LOG.info("REGION_EXCLUDE MN=%s report=%s scope=%s slide=%s item=%s object=%s",
-                     management_number or "-", report.filename, scope_id, slide_number, owner_id, detail)
-        LOG.info("REGION_BBOX MN=%s report=%s scope=%s slide=%s item=%s bbox=%s unpadded=%s "
-                 "padding=(left=%s,top=%s,right=%s,bottom=%s) objects=%s",
-                 management_number or "-", report.filename, scope_id, slide_number, owner_id, bbox, unpadded,
-                 *padding, len(included))
+        # PROMPT-025 §18/§19: cluster this item's After pictures into authored After blocks; every
+        # cluster becomes one item-scoped region (ImprovementItem -> AfterVisualRegion[]).
+        clusters = cluster_after_pictures(pictures, owner_captions, W, H)
+        cluster_captions = _assign_captions_to_clusters(clusters, owner_captions, W, H, report.filename,
+                                                        scope_id, slide_number, owner_id, management_number)
+        LOG.info("REGION_CLUSTERS MN=%s report=%s scope=%s slide=%s item=%s item_index=%d clusters=%d "
+                 "pictures=%s", management_number or "-", report.filename, scope_id, slide_number, owner_id,
+                 item_index, len(clusters), [[ref.label for ref in cluster] for cluster in clusters])
+        for after_block_index, cluster in enumerate(clusters):
+            region = _region_for_cluster(
+                report=report, slide=slide, slide_width=slide_width, slide_height=slide_height,
+                scope_id=scope_id, owner_id=owner_id, slide_number=slide_number, pictures=cluster,
+                captions=cluster_captions[after_block_index], roles=roles, roles_by_z=roles_by_z,
+                item_span=item_span, span_boundary=span_boundary, item_index=item_index,
+                after_block_index=after_block_index, management_number=management_number,
+                safe_padding_fraction=safe_padding_fraction,
+                association_gap_fraction=association_gap_fraction)
+            regions.append(region)
+    regions.sort(key=lambda r: (r.slide_index, r.item_index if r.item_index >= 0 else 10 ** 6,
+                                r.after_block_index, r.source_order))
     return regions
+
+
+def _pictures_x_overlap_boundary(picture_boxes: Sequence[BBox], boundary_bounds) -> bool:
+    """True when the After pictures' horizontal extent overlaps the span boundary's horizontal extent."""
+    if not picture_boxes or boundary_bounds is None:
+        return True
+    b_left, _b_top, b_width, _b_height = boundary_bounds
+    pic_left = min(box[0] for box in picture_boxes)
+    pic_right = max(box[2] for box in picture_boxes)
+    return not (b_left + b_width <= pic_left or b_left >= pic_right)
+
+
+def _assign_captions_to_clusters(clusters: Sequence[Sequence[PictureRef]], owner_captions: Sequence[Block],
+                                 W: int, H: int, report_name: str, scope_id: str, slide_number: int,
+                                 owner_id: str, management_number: str) -> List[List[Block]]:
+    """PROMPT-025 §14: each of the item's After captions joins the single closest After block
+    (caption association is item-scoped; a tie between blocks keeps the caption out)."""
+    assignment: List[List[Block]] = [[] for _ in clusters]
+    for caption in owner_captions:
+        scored: List[Tuple[Tuple[float, int], int]] = []
+        for cluster_index, cluster in enumerate(clusters):
+            for ref in cluster:
+                distance = _caption_distance(ref.block, caption, W, H)
+                if distance is None:
+                    continue
+                above_penalty = 0 if caption.bottom <= ref.block.top + ref.block.height * 0.25 else 1
+                scored.append(((distance, above_penalty), cluster_index))
+        if not scored:
+            continue
+        scored.sort(key=lambda item: (item[0], item[1]))
+        best_score, best_cluster = scored[0]
+        if best_score[0] > COLUMN_HEADER_GAP_MAX + 0.10:
+            continue
+        if (len(scored) > 1 and scored[1][0][1] == best_score[1]
+                and scored[1][0][0] - best_score[0] <= 0.02):
+            LOG.info("REGION_EXCLUDE MN=%s report=%s scope=%s slide=%s item=%s caption=%r "
+                     "reason=ambiguous-after-block", management_number or "-", report_name, scope_id,
+                     slide_number, owner_id, " ".join(caption.text.split())[:80])
+            continue
+        assignment[best_cluster].append(caption)
+    return assignment
+
+
+def _region_for_cluster(report: ReportData, slide, slide_width: int, slide_height: int,
+                        scope_id: str, owner_id: str, slide_number: int,
+                        pictures: Sequence[PictureRef], captions: Sequence[Block],
+                        roles, roles_by_z: Dict[int, list], item_span, span_boundary, item_index: int,
+                        after_block_index: int, management_number: str,
+                        safe_padding_fraction: float, association_gap_fraction: float
+                        ) -> ImprovementVisualRegion:
+    """Build ONE item-scoped After region for one clustered After block of one improvement item."""
+    W, H = max(1, slide_width), max(1, slide_height)
+    picture_ids = {id(ref.block) for ref in pictures}
+    picture_boxes = [_rotated_rect(ref.block) for ref in pictures]
+    other_pictures = [pic for pic in slide.pictures if id(pic) not in picture_ids]
+
+    core_boxes = picture_boxes + [_rotated_rect(caption) for caption in captions]
+    core = _union(core_boxes)
+    association_x = max(1, int(W * max(0.0, association_gap_fraction)))
+    association_y = max(1, int(H * max(0.0, association_gap_fraction)))
+    expanded_core = _expand(core, association_x, association_y)
+
+    before_caption_z = {role.block.z_order for role in roles
+                        if role.role == ROLE_CAPTION and role.caption_kind == "before"}
+    selected_caption_z = {caption.z_order for caption in captions if caption.z_order >= 0}
+    arrow_z = {arrow.z_order for arrow in slide.arrows if arrow.z_order >= 0 and arrow.direction}
+    included: List[Block] = []
+    excluded: List[str] = [
+        f"picture SH{pic.shape_id} bbox={_rotated_rect(pic)} reason=not-owned-by-this-item"
+        for pic in other_pictures
+    ]
+
+    # Every child yielded from a PPTX group retains absolute geometry and z-order in annotations.
+    for obj in slide.annotations:
+        obj_role = _role_for_block(obj, roles_by_z)
+        if obj.z_order in before_caption_z or (obj_role is not None and obj_role.role == ROLE_CAPTION
+                                               and obj_role.caption_kind == "before"):
+            excluded.append(_describe(obj) + " reason=before-caption")
+            continue
+        if obj_role is not None and obj_role.role == ROLE_CAPTION and obj_role.caption_kind == "after":
+            if obj_role.block.z_order in selected_caption_z:
+                included.append(obj)
+            else:
+                excluded.append(_describe(obj) + " reason=other-after-owner")
+            continue
+        visible = bool(obj.fill_visible or obj.line_visible or (obj.text or "").strip())
+        if not visible:
+            continue
+        if obj_role is not None and obj_role.role in (ROLE_TITLE, ROLE_SIDEBAR, ROLE_FURNITURE):
+            excluded.append(_describe(obj) + f" reason={obj_role.role}")
+            continue
+        if not _object_intersects_core(obj, core, expanded_core, arrow_z, picture_boxes):
+            if _is_arrow(obj, arrow_z):
+                excluded.append(_describe(obj) + " reason=outside-after-core-transition-or-decoration")
+            continue
+        obj_box = _rotated_rect(obj)
+        obj_area = _area(obj_box)
+        core_area = max(1, _area(core))
+        slide_area = W * H
+        other_centres = _centres_inside(obj_box, other_pictures)
+        if other_centres and (obj_area > core_area * 1.5 or len(other_centres) > 0):
+            excluded.append(_describe(obj) + " reason=spans-nonselected-picture")
+            continue
+        if obj_area > max(core_area * 6, int(slide_area * 0.40)) and not obj.line_endpoints:
+            excluded.append(_describe(obj) + " reason=oversized-neighbouring-background")
+            continue
+        included.append(obj)
+
+    # Text boxes are semantic blocks, so include them separately from vector styling records. Captions
+    # other than the selected After caption, headings, page furniture and side labels never trigger a crop.
+    selected_caption_ids = {id(caption) for caption in captions}
+    for block in slide.blocks:
+        if block.kind in ("picture", "visual") or not block.is_text:
+            continue
+        role = _role_for_block(block, roles_by_z)
+        if role is not None and role.role == ROLE_CAPTION:
+            if role.caption_kind == "after" and id(block) in selected_caption_ids:
+                included.append(block)
+            elif role.caption_kind == "before":
+                excluded.append(_describe(block) + " reason=before-caption")
+            continue
+        if role is not None and role.role in (ROLE_TITLE, ROLE_SIDEBAR, ROLE_FURNITURE):
+            continue
+        if not _object_intersects_core(block, core, expanded_core, arrow_z, picture_boxes):
+            continue
+        block_box = _rotated_rect(block)
+        block_area = _area(block_box)
+        if any(_centres_inside(block_box, other_pictures)):
+            excluded.append(_describe(block) + " reason=text-over-nonselected-picture")
+            continue
+        if block_area > max(_area(core) * 6, int(slide_area * 0.40)):
+            excluded.append(_describe(block) + " reason=oversized-neighbouring-text")
+            continue
+        included.append(block)
+
+    # De-duplicate the style record and its text block for diagnostics/bounds while keeping both when
+    # they provide different geometry (e.g. a caption inside a rounded button).
+    unique: List[Block] = []
+    seen = set()
+    for obj in included:
+        key = (obj.kind, obj.z_order, obj.shape_id, obj.left, obj.top, obj.width, obj.height, obj.text)
+        if key not in seen:
+            seen.add(key)
+            unique.append(obj)
+    included = unique
+
+    bounds = picture_boxes + [_rotated_rect(obj) for obj in included]
+    unpadded = _union(bounds)
+    max_stroke = max((int(obj.line_width or 0) for obj in included), default=0)
+    pad_x = max(int(W * max(0.0, safe_padding_fraction)), max_stroke // 2)
+    pad_y = max(int(H * max(0.0, safe_padding_fraction)), max_stroke // 2)
+    included_ids = {id(obj) for obj in included}
+    obstacle_boxes = [_rotated_rect(pic) for pic in other_pictures]
+    for obj in [*slide.annotations, *slide.blocks]:
+        if obj.kind == "picture" or id(obj) in included_ids:
+            continue
+        if obj.fill_visible or obj.line_visible or (obj.text or "").strip():
+            obstacle_boxes.append(_rotated_rect(obj))
+    padding = _safe_padding(unpadded, obstacle_boxes, pad_x, pad_y, W, H)
+    padded = (unpadded[0] - padding[0], unpadded[1] - padding[1],
+              unpadded[2] + padding[2], unpadded[3] + padding[3])
+    bbox = (max(0, padded[0]), max(0, padded[1]), min(slide_width, padded[2]), min(slide_height, padded[3]))
+
+    # PROMPT-025 §15/§34: hard guarantee – the crop can never cross the item's vertical span where the
+    # span boundary is horizontally relevant to this After block, so the next improvement item's
+    # heading/body text cannot enter this item's After evidence. When the boundary sits beside the
+    # block (side-by-side layouts, x-disjoint), the bottom stays unclamped – the boundary cannot be
+    # inside a crop it does not horizontally overlap.
+    if item_span is not None:
+        span_top, span_bottom = item_span[1], item_span[1] + item_span[3]
+        bottom = bbox[3]
+        if span_boundary is None or _pictures_x_overlap_boundary(picture_boxes, span_boundary.bounds):
+            bottom = min(bottom, span_bottom)
+        clamped = (bbox[0], max(bbox[1], span_top), bbox[2], bottom)
+        if clamped != bbox:
+            LOG.info("REGION_CLAMP MN=%s report=%s scope=%s slide=%s item=%s bbox=%s clamped=%s "
+                     "span=(%d,%d) boundary=%s", management_number or "-", report.filename, scope_id,
+                     slide_number, owner_id, bbox, clamped, span_top, span_bottom,
+                     span_boundary.owner_id if span_boundary is not None else "footer")
+        bbox = clamped
+
+    heading = next((ref.owner_heading for ref in pictures if ref.owner_heading), owner_id)
+    confidences = [ref.confidence for ref in pictures if ref.confidence is not None]
+    confidence = min(confidences) if confidences else None
+    anchor_text = " | ".join(dict.fromkeys(" ".join(c.text.split()) for c in captions if c.text.strip()))
+    region = ImprovementVisualRegion(
+        report_scope_id=scope_id, management_number=management_number, slide_index=slide_number,
+        improvement_item_id=owner_id, improvement_heading=heading,
+        semantic_role=SEMANTIC_PRODUCTION, temporal_role="AFTER", bbox=bbox,
+        source_order=min((ref.source_order for ref in pictures), default=0), confidence=confidence,
+        excel_output_eligible=True, anchor_text=anchor_text, pictures=list(pictures),
+        included_objects=included, excluded_objects=excluded,
+        item_index=item_index, after_block_index=after_block_index,
+    )
+    LOG.info("REGION_ITEM MN=%s report=%s scope=%s slide=%s item=%s item_index=%d block=%d heading=%r "
+             "semantic=%s temporal=%s eligible=%s confidence=%s pictures=%s",
+             management_number or "-", report.filename, scope_id, slide_number, owner_id, item_index,
+             after_block_index, heading, region.semantic_role, region.temporal_role,
+             region.excel_output_eligible, region.confidence, [ref.label for ref in pictures])
+    LOG.info("REGION_ANCHOR MN=%s report=%s scope=%s slide=%s item=%s anchor=%r",
+             management_number or "-", report.filename, scope_id, slide_number, owner_id,
+             anchor_text or "(none)")
+    for obj in included:
+        LOG.info("REGION_OBJECT MN=%s report=%s scope=%s slide=%s item=%s included=%s",
+                 management_number or "-", report.filename, scope_id, slide_number, owner_id, _describe(obj))
+    for detail in excluded:
+        LOG.info("REGION_EXCLUDE MN=%s report=%s scope=%s slide=%s item=%s object=%s",
+                 management_number or "-", report.filename, scope_id, slide_number, owner_id, detail)
+    LOG.info("REGION_BBOX MN=%s report=%s scope=%s slide=%s item=%s bbox=%s unpadded=%s "
+             "padding=(left=%s,top=%s,right=%s,bottom=%s) objects=%s",
+             management_number or "-", report.filename, scope_id, slide_number, owner_id, bbox, unpadded,
+             *padding, len(included))
+    return region
 
 
 def crop_box_px(bbox: BBox, slide_width: int, slide_height: int,

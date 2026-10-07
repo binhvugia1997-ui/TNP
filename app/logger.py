@@ -87,6 +87,7 @@ class FileResult:
     picture_notes: List[str] = field(default_factory=list)     # every picture decision (before/after/excluded/ambiguous)
     image_candidates: list = field(default_factory=list)       # PROMPT-006 ImageCandidate objects (not serialised)
     content_candidates: list = field(default_factory=list)     # PROMPT-006B ContentCandidate objects (ids only in JSON)
+    improvement_items: List[dict] = field(default_factory=list)  # PROMPT-025 logical ImprovementItem summaries
     classifier_notes: List[str] = field(default_factory=list)
     confidence: Optional[float] = None
     error: str = ""

@@ -18,6 +18,7 @@ production/process improvement item:
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -27,6 +28,8 @@ from .content_region import (ROLE_CAPTION, ROLE_CONTENT, ROLE_FURNITURE, ROLE_SI
                              classify_blocks, inline_anchor_kind, title_text)
 from .pptx_parser import Block, ReportData, SlideData, norm_key
 from .report_identity import report_scope_key
+
+LOG = logging.getLogger("report_extractor.improvement_pictures")
 
 AMBIGUOUS_REASON = "Cần kiểm tra: Không xác định chắc chắn ảnh Sau cải tiến tại slide {n}"
 
@@ -213,6 +216,33 @@ def _generic_production_heading(text: str) -> bool:
     }
 
 
+# PROMPT-025: a logical improvement-item anchor may also open with a defect name
+# ("Lỗi …", "Mẻ …", "Xước …", "Hiện trạng …") – the real report family names items after defects.
+_DEFECT_OPENER_RE = re.compile(
+    r"^(?:loi|hien trang|hien tuong|me|xuoc|bong|lech|cong venh|venh|bien dang|ro|nut|gay|dinh|tray|dom|"
+    r"khuyet tat|phong rop|diem loi)\b")
+
+
+def _is_item_anchor_text(text: str) -> bool:
+    """PROMPT-025 item-anchor wording: a colon-terminated production heading ("Cải tiến lỗi X (...):")
+    or a line opening with a defect name ("Lỗi lệch ATN sau ép nhỰA").  Plain body sentences never
+    match.  The colon test uses the raw text (``norm_key`` strips trailing punctuation)."""
+    key = norm_key(text)
+    if not key:
+        return False
+    if text.rstrip().endswith(":") and semantic_role_for_heading(text) == SEMANTIC_PRODUCTION:
+        return True
+    return bool(_DEFECT_OPENER_RE.match(key))
+
+
+def _visual_row_below(line_top: int, line_bottom: int, visual_tops: Sequence[int], H: int) -> bool:
+    """PROMPT-025 co-signal: an item anchor is authored together with its visual evidence – a caption
+    button or content picture must start within half a slide height below the anchor line."""
+    window_top = line_top - int(0.02 * H)
+    window_bottom = line_bottom + int(0.5 * H)
+    return any(window_top <= top <= window_bottom for top in visual_tops)
+
+
 def _line_box(block: Block, index: int, n_lines: int) -> Tuple[int, int, int, int]:
     line_h = max(1, int(block.height / max(1, n_lines)))
     return block.left, int(block.top + index * line_h), block.width, line_h
@@ -224,11 +254,26 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
     Section headings establish local semantics. A specific production heading such as "Cải tiến lỗi A"
     or a short item heading below a production section becomes a confident logical owner. Generic slide
     headings alone never count as a defect owner.
+
+    PROMPT-025: a slide may carry several logical improvement items. Besides the recognized section
+    headings, an item anchor is a short, non-bullet line under a production context that either is
+    colon-terminated with production semantics ("Cải tiến lỗi X (...):") or opens with a defect name
+    ("Lỗi lệch ATN sau ép nhựa"). Real decks repeat the item-heading style inside body frames (mid-block,
+    not bold), so the first-line/bold requirement of the defect-heading branch is intentionally relaxed;
+    an authored visual row (caption button or content picture) must follow within half the slide height.
     """
     roles = sorted(classify_blocks(slide), key=lambda r: (r.block.order, r.block.top, r.block.left))
     items: List[ItemRegion] = []
     current_semantic = SEMANTIC_OTHER
     duplicates: Dict[str, int] = {}
+    W = slide.width or 1
+    H = slide.height or 1
+    visual_tops: List[int] = [role.block.top for role in roles
+                              if role.role == ROLE_CAPTION and role.block.text.strip()]
+    for picture in slide.pictures:
+        if not is_decorative_picture(picture, W, H):
+            visual_tops.append(picture.top)
+    visual_tops.sort()
     for role in roles:
         if role.role not in (ROLE_TITLE, ROLE_CONTENT, ROLE_SIDEBAR):
             continue
@@ -287,6 +332,25 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
                 bounds = (block.left, block.top, block.width, block.height) if i == 0 else _line_box(block, i, n_lines)
                 items.append(ItemRegion(slide.number, owner, text, bounds,
                                         block.order * 100 + i, SEMANTIC_PRODUCTION, True, "item"))
+                continue
+
+            # PROMPT-025 multi-item anchor: colon-terminated production item heading or defect-name
+            # opener under a production context, with authored visual evidence below (see above).
+            if (current_semantic == SEMANTIC_PRODUCTION and len(text) <= 120
+                    and inline_anchor_kind(text) is None
+                    and not _generic_production_heading(text)
+                    and _is_item_anchor_text(text)):
+                line_box = _line_box(block, i, n_lines)
+                if _visual_row_below(line_box[1], line_box[1] + line_box[3], visual_tops, H):
+                    line_key = key.strip(" .:;-_")
+                    occurrence = duplicates.get(line_key, 0) + 1
+                    duplicates[line_key] = occurrence
+                    owner = f"item:{line_key}" + (f":{occurrence}" if occurrence > 1 else "")
+                    bounds = ((block.left, block.top, block.width, block.height)
+                              if i == 0 else line_box)
+                    items.append(ItemRegion(slide.number, owner, text, bounds,
+                                            block.order * 100 + i, SEMANTIC_PRODUCTION, True, "item"))
+                    continue
     items.sort(key=lambda item: (item.source_order, item.bounds[1], item.bounds[0]))
     # An item's content often continues well below its title (inline +Sau rows, grouped paragraphs, or
     # picture tables). Extend only confident item regions to the next logical item or non-production
@@ -301,9 +365,20 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
     for item in items:
         if not item.confident_defect_ownership:
             continue
-        following = [other.top for other in boundaries
-                     if other.source_order > item.source_order and other.top > item.top]
         x, y, width, _height = item.bounds
+        # PROMPT-025: a boundary clips this item only when it is horizontally relevant — it overlaps the
+        # item's own band or spans nearly the full slide width. A narrow sidebar label on the opposite
+        # side (e.g. an inspection oval in the left margin) must not cut the item's authored visual row
+        # (captions + Before/After pictures below the text) out of its own span.
+        following = []
+        for other in boundaries:
+            if other.source_order <= item.source_order or other.top <= item.top:
+                continue
+            o_left, _o_top, o_width, _o_height = other.bounds
+            full_width = o_width >= 0.55 * W
+            overlaps = not (o_left + o_width <= x or o_left >= x + width)
+            if full_width or overlaps:
+                following.append(other.top)
         if following:
             # A later heading inside the same text box divides the original box; clip at that line
             # even when the first-line block geometry spans the rest of the paragraph group.
@@ -800,6 +875,49 @@ def _finalize_picture(ref: PictureRef, slide: SlideData, items: Sequence[ItemReg
     sel.rejected.append(ref)
 
 
+def _anchor_in_span(anchor, item: ItemRegion, H: int, pad: float = 0.02) -> bool:
+    """PROMPT-025: an anchor (caption button / inline '+ Trước:/+ Sau:' line / blue text / arrow) belongs
+    to the logical item whose vertical span contains it."""
+    cy = getattr(anchor, "cy", None)
+    if cy is None:
+        cy = anchor.top + anchor.height / 2
+    return item.top - pad * H <= cy <= item.bottom + pad * H
+
+
+def _item_for_picture(p: Block, prod_items: Sequence[ItemRegion], W: int, H: int) -> Optional[ItemRegion]:
+    """The logical item a picture belongs to: span containment by centre, nearest item as fallback."""
+    if not prod_items:
+        return None
+    cy = p.top + p.height / 2
+    for item in prod_items:
+        if item.top <= cy < item.bottom:
+            return item
+    return min(prod_items, key=lambda item: _region_distance(p, item, W, H))
+
+
+def _item_anchor_bundles(prod_items: Sequence[ItemRegion], captions, inlines, blue, arrows, claims,
+                         content_pics, W: int, H: int) -> Dict[str, Dict[str, object]]:
+    """PROMPT-025: per-item temporal anchors. Captions, inline '+ Trước:/+ Sau:' lines, blue After text and
+    transition arrows are scoped to the item span, so one item's anchors never classify another item's
+    pictures. An item without in-span anchors of a kind falls back to the slide-wide list (prior behavior)."""
+    bundles: Dict[str, Dict[str, object]] = {}
+    for item in prod_items:
+        caps = [a for a in captions if _anchor_in_span(a, item, H)]
+        ins = [a for a in inlines if _anchor_in_span(a, item, H)]
+        ble = [a for a in blue if _anchor_in_span(a, item, H)]
+        arr = [a for a in arrows if _anchor_in_span(a, item, H)]
+        votes_i = _arrow_votes(content_pics, arr, W, H) if arr else {}
+        if caps:
+            cap_ids = {id(c) for c in caps}
+            claims_i = {pid: [a for a in anchors if id(a) in cap_ids]
+                        for pid, anchors in claims.items()}
+        else:
+            claims_i = claims
+        bundles[item.owner_id] = {"captions": caps, "inlines": ins, "blue": ble,
+                                  "votes": votes_i, "claims": claims_i}
+    return bundles
+
+
 def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> PictureSelection:
     """Only confidently owned After + production-improvement pictures are Excel eligible."""
     sel = PictureSelection()
@@ -810,6 +928,11 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
             continue
         roles = classify_blocks(slide)
         items = slide_items(slide)
+        prod_items = [it for it in items
+                      if it.region_kind == "item" and it.semantic_role == SEMANTIC_PRODUCTION]
+        LOG.info("ITEM_SEGMENTATION report=%s scope=%s slide=%s items=%d headings=%s",
+                 report.filename, report_scope_key(report.path), n, len(prod_items),
+                 [it.heading for it in prod_items])
         head = norm_key(title_text(slide))
         slide_is_inspection = bool(head and _INSPECTION_RE.search(head) and
                                    not re.search(r"san xuat|production|process|cong doan", head))
@@ -824,6 +947,8 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
         arrows = [a for a in getattr(slide, "arrows", [])
                   if _arrow_usable(a, W, H, bands, inspection_ranges, roles)]
         votes = _arrow_votes(content_pics, arrows, W, H)
+        bundles = _item_anchor_bundles(prod_items, captions, inlines, blue, arrows, claims,
+                                       content_pics, W, H)
 
         # Keep temporal classification independent, then apply semantic/item eligibility after row
         # neighbours have had a chance to inherit a caption's Before/After label.
@@ -835,11 +960,21 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
                 working.rejected.append(PictureRef(n, picture, "excluded", why,
                                                    temporal_role="UNKNOWN"))
                 continue
+            owner_item = _item_for_picture(picture, prod_items, W, H)
+            bundle = bundles.get(owner_item.owner_id) if owner_item is not None else None
+            if bundle is not None:
+                caps_i = bundle["captions"] or captions
+                ins_i = bundle["inlines"] or inlines
+                ble_i = bundle["blue"] or blue
+                claims_i = bundle["claims"]
+                votes_i = bundle["votes"]
+            else:
+                caps_i, ins_i, ble_i, claims_i, votes_i = captions, inlines, blue, claims, votes
             cy = picture.top + picture.height / 2
             band = next((k for y0, y1, k in bands if y0 <= cy < y1), None)
             if band:
                 band_label = "inspection/control" if band == "inspection" else band
-                band_kind, band_anchor = classify_picture(picture, captions, inlines, W, H, claims, blue, votes)
+                band_kind, band_anchor = classify_picture(picture, caps_i, ins_i, W, H, claims_i, ble_i, votes_i)
                 band_temporal = {"after": "AFTER", "before": "BEFORE"}.get(band_kind, "UNKNOWN")
                 working.rejected.append(PictureRef(
                     n, picture, "excluded", f"{band_label} section block (mid-slide heading)", band_anchor,
@@ -848,7 +983,7 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
             if any(y0 <= cy < y1 for y0, y1 in inspection_ranges) and not captions:
                 working.rejected.append(PictureRef(n, picture, "excluded", "inspection/control item"))
                 continue
-            kind, how = classify_picture(picture, captions, inlines, W, H, claims, blue, votes)
+            kind, how = classify_picture(picture, caps_i, ins_i, W, H, claims_i, ble_i, votes_i)
             temporal = {"after": "AFTER", "before": "BEFORE"}.get(kind, "UNKNOWN")
             if kind == "after":
                 working.after.append(PictureRef(n, picture, "after", "", how, temporal_role=temporal))
