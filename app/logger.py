@@ -64,6 +64,13 @@ class FileResult:
     occurrence_date: str = ""
     model: str = ""
     item: str = ""
+    slide_count: int = 0
+    cause_text: str = ""
+    improvement_text: str = ""
+    defect_text: str = ""
+    cause_sections: List[str] = field(default_factory=list)
+    improvement_sections: List[str] = field(default_factory=list)
+    after_assets: List[str] = field(default_factory=list)
     qpn_slide: Optional[int] = None
     cause_slides: List[int] = field(default_factory=list)
     improvement_slides: List[int] = field(default_factory=list)

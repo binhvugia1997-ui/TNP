@@ -386,6 +386,7 @@ class GuiController:
         self.model: str = self.cfg.model or DEFAULT_MODEL
         self.available_models: List[str] = []
         self.force_reprocess: bool = bool(self.cfg.force_reprocess)
+        self.manual_fields_by_path: Dict[str, Dict[str, str]] = {}
         # processing period (fast pre-scan)
         self.period_mode: str = self.cfg.period_mode if self.cfg.period_mode in PERIOD_MODES else "auto"
         self.period_month: str = str(self.cfg.period_month or "")
@@ -414,6 +415,7 @@ class GuiController:
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # reviewed scan list (before Start): real pre-scan result + manual exclusions
         self.all_files: List[Path] = []                # every discovered PPT/PPTX (recursive)
+        self.input_files_override: Optional[List[Path]] = None  # explicit native file selection, otherwise folder scan
         self.scan_result: Optional[PreScanResult] = None
         self.scan_stale: bool = False
         self.scan_message: str = ""
@@ -456,8 +458,10 @@ class GuiController:
         self._learning = None
         self.review_index = 0
         self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
+        self.pending_label_notes: Dict[str, str] = {}
         self.pending_image_reapply: list = []         # saved image labels whose region-crop Excel reapply is still owed
         self.pending_content_labels: Dict[str, str] = {}   # PROMPT-006B content review (separate dataset)
+        self.pending_content_notes: Dict[str, str] = {}
         self.pending_content_reapply: list = []              # candidates whose Excel re-apply is still owed (locked)
         self.last_content_review = ContentReviewOutcome()
         self.review_content_index = 0
@@ -522,11 +526,12 @@ class GuiController:
         n_rev = sum(1 for c in cands if c.decision == "review")
         return f"{len(cands)} khối chữ ứng viên, {n_rev} khối chưa chắc chắn"
 
-    def set_pending_content_label(self, cand, label: str) -> None:
+    def set_pending_content_label(self, cand, label: str, note: str = "") -> None:
         from .content_learning import CONTENT_LABELS
         if label not in CONTENT_LABELS:
             raise ValueError(label)
         self.pending_content_labels[cand.candidate_id] = label
+        self.pending_content_notes[cand.candidate_id] = note
 
     def save_content_confirmations(self, cands) -> Tuple[bool, str]:
         """Two independent transactions: (1) labels -> content_labels.jsonl (committed first, never rolled back);
@@ -543,10 +548,12 @@ class GuiController:
             c = by_id.get(cid)
             if c is None:
                 continue
-            if lrn.content.store.label(c, label) is not None:
+            note = self.pending_content_notes.get(cid, "")
+            if lrn.content.store.label(c, label, note) is not None:
                 written += 1
             touched.append(c)
         self.pending_content_labels.clear()
+        self.pending_content_notes.clear()
         LOG.info("CONTENT_REVIEW_LABELS_SAVED count=%d", written)
         self.last_content_review = ContentReviewOutcome(labels_saved=written)
         msg = f"Đã lưu {written} nhãn nội dung."
@@ -647,11 +654,12 @@ class GuiController:
             LOG.debug("candidate blob unavailable: %s", e)
         return None
 
-    def set_pending_label(self, cand, label: str) -> None:
+    def set_pending_label(self, cand, label: str, note: str = "") -> None:
         from .image_learning import LABELS
         if label not in LABELS:
             raise ValueError(label)
         self.pending_labels[cand.candidate_id] = label
+        self.pending_label_notes[cand.candidate_id] = note
 
     def save_confirmations(self, cands) -> Tuple[bool, str]:
         """Persist labels first, then re-apply region crops to the Excel image cells."""
@@ -666,10 +674,12 @@ class GuiController:
             c = by_id.get(cid)
             if c is None:
                 continue
-            if lrn.store.label(c, label) is not None:
+            note = self.pending_label_notes.get(cid, "")
+            if lrn.store.label(c, label, note) is not None:
                 written += 1
             touched.append(c)
         self.pending_labels.clear()
+        self.pending_label_notes.clear()
         # Include reports owed from a previous locked attempt; the label JSONL stays the source of truth.
         by_touched_id = {c.candidate_id: c for c in self.pending_image_reapply}
         by_touched_id.update({c.candidate_id: c for c in touched})
@@ -776,9 +786,11 @@ class GuiController:
 
     # ------------------------------------------------------------------ inputs
     def set_report_folder(self, folder: str) -> int:
-        """Select the report folder, discover PPT/PPTX recursively, propose the output path."""
-        changed = folder.strip() != self.report_folder
-        self.report_folder = folder.strip()
+        """Select a report folder, clearing any previous single-file selection."""
+        folder = folder.strip()
+        changed = folder != self.report_folder or self.input_files_override is not None
+        self.report_folder = folder
+        self.input_files_override = None
         if changed:
             self.excluded_keys = set()
         if not self.output or Path(self.output).name == DEFAULT_OUTPUT_NAME:
@@ -788,12 +800,32 @@ class GuiController:
             self._invalidate_scan()
         return n
 
+    def set_report_file(self, selected_file: str) -> int:
+        """Use one explicit native-dialog selection; only .pptx is accepted by the desktop integration."""
+        path = Path(selected_file)
+        if path.suffix.lower() != ".pptx" or not path.is_file():
+            raise ValueError("Chọn một file PPTX hiện có.")
+        resolved = path.resolve()
+        changed = self.input_files_override != [resolved]
+        self.input_files_override = [resolved]
+        self.report_folder = str(resolved.parent)
+        if changed:
+            self.excluded_keys = set()
+        if not self.output or Path(self.output).name == DEFAULT_OUTPUT_NAME:
+            self.output = default_output_path(self.report_folder)
+        self.discover()
+        self._invalidate_scan()
+        return len(self.all_files)
+
     def discover(self) -> int:
-        """Cheap recursive discovery (names only – nothing is opened)."""
+        """Cheap name-only discovery; opens no PPTX and honors an explicit selected file when present."""
         folder = Path(self.report_folder) if self.report_folder else None
         self.scan_rejections: List[Tuple[Path, str]] = []
-        self.all_files = (scan_inputs([folder], on_reject=lambda p, why: self.scan_rejections.append((p, why)))
-                          if folder and folder.is_dir() else [])
+        if self.input_files_override is not None:
+            sources = list(self.input_files_override)
+        else:
+            sources = [folder] if folder and folder.is_dir() else []
+        self.all_files = scan_inputs(sources, on_reject=lambda p, why: self.scan_rejections.append((p, why)))
         for p, why in self.scan_rejections:                  # every rejected PowerPoint-like entry is reported
             self.log_lines.append(f"Bỏ qua khi quét thư mục: {p.name} – {why}")
         self._set_files(self.all_files)
@@ -1392,7 +1424,8 @@ class GuiController:
                             use_ollama=use_ollama and bool(self.model),
                             fill_temporary_column=bool(self.cfg.fill_temporary_column),
                             vendors=list(self.cfg.vendors or []), row_mode=self.cfg.row_mode or "match",
-                            period=self.effective_period()[0], learning_dir=self.learning_dir)
+                            period=self.effective_period()[0], learning_dir=self.learning_dir,
+                            manual_fields={k: dict(v) for k, v in self.manual_fields_by_path.items()})
 
     def start(self, use_ollama: bool = True, in_thread: bool = True) -> bool:
         """Start the production batch; returns False when validation fails or already running."""

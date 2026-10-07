@@ -26,7 +26,8 @@ from .ollama_client import OllamaClient
 from .pptx_parser import parse_pptx
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE,
                       PROCESS_ACTIONS, CACHE_FILE_NAME,
-                      FastScanCache, MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, prescan)
+                      FastScanCache, MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, normalize_source_path,
+                      prescan)
 from .qpn_renderer import SlideRenderer, render_qpn_panel
 
 LOG = logging.getLogger("report_extractor.batch")
@@ -81,6 +82,9 @@ class BatchOptions:
     # PROMPT-006: image learning folder (None -> runtime_paths.learning_dir()); False disables the subsystem
     learning_dir: Optional[Path] = None
     use_image_learning: bool = True
+    # Explicit native-UI edits keyed by normalize_source_path(); only the selected report's Vendor/date are overridden.
+    # Values are validated by the desktop service; date is ISO (YYYY-MM-DD) or an explicit empty string.
+    manual_fields: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -425,11 +429,24 @@ class BatchProcessor:
             self.on_file(idx, "extracting", "")
             rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None,
                                  learning=self.learning)
+            manual_fields = self.opts.manual_fields.get(normalize_source_path(path), {})
+            if "vendor" in manual_fields:
+                rec.vendor = manual_fields["vendor"]
+                rec.vendors = [line.strip() for line in rec.vendor.splitlines() if line.strip()]
+            if "occurrence_date" in manual_fields:
+                value = manual_fields["occurrence_date"].strip()
+                rec.occurrence_date = date.fromisoformat(value) if value else None
             fr.image_candidates = list(rec.image_candidates)
             fr.content_candidates = list(rec.content_candidates)
             for diagnostic in getattr(rec, "cause_diagnostics", []):
                 LOG.info("%s: %s", path.name, diagnostic)
             fr.management_number = rec.management_number
+            fr.slide_count = len(report.slides)
+            fr.cause_text = rec.root_cause
+            fr.improvement_text = rec.improvement
+            fr.defect_text = rec.defect_content
+            fr.cause_sections = [section.text for section in rec.cause_sections if section.text]
+            fr.improvement_sections = [section.text for section in rec.improvement_sections if section.text]
             fr.after_picture_slides = list(rec.after_picture_slides)
             fr.vendor = rec.vendor
             fr.occurrence_date = rec.occurrence_date_text
@@ -467,6 +484,7 @@ class BatchProcessor:
                     imp_jpg, problems = export_after_pictures(
                         report, rec.after_pictures, assets / f"{prefix}_IMPROVEMENT_regions",
                         renderer=renderer, management_number=rec.management_number)
+                    fr.after_assets = [str(path) for path in imp_jpg]
                     rec.review_reasons.extend(problems)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("%s: improvement image failed: %s", path.name, e)
@@ -480,10 +498,11 @@ class BatchProcessor:
                     # explicit user request: rewrite every extractor-managed field
                     conflicts = writer.update_record(row, rec, qpn_png, imp_jpg,
                                                      fill_temporary=self.opts.fill_temporary_column,
-                                                     clear_missing_images=True)
+                                                     clear_missing_images=True, manual_fields=manual_fields)
                 else:
                     # auto fill: ONLY the blank fields, populated cells are preserved
-                    conflicts = writer.fill_missing_fields(row, rec, missing, qpn_png, imp_jpg)
+                    conflicts = writer.fill_missing_fields(row, rec, missing, qpn_png, imp_jpg,
+                                                           manual_fields=manual_fields)
                     rec.review_reasons = filter_review_reasons(rec.review_reasons, missing)
                     fr.filled_fields = [f for f in missing if _rec_has(rec, f, qpn_png, imp_jpg)]
                 rec.review_reasons.extend(conflicts)
@@ -502,7 +521,8 @@ class BatchProcessor:
                 note = "; ".join(rec.review_reasons)
                 row = writer.append_record(rec, qpn_png, imp_jpg,
                                            status_text="Cần kiểm tra" if rec.review_reasons else "",
-                                           note_text=note, fill_temporary=self.opts.fill_temporary_column)
+                                           note_text=note, fill_temporary=self.opts.fill_temporary_column,
+                                           manual_fields=manual_fields)
             status = "needs_review" if rec.review_reasons else "completed"
             note = "; ".join(rec.review_reasons)
             writer.save()                       # save after every successful record

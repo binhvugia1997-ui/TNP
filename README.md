@@ -385,6 +385,13 @@ Checklist smoke test Windows: (A) máy sạch không Python/Ollama → winget c�
 (E) bỏ qua Ollama local, cấu hình IP máy khác trong tab Cấu hình; (F) đường dẫn có dấu cách; (G) chạy setup.bat lần 2 →
 ".venv: dùng lại", không tải lại model.
 
+## React + pywebview development launcher (PROMPT-022R)
+
+The separate local React desktop development flow uses Python as the authoritative report-processing, Excel, learning,
+Ollama, configuration, log, and update-state backend. It does not replace the existing Tkinter/Portable workflow, serve
+user data over a web server, publish a LAN update, or build an EXE. Exact Windows PowerShell setup/run commands,
+automated checks, feature status, and the Windows manual-acceptance checklist are in [`DEVELOPMENT_WEBVIEW.md`](DEVELOPMENT_WEBVIEW.md).
+
 ## Cập nhật offline / mạng nội bộ (PROMPT-005)
 
 * Định danh ứng dụng: `app/__init__.py` là nguồn duy nhất – `__version__ = "1.0.4"`, `BUILD_NUMBER = 4`

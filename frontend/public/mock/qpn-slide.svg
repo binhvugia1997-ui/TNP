@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="560" viewBox="0 0 1000 560" font-family="Segoe UI, Tahoma, Arial, sans-serif">
+  <rect width="1000" height="560" fill="#ffffff"/>
+  <rect x="0" y="0" width="1000" height="54" fill="#1a73d1"/>
+  <text x="24" y="35" font-size="21" font-weight="700" fill="#ffffff">QPN — Thông báo vấn đề chất lượng</text>
+  <text x="976" y="35" font-size="14" fill="#dbeafe" text-anchor="end">CTMS · 260903129</text>
+
+  <rect x="0" y="54" width="1000" height="1" fill="#d8e1ec"/>
+
+  <text x="24" y="92" font-size="13" fill="#5b7290">Management Number</text>
+  <text x="24" y="114" font-size="16" font-weight="700" fill="#0f2b4c">260903129</text>
+
+  <text x="266" y="92" font-size="13" fill="#5b7290">Ngày phát sinh</text>
+  <text x="266" y="114" font-size="16" font-weight="700" fill="#0f2b4c">03/09/2026</text>
+
+  <text x="508" y="92" font-size="13" fill="#5b7290">Vendor name</text>
+  <rect x="508" y="98" width="200" height="22" rx="3" fill="#f4f7fb" stroke="#d8e1ec"/>
+  <text x="516" y="114" font-size="13" fill="#93a4b8">(người dùng điền tay)</text>
+
+  <text x="752" y="92" font-size="13" fill="#5b7290">Số lượng lỗi</text>
+  <text x="752" y="114" font-size="16" font-weight="700" fill="#b91c1c">12 pcs</text>
+
+  <rect x="24" y="140" width="952" height="1" fill="#e7edf5"/>
+
+  <text x="24" y="176" font-size="14" font-weight="700" fill="#0f2b4c">Hiện tượng</text>
+  <text x="24" y="200" font-size="14" fill="#1f3247">Lắp nhầm chủng loại linh kiện tại trạm lắp ráp số 3 — phát hiện ở công đoạn kiểm tra cuối.</text>
+  <text x="24" y="224" font-size="14" fill="#1f3247">Tỉ lệ phát hiện: 12/1.500 pcs (0,8 %).</text>
+
+  <text x="24" y="266" font-size="14" font-weight="700" fill="#0f2b4c">Xu hướng lỗi theo tuần</text>
+  <g stroke="#d8e1ec" stroke-width="1">
+    <line x1="24" y1="430" x2="470" y2="430"/>
+    <line x1="24" y1="396" x2="470" y2="396" stroke-dasharray="3 4"/>
+    <line x1="24" y1="362" x2="470" y2="362" stroke-dasharray="3 4"/>
+    <line x1="24" y1="328" x2="470" y2="328" stroke-dasharray="3 4"/>
+  </g>
+  <g fill="#1a73d1">
+    <rect x="46" y="404" width="44" height="26"/>
+    <rect x="132" y="392" width="44" height="38"/>
+    <rect x="218" y="376" width="44" height="54"/>
+    <rect x="304" y="386" width="44" height="44"/>
+    <rect x="390" y="412" width="44" height="18"/>
+  </g>
+  <polyline points="68,398 154,384 240,368 326,378 412,404" fill="none" stroke="#b91c1c" stroke-width="3"/>
+  <g fill="#b91c1c">
+    <circle cx="68" cy="398" r="4.5"/>
+    <circle cx="154" cy="384" r="4.5"/>
+    <circle cx="240" cy="368" r="4.5"/>
+    <circle cx="326" cy="378" r="4.5"/>
+    <circle cx="412" cy="404" r="4.5"/>
+  </g>
+  <g font-size="12" fill="#5b7290" text-anchor="middle">
+    <text x="68" y="446">W31</text>
+    <text x="154" y="446">W32</text>
+    <text x="240" y="446">W33</text>
+    <text x="326" y="446">W34</text>
+    <text x="412" y="446">W35</text>
+  </g>
+
+  <rect x="510" y="284" width="466" height="196" rx="4" fill="#fbfcfe" stroke="#d8e1ec"/>
+  <text x="528" y="312" font-size="14" font-weight="700" fill="#0f2b4c">Chi tiết lỗi theo mã linh kiện</text>
+  <g font-size="13" fill="#5b7290">
+    <text x="528" y="342">Mã linh kiện</text>
+    <text x="700" y="342">Số lỗi</text>
+    <text x="820" y="342">Trạm</text>
+  </g>
+  <line x1="528" y1="352" x2="958" y2="352" stroke="#e7edf5"/>
+  <g font-size="13" fill="#1f3247">
+    <text x="528" y="378">BOM-2291</text>
+    <text x="700" y="378">7</text>
+    <text x="820" y="378">Trạm 3</text>
+    <text x="528" y="404">BOM-2292</text>
+    <text x="700" y="404">5</text>
+    <text x="820" y="404">Trạm 3</text>
+  </g>
+  <line x1="528" y1="418" x2="958" y2="418" stroke="#e7edf5"/>
+  <text x="528" y="446" font-size="13" fill="#b91c1c">Hai mã có hình dạng ngoài giống nhau, đặt cạnh nhau.</text>
+  <text x="528" y="466" font-size="13" fill="#1f3247">Vùng khoanh đỏ: vị trí khay linh kiện tại trạm số 3.</text>
+
+  <rect x="24" y="486" width="952" height="1" fill="#e7edf5"/>
+  <text x="24" y="516" font-size="13" fill="#5b7290">Ảnh QPN được trích xuất từ report nguồn (slide 3) và dán vào file Excel kiểm chứng.</text>
+  <text x="24" y="538" font-size="13" fill="#5b7290">Report Extractor — 1.3.2 — Build 015 · bản mẫu giao diện</text>
+</svg>

@@ -1031,6 +1031,32 @@ class ExcelWriter:
         self._write_images_with_row_height(row, heights, qpn_png, improvement_jpg, want_qpn=True, want_imp=True,
                                            clear_missing=clear_missing_images)
 
+    def _write_manual_fields(self, row: int, manual_fields: Optional[Dict[str, str]]) -> None:
+        """Apply only explicitly edited Vendor/date cells. This is deliberately separate from extraction's
+        fill-if-blank/conflict behavior; the native UI records the edit and this method keeps backup + atomic save.
+        Date values are ISO (YYYY-MM-DD), or empty to explicitly clear the cell.
+        """
+        if not manual_fields:
+            return
+        if "vendor" in manual_fields:
+            self._set_cell(row, "vendor", (manual_fields.get("vendor") or "").strip())
+        if "occurrence_date" in manual_fields:
+            value = (manual_fields.get("occurrence_date") or "").strip()
+            if not value:
+                self._set_cell(row, "occurrence_date", None, wrap=False)
+            else:
+                try:
+                    parsed = date.fromisoformat(value)
+                except ValueError as exc:
+                    raise ValueError("Ngày phát sinh thủ công phải ở dạng ISO YYYY-MM-DD") from exc
+                self._write_date(row, parsed)
+
+    def apply_manual_fields(self, row: int, manual_fields: Dict[str, str]) -> None:
+        """Public explicit-edit path used by the desktop service after validating the selected report."""
+        if self.probe:
+            raise TemplateError("Workbook mở ở chế độ quét (probe) – không ghi")
+        self._write_manual_fields(row, manual_fields)
+
     def _write_vendor_and_date(self, row: int, rec, overwrite_blank_only: bool) -> List[str]:
         """Vendor / Ngày phát sinh: fill when blank, keep when equal, never overwrite a different value."""
         notes: List[str] = []
@@ -1093,7 +1119,8 @@ class ExcelWriter:
         return row
 
     def append_record(self, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
-                      status_text: str = "", note_text: str = "", fill_temporary: bool = False) -> int:
+                      status_text: str = "", note_text: str = "", fill_temporary: bool = False,
+                      manual_fields: Optional[Dict[str, str]] = None) -> int:
         """Write one report as one NEW row (append mode). Returns the Excel row number."""
         row = self.next_row()
         src = row - 1 if row - 1 >= self.data_start else self.data_start
@@ -1107,6 +1134,7 @@ class ExcelWriter:
         for i in range(1, 9):   # WEEK +1..+8: blank unless real source data (none parsed) -> blank
             self._set_cell(row, f"week_{i}", rec.weeks.get(i, "") or "", wrap=False)
         self._write_content(row, rec, qpn_png, improvement_jpg, fill_temporary)
+        self._write_manual_fields(row, manual_fields)
         if status_text:
             self._set_cell(row, "status", status_text)
         if note_text:
@@ -1115,7 +1143,8 @@ class ExcelWriter:
 
     def update_record(self, row: int, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
                       status_text: str = "", note_text: str = "", fill_temporary: bool = False,
-                      clear_missing_images: bool = False) -> List[str]:
+                      clear_missing_images: bool = False,
+                      manual_fields: Optional[Dict[str, str]] = None) -> List[str]:
         """Write the report into an EXISTING row located by Management Number.
 
         * the Management Number cell is preserved untouched;
@@ -1125,6 +1154,12 @@ class ExcelWriter:
         Returns conflict notes (to be added to 'Cần kiểm tra').
         """
         notes = self._write_vendor_and_date(row, rec, overwrite_blank_only=True)
+        self._write_manual_fields(row, manual_fields)
+        if manual_fields:
+            if "vendor" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Vendor trong Excel:")]
+            if "occurrence_date" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Ngày phát sinh trong Excel")]
         self._write_content(row, rec, qpn_png, improvement_jpg, fill_temporary,
                             clear_missing_images=clear_missing_images)
         if status_text:
@@ -1150,13 +1185,20 @@ class ExcelWriter:
         self._dirty = True
 
     def fill_missing_fields(self, row: int, rec, missing: List[str], qpn_png: Optional[Path] = None,
-                            improvement_jpg=None) -> List[str]:
+                            improvement_jpg=None,
+                            manual_fields: Optional[Dict[str, str]] = None) -> List[str]:
         """Partial update of an EXISTING row: write ONLY the fields listed in ``missing``.
 
         Populated cells are preserved even when the report holds another value (Vendor / Ngày phát sinh keep
         their conflict notes as before).  Returns the conflict notes.
         """
         notes = self._write_vendor_and_date(row, rec, overwrite_blank_only=True)
+        self._write_manual_fields(row, manual_fields)
+        if manual_fields:
+            if "vendor" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Vendor trong Excel:")]
+            if "occurrence_date" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Ngày phát sinh trong Excel")]
         heights = [self.ws.row_dimensions[row].height or 15.0]
         for f in ("model", "item", "defect_content", "root_cause", "improvement"):
             if f in missing:
