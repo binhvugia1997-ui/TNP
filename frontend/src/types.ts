@@ -197,6 +197,10 @@ export type ImageCandidate = {
   src: string
   /** Khung ảnh trên slide, tính theo % kích thước slide. */
   bounds: { x: number; y: number; w: number; h: number }
+  /** PROMPT-025: định danh mục cải tiến (một slide có thể có nhiều mục). */
+  itemId?: string
+  itemIndex?: number
+  itemHeading?: string
   decision: string
   confidenceBand: 'high' | 'medium' | 'low'
   confidence: number

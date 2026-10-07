@@ -11,7 +11,7 @@ import re
 import tempfile
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw
 
@@ -212,13 +212,19 @@ def _fallback_picture_group(region: ImprovementVisualRegion, out_dir: Path, stem
 
 
 def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_dir: Path,
-                          renderer: Optional[SlideRenderer] = None, management_number: str = ""
+                          renderer: Optional[SlideRenderer] = None, management_number: str = "",
+                          should_cancel: Optional[Callable[[], bool]] = None
                           ) -> Tuple[List[Path], List[str]]:
     """Render one faithful After-region PNG per eligible logical item/slide.
 
     All refs are rechecked against the PROMPT-015 gate. A failed/missing slide render falls back to the existing
     embedded-picture export for that region; if that also fails, no image is returned and a diagnostic is added.
     The returned :class:`GroupedImagePaths` keeps one logical item per Excel visual row.
+
+    PROMPT-025: ``should_cancel`` is an optional cooperative-cancellation hook checked between item-level
+    crops (the slide itself is rendered once and shared by every item region of that slide). The batch
+    keeps its file-atomic stop semantics ("Dừng sau file hiện tại"): the hook only shortens work that
+    would otherwise be redone, never an Excel commit.
     """
     problems: List[str] = []
     out_dir = Path(out_dir)
@@ -262,6 +268,16 @@ def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_
         path_groups: List[List[Path]] = []
         owners: List[str] = []
         for index, region in enumerate(regions, start=1):
+            if should_cancel is not None and should_cancel():
+                # cooperative stop between item-level crops (PROMPT-025 §43): finish nothing half-done,
+                # record the stop, and let the caller decide (the batch keeps file-atomic semantics).
+                problems.append(f"REGION_CANCELLED MN={management_number or '-'} report={report.filename} "
+                                f"scope={region.report_scope_id} slide={region.slide_index} "
+                                f"item={region.improvement_item_id}: đã dừng giữa các mục cải tiến")
+                LOG.info("REGION_CANCELLED MN=%s report=%s scope=%s slide=%s item=%s",
+                         management_number or "-", report.filename, region.report_scope_id,
+                         region.slide_index, region.improvement_item_id)
+                break
             stem = _region_stem(region, index)
             rendered = render_paths.get(region.slide_index)
             group: List[Path] = []
@@ -305,6 +321,6 @@ def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_
                                     "both failed")
                     continue
             path_groups.append(group)
-            owners.append(region.region_id)
+            owners.append(region.block_id)
 
     return GroupedImagePaths(path_groups, owners), problems

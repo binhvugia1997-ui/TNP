@@ -103,6 +103,7 @@ class ImageCandidate:
     semantic_role: str = "OTHER"
     logical_item_owner: str = ""
     owner_heading: str = ""
+    item_index: int = -1                      # PROMPT-025: stable item index on the slide (-1 = unknown)
     confident_owner: bool = False
     excel_output_eligible: bool = False
     eligibility_reason: str = ""
@@ -251,6 +252,9 @@ def build_candidates(report: ReportData, slide_numbers: Sequence[int], sel: Pict
         if s is None or not s.pictures:
             continue
         roles = classify_blocks(s)
+        from .improvement_pictures import slide_items                       # lazy: keep import order stable
+        from .improvement_items import item_index_for_owner
+        slide_item_regions = slide_items(s)
         head = norm_key(title_text(s))
         insp_slide = bool(head and _INSPECTION_RE.search(head)
                           and not re.search(r"san xuat|production|process|cong doan", head))
@@ -346,6 +350,8 @@ def build_candidates(report: ReportData, slide_numbers: Sequence[int], sel: Pict
                 temporal_role=ref.temporal_role if ref else "UNKNOWN",
                 semantic_role=ref.semantic_role if ref else "OTHER",
                 logical_item_owner=ref.owner_id if ref else "", owner_heading=ref.owner_heading if ref else "",
+                item_index=(item_index_for_owner(slide_item_regions, ref.owner_id)
+                            if ref and ref.owner_id else -1),
                 confident_owner=bool(ref and ref.confident_owner), excel_output_eligible=eligible,
                 eligibility_reason=eligibility_reason)
             out.append(c)

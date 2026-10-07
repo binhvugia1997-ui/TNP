@@ -19,7 +19,7 @@ from pathlib import Path
 from .classifier import (FOLLOWUP_LINE_RE, Classification, improvement_subkind, is_heading_like, is_long_term_heading,
                          section_kind_of_heading)
 from .pptx_parser import ReportData, SlideData, norm_key, clean_text
-from .improvement_pictures import PictureRef, select_after_pictures
+from .improvement_pictures import PictureRef, PictureSelection, select_after_pictures
 from .content_region import (ROLE_CONTENT, ROLE_TITLE, cause_sidebar_regions, classify_blocks,
                              is_slide_level_heading)
 
@@ -71,6 +71,9 @@ class ExtractedRecord:
     picture_notes: List[str] = field(default_factory=list)                # diagnostics: every picture decision
     image_candidates: list = field(default_factory=list)                   # PROMPT-006 ImageCandidate records
     content_candidates: list = field(default_factory=list)                 # PROMPT-006B ContentCandidate records
+    # PROMPT-025: explicit logical ImprovementItem summaries (slide, index, item id, item-scoped
+    # text, before/after pictures, captions) – one entry per logical improvement item, in item order.
+    improvement_items: List[dict] = field(default_factory=list)
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
     # Vendor: detected from the ORIGINAL improvement text ("Tại công đoạn assy <Vendor>")
@@ -827,18 +830,23 @@ def extract_record(report: ReportData, cls: Classification,
     if not rec.improvement:
         rec.review_reasons.append("Không tìm thấy Nội dung đối sách cải tiến trong báo cáo")
     # improvement pictures: After-only, deterministic geometry (never "all pictures of the slide")
+    final_sel = PictureSelection()
     if rec.improvement_image_slides:
         sel = select_after_pictures(report, rec.improvement_image_slides)
         rec.after_pictures = list(sel.after)
         rec.after_picture_slides = list(sel.slides_with_after)
         rec.picture_notes = list(sel.notes)
         reasons = list(sel.reasons)
+        final_sel = sel
         if learning is not None:
             from .image_learning import select_with_learning
             refs, cands, extra = select_with_learning(report, rec.improvement_image_slides, sel, learning,
                                                       rec.management_number, str(report.path))
             rec.after_pictures = refs
             rec.image_candidates = cands
+            final_sel = PictureSelection(after=list(refs), rejected=list(sel.rejected),
+                                         reasons=list(sel.reasons), notes=list(sel.notes),
+                                         slides_with_after=list(sel.slides_with_after))
             rec.after_picture_slides = sorted({r.slide for r in refs})
             reasons.extend(extra)
             # a learned/user decision resolved the ambiguity -> drop the generic ambiguity note for that slide
@@ -852,6 +860,22 @@ def extract_record(report: ReportData, cls: Classification,
             rec.review_reasons.append("Không tìm thấy ảnh Sau cải tiến trong các slide cải tiến")
     else:
         rec.review_reasons.append("Không có hình ảnh cải tiến")
+
+    # PROMPT-025: explicit logical ImprovementItem model – segmentation happens before evidence
+    # cropping; every item keeps its own text/pictures/captions (never the next item's content).
+    from .improvement_items import attach_selection, segment_report_items
+    item_slides = sorted(set(rec.improvement_image_slides) | {s.slide for s in rec.improvement_sections})
+    if item_slides:
+        items_by_slide = segment_report_items(report, item_slides)
+        attach_selection(items_by_slide, final_sel)
+        rec.improvement_items = [item.summary()
+                                 for items in items_by_slide.values() for item in items]
+        for summary in rec.improvement_items:
+            LOG.info("ITEM_RECORD MN=%s report=%s slide=%s index=%d item=%s heading=%r "
+                     "after=%s before=%s captions=%s", rec.management_number or "-", report.filename,
+                     summary["slide"], summary["index"], summary["itemId"], summary["heading"],
+                     summary["afterPictures"], summary["beforePictures"], summary["captions"])
+
     # ambiguous classification -> manual review rather than guessing
     rec.review_reasons.extend(cls.ambiguities)
     for name, val in (("Management number", rec.management_number), ("Tên vendor", rec.vendor),

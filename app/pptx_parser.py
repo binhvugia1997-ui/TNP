@@ -148,8 +148,12 @@ def strip_accents(s: str) -> str:
 
 
 def norm_key(s: str) -> str:
-    """Accent-insensitive, case-insensitive, whitespace-collapsed key."""
+    """Accent-insensitive, case-insensitive, whitespace-collapsed key.
+
+    PROMPT-025: the Sino-Vietnamese character 進 is a common authored stand-in for "tiến" in captions
+    ("Sau cải進"); fold it so caption/anchor recognition stays spelling-tolerant."""
     s = strip_accents(s or "").lower()
+    s = s.replace("進", " tien")      # 進 = tiến, often typed glued to the preceding word ("cải進")
     s = re.sub(r"[\s_\-–—:.,;()\[\]/\\]+", " ", s)
     return s.strip()
 

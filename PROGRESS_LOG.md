@@ -226,3 +226,57 @@
   `tools/build_portable.py` (stream + log `logs/build_and_publish_*.log`), mã thoát 0/1/2/3/4.
 - `BUILD_AND_PUBLISH.bat` ở gốc repo: tìm Python 3.10–3.13 + git, gọi orchestrator, báo kết quả tiếng Việt.
 - Test: `tests/test_build_and_publish.py` (19, dùng git thật trên repo tạm). Tổng 823 passed. Chưa build Portable.
+
+## PROMPT-025 — Một slide nhiều mục cải tiến: phân đoạn ImprovementItem + crop "Sau" chính xác theo mục (v1.3.2 / Build 015, không đổi build)
+- Giả định cũ "một slide = một mục cải tiến" sai với báo cáo thật: một slide "3. CẢI TIẾN TRONG SẢN XUẤT" có thể chứa
+  nhiều mục (ví dụ: mục 1 "Lỗi xước rear (Áp dụng cải tiến 17/9 – Công đoạn Assy Daoltech):" với Before ở trái,
+  mũi tên xanh giữa, After là BA ảnh nằm ngang bên phải và caption "Sau cải進" bên dưới; mục 2 "Cải tiến lỗi lệch
+  ATN ..." ngay dưới). Hệ quả cũ: một item duy nhất, một region gộp cả hai mục, ảnh "Before" bị nhận nhầm thành
+  "Sau", và crop của mục 1 chứa cả heading/body của mục 2.
+- Nguyên nhân gốc (đã nhân bản bằng fixture tổng hợp, không cần Windows): (1) `slide_items()` không nhận được
+  heading của mục 2 khi heading đó là dòng kiểu tên lỗi "Lỗi lệch ATN sau ép nhựa" (chứa "sau" → đúng tên bị loại
+  bởi exclusion regex của branch defect) hoặc là dòng không in đậm, có dấu hai chấm, nằm giữa một khung chữ chung;
+  (2) các anchor "+ Trước:/+ Sau:" và caption được áp dụng theo toàn slide, không theo mục; (3) không có mô hình
+  ImprovementItem nên không có gì neo crop theo từng mục; (4) đường biên của mục bị cắt bởi nhãn sidebar hẹp ở
+  mép trái (oval "Cải tiến trong kiểm tra") nên span của mục 1 mất cả hàng ảnh của chính nó.
+- Sửa (không đổi version/build 1.3.2 / Build 015):
+  - `app/improvement_items.py` (mới): mô hình `ImprovementItem` (Report → Slide[] → ImprovementItem[] → Before/After
+    regions): phân đoạn theo heading, marker Trước/Sau, mũi tên, hình học và khoảng trắng dọc (không OCR, không
+    detect khung đỏ/chụp màn hình); span của mục = từ anchor tới đỉnh đường biên kế tiếp có liên quan theo phương
+    ngang (hoặc full-width), không bao giờ thu nhỏ bên dưới khung anchor; text của mục theo span (dòng ở khoảng
+    trắng giữa các mục thuộc về không mục nào nhưng vẫn vào ô Excel qua join section — không mất nội dung).
+  - `app/improvement_pictures.py`: nhận diện anchor của mục theo 2 họ đúng thật (heading có dấu ":" + ngữ nghĩa sản
+    xuất, hoặc mở đầu bằng tên lỗi "Lỗi lệch ATN sau ép nhỰA"), luôn kèm tín hiệu thị giác (có caption/ảnh
+    trong hàng bên dưới) để không phân đoạn nhầm dòng body; span chỉ bị cắt bởi đường biên có overlap theo trục
+    ngang hoặc rộng ≥ 55% slide; anchor (caption / inline / chữ xanh / mũi tên / claims) được scope theo span của
+    từng mục với fallback toàn slide khi mục không có anchor (tương thích ngược); log `ITEM_SEGMENTATION`.
+  - `app/improvement_visual.py`: `ImprovementVisualRegion` thêm `item_index` + `after_block_index`; gom cụm các ảnh
+    "Sau" của một mục thành các After block (cùng hàng/cùng cột hoặc chung caption → 3 ảnh một block là MỘT
+    region, không phải 3); mỗi block là một region riêng; bbox bị clamp theo span dọc của mục (khi đường biên có
+    overlap theo trục ngang) → crop của mục nọ không bao giờ chứa heading/body của mục sau; caption gán theo
+    block gần nhất (hòa thì loại); sort theo (slide, item_index, after_block_index, source_order).
+  - `app/image_extractor.py`: render mỗi slide đúng một lần rồi crop theo từng region của từng mục; thêm hook
+    huỷ hợp tác `should_cancel` giữa các region (batch không truyền → vẫn "Dừng sau file hiện tại" nguyên khối file,
+    không bao giờ ngắt commit Excel); `owners` dùng `region.block_id` (ổn định, duy nhất theo block).
+  - `app/extractor.py`: giữ nguyên ô Excel improvement = join_sections (đủ các mục, đúng thứ tự, không gộp chéo);
+    thêm `ExtractedRecord.improvement_items` (summary mỗi mục: slide/index/itemId/scopedItemId/heading/text/bounds/
+    before/after/captions) tính sau khi chọn ảnh cuối cùng.
+  - `app/logger.py` + `app/batch_processor.py`: `FileResult.improvement_items` (batch_result.json).
+  - `app/image_learning.py`: `ImageCandidate.item_index` (điền từ segmentation); `candidate_id_for` giữ nguyên
+    (report|slide|shape|order → tương thích ngược, migration an toàn).
+  - `app/application_service.py`: DTO learning thêm `itemId`/`itemIndex`/`itemHeading`.
+  - `frontend/src/types.ts` + `frontend/src/tabs/LearningTab.tsx`: thêm field optional + chip "Mục #n" nhỏ cạnh
+    nhãn Slide ở preview học (không redesign; khung đích đã vẽ theo từng candidate).
+  - `app/pptx_parser.py`: `norm_key` fold ký tự Hán-Việt `進` → "tien" (caption "Sau cải進" trên báo cáo thật trước
+    đây không được nhận là caption "Sau").
+- Business logic giữ nguyên: PROMPT-014 (nguyên nhân cấu trúc), 015 (gate ngữ nghĩa), 020 (isolation theo báo
+  cáo), 021 (crop đúng slide đã render), 023 (picker/config), 024 (huỷ an toàn + learning + commit Excel nguyên tử);
+  Management Number, Vendor, ngày phát sinh, QPN, cause, improvement text, evidence, lock/retry Excel, force
+  reprocess, Ollama, learning, updater.
+- Test: `tests/test_prompt025_multi_item.py` (19): fixture đúng §30 (2 mục, 3 ảnh After của mục 1 + caption "Sau cải進" dưới, khoảng trắng, không khung chữ bao ngoài) + biến thể heading kiểu "Lỗi ... sau ép nhựa" (ca báo cáo
+  Windows), heading giữa khung không in đậm, slide 3 mục, slide 1 mục, 2 báo cáo giống hệt nhau, force reprocess,
+  identity học theo report+slide+item, render một lần cho 2 region, hook huỷ hợp tác, mapping Excel (1 dòng, đủ 2
+  mục đúng thứ tự, 2 nhóm ảnh), dừng sau file hiện tại vẫn nguyên khối, loại xử lý tạm thời. Tổng **894 passed**
+  (baseline 875 + 19 mới); compileall, pyflakes (file mới), `git diff --check`, frontend `tsc --noEmit` + `vite build`
+  đều pass.
+- Chưa chạy xác minh Windows: cần chạy lại file PPTX 2 mục thật trên Windows (xem checklist trong báo cáo).
