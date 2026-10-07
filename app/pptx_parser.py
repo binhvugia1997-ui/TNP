@@ -7,6 +7,7 @@ reading order matches the slide layout.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -34,8 +35,8 @@ class TextRunInfo:
 
 @dataclass
 class Block:
-    """One logical piece of slide content (paragraph, table row, picture)."""
-    kind: str                          # "paragraph" | "table" | "picture" | "title"
+    """One logical piece of slide content or render-only geometry (paragraph, table row, picture, visual shape)."""
+    kind: str                          # paragraph | table | picture | title | visual
     text: str = ""                     # original text ("" for pictures)
     left: int = 0                      # EMU
     top: int = 0
@@ -57,6 +58,14 @@ class Block:
     n_lines: int = 0                                      # paragraphs in the text frame
     line_colors: List[str] = field(default_factory=list)  # '#rrggbb' per paragraph ('' = inherited/unknown)
     direction: str = ""                                   # arrows only: "right" | "left" | "up" | "down" | ""
+    z_order: int = -1                                      # original drawing order, independent of reading order
+    fill_color: str = ""
+    line_color: str = ""
+    fill_visible: bool = False
+    line_visible: bool = False
+    line_width: int = 0                                    # EMU
+    line_endpoints: Optional[Tuple[int, int, int, int]] = None  # absolute EMU for straight connectors
+    shape_type: str = ""                                  # python-pptx shape kind for visual rendering/diagnostics
 
     @property
     def is_text(self) -> bool:
@@ -81,6 +90,7 @@ class SlideData:
     xml_stats: dict = field(default_factory=dict)          # raw-XML inventory (diagnostics)
     arrows: List[Block] = field(default_factory=list)      # directional arrow shapes/connectors (structure only,
                                                            # never content; kept out of ``blocks`` on purpose)
+    annotations: List[Block] = field(default_factory=list)  # non-picture visual shapes and text with z-order/geometry
 
     @property
     def alt_texts(self) -> List[str]:
@@ -138,8 +148,12 @@ def strip_accents(s: str) -> str:
 
 
 def norm_key(s: str) -> str:
-    """Accent-insensitive, case-insensitive, whitespace-collapsed key."""
+    """Accent-insensitive, case-insensitive, whitespace-collapsed key.
+
+    PROMPT-025: the Sino-Vietnamese character 進 is a common authored stand-in for "tiến" in captions
+    ("Sau cải進"); fold it so caption/anchor recognition stays spelling-tolerant."""
     s = strip_accents(s or "").lower()
+    s = s.replace("進", " tien")      # 進 = tiến, often typed glued to the preceding word ("cải進")
     s = re.sub(r"[\s_\-–—:.,;()\[\]/\\]+", " ", s)
     return s.strip()
 
@@ -374,6 +388,115 @@ def _shape_geometry(shape) -> Tuple[str, float]:
     except Exception:
         pass
     return prst, rot
+
+
+def _color_hex(color, theme: dict) -> str:
+    """Resolve an Office RGB/theme color to '#rrggbb' when possible."""
+    try:
+        from pptx.enum.dml import MSO_COLOR_TYPE
+        if color.type == MSO_COLOR_TYPE.RGB:
+            return "#" + str(color.rgb).lower()
+        if color.type == MSO_COLOR_TYPE.SCHEME:
+            name = str(color.theme_color).split(".")[-1].split(" ")[0]
+            return theme.get(_THEME_SLOTS.get(name, ""), "")
+    except Exception:
+        pass
+    return ""
+
+
+def _line_endpoints(shape, offset, left: int, top: int, width: int, height: int,
+                    rotation: float, prst: str) -> Optional[Tuple[int, int, int, int]]:
+    """Absolute endpoints of a straight PPTX line/connector, or None for area annotations."""
+    try:
+        is_line = prst == "line" or etree_localname(shape._element) == "cxnSp" \
+            or shape.shape_type == MSO_SHAPE_TYPE.LINE
+        if not is_line:
+            return None
+        xfrm = shape._element.find(".//{%s}xfrm" % _NS_A)
+        flip_h = bool(xfrm is not None and xfrm.get("flipH") in ("1", "true"))
+        flip_v = bool(xfrm is not None and xfrm.get("flipV") in ("1", "true"))
+        diagonal = flip_h ^ flip_v
+        if diagonal:
+            p1, p2 = (left, top + height), (left + width, top)
+        else:
+            p1, p2 = (left, top), (left + width, top + height)
+        cx, cy = left + width / 2.0, top + height / 2.0
+        theta = math.radians(rotation)
+        cosine, sine = math.cos(theta), math.sin(theta)
+        def rotate(point):
+            dx, dy = point[0] - cx, point[1] - cy
+            return (int(round(cx + dx * cosine - dy * sine)),
+                    int(round(cy + dx * sine + dy * cosine)))
+        p1, p2 = rotate(p1), rotate(p2)
+        return p1[0], p1[1], p2[0], p2[1]
+    except Exception:
+        return None
+
+
+def _style_reference_color(shape, ref_name: str, theme: dict) -> Tuple[bool, str]:
+    """Best-effort resolution of an inherited Office theme fill/line reference."""
+    try:
+        ref = shape._element.find(".//{%s}%s" % (_NS_A, ref_name))
+        if ref is None or int(ref.get("idx", "0")) <= 0:
+            return False, ""
+        srgb = ref.find("{%s}srgbClr" % _NS_A)
+        scheme = ref.find("{%s}schemeClr" % _NS_A)
+        if srgb is not None and srgb.get("val"):
+            return True, "#" + srgb.get("val").lower()
+        if scheme is not None and scheme.get("val"):
+            name = scheme.get("val")
+            return True, theme.get(name, theme.get(_THEME_SLOTS.get(name.upper(), ""), ""))
+    except Exception:
+        pass
+    return False, ""
+
+
+def _annotation_block(shape, offset, prst: str, rotation: float, z_order: int, theme: dict) -> Block:
+    """Geometry/style record for one non-picture visual object; excluded from semantic text classification."""
+    left, top, width, height = shape_geometry(shape, offset)
+    fill_color, fill_visible = "", False
+    line_color, line_visible, line_width = "", False, 0
+    visual_text = ""
+    try:
+        visual_text = clean_text(shape.text_frame.text) if shape.has_text_frame else ""
+    except Exception:
+        pass
+    try:
+        from pptx.enum.dml import MSO_FILL
+        fill = shape.fill
+        fill_visible = fill.type is not None and fill.type != MSO_FILL.BACKGROUND
+        if fill_visible:
+            fill_color = _color_hex(fill.fore_color, theme)
+        if not fill_visible:
+            sp_pr = shape._element.find("{%s}spPr" % _NS_P)
+            explicit_fill = (sp_pr is not None and any(sp_pr.find("{%s}%s" % (_NS_A, tag)) is not None
+                                                       for tag in ("solidFill", "noFill", "gradFill", "blipFill",
+                                                                   "pattFill", "grpFill")))
+            if not explicit_fill:
+                fill_visible, fill_color = _style_reference_color(shape, "fillRef", theme)
+    except Exception:
+        pass
+    try:
+        line = shape.line
+        line_visible = line.fill.type is not None
+        line_color = _color_hex(line.color, theme) if line_visible else ""
+        line_width = int(line.width or 0) if line_visible else 0
+        sp_pr = shape._element.find("{%s}spPr" % _NS_P)
+        line_element = sp_pr.find("{%s}ln" % _NS_A) if sp_pr is not None else None
+        explicit_no_line = (line_element is not None and line_element.find("{%s}noFill" % _NS_A) is not None)
+        if not line_visible and not explicit_no_line:
+            line_visible, line_color = _style_reference_color(shape, "lnRef", theme)
+            line_width = 12700 if line_visible else 0
+    except Exception:
+        pass
+    return Block(
+        kind="visual", text=visual_text, left=left, top=top, width=width, height=height,
+        shape_id=getattr(shape, "shape_id", 0), shape_name=getattr(shape, "name", ""),
+        prst=prst, rotation=rotation, z_order=z_order, fill_color=fill_color, line_color=line_color,
+        fill_visible=fill_visible, line_visible=line_visible, line_width=line_width,
+        line_endpoints=_line_endpoints(shape, offset, left, top, width, height, rotation, prst),
+        shape_type=str(getattr(shape, "shape_type", "")),
+    )
 
 
 def _frame_blocks(shape, offset, is_title: bool, theme: Optional[dict] = None) -> List[Block]:
@@ -672,38 +795,47 @@ def parse_pptx(path: str | Path) -> ReportData:
         sd = SlideData(number=idx, width=report.slide_width, height=report.slide_height)
         blocks: List[Block] = []
         arrows: List[Block] = []
+        annotations: List[Block] = []
         title_shape_id = None
         try:
             if slide.shapes.title is not None:
                 title_shape_id = slide.shapes.title.shape_id
         except Exception:
             title_shape_id = None
-        for shape, offset in _iter_shapes(slide.shapes):
+        for z_order, (shape, offset) in enumerate(_iter_shapes(slide.shapes)):
             try:
-                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE or shape.shape_type == MSO_SHAPE_TYPE.LINKED_PICTURE:
+                is_picture = (shape.shape_type in (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE)
+                              or (shape.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER and hasattr(shape, "image")))
+                if is_picture:
                     pb = _picture_block(shape, offset)
                     if pb:
+                        pb.z_order = z_order
                         blocks.append(pb)
                     continue
-                if getattr(shape, "has_table", False) and shape.has_table:
+                prst, rot = _shape_geometry(shape)
+                is_table = getattr(shape, "has_table", False) and shape.has_table
+                visual = _annotation_block(shape, offset, prst, rot, z_order, theme)
+                annotations.append(visual)
+                if is_table:
                     tb = _table_block(shape, offset)
                     if tb:
+                        tb.z_order = z_order
+                        visual.text = tb.text
                         blocks.append(tb)
                     continue
-                prst, rot = _shape_geometry(shape)
                 if prst in _ARROW_BASE or "Connector" in prst or prst == "line" or \
                         etree_localname(shape._element) == "cxnSp":
                     ab = arrow_block(shape, offset, prst, rot)
                     if ab is not None:
+                        ab.z_order = z_order
+                        visual.direction = ab.direction
                         arrows.append(ab)
                 if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
-                    blocks.extend(_frame_blocks(shape, offset, shape.shape_id == title_shape_id, theme))
+                    text_blocks = _frame_blocks(shape, offset, shape.shape_id == title_shape_id, theme)
+                    for text_block in text_blocks:
+                        text_block.z_order = z_order
+                    blocks.extend(text_blocks)
                     continue
-                # placeholder pictures / OLE objects with an image
-                if shape.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER and hasattr(shape, "image"):
-                    pb = _picture_block(shape, offset)
-                    if pb:
-                        blocks.append(pb)
             except Exception:
                 # a single broken shape must not break the slide
                 continue
@@ -722,6 +854,7 @@ def parse_pptx(path: str | Path) -> ReportData:
         _dedupe_shape_ids(blocks, idx)
         sd.blocks = reading_order(blocks, report.slide_height)
         sd.arrows = sorted(arrows, key=lambda a: (a.top, a.left))
+        sd.annotations = annotations
         try:
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
                 sd.notes = clean_text(slide.notes_slide.notes_text_frame.text)

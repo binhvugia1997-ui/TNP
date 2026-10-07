@@ -106,6 +106,14 @@ def _rgb(ref):
         return im.convert("RGB").getpixel((5, 5))
 
 
+def _image_has_rgb(ref, rgb, tolerance=3):
+    with Image.open(ref) as im:
+        pixels = im.convert("RGB").tobytes()
+    matches = sum(1 for i in range(0, len(pixels), 3)
+                  if all(abs(pixels[i + channel] - rgb[channel]) <= tolerance for channel in range(3)))
+    return matches >= 15
+
+
 def _after_colors(sel):
     return [tuple(Image.open(__import__("io").BytesIO(a.block.image_blob)).convert("RGB").getpixel((5, 5)))
             for a in sel.after]
@@ -278,6 +286,7 @@ def test_blue_logo_text_ignored(tmp_path):
 def test_blue_inspection_text_does_not_make_control_pictures_after(tmp_path):
     def slide(s, W):
         _prod_head(s, W)
+        _tb(s, "Cải tiến máy móc", 1.7, 0.65, 5, 0.35, 12)
         _tb_colored(s, [("+ Sau: Bọc silicon 2mm", "blue")], 1.7, 1.0, 5, 0.4)
         _pics(s, ["#c8e6c9"], 1.7, 1.5)
         _tb_colored(s, [("Cải tiến trong kiểm tra:", None), ("Bổ sung tiêu chuẩn kiểm tra ngoại quan", "blue")],
@@ -327,7 +336,10 @@ def test_arrow_itself_never_inserted(template, tmp_path):
     s_, ev, proc = _run([deck], template, out)
     ws = load_workbook(out)[SHEET]
     imgs = _images_at(ws, 4, COL["image"])
-    assert len(imgs) == 2 and all(_rgb(im.ref) == AFTER_RGB for im in imgs)
+    assert len(imgs) == 1  # one rendered After-region crop for the two authored After pictures
+    assert _image_has_rgb(imgs[0].ref, AFTER_RGB)
+    assert not _image_has_rgb(imgs[0].ref, BEFORE_RGB)
+    assert not _image_has_rgb(imgs[0].ref, (153, 153, 153))  # decorative arrow picture stays outside the crop
 
 
 # 20. single picture, no evidence -> omitted + reason (case 5)

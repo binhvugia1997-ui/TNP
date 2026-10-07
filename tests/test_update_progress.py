@@ -18,6 +18,20 @@ CTL_SRC = Path(app.__file__).with_name("gui_controller.py").read_text(encoding="
 NEW_V, NEW_B = "1.2.2", app.BUILD_NUMBER + 1
 
 
+class _TestClock:
+    """Deterministic monotonic clock for progress-speed tests (no wall-clock sleeps)."""
+    def __init__(self, start=0.0, step=0.0):
+        self.value = float(start)
+        self.step = float(step)
+        self.lock = threading.Lock()
+
+    def __call__(self):
+        with self.lock:
+            now = self.value
+            self.value += self.step
+            return now
+
+
 def _big_update_folder(tmp_path, size_mb=3, sha=True):
     """Release ZIP with a few MB of payload so the chunked copy produces many progress callbacks."""
     folder = tmp_path / "Update"
@@ -75,6 +89,8 @@ def test_install_async_publishes_snapshots_from_worker_without_tk(tmp_path, monk
     monkeypatch.setattr(gc, "portable_root", lambda: portable)
     c = _ctl(tmp_path, folder)
     c.check_update()
+    clock = _TestClock(start=100.0, step=1.0)  # deterministic, measurable intervals in the worker
+    c._clock = clock
     spawned, threads = [], []
 
     def spawn(cmd, **kw):
@@ -94,12 +110,56 @@ def test_install_async_publishes_snapshots_from_worker_without_tk(tmp_path, monk
     stages = [s.stage for s in snaps]
     assert stages[0] == "PREPARING" and stages[-1] == "HANDOFF"
     assert stages.index("COPYING") < stages.index("VERIFYING") < stages.index("READY") < stages.index("HANDOFF")
-    pcts = [s.percent for s in snaps if s.stage == "COPYING"]
+    copying = [s for s in snaps if s.stage == "COPYING"]
+    pcts = [s.percent for s in copying]
     assert pcts == sorted(pcts) and pcts[-1] == 100.0
+    assert copying[-1].percent == 100.0
+    assert copying[-1].bytes_copied == copying[-1].total_bytes == pkg.stat().st_size
     assert snaps[-1].percent == 100.0 and snaps[-1].bytes_copied == pkg.stat().st_size
-    assert any(s.speed_bps > 0 for s in snaps if s.stage == "COPYING")
+    assert any(s.speed_bps > 0 for s in copying)
+    for i, snapshot in enumerate(copying[1:], start=1):
+        expected_speed = snapshot.bytes_copied / (i * clock.step)
+        assert abs(snapshot.speed_bps - expected_speed) < 1e-6  # bytes / measured time, not a fabricated rate
     # handoff happened strictly after READY (verified) – the spawn call is the last thing the worker did
     assert events[-2].payload.stage == "HANDOFF"
+
+
+def test_copy_speed_handles_a_zero_monotonic_origin(tmp_path):
+    c = _ctl(tmp_path, tmp_path)
+    clock = _TestClock(start=0.0, step=0.25)
+    c._clock = clock
+    start = [None]
+    c._publish_update_progress("COPYING", 0, 100, 0.0, emit=False, t0=start)
+    assert start == [0.0] and c.update_progress.speed_bps == 0.0
+    c._publish_update_progress("COPYING", 100, 100, 100.0, emit=False, t0=start)
+    assert c.update_progress.speed_bps == 400.0  # 100 measured bytes / 0.25 measured seconds
+
+
+def test_fast_small_update_has_no_invented_speed_when_clock_does_not_advance(tmp_path, monkeypatch):
+    """A tiny copy may finish within one clock tick; zero speed is honest when elapsed time is unmeasurable."""
+    folder, pkg = _big_update_folder(tmp_path, size_mb=0)
+    assert pkg.stat().st_size < 1 << 20
+    portable = make_portable(tmp_path / "app")
+    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    c = _ctl(tmp_path, folder)
+    c.check_update()
+    c._clock = _TestClock(start=50.0, step=0.0)
+    spawned = []
+
+    assert c.install_update_async(spawn=lambda cmd, **kw: spawned.append((cmd, threading.current_thread().name)))
+    c._install_thread.join(30)
+    events = c.pump()
+    assert events[-1].kind == "update_done" and events[-1].payload[0] is True
+    assert len(spawned) == 1 and spawned[0][1] == "update-install"
+    snaps = [e.payload for e in events if e.kind == "update_progress"]
+    stages = [s.stage for s in snaps]
+    assert stages[0] == "PREPARING" and stages[-1] == "HANDOFF"
+    assert stages.index("COPYING") < stages.index("VERIFYING") < stages.index("READY") < stages.index("HANDOFF")
+    copying = [s for s in snaps if s.stage == "COPYING"]
+    assert copying[0].bytes_copied == 0 and copying[0].percent == 0.0
+    assert copying[-1].bytes_copied == pkg.stat().st_size and copying[-1].percent == 100.0
+    assert all(s.speed_bps == 0.0 for s in copying)  # no elapsed tick -> unavailable, not a guessed rate
+    assert snaps[-1].bytes_copied == pkg.stat().st_size and snaps[-1].percent == 100.0
 
 
 def test_copy_failure_shows_error_and_never_hands_off(tmp_path, monkeypatch):
@@ -244,4 +304,4 @@ def test_labels_and_build_011():
     p = UpdateProgress(stage="COPYING", bytes_copied=int(58.4 * (1 << 20)), total_bytes=int(87.1 * (1 << 20)),
                        percent=67.0, speed_bps=11.2 * (1 << 20))
     assert p.bytes_text == "58.4 MB / 87.1 MB" and p.speed_text == "Tốc độ: 11.2 MB/s"
-    assert app.__version__ == "1.2.1" and app.BUILD_NUMBER == 12 and app.BUILD_LABEL == "Build 012"
+    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_LABEL == "Build 015"

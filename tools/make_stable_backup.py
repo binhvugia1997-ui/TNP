@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
+from console_safe import child_env, configure_console
+
 EXCLUDED_DIRS = ("backup", ".venv", ".venv-build", "build", "dist", "Output", "logs", "config", "sample_data",
                  "learning_data", "release", "update_staging", "update_backup", "__pycache__", ".git",
                  ".pytest_cache")
@@ -26,7 +28,8 @@ class BackupError(RuntimeError):
 
 
 def tracked_files(root: Path) -> List[str]:
-    out = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True)
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True,
+                         env=child_env())
     return [p for p in out.stdout.decode("utf-8", "replace").split("\0") if p]
 
 
@@ -80,6 +83,7 @@ def verify_backup(target: Path) -> List[str]:
 
 
 def main(argv: Sequence[str]) -> int:
+    configure_console()
     if len(argv) != 2:
         print(__doc__)
         return 2

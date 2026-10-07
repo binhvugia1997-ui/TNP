@@ -167,16 +167,16 @@ def _scan_tree_names(app_):
 
 
 # ------------------------------------------------------------------ 1 version
-def test_canonical_version_prompt002():
-    assert app.__version__ == "1.2.1" and app.BUILD_ID == "012" and app.BUILD_LABEL == "Build 012"
-    assert app.APP_TITLE == "Report Extractor v1.2.1" and app.VERSION_LINE == "version=1.2.1 build=012"
-    assert "1.2.1" not in SRC and "Build 011" not in SRC.split('"""', 2)[2]   # header imports the constants
+def test_canonical_version_prompt017():
+    assert app.__version__ == "1.3.2" and app.BUILD_ID == "015" and app.BUILD_LABEL == "Build 015"
+    assert app.APP_TITLE == "Report Extractor v1.3.2" and app.VERSION_LINE == "version=1.3.2 build=015"
+    assert "1.3.2" not in SRC and "Build 014" not in SRC.split('"""', 2)[2]   # header imports the constants
 
 
 def test_window_title_and_header_use_constants(monkeypatch, tmp_path):
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
-    assert a.root.title_.startswith("Report Extractor v1.2.1")
-    assert a.lbl_version.cfg["text"] == "v1.2.1" and a.lbl_build.cfg["text"] == "Build 012"   # numeric build only
+    assert a.root.title_.startswith("Report Extractor v1.3.2")
+    assert a.lbl_version.cfg["text"] == "v1.3.2" and a.lbl_build.cfg["text"] == "Build 015"   # numeric build only
     assert a.root.geometry_ == "1400x850" and a.root.minsize_ == (880, 540)
 
 
@@ -187,7 +187,11 @@ def test_main_tabs_exist(monkeypatch, tmp_path):
     assert isinstance(nb, reg["classes"]["Notebook"])
     assert a.tab_run.master is nb and a.tab_cfg.master is nb
     tab_texts = re.findall(r'self\.nb\.add\(self\.tab_\w+, text="([^"]+)"\)', SRC)
-    assert [t.strip(" ▶⚙") for t in tab_texts] == ["Xử lý báo cáo", "Cấu hình & Ollama"]
+    assert [t.strip(" ▶⚙") for t in tab_texts] == ["Danh sách báo cáo", "Cài đặt", "Học cải tiến"]
+    assert a.tab_learning.master is nb and hasattr(a, "learning_cards")
+    assert "learning" not in a.cfg_cards
+    assert all(w not in a._config_widgets for w in (a.btn_review_images, a.btn_review_content, a.btn_train_images,
+                                                    a.btn_reapply_saved))
 
 
 def test_source_controls_exist(monkeypatch, tmp_path):
@@ -235,7 +239,7 @@ def test_resize_grid_weights_make_tables_expandable(monkeypatch, tmp_path):
         assert holder.col_weights.get(0) == 1 and holder.row_weights.get(0) == 1
     assert a.scan_tree.columns_["file"]["stretch"] and not a.scan_tree.columns_["mgmt"]["stretch"]
     assert a.tree.columns_["note"]["stretch"] and a.tree.columns_["file"]["stretch"]
-    assert a.txt_log.grid_info_["sticky"] == "nsew" and a.cfg_page.row_weights.get(4) == 1 and a.cfg_page.row_weights.get(2) in (None, 0)   # only the log row grows
+    assert a.txt_log.grid_info_["sticky"] == "nsew" and a.cfg_page.row_weights.get(3) == 1 and a.cfg_page.row_weights.get(2) in (None, 0)   # only the log row grows
 
 
 # ------------------------------------------------------------------ 7–11 running-state controls

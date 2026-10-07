@@ -19,8 +19,9 @@ from pathlib import Path
 from .classifier import (FOLLOWUP_LINE_RE, Classification, improvement_subkind, is_heading_like, is_long_term_heading,
                          section_kind_of_heading)
 from .pptx_parser import ReportData, SlideData, norm_key, clean_text
-from .improvement_pictures import PictureRef, select_after_pictures
-from .content_region import ROLE_CONTENT, ROLE_TITLE, classify_blocks, is_slide_level_heading
+from .improvement_pictures import PictureRef, PictureSelection, select_after_pictures
+from .content_region import (ROLE_CONTENT, ROLE_TITLE, cause_sidebar_regions, classify_blocks,
+                             is_slide_level_heading)
 
 LOG = logging.getLogger("report_extractor.extractor")
 
@@ -60,6 +61,7 @@ class ExtractedRecord:
     improvement: str = ""
     temporary_excluded: str = ""      # kept for audit only, never written to improvement cell
     cause_sections: List[Section] = field(default_factory=list)
+    cause_diagnostics: List[str] = field(default_factory=list)
     improvement_sections: List[Section] = field(default_factory=list)
     excluded_sections: List[str] = field(default_factory=list)     # "S5 inspection: Cải tiến tại công đoạn kiểm tra:" (audit)
     qpn_slide: Optional[int] = None
@@ -69,6 +71,9 @@ class ExtractedRecord:
     picture_notes: List[str] = field(default_factory=list)                # diagnostics: every picture decision
     image_candidates: list = field(default_factory=list)                   # PROMPT-006 ImageCandidate records
     content_candidates: list = field(default_factory=list)                 # PROMPT-006B ContentCandidate records
+    # PROMPT-025: explicit logical ImprovementItem summaries (slide, index, item id, item-scoped
+    # text, before/after pictures, captions) – one entry per logical improvement item, in item order.
+    improvement_items: List[dict] = field(default_factory=list)
     review_reasons: List[str] = field(default_factory=list)
     blank_fields: List[str] = field(default_factory=list)      # diagnostics: auto fields left blank
     # Vendor: detected from the ORIGINAL improvement text ("Tại công đoạn assy <Vendor>")
@@ -693,6 +698,69 @@ def _slide_of_reason(text: str) -> int:
     return int(m.group(1)) if m else -1
 
 
+def _structural_cause_sections(report: ReportData, slides: Sequence[int]) -> Tuple[List[Section], List[str]]:
+    """Fallback for a narrow cause sidebar whose adjacent body has no literal ``Nguyên nhân`` heading."""
+    out: List[Section] = []
+    diagnostics: List[str] = []
+    seen: set = set()
+    for slide_no in sorted(set(int(n) for n in slides)):
+        slide = report.slide(slide_no)
+        if slide is None:
+            continue
+        for region in cause_sidebar_regions(slide):
+            marker = region.marker.block
+            diagnostics.append(
+                f"CAUSE_MARKER S{slide_no} SH{marker.shape_id} geom=({marker.left},{marker.top},"
+                f"{marker.width},{marker.height}) text={region.marker.text.strip()!r}")
+            for candidate, reason in region.excluded:
+                b = candidate.block
+                diagnostics.append(
+                    f"CAUSE_EXCLUDED S{slide_no} SH{b.shape_id} geom=({b.left},{b.top},{b.width},{b.height}) "
+                    f"reason={reason} text={candidate.text.strip()[:100]!r}")
+            for candidate in region.body:
+                b = candidate.block
+                text_key = norm_key(candidate.text)
+                if (slide_no, text_key) in seen:
+                    diagnostics.append(f"CAUSE_EXCLUDED S{slide_no} SH{b.shape_id} reason=duplicate body block")
+                    continue
+                seen.add((slide_no, text_key))
+                section = Section(kind="cause", slide=slide_no, heading=region.marker.text.strip())
+                stop = False
+                for i, line in enumerate(candidate.text.splitlines()):
+                    raw = line.rstrip()
+                    key = norm_key(raw)
+                    if not key or _is_noise(raw):
+                        continue
+                    if key.strip(" .:;,-") in {"nguyen nhan", "phan tich nguyen nhan", "root cause", "cause analysis"}:
+                        continue
+                    if re.search(r"\b(hien trang|current status)\b", key):
+                        diagnostics.append(f"CAUSE_EXCLUDED S{slide_no} SH{b.shape_id} reason=current-state line text={raw!r}")
+                        continue
+                    heading = is_heading_like(raw, b.bold if i == 0 else False,
+                                              b.size_pt if i == 0 else None)
+                    kind = section_kind_of_heading(raw) if heading else None
+                    if is_slide_level_heading(raw) and kind == "cause":
+                        continue                       # section title, not business cause text
+                    if kind and kind != "cause":
+                        diagnostics.append(f"CAUSE_EXCLUDED S{slide_no} SH{b.shape_id} reason={kind} section text={raw!r}")
+                        stop = True
+                    if stop:
+                        break
+                    section.add(raw, b.shape_id)
+                if section.lines:
+                    out.append(section)
+                    diagnostics.append(
+                        f"CAUSE_SELECTED S{slide_no} SH{b.shape_id} geom=({b.left},{b.top},{b.width},{b.height}) "
+                        f"lines={len(section.lines)} text={section.text[:140]!r}")
+                else:
+                    diagnostics.append(f"CAUSE_EXCLUDED S{slide_no} SH{b.shape_id} reason=no cause body lines")
+    return out, diagnostics
+
+
+def _cause_lines_key(text: str) -> set:
+    return {norm_key(line) for line in (text or "").splitlines() if norm_key(line)}
+
+
 def extract_record(report: ReportData, cls: Classification,
                    item_mapping: Optional[Dict[str, str]] = None,
                    known_models: Sequence[str] = (), vendors: Optional[List[str]] = None,
@@ -713,6 +781,22 @@ def extract_record(report: ReportData, cls: Classification,
                              if s.kind in ("inspection", "followup", "verify", "temporary") and s.lines]
     tmp_sections = [s for s in sections if s.kind == "temporary"]
     rec.root_cause = join_sections(rec.cause_sections)
+    # Keep the existing heading-delimited cause extractor as the primary path.  Only recover an
+    # adjacent body through structural marker ownership when the strong path is blank/incomplete.
+    structural_slides = set(cls.cause_slides)
+    for slide in report.slides:
+        if cause_sidebar_regions(slide):
+            structural_slides.add(slide.number)
+    structural_cause, rec.cause_diagnostics = _structural_cause_sections(report, sorted(structural_slides))
+    for diagnostic in rec.cause_diagnostics:
+        LOG.info("%s", diagnostic)
+    if structural_cause:
+        structural_text = join_sections(structural_cause)
+        strong_lines = _cause_lines_key(rec.root_cause)
+        structural_lines = _cause_lines_key(structural_text)
+        if not rec.root_cause or (strong_lines and strong_lines.issubset(structural_lines)):
+            rec.cause_sections = structural_cause
+            rec.root_cause = structural_text
     rec.improvement = join_sections(rec.improvement_sections)
     rec.temporary_excluded = join_sections(tmp_sections)
     if learning is not None:                                   # PROMPT-006B: block-level content corrections
@@ -746,18 +830,23 @@ def extract_record(report: ReportData, cls: Classification,
     if not rec.improvement:
         rec.review_reasons.append("Không tìm thấy Nội dung đối sách cải tiến trong báo cáo")
     # improvement pictures: After-only, deterministic geometry (never "all pictures of the slide")
+    final_sel = PictureSelection()
     if rec.improvement_image_slides:
         sel = select_after_pictures(report, rec.improvement_image_slides)
         rec.after_pictures = list(sel.after)
         rec.after_picture_slides = list(sel.slides_with_after)
         rec.picture_notes = list(sel.notes)
         reasons = list(sel.reasons)
+        final_sel = sel
         if learning is not None:
             from .image_learning import select_with_learning
             refs, cands, extra = select_with_learning(report, rec.improvement_image_slides, sel, learning,
                                                       rec.management_number, str(report.path))
             rec.after_pictures = refs
             rec.image_candidates = cands
+            final_sel = PictureSelection(after=list(refs), rejected=list(sel.rejected),
+                                         reasons=list(sel.reasons), notes=list(sel.notes),
+                                         slides_with_after=list(sel.slides_with_after))
             rec.after_picture_slides = sorted({r.slide for r in refs})
             reasons.extend(extra)
             # a learned/user decision resolved the ambiguity -> drop the generic ambiguity note for that slide
@@ -771,6 +860,22 @@ def extract_record(report: ReportData, cls: Classification,
             rec.review_reasons.append("Không tìm thấy ảnh Sau cải tiến trong các slide cải tiến")
     else:
         rec.review_reasons.append("Không có hình ảnh cải tiến")
+
+    # PROMPT-025: explicit logical ImprovementItem model – segmentation happens before evidence
+    # cropping; every item keeps its own text/pictures/captions (never the next item's content).
+    from .improvement_items import attach_selection, segment_report_items
+    item_slides = sorted(set(rec.improvement_image_slides) | {s.slide for s in rec.improvement_sections})
+    if item_slides:
+        items_by_slide = segment_report_items(report, item_slides)
+        attach_selection(items_by_slide, final_sel)
+        rec.improvement_items = [item.summary()
+                                 for items in items_by_slide.values() for item in items]
+        for summary in rec.improvement_items:
+            LOG.info("ITEM_RECORD MN=%s report=%s slide=%s index=%d item=%s heading=%r "
+                     "after=%s before=%s captions=%s", rec.management_number or "-", report.filename,
+                     summary["slide"], summary["index"], summary["itemId"], summary["heading"],
+                     summary["afterPictures"], summary["beforePictures"], summary["captions"])
+
     # ambiguous classification -> manual review rather than guessing
     rec.review_reasons.extend(cls.ambiguities)
     for name, val in (("Management number", rec.management_number), ("Tên vendor", rec.vendor),

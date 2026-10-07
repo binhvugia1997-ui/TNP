@@ -1,0 +1,4 @@
+# Local React + pywebview development runtime; backend requirements remain authoritative.
+-r requirements.txt
+pywebview==6.2.1
+pythonnet==3.0.5 ; sys_platform == "win32"

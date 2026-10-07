@@ -64,6 +64,13 @@ class FileResult:
     occurrence_date: str = ""
     model: str = ""
     item: str = ""
+    slide_count: int = 0
+    cause_text: str = ""
+    improvement_text: str = ""
+    defect_text: str = ""
+    cause_sections: List[str] = field(default_factory=list)
+    improvement_sections: List[str] = field(default_factory=list)
+    after_assets: List[str] = field(default_factory=list)
     qpn_slide: Optional[int] = None
     cause_slides: List[int] = field(default_factory=list)
     improvement_slides: List[int] = field(default_factory=list)
@@ -80,6 +87,7 @@ class FileResult:
     picture_notes: List[str] = field(default_factory=list)     # every picture decision (before/after/excluded/ambiguous)
     image_candidates: list = field(default_factory=list)       # PROMPT-006 ImageCandidate objects (not serialised)
     content_candidates: list = field(default_factory=list)     # PROMPT-006B ContentCandidate objects (ids only in JSON)
+    improvement_items: List[dict] = field(default_factory=list)  # PROMPT-025 logical ImprovementItem summaries
     classifier_notes: List[str] = field(default_factory=list)
     confidence: Optional[float] = None
     error: str = ""

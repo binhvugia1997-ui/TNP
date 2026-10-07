@@ -11,11 +11,14 @@ from make_samples import make_report, make_template, make_sample_tree  # noqa: E
 
 
 @pytest.fixture(autouse=True)
-def _isolated_learning_dir(tmp_path, monkeypatch):
-    """PROMPT-006: the image-learning user data (learning_data/) must never be written into the repository by
-    tests – every test gets its own folder unless it passes an explicit directory."""
+def _isolated_runtime_root(tmp_path, monkeypatch):
+    """All default writable application state must stay inside this test's disposable directory.
+
+    Covers config/report/output preferences, manual-field retry state, logs/history, learning data and updater state;
+    individual tests may still inject a narrower path when that is the behavior under test.
+    """
     import app.runtime_paths as rp
-    monkeypatch.setattr(rp, "learning_dir", lambda create=True: tmp_path / "learning_data")
+    monkeypatch.setenv(rp.TEST_RUNTIME_ROOT_ENV, str(tmp_path / "tnp-runtime"))
     yield
 
 

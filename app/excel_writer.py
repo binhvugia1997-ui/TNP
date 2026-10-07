@@ -225,6 +225,66 @@ def plan_image_grid(sizes: List[Tuple[int, int]], area_px: int, max_row_pt: floa
             "height_pt": min(max_row_pt, px_to_pt(height_px))}
 
 
+def plan_grouped_image_rows(groups: List[List[Tuple[int, int]]], area_px: int,
+                            max_row_pt: float = MAX_ROW_HEIGHT_PT, max_image_pt: float = MAX_IMAGE_HEIGHT_PT,
+                            margin_px: int = IMAGE_MARGIN_PX, gap_px: int = IMAGE_GAP_PX,
+                            area_h_px: Optional[int] = None) -> Dict[str, Any]:
+    """Place one horizontal image row per logical defect; images stay source-ordered within each row.
+
+    Every image is scaled proportionally to fit its whole row width and the shared cell-height budget. Rows
+    are stacked top-to-bottom with a gap, and no picture is cropped or allowed to overlap another.
+    """
+    valid = [[(max(1, int(w)), max(1, int(h))) for w, h in group] for group in groups if group]
+    if not valid or area_px <= 2 * margin_px:
+        return {"items": [], "row_ranges": [], "height_pt": 0.0, "scales": []}
+    usable_w = max(1, int(area_px) - 2 * margin_px)
+    height_budget = max_row_pt * PX_PER_PT
+    if area_h_px is not None:
+        height_budget = min(height_budget, float(area_h_px))
+    usable_h = max(1.0, height_budget - 2 * margin_px)
+    max_image_px = max(1.0, max_image_pt * PX_PER_PT)
+    base_groups = []
+    for group in valid:
+        natural_w = sum(w for w, _ in group) + gap_px * max(0, len(group) - 1)
+        natural_h = max(h for _, h in group)
+        scale = min(1.0, usable_w / max(1, natural_w), max_image_px / max(1, natural_h))
+        dims = [(max(1, int(w * scale)), max(1, int(h * scale))) for w, h in group]
+        while sum(w for w, _ in dims) + gap_px * max(0, len(dims) - 1) > usable_w and scale > 0.001:
+            scale *= 0.98
+            dims = [(max(1, int(w * scale)), max(1, int(h * scale))) for w, h in group]
+        if sum(w for w, _ in dims) + gap_px * max(0, len(dims) - 1) > usable_w:
+            raise ValueError("too many images to fit on one logical-item row")
+        base_groups.append((group, dims, scale))
+
+    fixed_vertical_gaps = gap_px * max(0, len(base_groups) - 1)
+    base_height = sum(max(h for _, h in dims) for _, dims, _ in base_groups)
+    global_scale = min(1.0, max(0.001, usable_h - fixed_vertical_gaps) / max(1, base_height))
+    items: List[Tuple[int, int, int, int]] = []
+    row_ranges: List[Tuple[int, int]] = []
+    row_y = float(margin_px)
+    scales: List[float] = []
+    for _natural, dims, local_scale in base_groups:
+        scaled = [(max(1, int(w * global_scale)), max(1, int(h * global_scale))) for w, h in dims]
+        row_h = max(h for _, h in scaled)
+        start = len(items)
+        x = margin_px
+        for w, h in scaled:
+            y = int(row_y + (row_h - h) / 2)
+            items.append((int(x), y, int(w), int(h)))
+            x += w + gap_px
+        row_ranges.append((start, len(items)))
+        scales.append(local_scale * global_scale)
+        row_y += row_h + gap_px
+    bottom = max((y + h for _, y, _, h in items), default=margin_px)
+    height_px = bottom + margin_px
+    plan = {"columns": max((end - start for start, end in row_ranges), default=1),
+            "items": items, "row_ranges": row_ranges, "scales": scales,
+            "height_pt": min(max_row_pt, px_to_pt(height_px))}
+    check_h = int(area_h_px) if area_h_px is not None else max(pt_to_px(plan["height_pt"]), height_px)
+    assert_image_inside_area(items, area_px, check_h, margin_px)
+    return plan
+
+
 def _as_paths(value) -> List[Path]:
     """One path or a list of paths -> list (independent pictures stay independent)."""
     if not value:
@@ -692,6 +752,25 @@ class ExcelWriter:
         plan = plan_image_grid(sizes, self.image_area_px(row, field))
         return {"paths": paths, "sizes": sizes, "plan": plan, "height_pt": float(plan["height_pt"]) + 2}
 
+    def plan_grouped_field_images(self, row: int, field: str, groups: List[List[Path]]) -> Optional[Dict[str, Any]]:
+        """Plan one horizontal row per logical owner, preserving image order inside each group."""
+        clean_groups = [[Path(p) for p in group if p and Path(p).exists()] for group in groups]
+        clean_groups = [group for group in clean_groups if group]
+        if field not in self.columns or not clean_groups:
+            return None
+        group_sizes = []
+        flat_paths = []
+        for group in clean_groups:
+            sizes = []
+            for path in group:
+                with PILImage.open(path) as im:
+                    sizes.append(im.size)
+            group_sizes.append(sizes)
+            flat_paths.extend(group)
+        plan = plan_grouped_image_rows(group_sizes, self.image_area_px(row, field))
+        return {"paths": flat_paths, "sizes": [s for group in group_sizes for s in group],
+                "group_sizes": group_sizes, "plan": plan, "height_pt": float(plan["height_pt"]) + 2}
+
     def insert_planned_images(self, row: int, field: str, planned: Optional[Dict[str, Any]]) -> None:
         """Steps 2-4 (#35): with the FINAL row height applied, re-fit the pictures to the final rectangle,
         validate containment (#39) and only then create the anchors.  Never writes an overflowing geometry."""
@@ -702,7 +781,10 @@ class ExcelWriter:
         cell, rng = self._anchor(row, col)
         area_w = self._col_width_px(col, rng)
         area_h = self._area_height_px(row, rng)
-        plan = plan_image_grid(planned["sizes"], area_w, area_h_px=area_h)
+        if planned.get("group_sizes"):
+            plan = plan_grouped_image_rows(planned["group_sizes"], area_w, area_h_px=area_h)
+        else:
+            plan = plan_image_grid(planned["sizes"], area_w, area_h_px=area_h)
         items = plan["items"]
         shrink = 1.0
         while not images_inside_area(items, area_w, area_h) and shrink > 0.05:
@@ -710,7 +792,10 @@ class ExcelWriter:
             items = [(x, y, max(1, int(w * shrink)), max(1, int(h * shrink))) for (x, y, w, h) in plan["items"]]
         assert_image_inside_area(items, area_w, area_h)      # raises on a genuine layout bug instead of writing it
         for p, (x, y, w, h) in zip(planned["paths"], items):
-            img = XLImage(str(p))
+            # Snapshot image bytes at insertion time. XLImage(path) defers reading until workbook.save(); if a later
+            # report reuses/replaces that temporary asset path before the transaction commits, the earlier row would
+            # silently embed the later report's pixels. BytesIO gives each target row its own immutable evidence.
+            img = XLImage(BytesIO(Path(p).read_bytes()))
             img.width, img.height = max(1, w), max(1, h)
             marker = AnchorMarker(col=cell.column - 1, colOff=px_to_emu(x), row=cell.row - 1, rowOff=px_to_emu(y))
             img.anchor = OneCellAnchor(_from=marker, ext=XDRPositiveSize2D(cx=px_to_emu(img.width), cy=px_to_emu(img.height)))
@@ -720,8 +805,10 @@ class ExcelWriter:
 
     def place_images(self, row: int, field: str, paths: List[Path]) -> float:
         """Convenience for a single field: plan -> raise the row height if needed -> fit -> insert.
-        Returns the row height (pt) the pictures required."""
-        planned = self.plan_field_images(row, field, paths)
+        Grouped paths use one horizontal row per logical defect."""
+        groups = getattr(paths, "groups", None)
+        planned = (self.plan_grouped_field_images(row, field, groups) if groups else
+                   self.plan_field_images(row, field, paths))
         if not planned:
             return 0.0
         self._remove_images_in_cell(row, field)
@@ -731,7 +818,7 @@ class ExcelWriter:
         return planned["height_pt"]
 
     def _write_images_with_row_height(self, row: int, heights: List[float], qpn_png, improvement_jpg,
-                                      want_qpn: bool, want_imp: bool) -> None:
+                                      want_qpn: bool, want_imp: bool, clear_missing: bool = False) -> None:
         """Shared #35 sequence: candidate plans -> final row height -> fit to final rectangle -> anchors."""
         plans = {}
         if (want_qpn and qpn_png) or (want_imp and improvement_jpg):
@@ -739,9 +826,16 @@ class ExcelWriter:
         if want_qpn and qpn_png:
             self._remove_images_in_cell(row, "qpn")
             plans["qpn"] = self.plan_field_images(row, "qpn", [Path(qpn_png)])
+        elif want_qpn and clear_missing:
+            self._remove_images_in_cell(row, "qpn")
         if want_imp and improvement_jpg:
             self._remove_images_in_cell(row, "improvement_image")
-            plans["improvement_image"] = self.plan_field_images(row, "improvement_image", _as_paths(improvement_jpg))
+            groups = getattr(improvement_jpg, "groups", None)
+            plans["improvement_image"] = (self.plan_grouped_field_images(row, "improvement_image", groups)
+                                           if groups else self.plan_field_images(
+                                               row, "improvement_image", _as_paths(improvement_jpg)))
+        elif want_imp and clear_missing:
+            self._remove_images_in_cell(row, "improvement_image")
         heights.extend(pl["height_pt"] for pl in plans.values() if pl)
         self.ws.row_dimensions[row].height = min(MAX_ROW_HEIGHT_PT, max(heights))
         for field, pl in plans.items():
@@ -759,7 +853,7 @@ class ExcelWriter:
         self._placed = [t for t in self._placed if not (t[1] == row and t[2] == "improvement_image")]
         if not paths:
             return 0
-        self.place_images(row, "improvement_image", [Path(x) for x in paths])
+        self.place_images(row, "improvement_image", paths)
         return len(paths)
 
     def replace_improvement_text(self, row: int, text: str) -> bool:
@@ -920,7 +1014,7 @@ class ExcelWriter:
     # Writing
     # ------------------------------------------------------------------
     def _write_content(self, row: int, rec, qpn_png: Optional[Path], improvement_jpg,
-                       fill_temporary: bool) -> None:
+                       fill_temporary: bool, clear_missing_images: bool = False) -> None:
         """Report content shared by append/update: model, item, defect, cause, improvement, images."""
         self._set_cell(row, "model", rec.model)
         self._set_cell(row, "item", rec.item)
@@ -934,7 +1028,34 @@ class ExcelWriter:
         heights.append(self._text_height_pt(row, "improvement", rec.improvement))
         heights.append(self._text_height_pt(row, "root_cause", rec.root_cause))
         heights.append(self._text_height_pt(row, "defect_content", rec.defect_content))
-        self._write_images_with_row_height(row, heights, qpn_png, improvement_jpg, want_qpn=True, want_imp=True)
+        self._write_images_with_row_height(row, heights, qpn_png, improvement_jpg, want_qpn=True, want_imp=True,
+                                           clear_missing=clear_missing_images)
+
+    def _write_manual_fields(self, row: int, manual_fields: Optional[Dict[str, str]]) -> None:
+        """Apply only explicitly edited Vendor/date cells. This is deliberately separate from extraction's
+        fill-if-blank/conflict behavior; the native UI records the edit and this method keeps backup + atomic save.
+        Date values are ISO (YYYY-MM-DD), or empty to explicitly clear the cell.
+        """
+        if not manual_fields:
+            return
+        if "vendor" in manual_fields:
+            self._set_cell(row, "vendor", (manual_fields.get("vendor") or "").strip())
+        if "occurrence_date" in manual_fields:
+            value = (manual_fields.get("occurrence_date") or "").strip()
+            if not value:
+                self._set_cell(row, "occurrence_date", None, wrap=False)
+            else:
+                try:
+                    parsed = date.fromisoformat(value)
+                except ValueError as exc:
+                    raise ValueError("Ngày phát sinh thủ công phải ở dạng ISO YYYY-MM-DD") from exc
+                self._write_date(row, parsed)
+
+    def apply_manual_fields(self, row: int, manual_fields: Dict[str, str]) -> None:
+        """Public explicit-edit path used by the desktop service after validating the selected report."""
+        if self.probe:
+            raise TemplateError("Workbook mở ở chế độ quét (probe) – không ghi")
+        self._write_manual_fields(row, manual_fields)
 
     def _write_vendor_and_date(self, row: int, rec, overwrite_blank_only: bool) -> List[str]:
         """Vendor / Ngày phát sinh: fill when blank, keep when equal, never overwrite a different value."""
@@ -998,7 +1119,8 @@ class ExcelWriter:
         return row
 
     def append_record(self, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
-                      status_text: str = "", note_text: str = "", fill_temporary: bool = False) -> int:
+                      status_text: str = "", note_text: str = "", fill_temporary: bool = False,
+                      manual_fields: Optional[Dict[str, str]] = None) -> int:
         """Write one report as one NEW row (append mode). Returns the Excel row number."""
         row = self.next_row()
         src = row - 1 if row - 1 >= self.data_start else self.data_start
@@ -1012,6 +1134,7 @@ class ExcelWriter:
         for i in range(1, 9):   # WEEK +1..+8: blank unless real source data (none parsed) -> blank
             self._set_cell(row, f"week_{i}", rec.weeks.get(i, "") or "", wrap=False)
         self._write_content(row, rec, qpn_png, improvement_jpg, fill_temporary)
+        self._write_manual_fields(row, manual_fields)
         if status_text:
             self._set_cell(row, "status", status_text)
         if note_text:
@@ -1019,16 +1142,26 @@ class ExcelWriter:
         return row
 
     def update_record(self, row: int, rec, qpn_png: Optional[Path] = None, improvement_jpg: Optional[Path] = None,
-                      status_text: str = "", note_text: str = "", fill_temporary: bool = False) -> List[str]:
+                      status_text: str = "", note_text: str = "", fill_temporary: bool = False,
+                      clear_missing_images: bool = False,
+                      manual_fields: Optional[Dict[str, str]] = None) -> List[str]:
         """Write the report into an EXISTING row located by Management Number.
 
         * the Management Number cell is preserved untouched;
         * Vendor / Ngày phát sinh: fill if blank, keep if equal, conflict -> keep + note;
-        * WEEK +1..+8 and any other columns are left as they are.
+        * WEEK +1..+8 and any other columns are left as they are;
+        * ``clear_missing_images`` removes stale QPN/improvement images when a full reprocess has no eligible image.
         Returns conflict notes (to be added to 'Cần kiểm tra').
         """
         notes = self._write_vendor_and_date(row, rec, overwrite_blank_only=True)
-        self._write_content(row, rec, qpn_png, improvement_jpg, fill_temporary)
+        self._write_manual_fields(row, manual_fields)
+        if manual_fields:
+            if "vendor" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Vendor trong Excel:")]
+            if "occurrence_date" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Ngày phát sinh trong Excel")]
+        self._write_content(row, rec, qpn_png, improvement_jpg, fill_temporary,
+                            clear_missing_images=clear_missing_images)
         if status_text:
             self._set_cell(row, "status", status_text)
         if note_text or notes:
@@ -1052,13 +1185,20 @@ class ExcelWriter:
         self._dirty = True
 
     def fill_missing_fields(self, row: int, rec, missing: List[str], qpn_png: Optional[Path] = None,
-                            improvement_jpg=None) -> List[str]:
+                            improvement_jpg=None,
+                            manual_fields: Optional[Dict[str, str]] = None) -> List[str]:
         """Partial update of an EXISTING row: write ONLY the fields listed in ``missing``.
 
         Populated cells are preserved even when the report holds another value (Vendor / Ngày phát sinh keep
         their conflict notes as before).  Returns the conflict notes.
         """
         notes = self._write_vendor_and_date(row, rec, overwrite_blank_only=True)
+        self._write_manual_fields(row, manual_fields)
+        if manual_fields:
+            if "vendor" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Vendor trong Excel:")]
+            if "occurrence_date" in manual_fields:
+                notes = [n for n in notes if not n.startswith("Ngày phát sinh trong Excel")]
         heights = [self.ws.row_dimensions[row].height or 15.0]
         for f in ("model", "item", "defect_content", "root_cause", "improvement"):
             if f in missing:

@@ -19,8 +19,8 @@ from app.image_learning import (FEATURE_NAMES, IMAGE_FEATURE_SCHEMA, MSG_MODEL_U
                                 explain, load_model, save_model, train_model)
 from app.image_review import reapply_labels
 from app.improvement_pictures import AMBIGUOUS_REASON
-from tests.test_after_evidence import (AFTER_RGB, BEFORE_RGB, NAME, _arrow, _deck, _pics, _prod_head, _rgb,
-                                       _select, _tb, _tb_colored)
+from tests.test_after_evidence import (AFTER_RGB, BEFORE_RGB, NAME, _arrow, _deck, _image_has_rgb, _pics,
+                                       _prod_head, _rgb, _select, _tb, _tb_colored)
 from tests.test_content_region import COL, IMP_ITEM_1, INSPECTION_TEXT, SHEET, _images_at, _prefill, _shape
 from tests.test_prompt004 import MGMT
 from tests.test_updater import make_portable, make_update_folder
@@ -101,7 +101,7 @@ def test_24_stable_backup_exists_and_is_clean():
     assert BACKUP_DIR.is_dir() and msb.verify_backup(BACKUP_DIR) == []
     init = (BACKUP_DIR / "app" / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "1.0.4"' in init and "BUILD_NUMBER = 4" in init       # backup frozen at 1.0.4 / 004
-    assert app.__version__ == "1.2.1" and app.BUILD_NUMBER == 12             # dev version moved on
+    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15             # dev version moved on
     assert not any(p.name in ("sample_data", ".venv", "Output", "logs", "config", "learning_data")
                    for p in BACKUP_DIR.rglob("*") if p.is_dir())
 
@@ -225,23 +225,25 @@ def test_26_label_store_append_supersede_and_duplicate_protection(tmp_path):
     assert store.counts()["total"] == 1
 
 
-def test_26_user_label_is_authoritative_in_current_result_without_training(tmp_path):
+def test_26_user_label_is_saved_but_cannot_bypass_final_picture_eligibility(tmp_path):
     lrn = ImageLearning(tmp_path / "lrn")
     r, sel = _select(_deck(tmp_path / NAME, [slide_blue_ambiguous]))
     refs, cands, _ = il.select_with_learning(r, [3], sel, lrn, MGMT, str(r.path))
     assert len(refs) == 2 and AMBIGUOUS_REASON.format(n=3) in sel.reasons
     amb = next(c for c in cands if c.decision == "review")
     lrn.store.label(amb, "AFTER")
-    refs2, cands2, _ = il.select_with_learning(r, [3], sel, lrn, MGMT, str(r.path))
-    assert len(refs2) == 3 and lrn.model is None                   # no model involved
+    refs2, cands2, extra = il.select_with_learning(r, [3], sel, lrn, MGMT, str(r.path))
+    assert len(refs2) == 2 and lrn.model is None                   # labels do not manufacture temporal evidence
     c2 = next(c for c in cands2 if c.candidate_id == amb.candidate_id)
     assert c2.decision == "include" and c2.decision_source == "user" and c2.user_label == "AFTER"
+    assert c2.temporal_role == "UNKNOWN" and not c2.excel_output_eligible
     assert any(e.startswith("người dùng đã xác nhận") for e in c2.evidence)
-    # overriding a deterministic AFTER to IGNORE removes it
+    assert any("không đủ điều kiện Excel" in reason for reason in extra)
+    # overriding a deterministic AFTER to IGNORE removes it from the final workbook selection
     a0 = next(c for c in cands2 if c.decision_source == "rules" and c.decision == "include")
     lrn.store.label(a0, "IGNORE")
     refs3, _, _ = il.select_with_learning(r, [3], sel, lrn, MGMT, str(r.path))
-    assert len(refs3) == 2 and all(x.block.shape_id != a0.picture_id for x in refs3)
+    assert len(refs3) == 1 and all(x.block.shape_id != a0.picture_id for x in refs3)
     # a user label never resurrects a hard exclusion (logo / arrow / icon) – false inclusion is the worse error
     logo = next(c for c in cands2 if c.hard_excluded)
     out = decide([logo], None, {logo.candidate_id: "AFTER"})
@@ -272,30 +274,84 @@ def test_26_batch_pipeline_uses_labels_and_reapply_updates_only_image_cell(templ
     fr = proc.results[0]
     assert fr.image_candidates and any(c.decision == "review" for c in fr.image_candidates)
     ws = load_workbook(out)[SHEET]
-    assert len(_images_at(ws, 4, COL["image"])) == 2
+    assert len(_images_at(ws, 4, COL["image"])) == 1  # two eligible After photos, one rendered item crop
     assert "Không xác định chắc chắn" in " ".join(fr.review_reasons)
     # the batch_result.json entry stays compact (ids only)
     assert all(isinstance(x, str) for x in fr.to_dict()["image_candidates"])
-    # user confirms the ambiguous picture as After -> re-apply rewrites ONLY the picture cell
+    # The learning label is retained, but re-apply cannot replace unknown temporal evidence with After.
+    # It still transactionally rewrites ONLY the image cell using the two independently eligible photos.
     lrn = ImageLearning(lrn_dir)
     amb = next(c for c in fr.image_candidates if c.decision == "review")
     lrn.store.label(amb, "AFTER")
     before_cells = {c.coordinate: c.value for c in ws[4] if c.column != COL["image"]}
     res = reapply_labels(template, out, [amb], lrn)
-    assert res.ok and res.updated_rows == [4] and res.pictures == 3, res.errors
+    assert res.ok and res.updated_rows == [4] and res.pictures == 1, res.errors
     ws2 = load_workbook(out)[SHEET]
     imgs = _images_at(ws2, 4, COL["image"])
-    assert len(imgs) == 3 and sorted(_rgb(im.ref) for im in imgs) == sorted([AFTER_RGB, AFTER_RGB, BEFORE_RGB])
+    assert len(imgs) == 1 and _image_has_rgb(imgs[0].ref, AFTER_RGB)
     assert {c.coordinate: c.value for c in ws2[4] if c.column != COL["image"]} == before_cells
     assert ws2.cell(row=4, column=COL["vendor"]).value == "Mtech" and ws2.cell(row=4, column=COL["qpn"]).value == "QPN nhập tay"
     assert list((out.parent / "backup").glob("*_backup_*.xlsx"))      # backup before modification
     assert amb.decision == "include" and amb.decision_source == "user"
-    # a second batch run (new processor) now includes the confirmed picture directly
+    assert amb.temporal_role == "UNKNOWN" and not amb.excel_output_eligible
+    # Subsequent batches preserve the label and model behavior without weakening final eligibility.
     proc2 = BatchProcessor(BatchOptions(files=[deck], template=template, output_file=out, use_ollama=False,
                                         learning_dir=lrn_dir, force_reprocess=True))
     proc2.run()
     fr2 = proc2.results[0]
-    assert len(fr2.after_pictures) == 3 and "Không xác định chắc chắn" not in " ".join(fr2.review_reasons)
+    assert len(fr2.after_pictures) == 2 and any("không đủ điều kiện Excel" in r for r in fr2.review_reasons)
+
+
+def test_26_controller_pending_image_retry_regenerates_region_crop(template, tmp_path, monkeypatch):
+    from app.config import AppConfig
+    from app.gui_controller import GuiController
+    from app import image_review as review
+
+    deck = _deck(tmp_path / f"(CTMS)_{MGMT}_pending-retry.pptx", [slide_caption])
+    _prefill(template, [{"mgmt": MGMT, "vendor": "Mtech", "model": "A253", "qpn": "QPN"}])
+    out = tmp_path / "out" / "pending.xlsx"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(template, out)
+    _report, _selection, cands = _cands(tmp_path, [slide_caption], name=f"(CTMS)_{MGMT}_pending-retry.pptx")
+    candidate = next(c for c in cands if c.decision == "include")
+
+    ctl = GuiController(AppConfig(), config_path=tmp_path / "cfg" / "config.json",
+                        learning_dir_override=tmp_path / "learning")
+    ctl.template, ctl.output = template, out
+    ctl.set_pending_label(candidate, "AFTER")
+
+    real_commit = review._commit
+    real_export = review.export_after_pictures
+    commits = {"count": 0}
+    exports = []
+
+    def lock_first_commit(writer, result, kind):
+        commits["count"] += 1
+        if commits["count"] == 1:
+            result.locked_path = str(out)
+            result.errors.append("simulated Excel lock")
+            return
+        real_commit(writer, result, kind)
+
+    def track_region_export(*args, **kwargs):
+        exports.append(True)
+        return real_export(*args, **kwargs)
+
+    monkeypatch.setattr(review, "_commit", lock_first_commit)
+    monkeypatch.setattr(review, "export_after_pictures", track_region_export)
+
+    ok, msg = ctl.save_confirmations(cands)
+    assert ok and "Thử lại cập nhật ảnh đã lưu" in msg
+    assert ctl.image_reapply_pending == 1 and len(exports) == 1
+    crop_files = list((out.parent / "assets").glob("*_IMPROVEMENT_regions/region_*.png"))
+    assert len(crop_files) == 1 and _image_has_rgb(crop_files[0], AFTER_RGB)
+    assert len(_images_at(load_workbook(out)[SHEET], 4, COL["image"])) == 0
+
+    ok, msg = ctl.retry_image_reapply()
+    assert ok and "đã lưu" in msg and ctl.image_reapply_pending == 0 and len(exports) == 2
+    saved = load_workbook(out)[SHEET]
+    imgs = _images_at(saved, 4, COL["image"])
+    assert len(imgs) == 1 and _image_has_rgb(imgs[0].ref, AFTER_RGB)
 
 
 def test_26_reapply_reports_missing_row_and_touches_nothing(template, tmp_path):
@@ -412,7 +468,11 @@ def test_27_model_only_resolves_uncertain_candidates_never_hard_exclusions(tmp_p
     assert len(resolved) == 1 and resolved[0].slide == 3 and resolved[0].decision == "include"
     assert resolved[0].learned_probability > il.THRESHOLD_INCLUDE
     assert any(e.startswith("mô hình học") for e in resolved[0].evidence)
-    assert len([x for x in refs if x.slide == 3]) == 3 and len([x for x in refs if x.slide == 5]) == 0
+    assert len([x for x in refs if x.slide == 3]) == 2 and len([x for x in refs if x.slide == 5]) == 0
+    # The model may label relevance, but an ambiguous temporal role still fails the independent Excel gate.
+    assert any("không đủ điều kiện Excel" in reason for reason in extra)
+    assert all(ref.temporal_role == "AFTER" and ref.semantic_role == "PRODUCTION_IMPROVEMENT"
+               and ref.confident_owner and ref.excel_output_eligible for ref in refs)
     # the opposite model excludes the ambiguous picture with an explicit review note
     model.bias = -10.0
     save_model(model, tmp_path / "lrn")
@@ -549,10 +609,11 @@ def test_28_gui_learning_card_and_review_window(monkeypatch, tmp_path):
     a.ctl.learning_dir = tmp_path / "lrn"
     a.ctl._learning = None
     texts = [w.k.get("text") for w in reg["widgets"] if isinstance(w, reg["classes"]["Button"])]
-    for t in ("Kiểm tra ảnh cải tiến", "Kiểm tra nội dung cải tiến", "Cập nhật mô hình học", "Mở thư mục dữ liệu học",
-              "Xuất dữ liệu học"):
+    for t in ("Kiểm tra hình ảnh cải tiến", "Kiểm tra nội dung cải tiến", "Cập nhật mô hình học", "Mở thư mục dữ liệu học",
+              "Xuất dữ liệu học", "Thử lại cập nhật ảnh đã lưu"):
         assert t in texts
-    assert a.lbl_learning.cfg["text"].startswith("Ảnh:  Mẫu đã xác nhận: 0")
+    assert a.lbl_learning.cfg["text"].startswith("Hình ảnh:  Mẫu đã xác nhận: 0")
+    assert "learning" not in a.cfg_cards and a.learning_cards["data"].master.master.master is a.learning_page
     assert "Xóa toàn bộ" not in texts
     # no batch yet -> info box, no window
     a.open_image_review()
@@ -580,7 +641,8 @@ def test_28_gui_learning_card_and_review_window(monkeypatch, tmp_path):
     assert a.lbl_review_pos.cfg["text"].startswith("Ảnh 2/")
     a._review_move(-1)
     a._review_save()
-    assert a.ctl.learning_counts()["after"] == 1 and a.lbl_learning.cfg["text"].startswith("Ảnh:  Mẫu đã xác nhận: 1")
+    assert a.ctl.learning_counts()["after"] == 1 and a.lbl_learning.cfg["text"].startswith("Hình ảnh:  Mẫu đã xác nhận: 1")
+    assert a.ctl.image_reapply_pending == 1 and a.btn_reapply_images_saved.cfg["state"] == "normal"
     a.train_models()                                               # insufficient data -> two messages, no crash
     assert any(l.startswith("Ảnh cải tiến: chưa đủ dữ liệu — 1/10") for l in a.ctl.log_lines)
     assert any(l.startswith("Nội dung cải tiến: chưa đủ dữ liệu — 0/20") for l in a.ctl.log_lines)

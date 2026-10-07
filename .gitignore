@@ -2,6 +2,11 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+node_modules/
+# Local build virtual environment
+.venv-build/
+# Local pywebview development virtual environment
+.venv-webview/
 build/
 dist/
 *.spec.bak
@@ -14,6 +19,7 @@ logs/
 *.log
 .re_setup_probe.tmp
 *.egg-info/
+*.tsbuildinfo
 .mypy_cache/
 .ruff_cache/
 release/

@@ -386,6 +386,7 @@ class GuiController:
         self.model: str = self.cfg.model or DEFAULT_MODEL
         self.available_models: List[str] = []
         self.force_reprocess: bool = bool(self.cfg.force_reprocess)
+        self.manual_fields_by_path: Dict[str, Dict[str, str]] = {}
         # processing period (fast pre-scan)
         self.period_mode: str = self.cfg.period_mode if self.cfg.period_mode in PERIOD_MODES else "auto"
         self.period_month: str = str(self.cfg.period_month or "")
@@ -414,6 +415,7 @@ class GuiController:
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # reviewed scan list (before Start): real pre-scan result + manual exclusions
         self.all_files: List[Path] = []                # every discovered PPT/PPTX (recursive)
+        self.input_files_override: Optional[List[Path]] = None  # explicit native file selection, otherwise folder scan
         self.scan_result: Optional[PreScanResult] = None
         self.scan_stale: bool = False
         self.scan_message: str = ""
@@ -456,7 +458,10 @@ class GuiController:
         self._learning = None
         self.review_index = 0
         self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
+        self.pending_label_notes: Dict[str, str] = {}
+        self.pending_image_reapply: list = []         # saved image labels whose region-crop Excel reapply is still owed
         self.pending_content_labels: Dict[str, str] = {}   # PROMPT-006B content review (separate dataset)
+        self.pending_content_notes: Dict[str, str] = {}
         self.pending_content_reapply: list = []              # candidates whose Excel re-apply is still owed (locked)
         self.last_content_review = ContentReviewOutcome()
         self.review_content_index = 0
@@ -487,6 +492,23 @@ class GuiController:
             return MSG_MODEL_UNAVAILABLE
         return lrn.content.status_text()
 
+    def learning_model_status_text(self) -> str:
+        """Compact status for the separate learning tab; image/content models stay independent."""
+        lrn = self.learning
+        if lrn is None:
+            return "Mô hình ảnh và nội dung: không khả dụng."
+
+        def state_text(model, state: str) -> str:
+            if model is not None:
+                return f"đã huấn luyện ({model.n_examples} mẫu)"
+            if state in ("corrupt", "incompatible"):
+                return "không khả dụng — dùng quy tắc hiện tại"
+            return "chưa huấn luyện — dùng quy tắc hiện tại"
+
+        content = lrn.content
+        return (f"Mô hình ảnh: {state_text(lrn.model, lrn.model_status)}.  "
+                f"Mô hình nội dung: {state_text(content.model, content.model_status)}.")
+
     # ---- PROMPT-006B content review -------------------------------------------------------------
     def review_content_candidates(self) -> list:
         """Reviewable text blocks of the LAST finished batch (hard-excluded title/sidebar/footer never offered)."""
@@ -504,11 +526,12 @@ class GuiController:
         n_rev = sum(1 for c in cands if c.decision == "review")
         return f"{len(cands)} khối chữ ứng viên, {n_rev} khối chưa chắc chắn"
 
-    def set_pending_content_label(self, cand, label: str) -> None:
+    def set_pending_content_label(self, cand, label: str, note: str = "") -> None:
         from .content_learning import CONTENT_LABELS
         if label not in CONTENT_LABELS:
             raise ValueError(label)
         self.pending_content_labels[cand.candidate_id] = label
+        self.pending_content_notes[cand.candidate_id] = note
 
     def save_content_confirmations(self, cands) -> Tuple[bool, str]:
         """Two independent transactions: (1) labels -> content_labels.jsonl (committed first, never rolled back);
@@ -525,10 +548,12 @@ class GuiController:
             c = by_id.get(cid)
             if c is None:
                 continue
-            if lrn.content.store.label(c, label) is not None:
+            note = self.pending_content_notes.get(cid, "")
+            if lrn.content.store.label(c, label, note) is not None:
                 written += 1
             touched.append(c)
         self.pending_content_labels.clear()
+        self.pending_content_notes.clear()
         LOG.info("CONTENT_REVIEW_LABELS_SAVED count=%d", written)
         self.last_content_review = ContentReviewOutcome(labels_saved=written)
         msg = f"Đã lưu {written} nhãn nội dung."
@@ -629,14 +654,15 @@ class GuiController:
             LOG.debug("candidate blob unavailable: %s", e)
         return None
 
-    def set_pending_label(self, cand, label: str) -> None:
+    def set_pending_label(self, cand, label: str, note: str = "") -> None:
         from .image_learning import LABELS
         if label not in LABELS:
             raise ValueError(label)
         self.pending_labels[cand.candidate_id] = label
+        self.pending_label_notes[cand.candidate_id] = note
 
     def save_confirmations(self, cands) -> Tuple[bool, str]:
-        """Persist the pending labels, then re-apply them to the Excel result (improvement-image cells only)."""
+        """Persist labels first, then re-apply region crops to the Excel image cells."""
         lrn = self.learning
         if lrn is None:
             return False, "Không ghi được dữ liệu học (thư mục learning_data không khả dụng)."
@@ -648,23 +674,60 @@ class GuiController:
             c = by_id.get(cid)
             if c is None:
                 continue
-            if lrn.store.label(c, label) is not None:
+            note = self.pending_label_notes.get(cid, "")
+            if lrn.store.label(c, label, note) is not None:
                 written += 1
             touched.append(c)
         self.pending_labels.clear()
+        self.pending_label_notes.clear()
+        # Include reports owed from a previous locked attempt; the label JSONL stays the source of truth.
+        by_touched_id = {c.candidate_id: c for c in self.pending_image_reapply}
+        by_touched_id.update({c.candidate_id: c for c in touched})
+        touched = list(by_touched_id.values())
+        self.pending_image_reapply = []
         msg = f"Đã lưu {written} nhãn xác nhận."
-        if touched and self.template and self.output and Path(self.output).exists():
-            from .image_review import reapply_labels
-            res = reapply_labels(Path(self.template), Path(self.output), touched, lrn)
-            if res.updated_rows:
-                msg += f" Đã cập nhật ảnh cải tiến cho {len(res.updated_rows)} dòng Excel ({res.pictures} ảnh)."
-            if res.locked:
-                msg += (f"\n\nChưa thể cập nhật {len(res.prepared_rows)} dòng Excel vì file đang được sử dụng:"
-                        f"\n\n{res.locked_path}\n\nHãy đóng file rồi lưu xác nhận lại.")
-            elif res.errors:
-                msg += "\n\nChưa cập nhật được Excel: " + "; ".join(res.errors)
-            self.log_lines.extend(res.messages + res.errors)
+        if touched:
+            if self.template and self.output and Path(self.output).exists():
+                msg = self._image_reapply(touched, lrn, msg)
+            else:
+                self.pending_image_reapply = list(touched)
+                msg += "\n\nNhãn đã lưu; chưa có file Excel kết quả để tạo lại ảnh, có thể thử lại sau."
         return True, msg
+
+    def _image_reapply(self, touched, learning, msg: str) -> str:
+        from .image_review import reapply_labels
+        try:
+            res = reapply_labels(Path(self.template), Path(self.output), touched, learning)
+        except Exception as exc:  # noqa: BLE001 – saved labels remain safe; the Excel step is retryable
+            self.pending_image_reapply = list(touched)
+            self.log_lines.append(f"IMAGE_REAPPLY_FAILED: {exc}")
+            return msg + f"\n\nChưa cập nhật được Excel: {exc} (có thể thử lại từ nhãn đã lưu)."
+        self.log_lines.extend(res.messages + res.errors)
+        if res.updated_rows:
+            msg += f" Đã cập nhật ảnh cải tiến cho {len(res.updated_rows)} dòng Excel ({res.pictures} ảnh)."
+        if res.locked:
+            self.pending_image_reapply = list(touched)     # labels are already saved; retry re-renders region crops
+            msg += (f"\n\nChưa thể cập nhật {len(res.prepared_rows)} dòng Excel vì file đang được sử dụng:"
+                    f"\n\n{res.locked_path}\n\nĐóng file rồi chọn 'Thử lại cập nhật ảnh đã lưu'.")
+        elif res.errors:
+            self.pending_image_reapply = list(touched)
+            msg += "\n\nChưa cập nhật được Excel: " + "; ".join(res.errors)
+        return msg
+
+    def retry_image_reapply(self) -> Tuple[bool, str]:
+        """Retry a saved-label Excel transaction; re-parses PPTX and regenerates visual-region evidence."""
+        touched = list(self.pending_image_reapply)
+        if not touched:
+            return False, "Không có ảnh Excel nào đang chờ cập nhật."
+        if self.learning is None or not (self.template and self.output and Path(self.output).exists()):
+            return False, "Chưa có file Excel kết quả để cập nhật."
+        self.pending_image_reapply = []
+        msg = self._image_reapply(touched, self.learning, "Nhãn ảnh đã lưu được dùng lại.")
+        return not bool(self.pending_image_reapply), msg
+
+    @property
+    def image_reapply_pending(self) -> int:
+        return len(self.pending_image_reapply)
 
     def train_image_model(self) -> Tuple[bool, str]:
         lrn = self.learning
@@ -723,9 +786,11 @@ class GuiController:
 
     # ------------------------------------------------------------------ inputs
     def set_report_folder(self, folder: str) -> int:
-        """Select the report folder, discover PPT/PPTX recursively, propose the output path."""
-        changed = folder.strip() != self.report_folder
-        self.report_folder = folder.strip()
+        """Select a report folder, clearing any previous single-file selection."""
+        folder = folder.strip()
+        changed = folder != self.report_folder or self.input_files_override is not None
+        self.report_folder = folder
+        self.input_files_override = None
         if changed:
             self.excluded_keys = set()
         if not self.output or Path(self.output).name == DEFAULT_OUTPUT_NAME:
@@ -735,12 +800,32 @@ class GuiController:
             self._invalidate_scan()
         return n
 
+    def set_report_file(self, selected_file: str) -> int:
+        """Use one explicit native-dialog selection; only .pptx is accepted by the desktop integration."""
+        path = Path(selected_file)
+        if path.suffix.lower() != ".pptx" or not path.is_file():
+            raise ValueError("Chọn một file PPTX hiện có.")
+        resolved = path.resolve()
+        changed = self.input_files_override != [resolved]
+        self.input_files_override = [resolved]
+        self.report_folder = str(resolved.parent)
+        if changed:
+            self.excluded_keys = set()
+        if not self.output or Path(self.output).name == DEFAULT_OUTPUT_NAME:
+            self.output = default_output_path(self.report_folder)
+        self.discover()
+        self._invalidate_scan()
+        return len(self.all_files)
+
     def discover(self) -> int:
-        """Cheap recursive discovery (names only – nothing is opened)."""
+        """Cheap name-only discovery; opens no PPTX and honors an explicit selected file when present."""
         folder = Path(self.report_folder) if self.report_folder else None
         self.scan_rejections: List[Tuple[Path, str]] = []
-        self.all_files = (scan_inputs([folder], on_reject=lambda p, why: self.scan_rejections.append((p, why)))
-                          if folder and folder.is_dir() else [])
+        if self.input_files_override is not None:
+            sources = list(self.input_files_override)
+        else:
+            sources = [folder] if folder and folder.is_dir() else []
+        self.all_files = scan_inputs(sources, on_reject=lambda p, why: self.scan_rejections.append((p, why)))
         for p, why in self.scan_rejections:                  # every rejected PowerPoint-like entry is reported
             self.log_lines.append(f"Bỏ qua khi quét thư mục: {p.name} – {why}")
         self._set_files(self.all_files)
@@ -1339,7 +1424,8 @@ class GuiController:
                             use_ollama=use_ollama and bool(self.model),
                             fill_temporary_column=bool(self.cfg.fill_temporary_column),
                             vendors=list(self.cfg.vendors or []), row_mode=self.cfg.row_mode or "match",
-                            period=self.effective_period()[0], learning_dir=self.learning_dir)
+                            period=self.effective_period()[0], learning_dir=self.learning_dir,
+                            manual_fields={k: dict(v) for k, v in self.manual_fields_by_path.items()})
 
     def start(self, use_ollama: bool = True, in_thread: bool = True) -> bool:
         """Start the production batch; returns False when validation fails or already running."""
@@ -1815,12 +1901,12 @@ class GuiController:
         return True
 
     def _publish_update_progress(self, stage: str, done: int, total: int, pct: float, emit: bool,
-                                 t0: List[float]) -> None:
+                                 t0: List[Optional[float]]) -> None:
         """Worker-side: build an immutable snapshot and queue it (NO widget access here)."""
         now = self._clock()
-        if stage == "COPYING" and t0[0] <= 0:
+        if stage == "COPYING" and t0[0] is None:
             t0[0] = now
-        elapsed = now - t0[0] if t0[0] > 0 else 0.0
+        elapsed = now - t0[0] if t0[0] is not None else 0.0
         speed = (done / elapsed) if (stage == "COPYING" and elapsed > 0 and done) else 0.0
         snap = UpdateProgress(stage=stage, bytes_copied=int(done), total_bytes=int(total), percent=float(pct),
                               speed_bps=speed, determinate=(stage in ("COPYING", "VERIFYING", "READY", "HANDOFF",
@@ -1830,7 +1916,7 @@ class GuiController:
             self._queue.put(UiEvent("update_progress", snap))
 
     def _install_work(self, spawn, emit: bool) -> Tuple[bool, str]:
-        t0 = [0.0]
+        t0: List[Optional[float]] = [None]
         try:
             staged = updater.stage_update(self.update_check, portable_root(),
                                           progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p,
