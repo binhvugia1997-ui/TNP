@@ -1,8 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   BarChart3,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Cpu,
   Database,
   FileSpreadsheet,
@@ -10,6 +12,9 @@ import {
   Images,
   Info,
   Loader2,
+  Maximize2,
+  Minus,
+  Plus,
   RefreshCw,
   Save,
   ShieldAlert,
@@ -18,7 +23,7 @@ import {
 } from 'lucide-react'
 import { Button, Card, KeyValue, ProgressBar, TextInput, ToneChip } from '../components/ui'
 import { useStore, type LearningState } from '../state/store'
-import { CONFIDENCE_LABEL } from '../types'
+import { CONFIDENCE_LABEL, IMAGE_LABELS, type ImageCandidate } from '../types'
 import { cn } from '../lib/utils'
 
 type SectionKey = 'overview' | 'imageReview' | 'contentReview' | 'models'
@@ -178,11 +183,66 @@ function LearningGroup({
 
 /* ------------------------------------------------------------------ Kiểm tra ảnh */
 
+/** PROMPT-024R §20: target rectangle in slide-% space, straight from the authoritative Python DTO. */
+function targetRect(c: ImageCandidate): { x: number; y: number; w: number; h: number } {
+  const pct = c.targetBboxPct
+  if (pct) return { x: pct.x, y: pct.y, w: pct.w, h: pct.h }
+  return { x: c.bounds.x, y: c.bounds.y, w: c.bounds.w, h: c.bounds.h }
+}
+
+const MIN_LIST_W = 200
+const MAX_LIST_W = 420
+
 function ImageReview() {
   const s = useStore()
   const list = s.learning.images
   const index = list.length ? Math.min(Math.max(s.imageReviewIndex, 0), list.length - 1) : -1
   const cand = list[index]
+
+  /* §22: horizontally resizable left panel (drag the divider). */
+  const [listWidth, setListWidth] = useState(250)
+  const dragRef = useRef<{ startX: number; startW: number } | null>(null)
+  const startDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    dragRef.current = { startX: e.clientX, startW: listWidth }
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }
+  const moveDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return
+    const next = dragRef.current.startW + (e.clientX - dragRef.current.startX)
+    setListWidth(Math.max(MIN_LIST_W, Math.min(MAX_LIST_W, next)))
+  }
+  const endDrag = () => { dragRef.current = null }
+
+  /* §31: fit-to-viewport preview with zoom; geometry recomputed on container resize (§28/§37). */
+  const viewportRef = useRef<HTMLDivElement>(null)
+  const [viewport, setViewport] = useState({ w: 0, h: 0 })
+  const [zoom, setZoom] = useState(1)
+  useEffect(() => {
+    const el = viewportRef.current
+    if (!el) return
+    const update = () => setViewport({ w: el.clientWidth, h: el.clientHeight })
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  /* Compact report groups: the file name is shown once per report, never repeated on every item (§21). */
+  const groups = useMemo(() => {
+    const out: { key: string; managementNumber: string; fileName: string; items: { cand: ImageCandidate; idx: number }[] }[] = []
+    list.forEach((c, idx) => {
+      const key = `${c.managementNumber}|${c.sourceFile}`
+      const last = out[out.length - 1]
+      if (last && last.key === key) last.items.push({ cand: c, idx })
+      else out.push({ key, managementNumber: c.managementNumber, fileName: c.sourceFile, items: [{ cand: c, idx }] })
+    })
+    return out
+  }, [list])
+
+  const selectedRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    selectedRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [index])
 
   if (!cand) return (
     <Card title="Kiểm tra ảnh cải tiến">
@@ -193,167 +253,282 @@ function ImageReview() {
     </Card>
   )
 
-  const labelText = (key: string) => cand.userLabel === key
   const chosen = cand.userLabel !== 'UNLABELED'
+  const rect = targetRect(cand)
+  const clipTop = Math.max(0, rect.y)
+  const clipRight = Math.max(0, 100 - (rect.x + rect.w))
+  const clipBottom = Math.max(0, 100 - (rect.y + rect.h))
+  const clipLeft = Math.max(0, rect.x)
 
-  return (
-    <div className="grid grid-cols-1 gap-3 xl:grid-cols-[300px_1fr]">
-      <Card title="Đối tượng ảnh" actions={<span className="text-xs2 text-muted">{list.filter((c) => c.userLabel === 'UNLABELED').length} chưa xác nhận · {list.length} tổng</span>} dense>
-        <ul className="divide-y divide-lineSoft">
-          {list.map((c, i) => (
-            <li key={c.id}>
-              <button
-                type="button"
-                onClick={() => s.setImageReviewIndex(i)}
-                className={cn('flex w-full items-start gap-2 px-2.5 py-2 text-left', i === index ? 'bg-brand-50' : 'bg-white hover:bg-[#f6f9fd]')}
-              >
-                <img src={c.src} alt="" className="h-[38px] w-[58px] shrink-0 rounded-[2px] border border-line object-cover" />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-base2 font-medium text-header">{c.sourceFile}</span>
-                  <span className="block text-xs2 text-muted">
-                    Slide {c.slide} · ảnh #{c.pictureId}
-                  </span>
-                  <span className="mt-0.5 block">
-                    <ToneChip tone={c.userLabel === 'UNLABELED' ? 'muted' : c.labelPending ? 'warn' : 'ok'}>
-                      {c.userLabel === 'UNLABELED' ? 'Chưa xác nhận' : `${labelName(c.userLabel)}${c.labelPending ? ' · chưa lưu' : ''}`}
-                    </ToneChip>
-                  </span>
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      </Card>
+  /* §25/§28: true authored position — the slide's own aspect ratio drives the display box, so the
+     percentage highlight stays aligned at any panel size, DPI scale or zoom level. */
+  const slideAspect = cand.slideWidth && cand.slideHeight
+    ? cand.slideWidth / cand.slideHeight
+    : cand.slidePreviewWidth && cand.slidePreviewHeight
+      ? cand.slidePreviewWidth / cand.slidePreviewHeight
+      : 16 / 9
+  const pad = 24
+  const availW = Math.max(80, viewport.w - pad * 2)
+  const availH = Math.max(80, viewport.h - pad * 2)
+  let dispW = availW
+  let dispH = availW / slideAspect
+  if (dispH > availH) { dispH = availH; dispW = availH * slideAspect }
+  dispW *= zoom
+  dispH *= zoom
+  const itemLabel = typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 ? `Mục #${cand.itemIndex + 1}` : `ảnh #${cand.pictureId}`
 
-      <div className="flex min-w-0 flex-col gap-3">
-        <Card title="Ảnh xem trước" actions={<span className="text-xs2 text-muted">{cand.sourceFile}</span>}>
-          <div className="relative aspect-[16/9] w-full overflow-hidden rounded-sm2 border border-line bg-[#f4f7fb]">
-            <div className="absolute inset-x-0 top-0 flex h-[26px] items-center gap-2 border-b border-line bg-white px-2 text-xs2 text-muted">
-              <span className="font-medium text-header">Slide {cand.slide}</span>
-              {typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 && (
-                <>
-                  <span>·</span>
-                  <span className="rounded-[2px] bg-brand-50 px-1 font-medium text-brand-600">
-                    Mục #{cand.itemIndex + 1}
-                  </span>
-                </>
-              )}
-              <span>·</span>
-              <span>{cand.sourceFile}</span>
-              <span className="ml-auto">Ảnh #{cand.pictureId}</span>
-            </div>
+  /* §36: below the xl breakpoint the layout stacks, so the list panel must not keep its desktop width. */
+  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1280px)').matches)
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1280px)')
+    const onChange = (e: MediaQueryListEvent) => setIsDesktop(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
+  const leftPanel = (
+    <section
+      className="card flex min-h-0 flex-col xl:shrink-0"
+      style={isDesktop ? { width: listWidth } : undefined}
+      aria-label="Đối tượng ảnh"
+    >
+      <header className="card-head">
+        <h2 className="card-title mr-auto">Đối tượng ảnh</h2>
+        <span className="text-xs2 text-muted">
+          {list.filter((c) => c.userLabel === 'UNLABELED').length} chưa xác nhận · {list.length} tổng
+        </span>
+      </header>
+      <div className="min-h-0 flex-1 overflow-y-auto xl:max-h-none max-h-[300px]">
+        {groups.map((group) => (
+          <div key={group.key}>
             <div
-              className="absolute overflow-hidden rounded-[2px] border-2 border-dashed border-brand-500 shadow-sm"
-              style={{
-                left: `${cand.bounds.x}%`,
-                top: `${cand.bounds.y}%`,
-                width: `${cand.bounds.w}%`,
-                height: `${cand.bounds.h}%`,
-              }}
+              className="sticky top-0 z-10 border-b border-lineSoft bg-[#f4f7fb] px-2 py-1 text-xxs text-muted"
+              title={`${group.managementNumber} — ${group.fileName}`}
             >
-              {cand.src ? <img src={cand.src} alt={cand.nearbyText ?? ''} className="h-full w-full object-cover" />
-                : <span className="flex h-full items-center justify-center text-xs2 text-muted">Preview không khả dụng</span>}
+              <span className="font-medium text-header">{group.managementNumber}</span>
+              <span className="mx-1">·</span>
+              <span className="align-middle">{group.fileName}</span>
             </div>
-            <span
-              className="absolute rounded-[2px] bg-brand-500 px-1 py-[1px] text-xxs font-medium text-white"
-              style={{ left: `${cand.bounds.x}%`, top: `calc(${cand.bounds.y}% - 16px)` }}
-            >
-              Ảnh #{cand.pictureId} · {cand.decision}
-            </span>
+            <ul className="divide-y divide-lineSoft">
+              {group.items.map(({ cand: c, idx }) => {
+                const selected = idx === index
+                return (
+                  <li key={c.id}>
+                    <button
+                      type="button"
+                      ref={selected ? selectedRef : undefined}
+                      onClick={() => s.setImageReviewIndex(idx)}
+                      title={`${c.sourceFile} — Slide ${c.slide} — ${itemLabel}`}
+                      className={cn(
+                        'flex w-full items-center gap-2 px-2 py-1.5 text-left',
+                        selected ? 'bg-brand-50' : 'bg-white hover:bg-[#f6f9fd]',
+                      )}
+                    >
+                      {c.src
+                        ? <img src={c.src} alt="" className="h-[34px] w-[52px] shrink-0 rounded-[2px] border border-line object-cover" />
+                        : <span className="flex h-[34px] w-[52px] shrink-0 items-center justify-center rounded-[2px] border border-line bg-[#f4f7fb] text-xxs text-muted">—</span>}
+                      <span className="min-w-0 flex-1">
+                        <span className="flex flex-wrap items-center gap-1 text-xs2">
+                          <span className="font-medium text-header">Slide {c.slide}</span>
+                          {typeof c.itemIndex === 'number' && c.itemIndex >= 0 ? (
+                            <span className="rounded-[2px] bg-brand-50 px-1 font-medium text-brand-600">Mục #{c.itemIndex + 1}</span>
+                          ) : (
+                            <span className="text-muted">ảnh #{c.pictureId}</span>
+                          )}
+                        </span>
+                        <span className="mt-0.5 block">
+                          <ToneChip tone={c.userLabel === 'UNLABELED' ? 'muted' : c.labelPending ? 'warn' : 'ok'}>
+                            {c.userLabel === 'UNLABELED' ? 'Chưa xác nhận' : `${labelName(c.userLabel)}${c.labelPending ? ' · chưa lưu' : ''}`}
+                          </ToneChip>
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
           </div>
-          <p className="mt-1.5 text-xs2 text-muted">
-            Preview có kiểm soát do Python tạo; khung nét đứt biểu thị vị trí trên slide. Kết quả Excel vẫn tuân theo các
-            quy tắc eligibility và bằng chứng ngữ nghĩa phía Python.
-          </p>
-        </Card>
+        ))}
+      </div>
+    </section>
+  )
 
-        <Card
-          title="Thông tin & nhãn xác nhận"
-          actions={
-            <span className="text-xs2 text-muted">
-              Mục {index + 1}/{list.length}
-            </span>
-          }
-        >
-          <div className="grid grid-cols-1 gap-x-6 xl:grid-cols-2">
-            <div>
-              <KeyValue label="Report nguồn">{cand.sourceFile}</KeyValue>
-              <KeyValue label="Management Number">{cand.managementNumber}</KeyValue>
-              <KeyValue label="Slide">{cand.slide}</KeyValue>
-              <KeyValue label="Dự đoán">{cand.decision}</KeyValue>
-              <KeyValue label="Độ tin cậy">
-                <span className="inline-flex items-center gap-1.5">
-                  {CONFIDENCE_LABEL[cand.confidenceBand]}
-                  <span className="text-muted">({cand.confidence.toFixed(2)})</span>
-                </span>
-              </KeyValue>
-              <KeyValue label="Vào Excel">
-                {cand.excelEligible ? (
-                  'Đủ điều kiện'
-                ) : (
-                  <span className="text-warn-600">Chưa đủ điều kiện — {cand.eligibilityReason}</span>
-                )}
-              </KeyValue>
-            </div>
-            <div>
-              <p className="mb-1 text-base2 font-medium text-header">Lý do</p>
-              <ul className="list-disc pl-5 text-base2 text-body">
-                {cand.evidence.map((e) => (
-                  <li key={e}>{e}</li>
-                ))}
-              </ul>
-              {cand.nearbyText && <p className="mt-2 text-xs2 text-muted">Chữ gần ảnh: “{cand.nearbyText}”</p>}
-            </div>
-          </div>
-
-          <div className="mt-3 border-t border-lineSoft pt-2.5">
-            <p className="mb-1.5 text-base2 font-medium text-header">Chọn nhãn xác nhận</p>
-            <div className="flex flex-wrap gap-2">
-              {[
-                { key: 'AFTER', label: 'Sau cải tiến' },
-                { key: 'BEFORE', label: 'Trước cải tiến' },
-                { key: 'CONTROL', label: 'Kiểm tra / Kiểm soát' },
-                { key: 'IGNORE', label: 'Không lấy' },
-              ].map((l) => (
-                <Button key={l.key} active={labelText(l.key)} disabled={s.locked} onClick={() => s.labelImage(cand.id, l.key)}>
-                  {l.label}
-                </Button>
-              ))}
-            </div>
-
-            <p className="mb-1 mt-3 text-base2 font-medium text-header">Ghi chú</p>
-            <TextInput
-              value={cand.note}
-              disabled={s.locked}
-              maxLength={1000}
-              placeholder="Ghi chú cho đối tượng này (không bắt buộc)"
-              onChange={(e) => s.setNote('image', cand.id, e.target.value)}
-            />
-
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <Button disabled={index === 0} onClick={() => s.setImageReviewIndex(index - 1)}>
-                Mục trước
-              </Button>
-              <Button disabled={index >= list.length - 1} onClick={() => s.setImageReviewIndex(index + 1)}>
-                Mục tiếp
-              </Button>
-              <Button
-                variant="primary"
-                icon={<Save className="h-3.5 w-3.5" />}
-                disabled={!chosen || s.locked}
-                onClick={() => void s.saveImageCandidate(cand.id, cand.userLabel, cand.note)}
+  const centerPanel = (
+    <section className="card flex min-h-0 min-w-0 flex-1 flex-col" aria-label="Slide ngữ cảnh">
+      <header className="card-head gap-2">
+        <h2 className="card-title">Slide {cand.slide}</h2>
+        {typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 && (
+          <span className="rounded-[2px] bg-brand-50 px-1.5 py-[1px] text-xs2 font-medium text-brand-600">
+            Mục #{cand.itemIndex + 1}
+          </span>
+        )}
+        <span className="hidden min-w-0 flex-1 truncate text-xs2 text-muted sm:inline" title={cand.itemHeading || ''}>
+          {cand.itemHeading || ''}
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <Button variant="ghost" className="h-[24px] px-1.5" disabled={zoom <= 0.5}
+            onClick={() => setZoom((z) => Math.max(0.5, z / 1.25))} aria-label="Thu nhỏ">
+            <Minus className="h-3.5 w-3.5" />
+          </Button>
+          <span className="w-[42px] text-center font-mono text-xs2 text-body">{Math.round(zoom * 100)}%</span>
+          <Button variant="ghost" className="h-[24px] px-1.5" disabled={zoom >= 4}
+            onClick={() => setZoom((z) => Math.min(4, z * 1.25))} aria-label="Phóng to">
+            <Plus className="h-3.5 w-3.5" />
+          </Button>
+          <Button variant="ghost" className="h-[24px] px-2" icon={<Maximize2 className="h-3.5 w-3.5" />}
+            onClick={() => setZoom(1)}>
+            Vừa khung
+          </Button>
+        </div>
+      </header>
+      <div ref={viewportRef} className={cn('relative min-h-0 flex-1 overflow-auto bg-[#dbe3ec]', !cand.slidePreview && 'flex items-center justify-center')}>
+        {cand.slidePreview ? (
+          <div className="flex min-h-full min-w-full items-center justify-center p-3">
+            {/* §23/§24: the FULL authored slide stays visible; non-target content is dimmed/blurred,
+                the target keeps its TRUE authored position and stays sharp (§25). Review display only —
+                evidence bytes are never modified (§30). */}
+            <div className="relative shrink-0 overflow-hidden rounded-[2px] border border-line bg-white shadow-card"
+              style={{ width: dispW, height: dispH }}>
+              <img
+                src={cand.slidePreview} alt="" draggable={false}
+                className="absolute inset-0 h-full w-full select-none"
+                style={{ filter: 'blur(2px) brightness(0.82) saturate(0.85)' }}
+              />
+              <img
+                src={cand.slidePreview} alt="" draggable={false}
+                className="absolute inset-0 h-full w-full select-none"
+                style={{ clipPath: `inset(${clipTop}% ${clipRight}% ${clipBottom}% ${clipLeft}%)` }}
+              />
+              <div
+                className="absolute rounded-[2px] border-2 border-brand-500"
+                style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.w}%`, height: `${rect.h}%` }}
               >
-                Lưu nhãn & ghi chú
-              </Button>
-              {chosen && (
-                <span className={cn('inline-flex items-center gap-1.5 text-xs2', cand.labelPending ? 'text-warn-600' : 'text-ok-600')}>
-                  {cand.labelPending ? <AlertTriangle className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-                  {cand.labelPending ? `Nhãn “${labelName(cand.userLabel)}” chưa lưu.` : `Nhãn “${labelName(cand.userLabel)}” đã lưu cục bộ.`}
+                <span className="absolute -top-[18px] left-0 whitespace-nowrap rounded-[2px] bg-brand-500 px-1 py-[1px] text-xxs font-medium text-white">
+                  Ảnh #{cand.pictureId} · {itemLabel}
                 </span>
-              )}
+              </div>
             </div>
           </div>
-        </Card>
+        ) : cand.src ? (
+          <div className="flex flex-col items-center gap-2 p-4">
+            <img src={cand.src} alt={cand.nearbyText ?? ''} className="max-h-[420px] max-w-full rounded-[2px] border border-line object-contain" />
+            <p className="max-w-[460px] text-center text-xs2 text-muted">
+              Chưa render được toàn slide để làm ngữ cảnh — hiển thị ảnh trích xuất. Vị trí khung vẫn theo toạ độ gốc của slide.
+            </p>
+          </div>
+        ) : (
+          <p className="text-base2 text-muted">Preview không khả dụng.</p>
+        )}
+      </div>
+      <p className="border-t border-lineSoft px-3 py-1.5 text-xxs text-muted">
+        Vùng làm nét là vị trí thật của ảnh trên slide gốc; phần còn lại chỉ được làm mờ để dễ quan sát.
+        Kết quả Excel vẫn tuân theo quy tắc eligibility và bằng chứng ngữ nghĩa phía Python.
+      </p>
+    </section>
+  )
+
+  const rightPanel = (
+    <section className="card flex w-full shrink-0 flex-col xl:w-[330px]" aria-label="Thông tin và nhãn xác nhận">
+      <header className="card-head">
+        <h2 className="card-title mr-auto">Thông tin & nhãn xác nhận</h2>
+        <span className="text-xs2 text-muted">Mục {index + 1}/{list.length}</span>
+      </header>
+      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <KeyValue label="Report nguồn"><span title={cand.sourceFile}>{cand.sourceFile}</span></KeyValue>
+        <KeyValue label="Management Number">{cand.managementNumber}</KeyValue>
+        <KeyValue label="Slide / Mục">
+          Slide {cand.slide}
+          {typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 && ` · Mục #${cand.itemIndex + 1}`}
+        </KeyValue>
+        {cand.itemHeading && (
+          <KeyValue label="Tiêu đề mục"><span title={cand.itemHeading}>{cand.itemHeading}</span></KeyValue>
+        )}
+        <KeyValue label="Dự đoán">{cand.decision}</KeyValue>
+        <KeyValue label="Độ tin cậy">
+          {CONFIDENCE_LABEL[cand.confidenceBand]} <span className="text-muted">({cand.confidence.toFixed(2)})</span>
+        </KeyValue>
+        <KeyValue label="Vào Excel">
+          {cand.excelEligible ? 'Đủ điều kiện'
+            : <span className="text-warn-600">Chưa đủ điều kiện — {cand.eligibilityReason}</span>}
+        </KeyValue>
+
+        <p className="mb-1 mt-2.5 text-base2 font-medium text-header">Lý do</p>
+        <ul className="max-h-[110px] list-disc overflow-y-auto pl-5 text-xs2 leading-[17px] text-body">
+          {cand.evidence.map((e) => <li key={e}>{e}</li>)}
+        </ul>
+        {cand.nearbyText && <p className="mt-1.5 text-xs2 text-muted">Chữ gần ảnh: “{cand.nearbyText}”</p>}
+
+        <div className="mt-3 border-t border-lineSoft pt-2.5">
+          <p className="mb-1.5 text-base2 font-medium text-header">Chọn nhãn xác nhận</p>
+          <div className="grid grid-cols-2 gap-1.5">
+            {IMAGE_LABELS.map((l) => (
+              <Button key={l.key} active={cand.userLabel === l.key} disabled={s.locked}
+                className="justify-center"
+                onClick={() => s.labelImage(cand.id, l.key)}>
+                {l.label}
+              </Button>
+            ))}
+          </div>
+
+          <p className="mb-1 mt-3 text-base2 font-medium text-header">Ghi chú</p>
+          <TextInput
+            value={cand.note}
+            disabled={s.locked}
+            maxLength={1000}
+            placeholder="Ghi chú cho đối tượng này (không bắt buộc)"
+            onChange={(e) => s.setNote('image', cand.id, e.target.value)}
+          />
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Button icon={<ChevronLeft className="h-3.5 w-3.5" />} disabled={index === 0}
+              onClick={() => s.setImageReviewIndex(index - 1)}>
+              Mục trước
+            </Button>
+            <Button disabled={index >= list.length - 1} onClick={() => s.setImageReviewIndex(index + 1)}>
+              Mục tiếp
+              <ChevronRight className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          <Button
+            variant="primary"
+            className="mt-2 w-full justify-center"
+            icon={<Save className="h-3.5 w-3.5" />}
+            disabled={!chosen || s.locked}
+            onClick={() => void s.saveImageCandidate(cand.id, cand.userLabel, cand.note)}
+          >
+            Lưu nhãn & ghi chú
+          </Button>
+          {chosen && (
+            <span className={cn('mt-2 inline-flex items-center gap-1.5 text-xs2', cand.labelPending ? 'text-warn-600' : 'text-ok-600')}>
+              {cand.labelPending ? <AlertTriangle className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+              {cand.labelPending ? `Nhãn “${labelName(cand.userLabel)}” chưa lưu.` : `Nhãn “${labelName(cand.userLabel)}” đã lưu cục bộ.`}
+            </span>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+
+  /* §20/§35: three horizontal regions filling one viewport on desktop; each panel scrolls independently.
+     §36: below xl the preview + info stack under a compact list instead of squeezing three columns. */
+  return (
+    <div className="flex min-h-0 flex-col gap-3 xl:h-[calc(100dvh-132px)] xl:min-h-[540px]">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 xl:flex-row xl:gap-0">
+        {leftPanel}
+        <div
+          className="hidden w-[6px] shrink-0 cursor-col-resize touch-none items-stretch xl:flex"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Kéo để thay đổi độ rộng danh sách ảnh"
+          onPointerDown={startDrag}
+          onPointerMove={moveDrag}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+        >
+          <div className="mx-auto w-[2px] rounded bg-line transition-colors hover:bg-brand-400" />
+        </div>
+        {centerPanel}
+        {rightPanel}
       </div>
     </div>
   )

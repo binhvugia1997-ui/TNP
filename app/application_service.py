@@ -27,6 +27,7 @@ from .gui_controller import GuiController
 from .extractor import management_number_from_filename
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD,
                       ACTION_PROCESS, ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, normalize_source_path)
+from .preview_geometry import slide_fraction_box
 from .runtime_paths import config_dir, logs_dir
 
 LOG = logging.getLogger("report_extractor.webview")
@@ -69,6 +70,10 @@ class ApplicationService:
         self._server_apply_message = ""
         self._server_apply_thread: Optional[threading.Thread] = None
         self._preview_cache: Dict[str, str] = {}
+        # PROMPT-024R: FULL rendered slide per (report path, slide, mtime) for the review workspace.
+        # Rendered once and shared by every candidate of that report+slide; never shared across
+        # reports (§40/§54). Value: (data_uri, width_px, height_px).
+        self._slide_preview_cache: Dict[tuple, tuple] = {}
         self._load_manual_fields()
 
     # ------------------------------------------------------------------ static app/config DTOs
@@ -202,8 +207,12 @@ class ApplicationService:
                 result = self._result_for_path(Path(row.path))
                 reports.append(self._report_dto(report_id, row, result, fields, len(reports) + 1))
             progress = c.progress
-            run_status = "stopping" if c.state == "stopping" else "processing" if c.state == "running" else (
-                "done" if progress.finished else "idle")
+            # PROMPT-024R: distinct job states for the two stop modes. "cancelling" is shown while the
+            # worker has not yet acknowledged cancel-all; the UI only shows "Đã dừng" after "done".
+            run_status = ("cancelling" if c.state == "cancelling" else
+                          "stopping" if c.state == "stopping" else
+                          "processing" if c.state == "running" else
+                          ("done" if progress.finished else "idle"))
             current_name = ""
             if progress.current_index is not None and 0 <= progress.current_index < len(c.rows):
                 current_name = c.rows[progress.current_index].path.name
@@ -226,6 +235,10 @@ class ApplicationService:
                         "remainSec": c.eta_seconds(), "startedAt": started_at, "finishedAt": done_at,
                         "hasSamples": c.average_report_seconds() is not None,
                         "stopped": bool(c.summary and c.summary.stopped),
+                        # PROMPT-024R: cancel-all acknowledgement is surfaced separately from graceful stop.
+                        "cancelRequested": (c.state == "cancelling"
+                                            or bool(c.summary and getattr(c.summary, "cancel_requested", False))),
+                        "cancelledCount": int(getattr(c.summary, "cancelled", 0)) if c.summary else 0,
                         "error": self._redact_source_paths(c.worker_failure or "")},
                 "logs": list(self._log_entries[-500:]),
                 "ollama": {"host": c.host, "port": c.port, "model": c.model,
@@ -312,6 +325,8 @@ class ApplicationService:
             return "excluded"
         final_map = {"completed": "completed", "completed_new": "completed", "needs_review": "needs_review",
                      "not_written": "needs_review", "error": "error", "skipped": "skipped",
+                     # PROMPT-024R: user cancellation is its own terminal status – never mapped to "error".
+                     "cancelled": "cancelled",
                      "outside_period": "outside_period", "source_duplicate": "source_duplicate", "fast_skip": "fast_skip"}
         if run_stage in final_map:
             return final_map[run_stage]
@@ -347,6 +362,19 @@ class ApplicationService:
             if not self.controller.request_stop():
                 raise ServiceError("Không có file nào đang được xử lý.", "NOT_RUNNING")
             return self.dashboard_state()
+
+    def cancel_all(self) -> dict:
+        """PROMPT-024R "Dừng tất cả": cooperative cancel-all.
+
+        Returns a JSON-safe acknowledgement. Cancel while idle is harmless and deterministic (§49);
+        duplicate cancel clicks are idempotent (§48). No threading primitive ever crosses the bridge.
+        """
+        with self._lock:
+            requested = self.controller.request_cancel()
+            if requested:
+                LOG.info("WEBVIEW_CANCEL_ALL_REQUESTED")
+            return {"ok": True, "requested": bool(requested), "mode": "cancel_all",
+                    **self.dashboard_state()}
 
     def exclude_reports(self, report_ids: Iterable[str], restore: bool = False) -> dict:
         with self._lock:
@@ -947,6 +975,53 @@ class ApplicationService:
             LOG.debug("WEBVIEW_IMAGE_PREVIEW_UNAVAILABLE file=%s error=%s", path.name, exc)
             return ""
 
+    # ------------------------------------------------------------------ PROMPT-024R learning workspace
+    def _slide_preview_for(self, candidate) -> Dict[str, Any]:
+        """FULL authored slide of one candidate as a data URI (review display only, §23/§29/§30).
+
+        Rendered ONCE per (report, slide, file mtime) and shared by every candidate of that slide;
+        two reports with identical layouts never share a preview (§54). No filesystem path ever reaches
+        the browser (§39). Evidence bytes / Excel crops are untouched — this is review UI only.
+        """
+        empty = {"src": "", "width": 0, "height": 0}
+        try:
+            source = Path(candidate.source_file)
+            if not source or not source.is_file():
+                return empty
+            key = (str(source), int(candidate.slide), int(source.stat().st_mtime))
+            cached = self._slide_preview_cache.get(key)
+            if cached is not None:
+                return {"src": cached[0], "width": cached[1], "height": cached[2]}
+            from .pptx_parser import parse_pptx
+            from .qpn_renderer import SlideRenderer
+            report = parse_pptx(source)
+            if report.slide(int(candidate.slide)) is None:
+                self._slide_preview_cache[key] = ("", 0, 0)
+                return empty
+            renderer = SlideRenderer(width_px=1600)   # best available backend, same chain as production
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="re_learning_slide_") as tmp:
+                paths = renderer.render(report, [int(candidate.slide)], Path(tmp))
+                rendered = paths.get(int(candidate.slide))
+                if rendered is None or not Path(rendered).exists():
+                    self._slide_preview_cache[key] = ("", 0, 0)
+                    return empty
+                from PIL import Image
+                with Image.open(rendered) as im:
+                    image = im.convert("RGB")
+                    width, height = image.size
+                    buf = io.BytesIO()
+                    image.save(buf, format="JPEG", quality=82, optimize=True)
+            uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+            self._slide_preview_cache[key] = (uri, width, height)
+            if len(self._slide_preview_cache) > 48:
+                self._slide_preview_cache.pop(next(iter(self._slide_preview_cache)))
+            return {"src": uri, "width": width, "height": height}
+        except Exception as exc:  # noqa: BLE001 – preview is display-only; never break the review state
+            LOG.debug("WEBVIEW_SLIDE_PREVIEW_UNAVAILABLE candidate=%s error=%s",
+                      getattr(candidate, "candidate_id", "?"), exc)
+            return empty
+
     def _image_candidate_dto(self, candidate, learning) -> dict:
         src = self._preview_cache.get(candidate.candidate_id)
         if src is None:
@@ -961,11 +1036,23 @@ class ApplicationService:
         label = self.controller.pending_labels.get(candidate.candidate_id) or learning.store.current_label(candidate.candidate_id)
         latest = learning.store.latest().get(candidate.candidate_id, {})
         pending_note = self.controller.pending_label_notes.get(candidate.candidate_id)
+        # PROMPT-024R: full-slide context + authoritative target geometry for the review workspace.
+        fx, fy, fw, fh = slide_fraction_box((x, y, w, h), bw, bh)
+        preview = self._slide_preview_for(candidate)
         return {"id": candidate.candidate_id, "sourceFile": candidate.source_name,
                 "managementNumber": candidate.management_number, "slide": candidate.slide,
                 "pictureId": str(candidate.picture_id), "src": src,
                 "bounds": {"x": round(x / bw * 100, 2), "y": round(y / bh * 100, 2),
                            "w": round(w / bw * 100, 2), "h": round(h / bh * 100, 2)},
+                # Authoritative PPTX geometry (EMU + fractions) so the UI never guesses coordinates (§27/§38)
+                "slideWidth": bw, "slideHeight": bh,
+                "targetBbox": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
+                "targetBboxPct": {"x": round(fx * 100, 3), "y": round(fy * 100, 3),
+                                  "w": round(fw * 100, 3), "h": round(fh * 100, 3)},
+                "targetKind": "picture",
+                # Full authored slide rendered once per report+slide (review display only, §40)
+                "slidePreview": preview["src"],
+                "slidePreviewWidth": preview["width"], "slidePreviewHeight": preview["height"],
                 # PROMPT-025: logical improvement-item identity for the per-item learning preview
                 "itemId": candidate.logical_item_owner, "itemIndex": candidate.item_index,
                 "itemHeading": candidate.owner_heading,

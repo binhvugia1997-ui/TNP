@@ -399,7 +399,8 @@ function useStoreValue() {
     return counts
   }, [reports])
 
-  const running = run.status === 'processing' || run.status === 'stopping'
+  // PROMPT-024R: "cancelling" (Dừng tất cả) is still an active batch until the worker acknowledges.
+  const running = run.status === 'processing' || run.status === 'stopping' || run.status === 'cancelling'
   const locked = running || scanBusy || training || diagRunning || serverApplyRunning
   const queue = useMemo(() => {
     if (running) return run.queue.slice(run.doneCount)
@@ -551,6 +552,8 @@ function useStoreValue() {
   }, [configDto, runOperation, running, scanDirty, scanned])
 
   const stopAfterCurrent = useCallback(() => runOperation(() => callBridge('stop_after_current')), [runOperation])
+  /** PROMPT-024R: "Dừng tất cả" — hủy hợp tác tại điểm an toàn gần nhất (không giết tiến trình). */
+  const cancelAll = useCallback(() => runOperation(() => callBridge('cancel_all')), [runOperation])
   const resetRun = clearError
 
   const saveConfiguration = useCallback(() => runOperation(async () => {
@@ -711,7 +714,7 @@ function useStoreValue() {
     search, setSearch, filter, setFilter, scan, excludeSelected, restoreSelected,
     folder, setFolder, template, setTemplate, output, setOutput,
     periodMode, setPeriodMode, month, setMonth, year, setYear, fromDate, setFromDate, toDate, setToDate,
-    force, setForce, run, reveal, running, locked, startProcessing, stopAfterCurrent, resetRun,
+    force, setForce, run, reveal, running, locked, startProcessing, stopAfterCurrent, cancelAll, resetRun,
     log, logCollapsed, setLogCollapsed, clearLogView, openLogFile, openLogFolder, openOutputFile, openOutputFolder,
     ollama, setOllama, ollamaIndicator, aiStatusText, aiMode, discovering, discoveryMessage, discoveryResults,
     startDiscovery, stopDiscovery, useServer, appliedServer, serverApplyRunning, serverApplyMessage,
