@@ -116,8 +116,93 @@ def _force_win32(monkeypatch):
     monkeypatch.setattr(qrn, "sys", SimpleNamespace(platform="win32", version_info=sys.version_info))
 
 
-def test_probe_is_side_effect_free_and_negative_off_windows():
-    assert powerpoint_probe() == (False, "availability", "not-windows")
+def _force_non_win32(monkeypatch, host: str = "linux"):
+    """Simulate a non-Windows host explicitly.
+
+    PROMPT-029: this suite now also runs on REAL Windows during build validation, so a test of the
+    off-Windows branch must not depend on the machine it happens to run on.  ``powerpoint_probe()`` reads
+    ``qrn.sys.platform``, so replacing that namespace is enough — production behaviour is untouched.
+    """
+    assert host != "win32"
+    monkeypatch.setattr(qrn, "sys", SimpleNamespace(platform=host, version_info=sys.version_info))
+
+
+def test_probe_is_negative_off_windows_on_every_host(monkeypatch):
+    """The off-Windows branch, exercised deterministically no matter where the suite runs."""
+    for host in ("linux", "darwin", "freebsd"):
+        _force_non_win32(monkeypatch, host)
+        assert powerpoint_probe() == (False, "availability", "not-windows"), host
+        assert qrn.powerpoint_available() is False and qrn.powerpoint_unavailable_detail() == "not-windows"
+
+
+def test_probe_contract_holds_on_the_real_host_whatever_it_is():
+    """Host-independent: the probe always returns the documented 3-tuple with a safe, path-free detail.
+
+    On real Windows a machine without PowerPoint (or with a partial pywin32 whose ``pythoncom`` has no
+    ``CLSIDFromProgID``) legitimately answers ``progid-not-registered (<ExceptionType>)`` — that is a valid
+    availability answer, not a bug, so this test accepts it instead of hardcoding one host's outcome.
+    """
+    available, stage, detail = powerpoint_probe()
+    assert isinstance(available, bool) and isinstance(stage, str) and isinstance(detail, str)
+    assert stage in ("", "availability", "import"), stage
+    assert available is (stage == ""), "an available backend has nothing to explain"
+    if sys.platform == "win32":
+        assert detail != "not-windows", "production must NOT claim not-windows on Windows"
+        assert stage != "availability" or detail.startswith("progid-"), detail
+    else:
+        assert (available, stage, detail) == (False, "availability", "not-windows")
+    # the detail is a diagnostic shown in the UI/logs: no drive letters, no user paths
+    for needle in (":\\", ":/", "\\Users\\", "/home/"):
+        assert needle not in detail, f"{needle!r} leaked into {detail!r}"
+
+
+def test_a_partial_pywin32_is_reported_as_unavailable_with_the_reason_named(monkeypatch):
+    """Regression for the value seen on the real Windows build machine:
+    ``pythoncom`` imports but has no ``CLSIDFromProgID`` → ``progid-not-registered (AttributeError)``.
+
+    A broken/partial pywin32 must never be mistaken for "PowerPoint is installed", and must never crash
+    the probe or launch PowerPoint.
+    """
+    _force_win32(monkeypatch)
+    pythoncom = ModuleType("pythoncom")                       # deliberately WITHOUT CLSIDFromProgID
+    win32com = ModuleType("win32com")
+    client = ModuleType("win32com.client")
+    client.DispatchEx = lambda progid: pytest.fail("the probe must not create a COM instance")
+    win32com.client = client
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    winreg = ModuleType("winreg")
+    winreg.HKEY_CLASSES_ROOT = "HKCR"
+    winreg.KEY_READ = winreg.KEY_WOW64_64KEY = winreg.KEY_WOW64_32KEY = 1
+    winreg.OpenKey = lambda *a, **k: (_ for _ in ()).throw(OSError("missing"))
+    monkeypatch.setitem(sys.modules, "winreg", winreg)
+    assert powerpoint_probe() == (False, "availability", "progid-not-registered (AttributeError)")
+
+
+def test_probe_never_launches_powerpoint_even_when_it_is_registered(monkeypatch):
+    """The other half of "side-effect free": availability must not create a COM instance."""
+    _force_win32(monkeypatch)
+    launched = []
+
+    def boom(*args, **kwargs):
+        launched.append(args or kwargs)
+        raise AssertionError("powerpoint_probe() must not touch a live COM object")
+
+    pythoncom = ModuleType("pythoncom")
+    pythoncom.CLSIDFromProgID = lambda progid: "{91493441-5A91-11CF-8700-00AA0060263B}"
+    pythoncom.CoInitialize = boom
+    pythoncom.CoUninitialize = boom
+    win32com = ModuleType("win32com")
+    client = ModuleType("win32com.client")
+    client.DispatchEx, client.Dispatch, client.GetObject = boom, boom, boom
+    win32com.client = client
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    assert powerpoint_probe() == (True, "", "progid-com")
+    assert qrn.powerpoint_available() is True
+    assert launched == [], f"the probe started PowerPoint: {launched}"
 
 
 def test_missing_pywin32_is_classified_as_an_import_stage(monkeypatch):

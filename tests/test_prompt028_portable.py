@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 
 import pytest
 
@@ -770,15 +770,86 @@ def test_spec_does_not_fall_back_to_tkinter_to_hide_the_failure():
     assert main_src.index("def launch_ui") < main_src.index("def launch_gui")
 
 
+def _canonical(rel) -> str:
+    """Separator-neutral logical path — correct whether ``rel`` was spelled with "/" or "\\".
+
+    ``PurePath`` alone is NOT enough: on POSIX it is ``PosixPath``, which treats "\\" as an ordinary
+    character and therefore never splits a Windows-spelled string.  Folding "\\" -> "/" first (the same
+    trick production's ``is_allowed_dependency_resource()`` already uses) makes this host-independent.
+    """
+    return PurePath(str(rel).replace("\\", "/")).as_posix()
+
+
+def _logical(dest, src) -> str:
+    """The LOGICAL packaged location of ``src`` under ``dest``, separator spelling removed.
+
+    PROMPT-029 §2: on Windows ``collect_data_files()`` builds its destination with ``os.path.relpath``, so
+    it returns ``pythonnet\\runtime``; hook-clr instead uses ``PurePath.as_posix()`` and returns
+    ``pythonnet/runtime``.  Both denote the same place in the bundle, so every comparison here goes through
+    PurePath — asserting on separator spelling was the test bug, not a packaging bug.
+    """
+    dest, name = _canonical(dest), _canonical(src).rsplit("/", 1)[-1]
+    return f"{dest}/{name}" if dest else name
+
+
 def test_collect_data_files_pythonnet_would_have_added_the_dll_as_data():
     """What the two removed spec lines actually did — measured, not assumed."""
     hooks = pytest.importorskip("PyInstaller.utils.hooks")
     if importlib.util.find_spec("pythonnet") is None:
         pytest.skip("pythonnet not installed here")
-    as_data = [dest + "/" + os.path.basename(src) for src, dest in hooks.collect_data_files("pythonnet")]
+    as_data = [_logical(dest, src) for src, dest in hooks.collect_data_files("pythonnet")]
     assert SOURCE_DLL_REL in as_data, "collect_data_files('pythonnet') does pull the managed DLL in as DATA"
-    as_libs = [dest + "/" + os.path.basename(src) for src, dest in hooks.collect_dynamic_libs("pythonnet")]
+    as_libs = [_logical(dest, src) for src, dest in hooks.collect_dynamic_libs("pythonnet")]
     assert SOURCE_DLL_REL in as_libs, "…and collect_dynamic_libs pulls the SAME file a second time"
+
+
+def test_both_separator_spellings_denote_the_same_packaged_location():
+    """PROMPT-029 §2 regression: `pythonnet/runtime/…` and `pythonnet\\runtime\\…` must compare equal."""
+    posix = "pythonnet/runtime/Python.Runtime.dll"
+    windows = "pythonnet\\runtime\\Python.Runtime.dll"
+    assert posix == SOURCE_DLL_REL
+    assert _canonical(windows) == _canonical(posix) == SOURCE_DLL_REL, "both spellings are one location"
+    # PureWindowsPath splits on BOTH separators on every host — that is why it is the comparison type here
+    parts = ("pythonnet", "runtime", "Python.Runtime.dll")
+    assert PureWindowsPath(windows).parts == PureWindowsPath(posix).parts == parts
+    import ntpath
+    assert ntpath.normpath(windows) == ntpath.normpath(posix)
+    assert ntpath.normpath(windows).replace(ntpath.sep, "/") == SOURCE_DLL_REL
+    assert _logical("pythonnet\\runtime", "C:\\sp\\pythonnet\\runtime\\Python.Runtime.dll") == posix
+    assert _logical("pythonnet/runtime", "/sp/pythonnet/runtime/Python.Runtime.dll") == posix
+    # the packaged form, and production's own constant, are separator-neutral too
+    assert _canonical("_internal\\pythonnet\\runtime\\Python.Runtime.dll") == PACKAGED_DLL_REL
+    assert bp.PYTHONNET_RUNTIME_RELPATH.as_posix() == PACKAGED_DLL_REL
+
+
+def test_measured_hook_destinations_match_what_the_validator_expects(monkeypatch):
+    """PROMPT-029 §4: the fixture contract is tied to MEASURED hook output, not to hand-written paths.
+
+    Runs the shipped hook-clr and hook-clr_loader with is_win forced True and compares their logical
+    destinations (relative to _internal/) against what validate_pythonnet_runtime() requires.
+    """
+    stdhooks = _hooks_contrib_stdhooks()
+    if stdhooks is None or not (stdhooks / "hook-clr.py").is_file():
+        pytest.skip("pyinstaller-hooks-contrib not installed here")
+    if importlib.util.find_spec("pythonnet") is None or importlib.util.find_spec("clr_loader") is None:
+        pytest.skip("pythonnet/clr_loader not installed here")
+    compat = pytest.importorskip("PyInstaller.compat")
+    monkeypatch.setattr(compat, "is_win", True)
+    monkeypatch.setattr(compat, "is_cygwin", False)
+
+    def run(name):
+        ns = {"__name__": name, "__file__": str(stdhooks / f"{name}.py")}
+        exec(compile((stdhooks / f"{name}.py").read_text(encoding="utf-8"), ns["__file__"], "exec"), ns)
+        return ns
+
+    clr = run("hook-clr")
+    assert "_internal/" + SOURCE_DLL_REL == PACKAGED_DLL_REL
+    assert {_logical(d, s) for s, d in (clr.get("binaries") or [])} == {SOURCE_DLL_REL}, (
+        "hook-clr must place Python.Runtime.dll exactly where the validator looks for it")
+    loader = run("hook-clr_loader")
+    dests = {_logical(d, s) for s, d in (loader.get("binaries") or [])}
+    assert dests == {"clr_loader/ffi/dlls/amd64/ClrLoader.dll", "clr_loader/ffi/dlls/x86/ClrLoader.dll"}, dests
+    assert "_internal/" + f"clr_loader/ffi/dlls/{_build_arch()}/ClrLoader.dll" == _clrloader_rel()
 
 
 # ---------------------------------------------------------------- runtime diagnostics (§ diagnostics)
@@ -840,48 +911,126 @@ def test_desktop_main_logs_runtime_diagnostics_before_starting_the_window(fake_w
 def _package_with_dll(tmp_path, rel_paths, content=None):
     folder = tmp_path / "pkg"
     for rel in rel_paths:
-        target = folder / Path(rel)
+        target = folder / PurePath(rel)                      # accepts "/" OR "\" spelling
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content if content is not None else b"MANAGED-ASSEMBLY")
     return folder
 
 
-def test_validate_pythonnet_runtime_accepts_the_hook_layout(tmp_path):
-    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL])
+def _build_arch() -> str:
+    """The SAME rule validate_pythonnet_runtime() uses, so fixture and production cannot drift apart."""
+    import struct
+    return "amd64" if struct.calcsize("P") * 8 > 32 else "x86"
+
+
+def _clrloader_rel(arch=None) -> str:
+    return f"_internal/clr_loader/ffi/dlls/{arch or _build_arch()}/ClrLoader.dll"
+
+
+def _hook_layout_package(tmp_path, python_runtime=True, clrloader=True, extra=(), content=None):
+    """A package laid out the way hook-clr + hook-clr_loader lay it out on Windows.
+
+    PROMPT-029 §3: the production validator requires BOTH the managed Python.Runtime.dll AND the native
+    ClrLoader.dll of the build architecture, so a "valid" fixture has to be a COMPLETE hook-generated
+    layout.  A fixture carrying only Python.Runtime.dll silently passed on Linux (where the ClrLoader branch
+    is skipped) and failed on the real Windows host — the fixture was wrong, not the validator.
+    """
+    rel = []
+    if python_runtime:
+        rel.append(PACKAGED_DLL_REL)
+    if clrloader:
+        rel.append(_clrloader_rel())
+    return _package_with_dll(tmp_path, rel + list(extra), content=content)
+
+
+def _force_windows(monkeypatch):
+    """Run the validator's Windows branch on any host, so these tests are not host-dependent."""
+    monkeypatch.setattr(bp, "platform", type("P", (), {"system": staticmethod(lambda: "Windows")})())
+
+
+def test_validate_pythonnet_runtime_accepts_the_hook_layout(tmp_path, monkeypatch):
+    """Valid COMPLETE hook layout → [] — deterministically, on Windows and everywhere else."""
+    _force_windows(monkeypatch)
+    folder = _hook_layout_package(tmp_path)
     source = {"found": True, "path": "site-packages/pythonnet/runtime/Python.Runtime.dll",
               "sha256": bp_sha256(folder / PACKAGED_DLL_REL), "size": 16}
     assert validate_pythonnet_runtime(folder, source) == []
 
 
-def test_validate_pythonnet_runtime_rejects_a_second_conflicting_copy(tmp_path):
-    """The exact PROMPT-028R packaging defect: two copies, one of them in the wrong place."""
-    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL, "_internal/Python.Runtime.dll"])
+def test_validate_pythonnet_runtime_accepts_the_layout_the_hook_actually_produces(tmp_path, monkeypatch):
+    """hook-clr_loader ships ClrLoader.dll for BOTH architectures; that superset must be accepted."""
+    _force_windows(monkeypatch)
+    folder = _hook_layout_package(tmp_path, clrloader=False,
+                                  extra=[_clrloader_rel("amd64"), _clrloader_rel("x86")])
+    assert validate_pythonnet_runtime(folder, {"found": False}) == []
+
+
+def test_validate_pythonnet_runtime_accepts_the_hook_layout_on_the_real_host(tmp_path):
+    """Unforced: whatever this machine is, a layout carrying both required DLLs is accepted."""
+    folder = _hook_layout_package(tmp_path)
+    assert validate_pythonnet_runtime(folder, {"found": False}) == []
+
+
+def test_validate_pythonnet_runtime_rejects_a_second_conflicting_copy(tmp_path, monkeypatch):
+    """The PROMPT-028R packaging defect: two copies, one of them in the wrong place."""
+    _force_windows(monkeypatch)
+    folder = _hook_layout_package(tmp_path, extra=["_internal/Python.Runtime.dll"])
     problems = validate_pythonnet_runtime(folder, {"found": False})
     assert any("phải đúng 1" in p for p in problems)
     assert any("sai vị trí" in p for p in problems)
+    assert not any("ClrLoader" in p for p in problems), "only the defect under test may be reported"
 
 
-def test_validate_pythonnet_runtime_rejects_a_stale_or_modified_dll(tmp_path):
-    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL], content=b"STALE BUILD")
+def test_validate_pythonnet_runtime_rejects_a_stale_or_modified_dll(tmp_path, monkeypatch):
+    _force_windows(monkeypatch)
+    folder = _hook_layout_package(tmp_path, content=b"STALE BUILD")
     problems = validate_pythonnet_runtime(folder, {"found": True, "sha256": "0" * 64})
     assert any("SHA256 KHÁC" in p for p in problems)
     assert any(".venv-build" in p for p in problems)
+    assert not any("ClrLoader" in p for p in problems), "only the defect under test may be reported"
 
 
-def test_validate_pythonnet_runtime_rejects_a_missing_dll(tmp_path):
+def test_validate_pythonnet_runtime_rejects_a_missing_dll(tmp_path, monkeypatch):
+    """Missing Python.Runtime.dll → its own clear error (kept separate from the ClrLoader case)."""
+    _force_windows(monkeypatch)
     problems = validate_pythonnet_runtime(tmp_path / "empty", {"found": True, "sha256": "0" * 64})
     assert any("thiếu Python.Runtime.dll" in p for p in problems)
 
 
-def test_validate_pythonnet_runtime_checks_clrloader_on_windows(tmp_path, monkeypatch):
-    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL])
-    monkeypatch.setattr(bp, "platform", type("P", (), {"system": staticmethod(lambda: "Windows")})())
+def test_validate_pythonnet_runtime_rejects_a_missing_clrloader(tmp_path, monkeypatch):
+    """Missing ClrLoader.dll → its own clear error, and it must NOT blame Python.Runtime.dll."""
+    _force_windows(monkeypatch)
+    folder = _hook_layout_package(tmp_path, clrloader=False)
     problems = validate_pythonnet_runtime(folder, {"found": False})
-    assert any("ClrLoader.dll" in p for p in problems)
-    arch = "amd64" if sys.maxsize > 2 ** 32 else "x86"
-    (folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch).mkdir(parents=True)
-    (folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch / "ClrLoader.dll").write_bytes(b"x")
+    assert len(problems) == 1, problems
+    assert "ClrLoader.dll" in problems[0] and _build_arch() in problems[0]
+    assert "thiếu Python.Runtime.dll" not in problems[0], "the managed assembly IS present"
+    # putting it back clears the problem
+    (folder / PurePath(_clrloader_rel())).parent.mkdir(parents=True, exist_ok=True)
+    (folder / PurePath(_clrloader_rel())).write_bytes(b"NATIVE-HOST")
     assert validate_pythonnet_runtime(folder, {"found": False}) == []
+
+
+def test_validate_pythonnet_runtime_needs_the_clrloader_of_the_build_architecture(tmp_path, monkeypatch):
+    """The other architecture's ClrLoader.dll cannot serve this process."""
+    _force_windows(monkeypatch)
+    other = "x86" if _build_arch() == "amd64" else "amd64"
+    folder = _hook_layout_package(tmp_path, clrloader=False, extra=[_clrloader_rel(other)])
+    problems = validate_pythonnet_runtime(folder, {"found": False})
+    assert any("ClrLoader.dll" in p and _build_arch() in p for p in problems), problems
+
+
+def test_validate_pythonnet_runtime_messages_use_one_canonical_path_spelling(tmp_path, monkeypatch):
+    """§5: the validator reports canonical POSIX paths, never the host's separator spelling."""
+    _force_windows(monkeypatch)
+    # spelled with "/" so the stray copy is a real second Python.Runtime.dll on EVERY host
+    folder = _hook_layout_package(tmp_path, extra=["_internal/Python.Runtime.dll"])
+    problems = validate_pythonnet_runtime(folder, {"found": False})
+    text = "\n".join(problems)
+    assert any("phải đúng 1" in p for p in problems), problems
+    assert "_internal/Python.Runtime.dll" in text
+    assert "_internal/pythonnet/runtime/Python.Runtime.dll" in text
+    assert "\\" not in text, f"the validator must report canonical POSIX paths, got: {text}"
 
 
 def test_builder_can_recreate_the_build_venv_and_reports_dependency_versions():

@@ -190,7 +190,7 @@ def copy_frontend_into_portable(folder: Path) -> None:
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(FRONTEND_DIST, target)
-    print(f"   frontend/dist → {target.relative_to(folder)}")
+    print(f"   frontend/dist → {target.relative_to(folder).as_posix()}")
 
 
 def sha256(path: Path) -> str:
@@ -410,17 +410,17 @@ def validate_pythonnet_runtime(folder: Path, source: dict | None = None) -> list
         return problems
     if len(found) > 1:
         problems.append(f"có {len(found)} bản {PYTHONNET_RUNTIME_DLL} trong gói (phải đúng 1): "
-                        + ", ".join(str(p.relative_to(folder)) for p in found))
+                        + ", ".join(p.relative_to(folder).as_posix() for p in found))
     expected = (folder / PYTHONNET_RUNTIME_RELPATH).resolve()
     for dll in found:
         rel = dll.relative_to(folder)
         packaged_sha = sha256(dll)
-        print(f"   gói  {rel}: size={dll.stat().st_size} sha256={packaged_sha}")
+        print(f"   gói  {rel.as_posix()}: size={dll.stat().st_size} sha256={packaged_sha}")
         if dll.resolve() != expected:
-            problems.append(f"{PYTHONNET_RUNTIME_DLL} sai vị trí: {rel} (pythonnet tìm ở "
+            problems.append(f"{PYTHONNET_RUNTIME_DLL} sai vị trí: {rel.as_posix()} (pythonnet tìm ở "
                             f"{PYTHONNET_RUNTIME_RELPATH.as_posix()})")
         if source and source.get("found") and packaged_sha != source.get("sha256"):
-            problems.append(f"{rel} có SHA256 KHÁC bản pythonnet trong môi trường build "
+            problems.append(f"{rel.as_posix()} có SHA256 KHÁC bản pythonnet trong môi trường build "
                             f"(gói={packaged_sha[:16]}… nguồn={str(source.get('sha256'))[:16]}…) "
                             "- có thể .venv-build cũ hoặc hook đã sửa file")
     if platform.system() == "Windows":
@@ -608,7 +608,8 @@ def main() -> int:
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for p in sorted(folder.rglob("*")):
-            zf.write(p, str(Path(name) / p.relative_to(folder)))
+            # arcname is POSIX on purpose: str(Path(...)) would emit "\" on Windows (PROMPT-029 §5)
+            zf.write(p, f"{name}/{p.relative_to(folder).as_posix()}")
     exe = folder / "ReportExtractor.exe"
     lines = []
     if exe.exists():
