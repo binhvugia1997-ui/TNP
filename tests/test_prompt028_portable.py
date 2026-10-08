@@ -896,31 +896,54 @@ def test_builder_can_recreate_the_build_venv_and_reports_dependency_versions():
     assert main_src.index("validate_pythonnet_runtime(folder") < main_src.index("publish_step(release")
 
 
-def test_version_was_not_bumped_by_this_packaging_fix():
-    """PROMPT-027R owns the 1.3.4/017 bump; PROMPT-028R must not take it."""
+def test_canonical_version_after_prompt029_integration():
+    """PROMPT-029: the canonical version is 1.3.4 / Build 017, taken from PROMPT-027R.
+
+    PROMPT-028R was authored before integration and deliberately reported 1.3.3 / Build 016; the packaging
+    commits never touched app/__init__.py, so the bump can only have come from PROMPT-027R.  Regressing back
+    to 1.3.3/016 while resolving conflicts is exactly what this pins against.
+    """
     import app as app_pkg
-    assert app_pkg.__version__ == "1.3.3" and app_pkg.BUILD_NUMBER == 16 and app_pkg.BUILD_ID == "016"
+    assert (app_pkg.__version__, app_pkg.BUILD_NUMBER, app_pkg.BUILD_ID) == ("1.3.4", 17, "017")
+    assert app_pkg.BUILD_LABEL == "Build 017"
+    assert app_pkg.VERSION_LABEL == "1.3.4 — Build 017"
+    meta = json.loads((ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
+    assert meta["version"] == "1.3.4", "the React bundle must agree with the backend version"
 
 
-PROMPT027_BASELINE = "b5f8a29"
+PROMPT027_BASELINE = "b5f8a29"        # PROMPT-027
+PACKAGING_TIP = "78805fa"              # PROMPT-028R – tip of the packaging line
+PROMPT027R_COMMIT = "8f979eb"          # PROMPT-027R – integrated by PROMPT-029
+
+EVIDENCE_REGION_FILES = ("app/improvement_visual.py", "app/improvement_pictures.py", "app/qpn_renderer.py",
+                         "app/pptx_parser.py", "frontend/src/tabs/LearningTab.tsx")
 
 
-def _changed_files_vs_prompt027():
-    """Every path that differs from the PROMPT-027 baseline, committed AND uncommitted."""
+def _git(*args):
     import subprocess
-    changed = subprocess.run(["git", "diff", "--name-only", PROMPT027_BASELINE], cwd=str(ROOT),
-                             capture_output=True, text=True)
-    if changed.returncode != 0:
+    r = subprocess.run(["git", *args], cwd=str(ROOT), capture_output=True, text=True)
+    return r.returncode, r.stdout.split()
+
+
+def _packaging_changed_files():
+    """Paths touched by the packaging commits ONLY.
+
+    A FIXED range (b5f8a29..78805fa), so the guard stays meaningful after PROMPT-027R was merged in — a
+    working-tree-vs-baseline diff would of course list the evidence-region files now, and that is intended.
+    """
+    rc, files = _git("diff", "--name-only", PROMPT027_BASELINE, PACKAGING_TIP)
+    if rc != 0:
         pytest.skip("git history unavailable")
-    return changed.stdout.split()
+    return files
 
 
-def test_prompt028r_does_not_touch_evidence_region_logic():
-    """Scope guard: the region/clustering/item-span code belongs to PROMPT-027R, not to this fix."""
-    files = _changed_files_vs_prompt027()
-    for protected in ("app/improvement_visual.py", "app/improvement_pictures.py", "app/qpn_renderer.py",
-                      "app/pptx_parser.py"):
-        assert protected not in files, f"{protected} must not be modified by the packaging fix"
+def test_packaging_commits_never_touched_the_evidence_region_logic():
+    """Scope guard: the region/clustering/item-span code belongs to PROMPT-027R, not to the packaging work."""
+    files = _packaging_changed_files()
+    assert files, "the packaging range must resolve to something"
+    for protected in EVIDENCE_REGION_FILES:
+        assert protected not in files, f"{protected} must not be modified by PROMPT-028/028R"
+    assert "app/__init__.py" not in files, "the packaging commits must not bump the version"
 
 
 # --------------------------------------------------------------------- PROMPT-028R: cause elimination
@@ -1100,13 +1123,38 @@ def test_live_import_probe_reports_every_module_in_this_venv():
         assert info["imports"]["clr"], "there is no mono/.NET host here, so `import clr` must fail loudly"
 
 
-def test_version_and_evidence_region_scope_are_untouched_by_the_cause_elimination():
-    """Re-assert after the analysis changed: still 1.3.3/016, still no PROMPT-027R edits."""
-    import app
-    assert (app.__version__, app.BUILD_NUMBER, app.BUILD_ID) == ("1.3.3", 16, "016")
-    for protected in ("app/improvement_visual.py", "app/improvement_pictures.py", "app/qpn_renderer.py",
-                      "app/pptx_parser.py", "frontend/src/tabs/LearningTab.tsx"):
-        assert protected not in _changed_files_vs_prompt027(), f"{protected} must not be modified"
+def test_prompt029_kept_both_lines():
+    """PROMPT-029 integrated 027R WITHOUT dropping 028R — assert both sides are actually present."""
+    rc, _ = _git("merge-base", "--is-ancestor", PROMPT027R_COMMIT, "HEAD")
+    if rc != 0 and _git("rev-parse", "--verify", PROMPT027R_COMMIT)[0] != 0:
+        pytest.skip("git history unavailable")
+    assert rc == 0, f"{PROMPT027R_COMMIT} (PROMPT-027R) must be an ancestor of HEAD"
+    assert _git("merge-base", "--is-ancestor", PACKAGING_TIP, "HEAD")[0] == 0, (
+        f"{PACKAGING_TIP} (PROMPT-028R) must still be an ancestor of HEAD")
+
+    # ---- PROMPT-028R survived the merge
+    code = "\n".join(ln for ln in SPEC_TEXT.splitlines() if not ln.lstrip().startswith("#"))
+    assert 'collect_data_files("webview", subdir="js")' in code
+    assert 'collect_data_files("pythonnet")' not in code and "collect_dynamic_libs(" not in code
+    assert '"clr"' in code and '"clr_loader"' in code
+    reqs = (ROOT / "requirements-webview.txt").read_text(encoding="utf-8")
+    assert re.search(r"^clr-loader==[0-9.]+", reqs, re.M), "the clr-loader pin must survive integration"
+    for fn in ("validate_pythonnet_runtime", "verify_runtime_imports", "report_build_dependencies",
+               "source_pythonnet_dll"):
+        assert callable(getattr(bp, fn, None)), f"builder lost {fn}() during the merge"
+    for fn in ("runtime_diagnostics", "explain_clr_failure", "dotnet_framework_report", "pythonnet_runtime_dll"):
+        assert callable(getattr(desktop, fn, None)), f"app/desktop.py lost {fn}() during the merge"
+    assert "--fresh-venv" in (ROOT / "tools" / "build_portable.py").read_text(encoding="utf-8")
+
+    # ---- PROMPT-027R survived the merge
+    visual = (ROOT / "app" / "improvement_visual.py").read_text(encoding="utf-8")
+    for marker in ("REGION_EVIDENCE", "REGION_BOUNDARY_CONFLICT", "REGION_MEMBER", "boundary_source"):
+        assert marker in visual, f"improvement_visual.py lost {marker}"
+    for fn in ("_item_span", "_clamp_bottom", "_cluster_with_reasons", "_assign_captions_to_clusters"):
+        assert f"def {fn}" in visual, f"improvement_visual.py lost {fn}()"
+    service = (ROOT / "app" / "application_service.py").read_text(encoding="utf-8")
+    assert "evidenceRegionPictureIds" in service and "boundary_source" in service
+    assert "evidenceRegionPictureIds" in (ROOT / "frontend" / "src" / "types.ts").read_text(encoding="utf-8")
 
 
 

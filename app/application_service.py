@@ -16,6 +16,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
@@ -36,6 +37,9 @@ LOG = logging.getLogger("report_extractor.webview")
 # The image is never trimmed, white-balanced or repositioned, so its pixel plane stays a linear map of
 # the slide coordinate plane (x=0,y=0 .. slide_width,slide_height) for both overlay geometries (§27).
 LEARNING_PREVIEW_WIDTH_PX = 1600
+# PROMPT-027R §30: a preview rendered while a higher-fidelity backend FAILED (not merely absent) is reused only
+# for this many seconds, so a transient COM failure can never pin the fallback for the whole session.
+DEGRADED_PREVIEW_TTL_S = 15.0
 
 
 class ServiceError(RuntimeError):
@@ -982,18 +986,19 @@ class ApplicationService:
             return ""
 
     # ------------------------------------------------------------------ PROMPT-024R learning workspace
-    def _slide_preview_for(self, candidate) -> Dict[str, Any]:
+    def _slide_preview_for(self, candidate, learning=None) -> Dict[str, Any]:
         """FULL authored slide of one candidate + the slide's authoritative After evidence regions.
 
-        Rendered ONCE per (report, slide, file mtime, renderer identity) and shared by every candidate of
-        that slide; two reports with identical layouts never share a preview (§54). No filesystem path ever
-        reaches the browser (§39). Evidence bytes / Excel crops are untouched — this is review UI only.
+        Rendered ONCE per (report, slide, file identity, renderer identity) and shared by every candidate of that slide;
+        two reports with identical layouts never share a preview (§54). No filesystem path ever reaches the browser
+        (§39). Evidence bytes / Excel crops are untouched — this is review UI only.
 
-        PROMPT-027 §29: the cache identity also carries the renderer preference chain, the render width and
-        :data:`RENDER_SCHEMA_VERSION`, so a preview produced by older (wrong) rendering geometry is never
-        reused after a renderer fix.  §15: the evidence regions returned here are the SAME
-        :class:`ImprovementVisualRegion` objects the production Excel pipeline crops from — the UI never
-        recomputes that geometry in React and never derives it from the picture candidate's bounds.
+        PROMPT-027 §29: the cache identity carries the renderer preference chain, the render width and
+        :data:`RENDER_SCHEMA_VERSION`.  PROMPT-027R §30: it also carries the file size and nanosecond mtime AND the
+        availability of every backend in the chain, so a PowerPoint that becomes available is a NEW identity and a stale
+        fallback is never reused.  A preview produced while a faithful backend FAILED is marked degraded and expires
+        after :data:`DEGRADED_PREVIEW_TTL_S`, so recovery is never hidden.  §15: the evidence regions returned here are
+        the SAME :class:`ImprovementVisualRegion` objects the production Excel pipeline crops from.
         """
         empty = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "regions": []}
         regions: List[Dict[str, Any]] = []
@@ -1005,10 +1010,12 @@ class ApplicationService:
             from .report_identity import report_scope_key
             slide_number = int(candidate.slide)
             renderer = SlideRenderer(width_px=LEARNING_PREVIEW_WIDTH_PX)  # same chain as production
-            key = (report_scope_key(source), str(source), slide_number, int(source.stat().st_mtime),
-                   tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION)
+            stat = source.stat()
+            key = (report_scope_key(source), str(source), slide_number, int(stat.st_mtime_ns), int(stat.st_size),
+                   tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION,
+                   tuple(sorted(renderer.availability().items())), self._learning_identity(learning))
             cached = self._slide_preview_cache.get(key)
-            if cached is not None:
+            if cached is not None and not self._preview_expired(cached):
                 return dict(cached)
             from .pptx_parser import parse_pptx
             report = parse_pptx(source)
@@ -1018,15 +1025,16 @@ class ApplicationService:
             # §15: the authoritative item-scoped After regions of this slide, from the SAME builder the
             # Excel pipeline uses.  Resolved BEFORE rendering so a failed/reduced preview still reports
             # the true evidence geometry instead of implying the picture belongs to no region at all.
-            regions = self._slide_evidence_regions(report, slide_number, candidate)
+            regions = self._slide_evidence_regions(report, slide_number, candidate, learning)
             result = {**empty, "regions": regions}
             import tempfile
             with tempfile.TemporaryDirectory(prefix="re_learning_slide_") as tmp:
                 paths = renderer.render(report, [slide_number], Path(tmp), purpose="learning_preview")
+                degraded = renderer.degraded
                 rendered = paths.get(slide_number)
                 if rendered is None or not Path(rendered).exists():
-                    self._remember_preview(key, result)      # no bitmap, but the region truth is kept
-                    return result
+                    self._remember_preview(key, {**result, "degraded": True, "created": time.monotonic()})
+                    return result                            # no bitmap, but the region truth is kept
                 from PIL import Image
                 with Image.open(rendered) as im:
                     image = im.convert("RGB")
@@ -1036,7 +1044,8 @@ class ApplicationService:
             result.update({"src": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii"),
                            "width": width, "height": height,
                            "backend": renderer.last_backend or "",
-                           "faithful": is_faithful_backend(renderer.last_backend)})
+                           "faithful": is_faithful_backend(renderer.last_backend),
+                           "degraded": degraded, "created": time.monotonic()})
             self._remember_preview(key, result)
             return result
         except Exception as exc:  # noqa: BLE001 – preview is display-only; never break the review state
@@ -1044,13 +1053,35 @@ class ApplicationService:
                       getattr(candidate, "candidate_id", "?"), exc)
             return {**empty, "regions": regions}             # not cached: the render is retried later
 
+    @staticmethod
+    def _learning_identity(learning) -> tuple:
+        """What the production decision depends on from the learning state (PROMPT-027R §25): the saved labels and the
+        trained model.  A label change or retrain changes the identity, so no preview region can outlive its decision."""
+        if learning is None:
+            return ("none",)
+        try:
+            overrides = tuple(sorted((str(k), str(v)) for k, v in learning.overrides().items()))
+        except Exception:  # noqa: BLE001 – an unreadable label file is treated as no overrides
+            overrides = ()
+        model = getattr(learning, "model", None)
+        model_identity = (str(getattr(model, "trained_at", "")), int(getattr(model, "n_examples", 0) or 0)) \
+            if model is not None else None
+        return (bool(getattr(learning, "enabled", True)), model_identity, overrides)
+
+    @staticmethod
+    def _preview_expired(entry: Dict[str, Any]) -> bool:
+        """Only a degraded preview (a faithful backend failed while rendering it) expires; everything else is reused."""
+        if not entry.get("degraded"):
+            return False
+        return (time.monotonic() - float(entry.get("created", 0.0))) > DEGRADED_PREVIEW_TTL_S
+
     def _remember_preview(self, key: tuple, value: Dict[str, Any]) -> None:
         self._slide_preview_cache[key] = dict(value)
         if len(self._slide_preview_cache) > 48:
             self._slide_preview_cache.pop(next(iter(self._slide_preview_cache)))
 
     @staticmethod
-    def _slide_evidence_regions(report, slide_number: int, candidate) -> List[Dict[str, Any]]:
+    def _slide_evidence_regions(report, slide_number: int, candidate, learning=None) -> List[Dict[str, Any]]:
         """Every item-scoped After evidence region of one slide, as JSON-safe primitives (§14/§20/§21).
 
         This is the production region builder, unchanged: one region per (logical item, After block), each
@@ -1062,8 +1093,13 @@ class ApplicationService:
             from .improvement_pictures import select_after_pictures
             from .improvement_visual import build_improvement_visual_regions
             selection = select_after_pictures(report, [slide_number])
-            regions = build_improvement_visual_regions(report, selection.after,
-                                                       management_number=candidate.management_number)
+            refs = selection.after
+            if learning is not None:
+                # PROMPT-027R §25: exactly the eligible refs the Excel pipeline would crop (labels/model applied)
+                from .image_learning import select_with_learning
+                refs, _candidates, _reasons = select_with_learning(
+                    report, [slide_number], selection, learning, candidate.management_number, candidate.source_file)
+            regions = build_improvement_visual_regions(report, refs, management_number=candidate.management_number)
         except Exception as exc:  # noqa: BLE001 – a region failure must not remove the slide preview
             LOG.debug("WEBVIEW_EVIDENCE_REGIONS_UNAVAILABLE slide=%s error=%s", slide_number, exc)
             return []
@@ -1073,10 +1109,14 @@ class ApplicationService:
             out.append({"itemId": region.improvement_item_id, "itemIndex": region.item_index,
                         "itemHeading": region.improvement_heading,
                         "afterBlockIndex": int(region.after_block_index),
+                        "regionId": region.block_id,
                         "bbox": {"x": int(left), "y": int(top),
                                  "width": max(0, int(right - left)), "height": max(0, int(bottom - top))},
                         "pictureShapeIds": [int(ref.block.shape_id) for ref in region.pictures],
-                        "excelEligible": bool(region.excel_output_eligible)})
+                        "excelEligible": bool(region.excel_output_eligible),
+                        # PROMPT-027R §10: the boundary that actually limited this region (display/debug only)
+                        "boundarySource": region.boundary_source or "",
+                        "nextHeadingTop": int(region.boundary_top) if region.boundary_top is not None else None})
         return out
 
     @staticmethod
@@ -1117,7 +1157,7 @@ class ApplicationService:
         pending_note = self.controller.pending_label_notes.get(candidate.candidate_id)
         # PROMPT-024R: full-slide context + authoritative target geometry for the review workspace.
         fx, fy, fw, fh = slide_fraction_box((x, y, w, h), bw, bh)
-        preview = self._slide_preview_for(candidate)
+        preview = self._slide_preview_for(candidate, learning)
         # PROMPT-027 §13/§15: the picture candidate and the FINAL Excel evidence region are two different
         # review geometries.  The region below is the production ImprovementVisualRegion that owns this
         # candidate — never a React-side derivation from candidate.bounds.
@@ -1156,6 +1196,13 @@ class ApplicationService:
                 "evidenceRegionItemIndex": region["itemIndex"] if region else -1,
                 "evidenceRegionItemHeading": region["itemHeading"] if region else "",
                 "evidenceRegionPictureCount": len(region["pictureShapeIds"]) if region else 0,
+                # PROMPT-027R §24: which pictures form the production region (display/debug only; React never
+                # derives geometry from these ids) and the region identity both overlays and Excel share.
+                "evidenceRegionPictureIds": [int(v) for v in region["pictureShapeIds"]] if region else [],
+                "evidenceRegionId": region["regionId"] if region else "",
+                "evidenceRegionBlockIndex": int(region["afterBlockIndex"]) if region else -1,
+                "evidenceRegionBoundarySource": region.get("boundarySource", "") if region else "",
+                "evidenceRegionNextHeadingTop": region.get("nextHeadingTop") if region else None,
                 # PROMPT-025: logical improvement-item identity for the per-item learning preview
                 "itemId": candidate.logical_item_owner, "itemIndex": candidate.item_index,
                 "itemHeading": candidate.owner_heading,

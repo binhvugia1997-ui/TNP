@@ -301,14 +301,9 @@ function ImageReview() {
   /* PROMPT-027 §13: TWO different review geometries.  ``rect`` is the picture currently being labelled;
      ``evidence`` is the item-scoped region production would export to Excel.  They are never conflated. */
   const evidence = evidenceRect(cand)
-  /* §16/§18: the sharp (un-dimmed) window follows the FINAL Excel region when one exists — those are the
-     pixels the reviewer must judge.  Blur/dim stays pure React visualization: the rendered slide bitmap,
-     the ImprovementVisualRegion, the production crop and the Excel bytes are never modified here. */
-  const focus = evidence ?? rect
-  const clipTop = Math.max(0, focus.y)
-  const clipRight = Math.max(0, 100 - (focus.x + focus.w))
-  const clipBottom = Math.max(0, 100 - (focus.y + focus.h))
-  const clipLeft = Math.max(0, focus.x)
+  /* PROMPT-027R §18/§19: the slide bitmap is shown EXACTLY as rendered.  No blur, no brightness/saturation, no dimming
+     and no second clipped copy — those changed the perceived colour of gray authored text.  Both overlays are outlines
+     positioned from Python's DTO percentages; nothing here recomputes geometry or touches the evidence bytes. */
   const showEvidence = overlayMode !== 'picture' && evidence !== null
   const showPicture = overlayMode !== 'evidence'
   const evidenceItemIndex = typeof cand.evidenceRegionItemIndex === 'number' && cand.evidenceRegionItemIndex >= 0
@@ -479,20 +474,15 @@ function ImageReview() {
       <div ref={viewportRef} className={cn('relative min-h-0 flex-1 overflow-auto bg-[#dbe3ec]', !cand.slidePreview && 'flex items-center justify-center')}>
         {cand.slidePreview ? (
           <div className="flex min-h-full min-w-full items-center justify-center p-3">
-            {/* §23/§24: the FULL authored slide stays visible; non-target content is dimmed/blurred,
-                the target keeps its TRUE authored position and stays sharp (§25). Review display only —
-                evidence bytes are never modified (§30). */}
+            {/* PROMPT-027R §18/§19: the FULL authored slide is shown unchanged (the bitmap is the render, not a
+                restyled copy). Overlays sit on top at their true authored positions. Evidence bytes are never
+                modified here (§30). */}
             <div className="relative shrink-0 overflow-hidden rounded-[2px] border border-line bg-white shadow-card"
               style={{ width: dispW, height: dispH }}>
               <img
+                data-testid="slide-preview-bitmap"
                 src={cand.slidePreview} alt="" draggable={false}
                 className="absolute inset-0 h-full w-full select-none"
-                style={{ filter: 'blur(2px) brightness(0.82) saturate(0.85)' }}
-              />
-              <img
-                src={cand.slidePreview} alt="" draggable={false}
-                className="absolute inset-0 h-full w-full select-none"
-                style={{ clipPath: `inset(${clipTop}% ${clipRight}% ${clipBottom}% ${clipLeft}%)` }}
               />
               {/* PROMPT-027 §16: SECONDARY — the picture currently being classified/labelled.  Thin dashed
                   box, drawn first so the Excel region stays visually dominant.  Purely a highlight. */}
@@ -553,8 +543,9 @@ function ImageReview() {
         </p>
         <p className="mt-0.5">
           Hai khung là HAI khái niệm khác nhau: khung nét đứt là một ảnh ứng viên, khung liền nét là vùng bằng
-          chứng Sau cải tiến của cả Mục (có thể gồm nhiều ảnh + chú thích) mà Excel sẽ nhận. Vùng làm nét là vị trí
-          thật trên slide gốc; phần còn lại chỉ được làm mờ để dễ quan sát và không ảnh hưởng dữ liệu xuất.
+          chứng Sau cải tiến của cả Mục (có thể gồm nhiều ảnh + chú thích) mà Excel sẽ nhận. Ảnh slide được hiển thị
+          nguyên bản như bản render (không làm mờ, không đổi độ sáng hay màu); khung chỉ là viền đánh dấu và không
+          thay đổi ảnh hay dữ liệu xuất Excel.
         </p>
       </div>
     </section>
@@ -596,6 +587,14 @@ function ImageReview() {
                 {typeof cand.evidenceRegionPictureCount === 'number' && cand.evidenceRegionPictureCount > 0 &&
                   ` · ${cand.evidenceRegionPictureCount} ảnh`}
               </KeyValue>
+              {Array.isArray(cand.evidenceRegionPictureIds) && cand.evidenceRegionPictureIds.length > 0 && (
+                <KeyValue label="Ảnh trong vùng">
+                  <span className="font-mono text-xxs" data-testid="evidence-picture-ids">
+                    {/* PROMPT-027R §24: display/debug only — the region itself is the Python DTO bbox */}
+                    {cand.evidenceRegionPictureIds.map((id) => `#${id}`).join(', ')}
+                  </span>
+                </KeyValue>
+              )}
               <KeyValue label="Toạ độ EMU">
                 <span className="font-mono text-xxs">
                   {cand.evidenceRegionBbox.x}, {cand.evidenceRegionBbox.y} ·

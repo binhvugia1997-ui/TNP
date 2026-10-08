@@ -232,6 +232,13 @@ export type ImageCandidate = {
   evidenceRegionItemIndex?: number
   evidenceRegionItemHeading?: string
   evidenceRegionPictureCount?: number
+  /** PROMPT-027R §24: shape ids of the pictures that form the production region — display/debug only; React never
+   *  derives any geometry from them. */
+  evidenceRegionPictureIds?: number[]
+  evidenceRegionId?: string
+  evidenceRegionBlockIndex?: number
+  evidenceRegionBoundarySource?: string
+  evidenceRegionNextHeadingTop?: number | null
   /** PROMPT-025: định danh mục cải tiến (một slide có thể có nhiều mục). */
   itemId?: string
   itemIndex?: number

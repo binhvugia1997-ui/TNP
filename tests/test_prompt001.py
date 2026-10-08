@@ -137,9 +137,9 @@ def _norm(s: str) -> str:
 
 # ------------------------------------------------------------------ versioning
 def test_single_canonical_version():
-    assert app.__version__ == "1.3.3" and app.BUILD_NUMBER == 16 and app.BUILD_ID == "016"
-    assert app.APP_TITLE == "Report Extractor v1.3.3" and app.BUILD_LABEL == "Build 016"
-    assert app.VERSION_LINE == "version=1.3.3 build=016"
+    assert app.__version__ == "1.3.4" and app.BUILD_NUMBER == 17 and app.BUILD_ID == "017"
+    assert app.APP_TITLE == "Report Extractor v1.3.4" and app.BUILD_LABEL == "Build 017"
+    assert app.VERSION_LINE == "version=1.3.4 build=017"
     src = Path(app.__file__).parent
     hits = [p for p in src.glob("*.py") if p.name != "__init__.py" and "1.0.2" in p.read_text(encoding="utf-8")]
     assert hits == [], f"version string duplicated in {hits}"

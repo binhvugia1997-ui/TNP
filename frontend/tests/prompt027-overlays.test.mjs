@@ -20,8 +20,8 @@ import { fileURLToPath } from 'node:url'
 const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
 const delay = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms))
 
-const APP_VERSION = '1.3.3'
-const APP_BUILD = '016'
+const APP_VERSION = '1.3.4'
+const APP_BUILD = '017'
 
 const SLIDE_W = 9144000
 const SLIDE_H = 5143500
@@ -359,7 +359,11 @@ test('a reduced-fidelity backend shows a non-blocking notice and PowerPoint does
         assert.match(harness.panel().textContent, notice, `${backend} must warn about reduced fidelity`)
         // non-blocking: the preview and BOTH overlays still render normally
         assert.ok(harness.overlay('overlay-evidence-region'), `${backend} must still render the region`)
-        assert.equal(harness.panel().querySelectorAll('img').length, 2)
+        // PROMPT-027R §18/§19: exactly ONE bitmap — the authored render, unfiltered — plus outline overlays only
+        assert.equal(harness.panel().querySelectorAll('img').length, 1, 'one unmodified slide bitmap')
+        const bitmap = harness.panel().querySelector('[data-testid="slide-preview-bitmap"]')
+        assert.ok(bitmap, 'the slide bitmap must render')
+        assert.doesNotMatch(bitmap.getAttribute('style') || '', /filter|clip|opacity|brightness|blur/i)
       } else {
         assert.doesNotMatch(harness.panel().textContent, notice, 'PowerPoint must not show a fallback warning')
       }
@@ -491,7 +495,7 @@ test('the header shows version AND build so a stale Windows checkout is obvious'
     const badge = harness.container.querySelector('[data-testid="app-version-badge"]')
     assert.ok(badge, 'the version badge must render')
     assert.equal(badge.textContent, `v${APP_VERSION} · Build ${APP_BUILD}`)
-    assert.match(badge.textContent, /v1\.3\.3 · Build 016/)
+    assert.match(badge.textContent, /v1\.3\.4 · Build 017/)
     // no duplicated version text in the product title next to it
     assert.equal(harness.container.querySelector('h1').textContent, 'Report Extractor')
   } finally {
@@ -512,7 +516,7 @@ test('the frontend package metadata agrees with the authoritative backend versio
   const pythonInit = await readFile(join(frontendRoot, '..', 'app', '__init__.py'), 'utf8')
   const version = pythonInit.match(/__version__\s*=\s*"([^"]+)"/)[1]
   const buildNumber = Number(pythonInit.match(/BUILD_NUMBER\s*=\s*(\d+)/)[1])
-  // This is the §51 regression guard: it FAILS if the two sides drift (backend 1.3.3 / frontend 1.3.2).
+  // This is the §51 regression guard: it FAILS if the two sides drift (backend 1.3.4 / frontend 1.3.2).
   assert.equal(pkg.version, version, 'frontend/package.json must match app/__init__.py __version__')
   assert.equal(APP_VERSION, version)
   assert.equal(APP_BUILD, String(buildNumber).padStart(3, '0'))
