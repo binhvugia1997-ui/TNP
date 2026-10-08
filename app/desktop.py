@@ -22,6 +22,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Run the local React + pywebview development application.")
     parser.add_argument("--debug", action="store_true", help="Enable pywebview developer tools and verbose logs.")
     args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     if not FRONTEND_INDEX.is_file():
         parser.error(f"React bundle not found: {FRONTEND_INDEX}. Run `cd frontend && npm run build` first.")
@@ -43,6 +44,12 @@ def main(argv=None) -> int:
         text_select=True,
     )
     bridge.bind_window(window)
+    LOG.info("WEBVIEW_BRIDGE bound")
+
+    def on_loaded(*_args):
+        LOG.info("WEBVIEW_BRIDGE ready")
+
+    window.events.loaded += on_loaded
 
     def on_closing(*_args):
         allowed, message = service.close_requested()

@@ -8,7 +8,17 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { BridgeCallError, callBridge, hasNativeBridge } from '../lib/bridge'
+import {
+  BridgeCallError,
+  BridgeMethodMissingError,
+  BridgeProtocolError,
+  BridgeUnavailableError,
+  callBridgeWithOptions,
+  isAbortError,
+  isBridgeConnectionError,
+  resetBridgeHandshake,
+} from '../lib/bridge'
+import { createBridgeSessionController, startAppBridge, type BridgeSessionController } from '../lib/startup'
 import {
   BUCKET_OF,
   type ContentCandidate,
@@ -145,6 +155,15 @@ function normalizeDashboard(raw: DashboardDTO): DashboardDTO {
   }
 }
 
+function safeErrorDetails(error: unknown): { code: string; message: string } {
+  if (error instanceof BridgeCallError || error instanceof BridgeUnavailableError
+    || error instanceof BridgeMethodMissingError || error instanceof BridgeProtocolError) {
+    return { code: error.code, message: error.message }
+  }
+  // Unclassified JavaScript exceptions can contain stack traces, local paths, or implementation details.
+  return { code: 'INTERNAL_ERROR', message: 'Thao tác không thành công. Hãy kiểm tra nhật ký ứng dụng.' }
+}
+
 function useStoreValue() {
   const [tabValue, setTabValue] = useState<TabKey>('reports')
   const [connected, setConnected] = useState(false)
@@ -196,19 +215,32 @@ function useStoreValue() {
   const dashboardInFlight = useRef(false)
   const learningInFlight = useRef(false)
   const lastLearningRefresh = useRef(0)
+  const bridgeReadyRef = useRef(false)
+  const bridgeLifetimeRef = useRef<AbortController | null>(null)
+  const bridgeSessionRef = useRef<BridgeSessionController | null>(null)
   const tabRef = useRef<TabKey>(tabValue)
   const detailStatus = useRef<Record<string, string>>({})
   const ollamaDirty = useRef(false)
   const updateDirty = useRef(false)
   const alive = useRef(true)
-  const recordError = useCallback((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error)
-    const code = error instanceof BridgeCallError ? error.code
-      : message.includes('Python bridge is not connected') ? 'BRIDGE_UNAVAILABLE' : 'INTERNAL_ERROR'
-    setErrorCode(code)
-    setErrorMessage(message)
+  const publishError = useCallback((error: unknown) => {
+    if (!alive.current || isAbortError(error)) return
+    const details = safeErrorDetails(error)
+    setErrorCode((current) => current === details.code ? current : details.code)
+    setErrorMessage((current) => current === details.message ? current : details.message)
   }, [])
+  const recordError = useCallback((error: unknown) => {
+    if (isAbortError(error)) return
+    if (isBridgeConnectionError(error) && bridgeSessionRef.current) {
+      bridgeSessionRef.current.invalidate(error)
+      return
+    }
+    publishError(error)
+  }, [publishError])
   const clearError = useCallback(() => { setErrorCode(''); setErrorMessage('') }, [])
+
+  const callNative = useCallback(<T,>(method: string, ...args: unknown[]) =>
+    callBridgeWithOptions<T>(method, args, { signal: bridgeLifetimeRef.current?.signal }), [])
 
   const configDto = useCallback((): NativeConfig => ({
     paths: { reportFolder: folder, template, output },
@@ -240,7 +272,6 @@ function useStoreValue() {
   const acceptDashboard = useCallback((raw: DashboardDTO) => {
     if (!alive.current) return
     const data = normalizeDashboard(raw)
-    setConnected(true)
     setAppInfo({ name: data.app.name, title: data.app.title, version: data.app.version, build: data.app.build })
     setReports(data.reports)
     setScanned(Boolean(data.scan.scanned))
@@ -267,8 +298,11 @@ function useStoreValue() {
     setDiagRunning(Boolean(data.diagnostics.running))
     const freshLogs = (data.logs || []).filter((entry) => (entry.id || 0) > clearLogThroughRef.current).slice(-500)
     setLog(freshLogs)
-    setErrorMessage((current) => current.includes('Python bridge is not connected') ? '' : current)
-    setErrorCode((current) => current === 'BRIDGE_UNAVAILABLE' ? '' : current)
+    if (bridgeReadyRef.current) {
+      setErrorMessage((current) => current.startsWith('Chưa kết nối ứng dụng Python.')
+        || current.startsWith('Hợp đồng bridge Python') || current.startsWith('Python bridge trả về phản hồi') ? '' : current)
+      setErrorCode((current) => ['BRIDGE_UNAVAILABLE', 'BRIDGE_METHOD_MISSING', 'BRIDGE_CONTRACT_ERROR'].includes(current) ? '' : current)
+    }
     if (data.reports.length === 0) {
       setActiveIdValue('')
       setSelectedIds([])
@@ -278,28 +312,28 @@ function useStoreValue() {
     if (data.job.error) { setErrorCode('WORKER_FAILED'); setErrorMessage(data.job.error) }
   }, [])
 
-  const refreshDashboard = useCallback(async () => {
+  const loadDashboard = useCallback(async (signal?: AbortSignal) => {
     if (dashboardInFlight.current) return
     dashboardInFlight.current = true
     try {
-      const raw = await callBridge<DashboardDTO>('get_dashboard_state')
+      const raw = await callBridgeWithOptions<DashboardDTO>('get_dashboard_state', [], {
+        signal: signal ?? bridgeLifetimeRef.current?.signal,
+      })
       acceptDashboard(raw)
-    } catch (error) {
-      if (alive.current) {
-        setConnected(false)
-        recordError(error)
-      }
     } finally {
       dashboardInFlight.current = false
     }
-  }, [acceptDashboard, recordError])
+  }, [acceptDashboard])
+  const refreshDashboard = useCallback(() => loadDashboard(), [loadDashboard])
 
-  const refreshLearning = useCallback(async () => {
-    if (learningInFlight.current || !hasNativeBridge()) return
+  const refreshLearning = useCallback(async (signal?: AbortSignal) => {
+    if (learningInFlight.current || !bridgeReadyRef.current) return
     learningInFlight.current = true
     lastLearningRefresh.current = Date.now()
     try {
-      const raw = await callBridge<LearningState & { training?: boolean }>('get_learning_state')
+      const raw = await callBridgeWithOptions<LearningState & { training?: boolean }>('get_learning_state', [], {
+        signal: signal ?? bridgeLifetimeRef.current?.signal,
+      })
       if (!alive.current) return
       setLearningState({ ...EMPTY_LEARNING, ...raw })
       setTraining(Boolean(raw.training))
@@ -310,43 +344,56 @@ function useStoreValue() {
     }
   }, [recordError])
 
+  const markBridgeDisconnected = useCallback((error: unknown) => {
+    bridgeReadyRef.current = false
+    resetBridgeHandshake()
+    setConnected(false)
+    publishError(error)
+  }, [publishError])
+
   useEffect(() => {
     alive.current = true
-    let cancelled = false
-    const initialize = async () => {
-      try {
-        const [version, config] = await Promise.all([
-          callBridge<typeof appInfo>('get_app_version'),
-          callBridge<NativeConfig>('get_current_config'),
-        ])
-        if (cancelled) return
-        setConnected(true)
-        setAppInfo({ name: version.name, title: version.title, version: version.version, build: version.build })
-        applyConfig(config)
-        await refreshDashboard()
-      } catch (error) {
-        if (cancelled) return
-        setConnected(false)
-        recordError(error)
-      }
-    }
-    void initialize()
-    const timer = window.setInterval(() => {
-      void refreshDashboard()
-      if (tabRef.current === 'learning' && Date.now() - lastLearningRefresh.current > 1400) void refreshLearning()
-    }, 750)
+    const lifetime = new AbortController()
+    bridgeLifetimeRef.current = lifetime
     const onDeferredClose = (event: Event) => {
       const detail = (event as CustomEvent<string>).detail
       if (detail) { setErrorCode('BUSY'); setErrorMessage(detail) }
     }
     window.addEventListener('tnp-close-requested', onDeferredClose)
+
+    const session = createBridgeSessionController({
+      connect: (signal) => startAppBridge<typeof appInfo, NativeConfig, DashboardDTO>(signal),
+      poll: async (signal) => {
+        const tasks: Promise<void>[] = [loadDashboard(signal)]
+        if (tabRef.current === 'learning' && Date.now() - lastLearningRefresh.current > 1400) {
+          tasks.push(refreshLearning(signal))
+        }
+        await Promise.all(tasks)
+      },
+      onConnected: ({ version, config, dashboard }) => {
+        bridgeReadyRef.current = true
+        setAppInfo({ name: version.name, title: version.title, version: version.version, build: version.build })
+        applyConfig(config)
+        acceptDashboard(dashboard)
+        setConnected(true)
+      },
+      onDisconnected: markBridgeDisconnected,
+      onPollError: recordError,
+    })
+    bridgeSessionRef.current = session
+    session.start()
+
     return () => {
-      cancelled = true
       alive.current = false
-      window.clearInterval(timer)
+      bridgeReadyRef.current = false
+      lifetime.abort()
+      session.stop()
+      resetBridgeHandshake()
+      if (bridgeSessionRef.current === session) bridgeSessionRef.current = null
+      if (bridgeLifetimeRef.current === lifetime) bridgeLifetimeRef.current = null
       window.removeEventListener('tnp-close-requested', onDeferredClose)
     }
-  }, [applyConfig, recordError, refreshDashboard, refreshLearning])
+  }, [acceptDashboard, applyConfig, loadDashboard, markBridgeDisconnected, recordError, refreshLearning])
 
   const setTab = useCallback((value: TabKey) => {
     tabRef.current = value
@@ -359,7 +406,7 @@ function useStoreValue() {
 
   const fetchReportDetails = useCallback(async (report: Report) => {
     try {
-      const details = await callBridge<{
+      const details = await callNative<{
         causes: string[]; countermeasures: string[]; afterImages: Report['results']['afterImages'];
         qpn?: Report['results']['qpn']; slides: number; excelRow?: number; defectText?: string;
         temporaryRemoved?: boolean; warning?: string; occurrenceDate?: string; vendor?: string;
@@ -461,7 +508,7 @@ function useStoreValue() {
     clearError()
     setScanMessage('Đang quét danh sách bằng bộ quét Python…')
     try {
-      const raw = await callBridge<DashboardDTO>('scan_reports', configDto(), inputFileToken)
+      const raw = await callNative<DashboardDTO>('scan_reports', configDto(), inputFileToken)
       detailStatus.current = {}
       ollamaDirty.current = false
       updateDirty.current = false
@@ -479,7 +526,7 @@ function useStoreValue() {
   const chooseReportFolder = useCallback(async () => {
     clearError()
     try {
-      const result = await callBridge<{ cancelled: boolean; path?: string }>('choose_report_folder')
+      const result = await callNative<{ cancelled: boolean; path?: string }>('choose_report_folder')
       if (!result.cancelled && result.path) setFolder(result.path)
     } catch (error) { recordError(error) }
   }, [clearError, recordError, setFolder])
@@ -487,7 +534,7 @@ function useStoreValue() {
   const choosePptxFile = useCallback(async () => {
     clearError()
     try {
-      const result = await callBridge<{ cancelled: boolean; token?: string; name?: string; folder?: string }>('choose_pptx_file')
+      const result = await callNative<{ cancelled: boolean; token?: string; name?: string; folder?: string }>('choose_pptx_file')
       if (!result.cancelled && result.token) {
         setInputFileToken(result.token)
         setInputFileName(result.name || '')
@@ -500,7 +547,7 @@ function useStoreValue() {
   const chooseTemplateFile = useCallback(async () => {
     clearError()
     try {
-      const result = await callBridge<{ cancelled: boolean; path?: string }>('choose_template_file')
+      const result = await callNative<{ cancelled: boolean; path?: string }>('choose_template_file')
       if (!result.cancelled && result.path) setTemplate(result.path)
     } catch (error) { recordError(error) }
   }, [clearError, recordError, setTemplate])
@@ -508,7 +555,7 @@ function useStoreValue() {
   const chooseOutputFile = useCallback(async () => {
     clearError()
     try {
-      const result = await callBridge<{ cancelled: boolean; path?: string }>('choose_output_file')
+      const result = await callNative<{ cancelled: boolean; path?: string }>('choose_output_file')
       if (!result.cancelled && result.path) setOutput(result.path)
     } catch (error) { recordError(error) }
   }, [clearError, recordError, setOutput])
@@ -516,7 +563,7 @@ function useStoreValue() {
   const chooseUpdateFolder = useCallback(async () => {
     clearError()
     try {
-      const result = await callBridge<{ cancelled: boolean; path?: string }>('choose_update_folder')
+      const result = await callNative<{ cancelled: boolean; path?: string }>('choose_update_folder')
       if (!result.cancelled && result.path) {
         updateDirty.current = true
         setUpdateState((prev) => ({ ...prev, path: result.path || '' }))
@@ -527,7 +574,7 @@ function useStoreValue() {
   const changeSelected = useCallback(async (restore: boolean) => {
     const ids = selectedIds.length ? selectedIds : activeId ? [activeId] : []
     if (!ids.length) return
-    await runOperation(() => callBridge(restore ? 'restore_reports' : 'exclude_reports', ids))
+    await runOperation(() => callNative(restore ? 'restore_reports' : 'exclude_reports', ids))
     setSelectedIds([])
   }, [activeId, runOperation, selectedIds])
   const excludeSelected = useCallback(() => changeSelected(false), [changeSelected])
@@ -545,67 +592,67 @@ function useStoreValue() {
       return
     }
     await runOperation(async () => {
-      await callBridge('start_processing', configDto(), true)
+      await callNative('start_processing', configDto(), true)
       ollamaDirty.current = false
       updateDirty.current = false
     })
   }, [configDto, runOperation, running, scanDirty, scanned])
 
-  const stopAfterCurrent = useCallback(() => runOperation(() => callBridge('stop_after_current')), [runOperation])
+  const stopAfterCurrent = useCallback(() => runOperation(() => callNative('stop_after_current')), [runOperation])
   /** PROMPT-024R: "Dừng tất cả" — hủy hợp tác tại điểm an toàn gần nhất (không giết tiến trình). */
-  const cancelAll = useCallback(() => runOperation(() => callBridge('cancel_all')), [runOperation])
+  const cancelAll = useCallback(() => runOperation(() => callNative('cancel_all')), [runOperation])
   const resetRun = clearError
 
   const saveConfiguration = useCallback(() => runOperation(async () => {
-    await callBridge('save_configuration', configDto())
+    await callNative('save_configuration', configDto())
     ollamaDirty.current = false
     updateDirty.current = false
   }), [configDto, runOperation])
   const checkConnection = useCallback(() => runOperation(async () => {
-    await callBridge('check_ollama_connection', configDto())
+    await callNative('check_ollama_connection', configDto())
     ollamaDirty.current = false
     updateDirty.current = false
   }), [configDto, runOperation])
   const refreshModels = useCallback(() => runOperation(async () => {
-    await callBridge('refresh_ollama_models', configDto())
+    await callNative('refresh_ollama_models', configDto())
     ollamaDirty.current = false
     updateDirty.current = false
   }), [configDto, runOperation])
   const saveOllamaConfig = saveConfiguration
-  const startDiscovery = useCallback(() => runOperation(() => callBridge('start_ollama_discovery')), [runOperation])
-  const stopDiscovery = useCallback(() => runOperation(() => callBridge('stop_ollama_discovery')), [runOperation])
+  const startDiscovery = useCallback(() => runOperation(() => callNative('start_ollama_discovery')), [runOperation])
+  const stopDiscovery = useCallback(() => runOperation(() => callNative('stop_ollama_discovery')), [runOperation])
   const useServer = useCallback((host: string, port: number) => runOperation(async () => {
-    await callBridge('use_discovered_server', host, port)
+    await callNative('use_discovered_server', host, port)
     ollamaDirty.current = false
     setAppliedServer(`${host}:${port}`)
   }), [runOperation])
 
   const checkUpdate = useCallback((_startup = false) => runOperation(async () => {
-    await callBridge('check_update', configDto())
+    await callNative('check_update', configDto())
     updateDirty.current = false
     ollamaDirty.current = false
   }), [configDto, runOperation])
   const installUpdate = useCallback(() => runOperation(async () => {
-    const result = await callBridge<{ status: string; message: string }>('install_update')
+    const result = await callNative<{ status: string; message: string }>('install_update')
     setUpdateState((current) => ({ ...current, status: 'error', message: result.message }))
   }), [runOperation])
 
-  const runDiagnostics = useCallback(() => runOperation(() => callBridge('run_diagnostics')), [runOperation])
+  const runDiagnostics = useCallback(() => runOperation(() => callNative('run_diagnostics')), [runOperation])
   const clearLogView = useCallback(() => {
     const through = log.reduce((latest, entry) => Math.max(latest, entry.id || 0), clearLogThroughRef.current)
     clearLogThroughRef.current = through
     setLog([])
   }, [log])
-  const openOutputFile = useCallback(() => runOperation(() => callBridge('open_output_file')), [runOperation])
-  const openOutputFolder = useCallback(() => runOperation(() => callBridge('open_output_folder')), [runOperation])
-  const openLogFile = useCallback(() => runOperation(() => callBridge('open_log_file')), [runOperation])
-  const openLogFolder = useCallback(() => runOperation(() => callBridge('open_log_folder')), [runOperation])
-  const openLearningFolder = useCallback(() => runOperation(() => callBridge('open_learning_folder')), [runOperation])
+  const openOutputFile = useCallback(() => runOperation(() => callNative('open_output_file')), [runOperation])
+  const openOutputFolder = useCallback(() => runOperation(() => callNative('open_output_folder')), [runOperation])
+  const openLogFile = useCallback(() => runOperation(() => callNative('open_log_file')), [runOperation])
+  const openLogFolder = useCallback(() => runOperation(() => callNative('open_log_folder')), [runOperation])
+  const openLearningFolder = useCallback(() => runOperation(() => callNative('open_learning_folder')), [runOperation])
 
   const setActiveManualFields = useCallback(async (id: string, fields: { vendor?: string; occurrence_date?: string }) => {
     clearError()
     try {
-      const result = await callBridge<{ status: string; message: string; state: DashboardDTO }>('save_manual_fields', id, fields)
+      const result = await callNative<{ status: string; message: string; state: DashboardDTO }>('save_manual_fields', id, fields)
       if (result.state) acceptDashboard(result.state)
       setErrorCode(result.status === 'locked' ? 'EXCEL_LOCKED' : result.status === 'error' ? 'MANUAL_FIELDS_FAILED' : '')
       setErrorMessage(result.message)
@@ -615,7 +662,7 @@ function useStoreValue() {
   const retryManualFields = useCallback(async (id: string) => {
     clearError()
     try {
-      const result = await callBridge<{ status: string; message: string; state: DashboardDTO }>('retry_manual_fields', id)
+      const result = await callNative<{ status: string; message: string; state: DashboardDTO }>('retry_manual_fields', id)
       if (result.state) acceptDashboard(result.state)
       setErrorCode(result.status === 'locked' ? 'EXCEL_LOCKED' : result.status === 'error' ? 'MANUAL_FIELDS_FAILED' : '')
       setErrorMessage(result.message)
@@ -626,14 +673,14 @@ function useStoreValue() {
   const labelImage = useCallback(async (id: string, label: string) => {
     const candidate = learningState.images.find((item) => item.id === id)
     try {
-      const next = await callBridge<LearningState>('set_learning_label', 'image', id, label, candidate?.note || '')
+      const next = await callNative<LearningState>('set_learning_label', 'image', id, label, candidate?.note || '')
       setLearningState(next)
     } catch (error) { recordError(error) }
   }, [learningState.images, recordError])
   const labelContent = useCallback(async (id: string, label: string) => {
     const candidate = learningState.contents.find((item) => item.id === id)
     try {
-      const next = await callBridge<LearningState>('set_learning_label', 'content', id, label, candidate?.note || '')
+      const next = await callNative<LearningState>('set_learning_label', 'content', id, label, candidate?.note || '')
       setLearningState(next)
     } catch (error) { recordError(error) }
   }, [learningState.contents, recordError])
@@ -647,7 +694,7 @@ function useStoreValue() {
       ? Object.fromEntries(learningState.images.map((candidate) => [candidate.id, candidate.note]))
       : Object.fromEntries(learningState.contents.map((candidate) => [candidate.id, candidate.note]))
     try {
-      const result = await callBridge<{ message: string; state: LearningState }>('save_learning_labels', kind, notes)
+      const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, notes)
       setLearningState({ ...EMPTY_LEARNING, ...result.state })
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
@@ -658,8 +705,8 @@ function useStoreValue() {
   const saveContentLabels = useCallback(() => saveLearningLabels('content'), [saveLearningLabels])
   const saveLearningCandidate = useCallback(async (kind: 'image' | 'content', id: string, label: string, note: string) => {
     try {
-      await callBridge<LearningState>('set_learning_label', kind, id, label, note)
-      const result = await callBridge<{ message: string; state: LearningState }>('save_learning_labels', kind, { [id]: note })
+      await callNative<LearningState>('set_learning_label', kind, id, label, note)
+      const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, { [id]: note })
       setLearningState({ ...EMPTY_LEARNING, ...result.state })
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
@@ -671,7 +718,7 @@ function useStoreValue() {
     saveLearningCandidate('content', id, label, note), [saveLearningCandidate])
   const trainModels = useCallback(async () => {
     try {
-      const result = await callBridge<LearningState & { training?: boolean }>('train_models')
+      const result = await callNative<LearningState & { training?: boolean }>('train_models')
       setLearningState({ ...EMPTY_LEARNING, ...result })
       setTraining(Boolean(result.training))
     } catch (error) { recordError(error) }
@@ -679,13 +726,13 @@ function useStoreValue() {
   const exportLearningData = useCallback(async () => {
     clearError()
     try {
-      const result = await callBridge<{ cancelled?: boolean; message?: string }>('export_learning_data')
+      const result = await callNative<{ cancelled?: boolean; message?: string }>('export_learning_data')
       if (result.message) setErrorMessage(result.message)
     } catch (error) { recordError(error) }
   }, [clearError, recordError])
   const applyLabelsToExcel = useCallback(async (_retry = false) => {
     try {
-      const result = await callBridge<{ message: string; state: LearningState }>('retry_learning_excel')
+      const result = await callNative<{ message: string; state: LearningState }>('retry_learning_excel')
       setLearningState({ ...EMPTY_LEARNING, ...result.state })
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
@@ -693,7 +740,7 @@ function useStoreValue() {
   }, [recordError])
   const dismissExcelResult = useCallback(async () => {
     try {
-      const next = await callBridge<LearningState>('dismiss_learning_excel_notice')
+      const next = await callNative<LearningState>('dismiss_learning_excel_notice')
       setLearningState({ ...EMPTY_LEARNING, ...next })
     } catch (error) { recordError(error) }
   }, [recordError])
