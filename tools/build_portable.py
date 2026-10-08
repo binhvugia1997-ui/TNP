@@ -2,15 +2,19 @@
 
 Steps (fail fast, clear Vietnamese message on error):
   1. Python version check (same tuples as setup.bat / app.diagnostics – never weakened for the build)
-  2. build virtualenv .venv-build (or reuse) with requirements-build.txt
+  2. build virtualenv .venv-build (or reuse) with requirements-build.txt (which now also installs
+     requirements-webview.txt – pywebview + pythonnet, i.e. the WebView2 runtime the exe launches)
   3. pyflakes + pytest (can be skipped with --skip-tests, never skipped by default)
-  4. clean build/ and dist/<name>/
-  5. PyInstaller ReportExtractor.spec (onedir, windowed, no UPX)
-  6. assemble portable folder: Output/, logs/, config/, README.txt, FIRST_RUN.txt, VERSION.txt,
+  4. build the React frontend (`cd frontend && npm run build`) – the exe serves frontend/dist (§2/§3)
+  5. clean build/ and dist/<name>/
+  6. PyInstaller ReportExtractor.spec (onedir, windowed, no UPX; bundles frontend/dist + webview)
+  7. assemble portable folder: Output/, logs/, config/, frontend/dist (documented Portable layout,
+     byte-identical to the copy inside _internal), README.txt, FIRST_RUN.txt, VERSION.txt,
      Install_Ollama_Optional.bat
-  7. validate artifact (no tests/.venv/.git/sample data/dev config inside; exe present)
-  8. ZIP + SHA256SUMS.txt → release/
-  9. publish to the LAN update folder (tools/publish_update.py) – ONLY after every step above succeeded;
+  8. validate artifact (no tests/.venv/.git/sample data/dev config inside; exe present; React bundle and
+     the pywebview JS bridge / WebView2 interop assemblies present)
+  9. ZIP + SHA256SUMS.txt → release/
+ 10. publish to the LAN update folder (tools/publish_update.py) – ONLY after every step above succeeded;
      ZIP first (verified), version.json LAST, obsolete ReportExtractor_*.zip removed afterwards (--no-publish to skip)
 The script never bundles Ollama or any model and never writes a developer config into the artifact.
 """
@@ -134,6 +138,61 @@ def get_git_revision(root: Path = ROOT, timeout: float = 10.0) -> str:
     return rev if rev else GIT_UNAVAILABLE
 
 
+FRONTEND_DIR = ROOT / "frontend"
+FRONTEND_DIST = FRONTEND_DIR / "dist"
+
+
+def find_npm() -> str | None:
+    """Absolute npm/npm.cmd of the BUILD machine (the Portable target never needs Node – §8)."""
+    for candidate in (("npm.cmd", "npm.bat", "npm") if os.name == "nt" else ("npm",)):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def build_frontend(skip: bool) -> None:
+    """Produce `frontend/dist` with the SAME command a developer runs (§2).
+
+    A stale or missing bundle is the single most common cause of a Portable exe that opens a blank window,
+    so the build stops here rather than packaging whatever happens to be on disk.
+    """
+    npm = find_npm()
+    if skip:
+        if not (FRONTEND_DIST / "index.html").is_file():
+            fail("--skip-frontend được dùng nhưng thiếu frontend/dist/index.html. "
+                 "Chạy: cd frontend && npm run build")
+        print("   (bỏ qua build frontend theo --skip-frontend) dùng frontend/dist sẵn có")
+        return
+    if npm is None:
+        fail("không tìm thấy npm trên máy BUILD (máy đích không cần Node, nhưng máy build thì cần). "
+             "Cài Node.js LTS rồi chạy lại, hoặc dùng --skip-frontend nếu frontend/dist đã build sẵn.")
+    print(f"   npm: {npm}")
+    if not (FRONTEND_DIR / "node_modules").is_dir():
+        run([npm, "install", "--no-audit", "--no-fund"], cwd=FRONTEND_DIR)
+    run([npm, "run", "build"], cwd=FRONTEND_DIR)
+    if not (FRONTEND_DIST / "index.html").is_file():
+        fail("npm run build không tạo ra frontend/dist/index.html")
+    assets = FRONTEND_DIST / "assets"
+    if not assets.is_dir() or not any(assets.glob("*.js")):
+        fail("frontend/dist/assets thiếu file .js – bản build React không hợp lệ")
+    print(f"   frontend/dist OK (index.html + {len(list(assets.glob('*')))} file trong assets/)")
+
+
+def copy_frontend_into_portable(folder: Path) -> None:
+    """Place the React bundle at the documented Portable layout: `<folder>/frontend/dist` (§14).
+
+    `_internal/frontend/dist` is already inside the onedir package (ReportExtractor.spec `datas`);
+    `app.desktop.frontend_dist_dir()` accepts either location.  Both copies come from the same build, and
+    `validate_artifact` proves they are byte-identical so a tester can never edit a stale duplicate.
+    """
+    target = folder / "frontend" / "dist"
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(FRONTEND_DIST, target)
+    print(f"   frontend/dist → {target.relative_to(folder)}")
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -180,6 +239,75 @@ def is_allowed_dependency_resource(rel: Path | str) -> bool:
     return parts in ALLOWED_DEPENDENCY_RESOURCES
 
 
+#: Files that MUST exist inside the package for the React UI and the JS↔Python bridge to work (§3/§17/§18).
+#: Checked relative to the portable folder; ``_internal`` is the PyInstaller onedir resource root.
+REQUIRED_FRONTEND_FILES = (
+    "_internal/frontend/dist/index.html",      # bundled by ReportExtractor.spec `datas`
+    "frontend/dist/index.html",                # documented Portable layout, next to _internal (§14)
+)
+#: pywebview data files.  Without webview/js/* the window opens but window.pywebview.api never appears, so
+#: the bridge silently dies; without the WebView2 assemblies the EdgeChromium backend cannot start (§6/§18).
+REQUIRED_WEBVIEW_FILES = (
+    "_internal/webview/js/api.js",
+    "_internal/webview/js/lib/dom_json.js",
+    "_internal/webview/js/state.js",
+)
+REQUIRED_WEBVIEW_WINDOWS_FILES = (
+    "_internal/webview/lib/Microsoft.Web.WebView2.Core.dll",
+    "_internal/webview/lib/Microsoft.Web.WebView2.WinForms.dll",
+    "_internal/webview/lib/runtimes/win-x64/native/WebView2Loader.dll",
+)
+
+
+def _same_tree(left: Path, right: Path) -> bool:
+    """True when two directories hold byte-identical files under identical relative paths."""
+    if not left.is_dir() or not right.is_dir():
+        return False
+    rel_left = sorted(p.relative_to(left) for p in left.rglob("*") if p.is_file())
+    rel_right = sorted(p.relative_to(right) for p in right.rglob("*") if p.is_file())
+    if rel_left != rel_right:
+        return False
+    return all((left / rel).read_bytes() == (right / rel).read_bytes() for rel in rel_left)
+
+
+def validate_frontend(folder: Path) -> list[str]:
+    """The packaged React UI + pywebview runtime, verified instead of assumed (§16/§17/§18)."""
+    problems: list[str] = []
+    for rel in REQUIRED_FRONTEND_FILES:
+        if not (folder / Path(rel)).is_file():
+            problems.append(f"thiếu UI React trong gói: {rel}")
+    bundled, portable = folder / "_internal" / "frontend" / "dist", folder / "frontend" / "dist"
+    if bundled.is_dir() and portable.is_dir() and not _same_tree(bundled, portable):
+        problems.append("frontend/dist trong _internal và ngoài portable root KHÁC nhau "
+                        "(hai bản copy phải giống hệt từng byte)")
+    assets = portable / "assets"
+    if not assets.is_dir():
+        problems.append("thiếu frontend/dist/assets (React bundle không đầy đủ)")
+    else:
+        if not any(assets.glob("*.js")):
+            problems.append("frontend/dist/assets không có file .js nào")
+        if not any(assets.glob("*.css")):
+            problems.append("frontend/dist/assets không có file .css nào")
+    index = portable / "index.html"
+    if index.is_file():
+        html = index.read_text(encoding="utf-8", errors="replace")
+        # Vite emits root-relative asset URLs; pywebview serves the dist folder over loopback HTTP, so
+        # these must resolve.  A source-tree or repository path here would mean a broken package (§16).
+        if "/assets/" not in html:
+            problems.append("frontend/dist/index.html không tham chiếu /assets/ – bundle React sai")
+        for leak in ("frontend/src", "node_modules", str(ROOT)):
+            if leak in html:
+                problems.append(f"frontend/dist/index.html còn tham chiếu đường dẫn máy dev: {leak}")
+    for rel in REQUIRED_WEBVIEW_FILES:
+        if not (folder / Path(rel)).is_file():
+            problems.append(f"thiếu pywebview JS bridge trong gói: {rel}")
+    if platform.system() == "Windows":
+        for rel in REQUIRED_WEBVIEW_WINDOWS_FILES:
+            if not (folder / Path(rel)).is_file():
+                problems.append(f"thiếu WebView2 interop assembly trong gói: {rel}")
+    return problems
+
+
 def validate_artifact(folder: Path, exe_name: str = "ReportExtractor.exe") -> list[str]:
     problems: list[str] = []
     if not (folder / exe_name).exists() and not (folder / "ReportExtractor").exists():
@@ -217,6 +345,8 @@ def main() -> int:
     ap.add_argument("--skip-tests", action="store_true", help="không chạy pytest (chỉ dùng khi đã chạy riêng)")
     ap.add_argument("--no-venv", action="store_true", help="dùng interpreter hiện tại thay vì .venv-build")
     ap.add_argument("--allow-non-windows", action="store_true", help="cho phép chạy trên Linux/macOS (chỉ thử nghiệm)")
+    ap.add_argument("--skip-frontend", action="store_true",
+                    help="không chạy `npm run build`, dùng frontend/dist đã có sẵn")
     ap.add_argument("--no-publish", action="store_true", help="không tự động xuất bản vào thư mục cập nhật LAN")
     ap.add_argument("--publish-dir", default=None,
                     help=f"thư mục cập nhật cục bộ (mặc định {publish_update.update_folder()})")
@@ -256,33 +386,37 @@ def main() -> int:
     else:
         run([py, "-m", "pytest", "-q"])
 
-    step(5, "Dọn build/ và dist/")
+    step(5, "Build frontend React (npm run build) – UI của ReportExtractor.exe")
+    build_frontend(args.skip_frontend)
+
+    step(6, "Dọn build/ và dist/")
     for d in (ROOT / "build", ROOT / "dist" / name):
         if d.exists():
             shutil.rmtree(d)
 
-    step(6, "PyInstaller (onedir, windowed, no UPX)")
+    step(7, "PyInstaller (onedir, windowed, no UPX, bundle frontend/dist + pywebview/WebView2)")
     run([py, "-m", "PyInstaller", "--noconfirm", "--clean", str(ROOT / "ReportExtractor.spec")])
     folder = ROOT / "dist" / name
     if not folder.exists():
         fail(f"PyInstaller không tạo {folder}")
 
-    step(7, "Tạo thư mục Output/, logs/, config/")
+    step(8, "Tạo thư mục Output/, logs/, config/ và frontend/dist (layout Portable)")
     for sub in ("Output", "logs", "config"):
         (folder / sub).mkdir(exist_ok=True)
         (folder / sub / ".keep").write_text("", encoding="utf-8")
+    copy_frontend_into_portable(folder)
 
-    step(8, "Tài liệu README.txt / FIRST_RUN.txt / VERSION.txt / Install_Ollama_Optional.bat")
+    step(9, "Tài liệu README.txt / FIRST_RUN.txt / VERSION.txt / Install_Ollama_Optional.bat")
     git_rev = write_release_metadata(folder, version, build_id, name)
     print(f"  Git revision: {git_rev}")
 
-    step(9, "Kiểm tra gói (không chứa file dev, không config máy dev, không Ollama/model)")
-    problems = validate_artifact(folder)
+    step(10, "Kiểm tra gói (không chứa file dev, không config máy dev, không Ollama/model)")
+    problems = validate_artifact(folder) + validate_frontend(folder)
     if problems:
         fail("gói không hợp lệ:\n   - " + "\n   - ".join(problems))
     print("   OK")
 
-    step(10, "Nén ZIP, SHA256SUMS.txt và version.json (gói cập nhật offline)")
+    step(11, "Nén ZIP, SHA256SUMS.txt và version.json (gói cập nhật offline)")
     release = ROOT / "release"
     release.mkdir(exist_ok=True)
     zip_path = release / package_name(version)
@@ -303,7 +437,7 @@ def main() -> int:
     manifest = write_version_manifest(release, version, build_number(), zip_path)
     print(f"   version.json: {manifest.read_text(encoding='utf-8').strip()}")
 
-    step(11, "Hoàn tất build")
+    step(12, "Hoàn tất build")
     print(f"   Thư mục portable: {folder}\n   ZIP: {zip_path}\n   SHA256SUMS: {release / 'SHA256SUMS.txt'}\n"
           f"   version.json: {manifest}")
 
@@ -311,7 +445,7 @@ def main() -> int:
         print(f"   (bỏ qua xuất bản theo --no-publish) Phát hành thủ công: copy {zip_path.name} vào thư mục Update "
               f"TRƯỚC, sau đó copy version.json SAU CÙNG.")
         return 0
-    step(12, "Xuất bản vào thư mục cập nhật LAN (ZIP trước – version.json SAU CÙNG)")
+    step(13, "Xuất bản vào thư mục cập nhật LAN (ZIP trước – version.json SAU CÙNG)")
     return publish_step(release, args.publish_dir)
 
 

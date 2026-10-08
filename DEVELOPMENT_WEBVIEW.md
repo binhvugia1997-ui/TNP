@@ -71,8 +71,36 @@ Pop-Location
 git diff --check
 ```
 
-Do **not** run `BUILD_AND_PUBLISH.bat`, build Portable/EXE, publish an update/release ZIP, or edit production
-`version.json` for development acceptance.
+Do **not** run `BUILD_AND_PUBLISH.bat`, publish an update/release ZIP, or edit production `version.json` for
+development acceptance.
+
+## Windows Portable acceptance build (no publishing)
+
+`ReportExtractor.exe` launches the same React application as `python -m app.desktop`:
+`run.py` → `app.main.main()` → `launch_ui()` → `app.desktop.main()` (pywebview + EdgeChromium/WebView2).
+Build an acceptance package **without** publishing anything:
+
+```powershell
+cd frontend
+npm.cmd install ; npm.cmd run build      # the exe serves frontend/dist; a stale bundle = a blank window
+cd ..
+build_portable.bat --no-publish
+```
+
+`tools/build_portable.py` rebuilds the frontend itself (step 5), runs pyflakes + pytest, packages with
+`ReportExtractor.spec`, copies `frontend/dist` next to `_internal`, writes `README.txt` / `FIRST_RUN.txt` /
+`VERSION.txt`, then **validates** the artifact: the React bundle in both locations (byte-identical),
+root-relative `/assets/` URLs with no developer path, `webview/js/*` (the JS↔Python bridge) and the WebView2
+interop assemblies. `--no-publish` stops before the LAN update folder; the ZIP and `SHA256SUMS.txt` stay in
+`release/`. Use `--skip-frontend` only when `frontend/dist` was just built.
+
+PyInstaller cannot cross-compile, so this must run on Windows. The target machine needs neither Python,
+Node.js, npm, Git nor the source checkout; it does need the Microsoft Edge WebView2 Runtime. PowerPoint stays
+**optional** — without it the renderer chain falls back to LibreOffice and then the built-in renderer, and the
+UI reports which backend produced the preview.
+
+Confirm the running build in the header (`vX.Y.Z · Build NNN`), in Settings → *Phiên bản hiện tại*, and in
+`VERSION.txt` before trusting any acceptance result.
 
 ## Acceptance status
 

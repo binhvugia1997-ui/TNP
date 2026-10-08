@@ -210,15 +210,21 @@ def test_missing_release_inputs_fail_cleanly(tmp_path):
 # ------------------------------------------------------------------ build integration: only after a successful build
 def test_publish_is_the_last_build_step_and_never_runs_after_failures():
     main_src = BUILD_SRC[BUILD_SRC.index("def main("):BUILD_SRC.index("def publish_step(")]
-    order = [m.group(1) for m in re.finditer(r"step\((\d+),", main_src)]
-    assert order == [str(i) for i in range(1, 13)] and 'step(12, "Xuất bản' in main_src
+    order = [int(m.group(1)) for m in re.finditer(r"step\((\d+),", main_src)]
+    # contiguous from 1, whatever the current step count is (PROMPT-028 inserted the frontend build step)
+    assert order == list(range(1, len(order) + 1)) and len(order) >= 12
+    # publishing is the FINAL step and is named as such
+    publish_number = order[-1]
+    assert f'step({publish_number}, "Xuất bản' in main_src
     publish_pos = main_src.index("publish_step(")
-    for gate in ("pyflakes", 'run([py, "-m", "pytest", "-q"])', "PyInstaller", "validate_artifact(folder)",
-                 "write_version_manifest(", "zipfile.ZipFile(zip_path"):
+    for gate in ("pyflakes", 'run([py, "-m", "pytest", "-q"])', "build_frontend(", "PyInstaller",
+                 "copy_frontend_into_portable(folder)", "validate_artifact(folder)",
+                 "validate_frontend(folder)", "write_version_manifest(", "zipfile.ZipFile(zip_path"):
         assert main_src.index(gate) < publish_pos                         # every gate precedes publishing
     # fail() exits the process (code 1) -> publishing is unreachable after any failed gate
     assert "sys.exit(code)" in BUILD_SRC[BUILD_SRC.index("def fail("):BUILD_SRC.index("def run(")]
     assert "--no-publish" in main_src and "--publish-dir" in main_src
+    assert "--skip-frontend" in main_src                                  # the bundle is rebuilt by default
 
 
 def test_publish_step_reports_failure_without_masking_build_success(tmp_path, capsys):

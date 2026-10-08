@@ -362,3 +362,77 @@ kiểm chứng crop thật.
   test:learning-hooks` (1), `npm run typecheck`, `npm run build` đều pass.
 - CHƯA xác minh trên Windows: độ trung thực PowerPoint thật, hành vi No Fill / No Line trên PowerPoint thật, và crop
   Excel cuối cùng trên báo cáo thật — chỉ được kết luận sau khi chạy PPTX thật trên Windows với v1.3.3 / Build 016.
+
+## PROMPT-028 — Đóng gói Windows Portable cho ứng dụng React + pywebview (v1.3.3 / Build 016, không đổi version)
+
+Yêu cầu: `ReportExtractor.exe` phải mở ĐÚNG ứng dụng mà `python -m app.desktop` đang mở, build frontend trước,
+bundle `frontend/dist`, sửa cách tìm đường dẫn frontend khi chạy frozen, đóng gói đủ runtime pywebview, giữ
+WebView2, PowerPoint vẫn là TÙY CHỌN, máy đích không cần Python/Node/npm/Git, và CHỈ build gói nghiệm thu
+(`--no-publish`).
+
+- Hiện trạng trước khi sửa (đã đọc code, không phỏng đoán):
+  - `ReportExtractor.spec` trỏ entry `run.py` → `app.main.main()` → `launch_gui()` → **Tk cổ điển**; `datas`
+    KHÔNG có `frontend/dist`; `hiddenimports` KHÔNG có `webview`/`pythonnet`/`clr`. Tức là exe build ra sẽ KHÔNG
+    phải ứng dụng React.
+  - `app/desktop.py` tìm bundle bằng `Path(__file__).parent.parent / "frontend/dist"` và hardcode
+    `FRONTEND_URL = "../frontend/dist/index.html"` — đúng khi chạy source, sai khi frozen.
+  - `requirements-build.txt` không kéo `requirements-webview.txt` → venv build KHÔNG có pywebview.
+- Nguyên nhân gốc của "cửa sổ trắng" khi đóng gói (đã chứng minh bằng cách đọc source pywebview 6.2.1):
+  `webview.util.get_app_root()` trả về `sys._MEIPASS` khi frozen, còn ở chế độ source trả về
+  `dirname(realpath(sys.argv[0]))`; `abspath()` nối URL tương đối vào root đó, và `http.start_server()` đặt
+  `server.root_path = abspath(dirname(commonpath(urls)))`. Vậy CÙNG một bundle phải được gọi bằng
+  `frontend/dist/index.html` khi nằm trong `_internal`, và `../frontend/dist/index.html` khi nằm cạnh
+  `_internal` — hardcode một giá trị là sai một trong hai trường hợp.
+- `app/desktop.py`: thêm `assumed_app_root()` (xác định: `_MEIPASS` khi frozen, `<repo>/app` khi source — KHÔNG
+  đọc `sys.argv[0]` nên không phụ thuộc pytest/IDE/`python -c`), `runtime_app_root()` (ưu tiên
+  `webview.util.get_app_root()` thật), `frontend_dist_candidates()`, `frontend_dist_dir()`, `frontend_url()`,
+  `frontend_index()`. URL được SUY RA từ thư mục dist đã phân giải (`relpath(dist, root)`), không hardcode theo
+  từng chế độ; luôn là đường dẫn tương đối để pywebview phục vụ qua HTTP loopback (giữ nguyên lý do không dùng
+  `file://`: ES module của Chromium). Khi frozen CHỈ tìm trong thư mục portable — không fallback về checkout
+  nguồn, vì fallback sẽ che mất một gói bị hỏng. Log `WEBVIEW_FRONTEND packaged/app_root/dist/url` và cảnh báo
+  `WEBVIEW_FRONTEND_URL_MISMATCH` nếu round-trip sai.
+- `app/main.py`: thêm `launch_desktop()` (chạy `app.desktop.main()`), `launch_ui()` (mặc định React, tự lùi về
+  Tk khi thiếu pywebview/bundle) và cờ `--legacy-gui`. `launch_gui()` giữ NGUYÊN (test cũ vẫn pass). Mọi lỗi
+  khởi động vẫn ghi `logs/startup_error.log`, không bao giờ im lặng.
+- `ReportExtractor.spec`: bundle `frontend/dist` → `_internal/frontend/dist`; THU THẬP `webview`
+  (`collect_data_files` + `collect_dynamic_libs` + `collect_submodules`) vì `webview/js/*` chính là phần inject
+  cầu nối JS↔Python và `webview/lib/*.dll` + `runtimes/win-x64/native/WebView2Loader.dll` là bộ interop
+  WebView2; thêm `pythonnet`/`clr`/`clr_loader`/`bottle`/`proxy_tools`; loại trừ PyQt/PySide/gi/cefpython3 để
+  luôn đi qua EdgeChromium. PowerPoint/pywin32 chỉ thu thập NẾU có trên máy build (`_module_available`) — máy
+  đích không có PowerPoint vẫn chạy vì `qpn_renderer` import COM bên trong hàm và fallback. Build DỪNG NGAY nếu
+  thiếu `frontend/dist/index.html` hoặc `assets/` (không để tester nhận một exe cửa sổ trắng).
+- `requirements-build.txt`: thêm `-r requirements-webview.txt` (nếu không thì venv build thiếu pywebview và
+  spec không thể bundle WebView2).
+- `tools/build_portable.py`: thêm `find_npm()`, `build_frontend()` (bước 5, chạy `npm run build` TRƯỚC
+  PyInstaller, tự `npm install` khi thiếu `node_modules`, kiểm tra `assets/*.js`), `copy_frontend_into_portable()`
+  (bước 8, đặt bundle cạnh `_internal` theo đúng layout Portable), `_same_tree()` và `validate_frontend()`
+  (bước 10): yêu cầu bundle ở CẢ HAI vị trí và GIỐNG NHAU từng byte, `index.html` tham chiếu `/assets/`, không
+  rò đường dẫn máy dev, có `webview/js/api.js` + `js/lib/dom_json.js` + `js/state.js`, và (chỉ trên Windows) có
+  3 assembly WebView2. Thêm `--skip-frontend`. Đánh số bước 1→13, publish vẫn là bước CUỐI.
+- `build_portable.bat`: cảnh báo sớm nếu máy build thiếu npm (kèm gợi ý `--skip-frontend`), vẫn chuyển `%*`
+  nên `--no-publish` hoạt động. Không đụng `BUILD_AND_PUBLISH.bat`.
+- `release_docs/README.txt` + `FIRST_RUN.txt`: viết lại theo UI React thật (tab "Danh sách báo cáo" / "Cài đặt"
+  / "Học cải tiến", không còn tên tab Tk cũ), thêm mục "MÁY ĐÍCH CẦN GÌ" (không cần Python/Node/npm/Git; cần
+  WebView2 Runtime; PowerPoint tùy chọn), mô tả thư mục `frontend\dist\`, cách chữa cửa sổ trắng
+  (`WEBVIEW_FRONTEND` trong `logs\app.log`), `--legacy-gui` / `--version` / `--diag`, và nhắc kiểm tra phiên bản
+  trên thanh tiêu đề TRƯỚC khi báo lỗi.
+- `DEVELOPMENT_WEBVIEW.md`: thêm mục "Windows Portable acceptance build (no publishing)" với lệnh
+  `build_portable.bat --no-publish` và danh sách những gì bước validate kiểm tra.
+- Không đổi: `crop_box_px`, `improvement_visual.py`, toàn bộ sửa đổi renderer/parser của PROMPT-027, cầu nối
+  PROMPT-026R, huỷ PROMPT-024R, an toàn Excel, `backup/…STABLE/`. KHÔNG xuất bản LAN, KHÔNG sửa `version.json`
+  triển khai, KHÔNG chạy `BUILD_AND_PUBLISH.bat`, KHÔNG merge `main`.
+- Test: `tests/test_prompt028_portable.py` (47) — phân giải bundle khi frozen ở cả hai layout, ưu tiên bản cạnh
+  `_internal`, chế độ source không đổi, không phụ thuộc `sys.argv[0]`/thư mục hiện hành, gói frozen KHÔNG BAO
+  GIỜ lấy bundle từ checkout nguồn, báo đủ đường dẫn đã tìm khi thiếu bundle, `launch_ui` ưu tiên React và chỉ
+  lùi về Tk khi thật sự không chạy được, `main([])` → React / `--legacy-gui` → Tk / `--cli` không mở cửa sổ,
+  chạy thật `desktop.main()` với pywebview giả (đúng title kèm version, URL tương đối round-trip, `js_api` là
+  `BridgeService`, `gui="edgechromium"` trên win32, handler đóng cửa sổ hoãn lại khi service đang bận), kiểm tra
+  nội dung spec/requirements/docs, và `validate_frontend` với gói thật. Tổng **1012 passed**
+  (965 của PROMPT-027 + 47 mới). Đã chạy THẬT `build_frontend()` (npm run build) + lắp ráp + validate một thư
+  mục portable đầy đủ trên Linux: `problems: NONE`, hai bản `frontend/dist` giống hệt nhau.
+- GIỚI HẠN (quan trọng): sandbox là **Linux x86_64, không có PyInstaller, không có Wine**. PyInstaller KHÔNG
+  cross-compile nên `ReportExtractor.exe`, ZIP thật và SHA256 của exe **không thể tạo ở đây** — phải chạy
+  `build_portable.bat --no-publish` trên Windows. Ghi nhận thêm: `tests/test_ollama_discovery.py::
+  test_15_cancel_stops_early_and_reports_partial` trượt 1 lần trong 4 lần chạy full-suite (chạy riêng luôn pass;
+  4/4 lần chạy ở commit gốc cũng pass) — đây là race có sẵn của test đó (phụ thuộc lịch thread), KHÔNG thuộc
+  phạm vi đã sửa và không bị thay đổi.
