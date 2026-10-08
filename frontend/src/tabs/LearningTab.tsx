@@ -244,6 +244,15 @@ function ImageReview() {
     selectedRef.current?.scrollIntoView({ block: 'nearest' })
   }, [index])
 
+  /* §36: below the xl breakpoint the layout stacks, so the list panel must not keep its desktop width. */
+  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1280px)').matches)
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1280px)')
+    const onChange = (e: MediaQueryListEvent) => setIsDesktop(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
   if (!cand) return (
     <Card title="Kiểm tra ảnh cải tiến">
       <div className="flex flex-col items-start gap-2 text-base2 text-muted">
@@ -276,15 +285,6 @@ function ImageReview() {
   dispW *= zoom
   dispH *= zoom
   const itemLabel = typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 ? `Mục #${cand.itemIndex + 1}` : `ảnh #${cand.pictureId}`
-
-  /* §36: below the xl breakpoint the layout stacks, so the list panel must not keep its desktop width. */
-  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1280px)').matches)
-  useEffect(() => {
-    const mq = window.matchMedia('(min-width: 1280px)')
-    const onChange = (e: MediaQueryListEvent) => setIsDesktop(e.matches)
-    mq.addEventListener('change', onChange)
-    return () => mq.removeEventListener('change', onChange)
-  }, [])
 
   const leftPanel = (
     <section
