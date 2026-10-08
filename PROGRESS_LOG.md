@@ -598,3 +598,75 @@ trên fixture tái tạo đúng bố cục đã báo cáo (log `REGION_*` + ản
 - CHƯA xác minh trên Windows (bắt buộc trước khi kết luận): PowerPoint COM thật (`DispatchEx`, từng stage), so sánh
   A/B/C (PowerPoint UI / PNG COM / Learning), PPTX thật (vùng Mục #1 chứa đủ ảnh Sau và kết thúc trên tiêu đề Mục #2;
   Mục #2 độc lập; crop Excel), và máy không có PowerPoint/LibreOffice với bản đóng gói (probe `import`/`availability`).
+
+## PROMPT-029 — Tích hợp PROMPT-027R vào PROMPT-028R (v1.3.4 / Build 017)
+
+Yêu cầu: tích hợp ĐÚNG commit `8f979eb4a520363b4967d9b424e5456d78f5c9f6` (nhánh `arena/6e89ee9d-tnp`) lên
+HEAD `78805faad9bad464abff0f2ed3e46c18c7573bfc`. KHÔNG reset về `db92966`, KHÔNG bỏ PROMPT-028R, KHÔNG viết
+lại PROMPT-027R từ đầu.
+
+- **Cách tích hợp**: `git merge --no-ff origin/arena/6e89ee9d-tnp`. `merge-base` của hai phía đúng bằng
+  `b5f8a29` (PROMPT-027) và PROMPT-027R là MỘT commit duy nhất trên đó, nên đây là tích hợp hai phía sạch.
+  Merge giữ `8f979eb` làm ancestor thật (không tạo SHA mới như cherry-pick), nên có thể kiểm chứng bằng
+  `git merge-base --is-ancestor`. Kết quả: commit merge `3dae422`; cả `8f979eb` và `78805fa` đều là ancestor
+  của HEAD.
+- **Phiên bản chuẩn sau tích hợp: v1.3.4 / Build 017 / VERSION_LABEL "1.3.4 — Build 017"**, và
+  `frontend/package.json` cũng là 1.3.4. PROMPT-028R vẫn báo 1.3.3 / Build 016 vì nó được viết TRƯỚC khi tích
+  hợp — đúng như đề bài nói. Các commit đóng gói KHÔNG hề sửa `app/__init__.py`, nên bản nâng version chỉ có
+  thể đến từ PROMPT-027R; KHÔNG có chỗ nào bị kéo lùi về 1.3.3/016 trong lúc giải quyết xung đột.
+- **Xung đột: 3 trên 45 đường dẫn** (hai phía cùng sửa):
+  - `PROGRESS_LOG.md` — cả hai append cùng một điểm neo (sau entry PROMPT-027). Giải quyết: giữ NGUYÊN VĂN CẢ
+    HAI khối, theo thứ tự thời điểm viết (PROMPT-028 → PROMPT-028R → PROMPT-027R), ngăn bằng một dòng trống.
+    Không viết lại entry lịch sử nào, nên mỗi entry vẫn ghi đúng phiên bản chuẩn tại thời điểm nó được viết.
+  - `DEVELOPMENT_WEBVIEW.md` — git tự merge. Giữ mục điều tra PROMPT-028R + dòng nghiệm thu của nó, ĐỒNG THỜI
+    giữ hai dòng nghiệm thu PROMPT-027R và việc 027R đổi "1.3.3 — Build 016" thành "1.3.4 — Build 017" trong
+    danh sách kiểm tra sau vá.
+  - `tests/test_publish_update.py` — git tự merge vì hai phía sửa hai vùng rời nhau: 027R đổi
+    `test_build_010_identity` sang 1.3.4/17/017; 028R làm các assertion thứ tự bước chịu được việc đánh số lại
+    và bổ sung stub `subprocess.run` cho truy vấn môi trường build mới ở bước 3.
+- **Kiểm chứng tích hợp (đo, không phỏng đoán)**: 32/32 đường dẫn chỉ PROMPT-027R sửa đều GIỐNG HỆT `8f979eb`;
+  9/10 đường dẫn chỉ PROMPT-028R sửa đều GIỐNG HỆT `78805fa`. Lệch duy nhất là
+  `tests/test_prompt028_portable.py` — do chủ động sửa ở commit này (xem dưới).
+- **`tests/test_prompt028_portable.py` phải sửa 3 chỗ vì tích hợp làm tiền đề của chúng hết hiệu lực** (vẫn 80
+  test, không xoá test nào):
+  - `test_version_was_not_bumped_by_this_packaging_fix` (khẳng định 1.3.3/16/016) → thay bằng
+    `test_canonical_version_after_prompt029_integration`: khẳng định 1.3.4/17/017, `BUILD_LABEL == "Build 017"`,
+    `VERSION_LABEL == "1.3.4 — Build 017"` và `frontend/package.json` đồng ý với backend.
+  - Scope guard cũ diff working-tree với `b5f8a29`, giờ dĩ nhiên liệt kê các file vùng bằng chứng. Đổi thành
+    diff DẢI CỐ ĐỊNH `b5f8a29..78805fa` (`test_packaging_commits_never_touched_the_evidence_region_logic`),
+    nên vẫn chứng minh được các commit đóng gói không đụng logic đó, và nay còn khẳng định chúng không đụng
+    `app/__init__.py`.
+  - `test_version_and_evidence_region_scope_…` → thay bằng `test_prompt029_kept_both_lines`: khẳng định cả hai
+    commit là ancestor của HEAD, và CHẤT của mỗi phía còn nguyên — phía 028R: spec chỉ để hook chính thức sở
+    hữu (không còn `collect_dynamic_libs`, chỉ `collect_data_files("webview", subdir="js")`, có `clr`/
+    `clr_loader`), ghim `clr-loader`, `validate_pythonnet_runtime` / `verify_runtime_imports` /
+    `report_build_dependencies` / `source_pythonnet_dll`, chẩn đoán trong `app/desktop.py`, `--fresh-venv`;
+    phía 027R: log `REGION_EVIDENCE` / `REGION_BOUNDARY_CONFLICT` / `REGION_MEMBER` / `boundary_source`, các hàm
+    `_item_span` / `_clamp_bottom` / `_cluster_with_reasons` / `_assign_captions_to_clusters`, và
+    `evidenceRegionPictureIds` trong DTO của `app/application_service.py` lẫn `frontend/src/types.ts`.
+- **`frontend/dist` được build lại** (027R có sửa `frontend/index.html`): nay là `index-B5WzBAyA.js` và
+  `index-BTW1TSfn.css`.
+- **Artifact sẽ tạo ra khi build trên Windows** (đã đối chiếu với code, không phải chép lại đề bài):
+  `ReportExtractor.spec` đặt `PORTABLE_NAME = f"ReportExtractor_v{VERSION}_Portable"` → `dist\ReportExtractor_v1.3.4_Portable\`
+  với `ReportExtractor.exe` bên trong; `tools/build_portable.py` đặt tên ZIP `ReportExtractor_<version>.zip` →
+  `release\ReportExtractor_1.3.4.zip`. Cả hai khớp đúng artifact PROMPT-029 mong đợi. Chỉ build bằng
+  `build_portable.bat --no-publish`.
+- **Test**: Python **1087 passed** (1045 ở HEAD PROMPT-028R + 42 của PROMPT-027R: 20 trong
+  `tests/test_prompt027r_regions.py`, 22 trong `tests/test_prompt027r_renderer.py`; KHÔNG xoá test nào).
+  `tests/test_prompt028_portable.py` vẫn 80. Frontend **29/29** (22 + 7 test mới
+  `tests/prompt027r-regression.test.mjs`, và `test:frontend` đã gồm cả 4 file). `tsc -b && vite build` pass,
+  `tsc --noEmit` sạch, `compileall` sạch, `pyflakes app tools run.py` (đúng phạm vi cổng build) sạch,
+  `git diff --check` sạch, không còn marker xung đột ở bất kỳ đâu. Ghi chú: `pyflakes tests` có vài cảnh báo
+  "local variable assigned but never used" / "redefinition of unused" ở `tests/test_image_learning.py`,
+  `tests/test_prompt004.py`, `tests/test_scan_list_compact.py` — có sẵn từ trước, KHÔNG thuộc phạm vi cổng
+  build và không phải do tích hợp này sinh ra, nên không đụng tới.
+- **GIỚI HẠN (quan trọng, phải nói rõ)**: sandbox vẫn là **Linux x86_64**. PyInstaller KHÔNG cross-compile nên
+  ở đây **không tạo được `dist\ReportExtractor_v1.3.4_Portable\`, không tạo được
+  `release\ReportExtractor_1.3.4.zip`, và không chạy được `ReportExtractor.exe`**. Toàn bộ nghiệm thu Windows
+  bắt buộc của PROMPT-028R (chạy `build_portable.bat --no-publish` không dùng `--skip-tests`, khởi động exe từ
+  `dist\`, chép cả thư mục sang ổ/đường dẫn khác rồi khởi động lại, kiểm cầu nối JS↔Python / Settings /
+  "Học cải tiến") VÀ của PROMPT-027R (PPTX thật với PowerPoint, `SLIDE_RENDER purpose=… backend=powerpoint
+  faithful=true`, `REGION_EVIDENCE` của Mục #1 kết thúc trên tiêu đề Mục #2, Mục #2 độc lập, crop Excel) đều
+  **CHƯA THỰC HIỆN** và không được báo là đã đạt.
+- KHÔNG đổi: `backup/…STABLE/`. KHÔNG merge PR #7 vào `main`, KHÔNG xuất bản LAN, KHÔNG sửa `version.json`
+  triển khai, KHÔNG chạy `BUILD_AND_PUBLISH.bat`.
