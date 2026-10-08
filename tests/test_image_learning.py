@@ -101,7 +101,7 @@ def test_24_stable_backup_exists_and_is_clean():
     assert BACKUP_DIR.is_dir() and msb.verify_backup(BACKUP_DIR) == []
     init = (BACKUP_DIR / "app" / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "1.0.4"' in init and "BUILD_NUMBER = 4" in init       # backup frozen at 1.0.4 / 004
-    assert app.__version__ == "1.3.3" and app.BUILD_NUMBER == 16             # dev version moved on
+    assert app.__version__ == "1.3.4" and app.BUILD_NUMBER == 17             # dev version moved on
     assert not any(p.name in ("sample_data", ".venv", "Output", "logs", "config", "learning_data")
                    for p in BACKUP_DIR.rglob("*") if p.is_dir())
 

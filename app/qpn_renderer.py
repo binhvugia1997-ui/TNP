@@ -35,7 +35,7 @@ EMU_PER_PT = 12700
 
 # PROMPT-027: bump whenever the rendered full-slide bitmap's GEOMETRY or paint semantics change, so a
 # cached preview produced by older (wrong) rendering can never be reused (§29).
-RENDER_SCHEMA_VERSION = 2
+RENDER_SCHEMA_VERSION = 3
 
 # Fallback paint used ONLY for a slot that is genuinely visible but whose colour could not be resolved
 # from the PPTX/theme.  Never applied to a slot the author hid (No Fill / No Line) — §7/§9.
@@ -55,17 +55,58 @@ MIN_TEXT_PX = 10
 # ----------------------------------------------------------------------------
 # Availability checks
 # ----------------------------------------------------------------------------
-def powerpoint_available() -> bool:
-    if sys.platform != "win32":
-        return False
+POWERPOINT_PROGID = "PowerPoint.Application"
+
+
+def _powerpoint_progid_registered(pythoncom_module) -> Tuple[bool, str]:
+    """Is PowerPoint's COM class registered?  COM's own lookup first (the same registry COM itself reads, no process
+    is started), then the explicit HKCR probe in the default, 64-bit and 32-bit registry views (§15: a single brittle
+    probe must never mark an installed PowerPoint as missing)."""
+    try:
+        pythoncom_module.CLSIDFromProgID(POWERPOINT_PROGID)
+        return True, "progid-com"
+    except Exception as exc:  # noqa: BLE001 – a missing ProgID is the normal negative answer here
+        com_reason = type(exc).__name__
     try:
         import winreg  # type: ignore
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "PowerPoint.Application"):
-            pass
-        import win32com.client  # noqa: F401
-        return True
-    except Exception:
-        return False
+        for access in (0, getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0)):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, POWERPOINT_PROGID, 0, winreg.KEY_READ | access):
+                    return True, "progid-registry"
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001 – registry access denied / unavailable: fall back to the COM answer
+        pass
+    return False, f"progid-not-registered ({com_reason})"
+
+
+def powerpoint_probe() -> Tuple[bool, str, str]:
+    """(available, stage, detail).  Side-effect free: it never starts PowerPoint.  ``stage`` names the first check that
+    failed (``availability`` / ``import``); ``detail`` is a safe, path-free explanation for diagnostics."""
+    if sys.platform != "win32":
+        return False, "availability", "not-windows"
+    try:
+        import pythoncom  # type: ignore  # pywin32
+    except Exception as exc:  # noqa: BLE001
+        return False, "import", f"pythoncom {type(exc).__name__}"
+    try:
+        import win32com.client  # type: ignore  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return False, "import", f"win32com.client {type(exc).__name__}"
+    registered, how = _powerpoint_progid_registered(pythoncom)
+    if not registered:
+        return False, "availability", how
+    return True, "", how
+
+
+def powerpoint_available() -> bool:
+    """True when the PowerPoint COM backend can be attempted on this machine (no cached answer: a later install or a
+    repaired COM registration is seen immediately, PROMPT-027R §15)."""
+    return bool(powerpoint_probe()[0])
+
+
+def powerpoint_unavailable_detail() -> str:
+    return powerpoint_probe()[2]
 
 
 def find_soffice() -> Optional[str]:
@@ -174,36 +215,102 @@ def get_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
 # ----------------------------------------------------------------------------
 # 1) PowerPoint COM
 # ----------------------------------------------------------------------------
+class PowerPointStageError(RuntimeError):
+    """A PowerPoint COM failure tagged with the stage that failed (PROMPT-027R §14).
+
+    ``stage`` is one of import / com-init / dispatch / presentation-open / slide-export; ``reason`` is path-free and
+    safe for logs; ``hresult`` is the COM error code when the exception carries one.
+    """
+
+    def __init__(self, stage: str, exc: BaseException, pptx: Optional[Path] = None):
+        self.stage = stage
+        self.exception_type = type(exc).__name__
+        self.hresult = _hresult_text(exc)
+        self.reason = _com_reason(exc, pptx)
+        super().__init__(f"{stage}: {self.reason}")
+
+
+def _hresult_text(exc: BaseException) -> str:
+    code = getattr(exc, "hresult", None)
+    if not isinstance(code, int):
+        args = getattr(exc, "args", ()) or ()
+        code = args[0] if args and isinstance(args[0], int) else None
+    return f"0x{code & 0xFFFFFFFF:08X}" if isinstance(code, int) else "-"
+
+
+def _com_reason(exc: BaseException, pptx: Optional[Path]) -> str:
+    text = str(exc).strip()
+    if pptx is not None:
+        for secret in (str(pptx), Path(pptx).name):
+            if secret:
+                text = text.replace(secret, "<report>")
+    text = " ".join(text.split())
+    if len(text) > 180:
+        text = text[:177] + "..."
+    return text or type(exc).__name__
+
+
 def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Path,
                            width_px: int = 1920) -> Dict[int, Path]:
-    import pythoncom  # type: ignore
-    import win32com.client  # type: ignore
+    """Export COMPLETE authored slides through an APP-OWNED PowerPoint instance (PROMPT-027R §16).
+
+    The user's interactive PowerPoint is never attached to, never closed and never quit: the instance is created with
+    ``DispatchEx``, the source is opened read-only without a window, only that presentation is closed and only the
+    instance this function created is quit.  CoInitialize / CoUninitialize are balanced.  Every failure raises
+    :class:`PowerPointStageError` naming the stage that failed, so diagnostics say WHERE COM broke.
+    """
+    try:
+        import pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise PowerPointStageError("import", exc, pptx)
     out: Dict[int, Path] = {}
-    pythoncom.CoInitialize()
+    try:
+        pythoncom.CoInitialize()
+    except Exception as exc:  # noqa: BLE001 – RPC_E_CHANGED_MODE etc.: never CoUninitialize what we did not start
+        raise PowerPointStageError("com-init", exc, pptx)
     app = None
     pres = None
+    created_app = False
+    cleanup_failures: List[Tuple[str, BaseException]] = []
     try:
-        app = win32com.client.Dispatch("PowerPoint.Application")
-        # WithWindow=False keeps it invisible; ReadOnly=True never modifies the source
-        pres = app.Presentations.Open(str(pptx.resolve()), True, False, False)
-        ratio = pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth
-        h = int(width_px * ratio)
-        for n in slide_numbers:
-            target = out_dir / f"slide_{n:03d}.png"
-            pres.Slides(n).Export(str(target.resolve()), "PNG", width_px, h)
-            out[n] = target
+        try:
+            app = win32com.client.DispatchEx(POWERPOINT_PROGID)           # always a NEW, application-owned instance
+            created_app = True
+        except Exception as exc:  # noqa: BLE001
+            raise PowerPointStageError("dispatch", exc, pptx)
+        try:
+            # WithWindow=False keeps it invisible; ReadOnly=True never modifies the source
+            pres = app.Presentations.Open(str(pptx.resolve()), True, False, False)
+        except Exception as exc:  # noqa: BLE001
+            raise PowerPointStageError("presentation-open", exc, pptx)
+        try:
+            ratio = pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth
+            h = int(width_px * ratio)
+            for n in slide_numbers:
+                target = out_dir / f"slide_{n:03d}.png"
+                pres.Slides(n).Export(str(target.resolve()), "PNG", width_px, h)
+                out[n] = target
+        except Exception as exc:  # noqa: BLE001
+            raise PowerPointStageError("slide-export", exc, pptx)
     finally:
+        if pres is not None:
+            try:
+                pres.Close()                                              # only the presentation WE opened
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failures.append(("presentation-close", exc))
+        if created_app and app is not None:
+            try:
+                app.Quit()                                                # only the instance WE created
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failures.append(("app-quit", exc))
         try:
-            if pres is not None:
-                pres.Close()
-        except Exception:
+            pythoncom.CoUninitialize()
+        except Exception:  # noqa: BLE001
             pass
-        try:
-            if app is not None and app.Presentations.Count == 0:
-                app.Quit()
-        except Exception:
-            pass
-        pythoncom.CoUninitialize()
+        for step, exc in cleanup_failures:
+            LOG.info("SLIDE_RENDER_CLEANUP backend=powerpoint stage=cleanup step=%s exception_type=%s reason=%s",
+                     step, type(exc).__name__, _com_reason(exc, pptx))
     return out
 
 
@@ -539,11 +646,12 @@ def _draw_table(draw: ImageDraw.ImageDraw, b: Block, px) -> None:
 class SlideRenderer:
     """Renders slides with the best available backend; caches per file.
 
-    PROMPT-027 §3: every backend attempt is logged with a ``purpose`` so Windows acceptance can tell
-    which renderer actually produced the learning preview and the final After evidence, and why a
-    higher-fidelity backend was not used.  Only ``powerpoint`` is pixel-faithful to PowerPoint
-    (:data:`FAITHFUL_BACKENDS`); LibreOffice and the built-in renderer are honest fallbacks and are
-    reported as reduced fidelity rather than pretending to be PowerPoint output (§6).
+    PROMPT-027 §3 / PROMPT-027R §14: every backend attempt is logged with a ``purpose`` (learning_preview /
+    after_evidence / qpn_panel / improvement_sheet) and, for failures, the STAGE that broke (availability, import,
+    com-init, dispatch, presentation-open, slide-export, render), so Windows acceptance can tell which renderer actually
+    produced the preview and why a higher-fidelity backend was not used.  Only ``powerpoint`` is pixel-faithful to
+    PowerPoint (:data:`FAITHFUL_BACKENDS`); LibreOffice and the built-in renderer are honest fallbacks and are reported
+    as reduced fidelity rather than pretending to be PowerPoint output (§6).  No failure is silently skipped.
     """
 
     def __init__(self, prefer: Sequence[str] = ("powerpoint", "libreoffice", "builtin"),
@@ -554,6 +662,21 @@ class SlideRenderer:
         self.last_backend = ""
         self.last_purpose = ""
         self.backend_tried: List[str] = []
+        self.last_failures: List[Dict[str, str]] = []
+
+    def availability(self) -> Dict[str, bool]:
+        """Per-backend availability for cache identity (PROMPT-027R §30).  Cheap; never starts a renderer."""
+        out: Dict[str, bool] = {}
+        for backend in self.prefer:
+            if backend == "powerpoint":
+                out[backend] = bool(powerpoint_available())
+            elif backend == "libreoffice":
+                out[backend] = bool(find_soffice() and pymupdf_available())
+            elif backend == "builtin":
+                out[backend] = True
+            else:
+                out[backend] = False
+        return out
 
     def render(self, report: ReportData, slide_numbers: Sequence[int], out_dir: Path,
                should_cancel: Optional[Callable[[], bool]] = None,
@@ -574,6 +697,7 @@ class SlideRenderer:
         check_cancelled(should_cancel)
         errors: List[str] = []
         self.backend_tried = []
+        self.last_failures = []
         slide_width = int(report.slide_width or 0)
         slide_height = int(report.slide_height or 0)
         for backend in self.prefer:
@@ -582,12 +706,13 @@ class SlideRenderer:
             try:
                 if backend == "powerpoint":
                     if not powerpoint_available():
-                        self._log_backend_failed(purpose, backend, report, "unavailable")
+                        self._fail(purpose, backend, report, stage="availability", reason="unavailable",
+                                   detail=powerpoint_unavailable_detail())
                         continue
                     res = render_with_powerpoint(report.path, wanted, out_dir, self.width_px)
                 elif backend == "libreoffice":
                     if not (find_soffice() and pymupdf_available()):
-                        self._log_backend_failed(purpose, backend, report, "unavailable")
+                        self._fail(purpose, backend, report, stage="availability", reason="unavailable")
                         continue
                     res = render_with_libreoffice(report.path, wanted, out_dir, self.dpi)
                 elif backend == "builtin":
@@ -599,31 +724,52 @@ class SlideRenderer:
                         img.save(target, "PNG")
                         res[n] = target
                 else:
-                    self._log_backend_failed(purpose, backend, report, "unknown-backend")
+                    self._fail(purpose, backend, report, stage="availability", reason="unknown-backend")
                     continue
                 if res and all(n in res for n in wanted):
                     self.last_backend = backend
                     self.last_purpose = purpose
-                    self._log_render(purpose, backend, report, res, slide_width, slide_height)
+                    self._log_render(purpose, backend, report, res, slide_width, slide_height,
+                                     attempted=self.backend_tried)
                     return res
-                self._log_backend_failed(purpose, backend, report, "incomplete-result")
+                self._fail(purpose, backend, report, stage="render", reason="incomplete-result")
                 errors.append(f"{backend}: incomplete result")
             except CancellationRequested:
                 raise                                    # cooperative cancel is never a renderer failure
+            except PowerPointStageError as e:
+                self._fail(purpose, backend, report, stage=e.stage, reason=e.reason,
+                           exception_type=e.exception_type, hresult=e.hresult)
+                errors.append(f"{backend}[{e.stage}]: {e.reason}")
             except Exception as e:  # noqa: BLE001
                 reason = _safe_reason(report, e)
-                LOG.warning("Renderer %s failed for %s: %s", backend, report.filename, e)
-                self._log_backend_failed(purpose, backend, report, reason)
-                errors.append(f"{backend}: {e}")
+                LOG.warning("Renderer %s failed for %s: %s", backend, report.filename, reason)
+                self._fail(purpose, backend, report, stage="render", reason=reason,
+                           exception_type=type(e).__name__)
+                errors.append(f"{backend}: {reason}")
         LOG.error("SLIDE_RENDER_FAILED purpose=%s report=%s slides=%s tried=%s errors=%s",
                   purpose or "-", report.filename, wanted, ",".join(self.backend_tried) or "-",
                   "; ".join(errors) or "-")
         raise RuntimeError("Không render được slide: " + "; ".join(errors))
 
-    # ------------------------------------------------------------------ diagnostics (PROMPT-027 §3)
+    @property
+    def degraded(self) -> bool:
+        """True when a backend that SHOULD have been tried actually failed during the last render (not merely absent).
+
+        A degraded preview is reused only briefly, so a transient COM failure cannot pin the fallback (§30)."""
+        return any(failure.get("stage") not in ("availability", "") for failure in self.last_failures)
+
+    # ------------------------------------------------------------------ diagnostics (PROMPT-027 §3 / 027R §14)
+    def _fail(self, purpose: str, backend: str, report: ReportData, stage: str, reason: str,
+              exception_type: str = "", hresult: str = "", detail: str = "") -> None:
+        self.last_failures.append({"backend": backend, "stage": stage, "reason": reason})
+        LOG.warning("SLIDE_RENDER_BACKEND_FAILED purpose=%s backend=%s stage=%s exception_type=%s hresult=%s "
+                    "reason=%s detail=%s report=%s",
+                    purpose or "-", backend, stage, exception_type or "-", hresult or "-", reason,
+                    detail or "-", report.filename)
+
     @staticmethod
     def _log_render(purpose: str, backend: str, report: ReportData, res: Dict[int, Path],
-                    slide_width: int, slide_height: int) -> None:
+                    slide_width: int, slide_height: int, attempted: Sequence[str] = ()) -> None:
         for number in sorted(res):
             width = height = 0
             try:
@@ -631,16 +777,17 @@ class SlideRenderer:
                     width, height = image.size
             except Exception:  # noqa: BLE001
                 pass
-            LOG.info("SLIDE_RENDER purpose=%s backend=%s faithful=%s report=%s slide=%s "
-                     "rendered=%sx%s slide_emu=%sx%s schema=v%s",
-                     purpose or "-", backend, str(backend in FAITHFUL_BACKENDS).lower(),
-                     report.filename, number, width, height, slide_width, slide_height,
+            faithful = backend in FAITHFUL_BACKENDS
+            LOG.info("SLIDE_RENDER purpose=%s backend=%s slide=%s attempted_backend=%s selected_backend=%s "
+                     "faithful=%s report=%s rendered=%sx%s slide_emu=%sx%s schema=v%s",
+                     purpose or "-", backend, number, ",".join(attempted) or backend, backend,
+                     str(faithful).lower(), report.filename, width, height, slide_width, slide_height,
                      RENDER_SCHEMA_VERSION)
 
     @staticmethod
     def _log_backend_failed(purpose: str, backend: str, report: ReportData, reason: str) -> None:
-        LOG.warning("SLIDE_RENDER_BACKEND_FAILED purpose=%s backend=%s report=%s reason=%s",
-                    purpose or "-", backend, report.filename, reason)
+        LOG.warning("SLIDE_RENDER_BACKEND_FAILED purpose=%s backend=%s stage=render exception_type=- hresult=- "
+                    "reason=%s detail=- report=%s", purpose or "-", backend, reason, report.filename)
 
 
 @dataclass

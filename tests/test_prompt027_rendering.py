@@ -1,4 +1,4 @@
-"""PROMPT-027: PowerPoint-faithful rendering, true After-region preview, No Fill / No Line, version 1.3.3.
+"""PROMPT-027: PowerPoint-faithful rendering, true After-region preview, No Fill / No Line, version 1.3.4.
 
 Real-PPTX acceptance exposed several DISTINCT problems that must not be conflated (§58):
 
@@ -1013,17 +1013,17 @@ def test_overlay_percentages_are_relative_to_the_slide_image_not_the_panel():
 
 
 # ================================================================== §49/§50/§51 version consistency
-def test_backend_version_is_the_authoritative_1_3_3_build_016():
-    assert app_pkg.__version__ == "1.3.3"
-    assert app_pkg.BUILD_NUMBER == 16
-    assert app_pkg.BUILD_ID == "016" and app_pkg.BUILD_LABEL == "Build 016"
-    assert app_pkg.APP_TITLE == "Report Extractor v1.3.3"
-    assert app_pkg.VERSION_LABEL == "1.3.3 — Build 016"
-    assert app_pkg.VERSION_LINE == "version=1.3.3 build=016"
+def test_backend_version_is_the_authoritative_1_3_4_build_017():
+    assert app_pkg.__version__ == "1.3.4"
+    assert app_pkg.BUILD_NUMBER == 17
+    assert app_pkg.BUILD_ID == "017" and app_pkg.BUILD_LABEL == "Build 017"
+    assert app_pkg.APP_TITLE == "Report Extractor v1.3.4"
+    assert app_pkg.VERSION_LABEL == "1.3.4 — Build 017"
+    assert app_pkg.VERSION_LINE == "version=1.3.4 build=017"
 
 
 def test_frontend_and_backend_version_metadata_agree():
-    """§51: the regression test that FAILS if the two sides drift (e.g. backend 1.3.3 / frontend 1.3.2)."""
+    """§51: the regression test that FAILS if the two sides drift (e.g. backend 1.3.4 / frontend 1.3.2)."""
     frontend = Path(__file__).resolve().parent.parent / "frontend"
     package = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
     lock = json.loads((frontend / "package-lock.json").read_text(encoding="utf-8"))
@@ -1042,7 +1042,7 @@ def test_frontend_and_backend_version_metadata_agree():
 
     # the single canonical backend source: the frontend must not hardcode its own copy
     header = (frontend / "src" / "components" / "AppHeader.tsx").read_text(encoding="utf-8")
-    assert app_pkg.__version__ not in header and "Build 016" not in header
+    assert app_pkg.__version__ not in header and "Build 017" not in header
     assert "appInfo.version" in header and "appInfo.build" in header
 
 
@@ -1051,10 +1051,10 @@ def test_bridge_reports_one_authoritative_version_to_the_ui(sample_tree, tmp_pat
 
     service, _ = _make_service(sample_tree, tmp_path)
     payload = service.app_version()
-    assert payload["version"] == app_pkg.__version__ == "1.3.3"
-    assert payload["build"] == app_pkg.BUILD_ID == "016"
-    assert payload["buildNumber"] == app_pkg.BUILD_NUMBER == 16
-    assert payload["title"] == app_pkg.APP_TITLE == "Report Extractor v1.3.3"
+    assert payload["version"] == app_pkg.__version__ == "1.3.4"
+    assert payload["build"] == app_pkg.BUILD_ID == "017"
+    assert payload["buildNumber"] == app_pkg.BUILD_NUMBER == 17
+    assert payload["title"] == app_pkg.APP_TITLE == "Report Extractor v1.3.4"
     config = service.current_config()["app"]
     assert (config["version"], config["build"]) == (app_pkg.__version__, app_pkg.BUILD_ID)
 
@@ -1075,7 +1075,7 @@ def test_stable_backup_is_untouched():
     init = (Path(__file__).resolve().parent.parent / "backup"
             / "ReportExtractor_v1.0.4_Build004_STABLE" / "app" / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "1.0.4"' in init and "BUILD_NUMBER = 4" in init
-    assert "1.3.3" not in init and "BUILD_NUMBER = 16" not in init
+    assert "1.3.4" not in init and "BUILD_NUMBER = 17" not in init
 
 
 # ================================================================== §18 preview never mutates evidence

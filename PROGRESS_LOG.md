@@ -362,3 +362,81 @@ kiểm chứng crop thật.
   test:learning-hooks` (1), `npm run typecheck`, `npm run build` đều pass.
 - CHƯA xác minh trên Windows: độ trung thực PowerPoint thật, hành vi No Fill / No Line trên PowerPoint thật, và crop
   Excel cuối cùng trên báo cáo thật — chỉ được kết luận sau khi chạy PPTX thật trên Windows với v1.3.3 / Build 016.
+
+## PROMPT-027R — Vùng bằng chứng Sau thật, ranh giới mục tiếp theo và độ trung thực renderer (v1.3.4 / Build 017, nhánh phát triển)
+
+Bối cảnh: slide 3 thật (hai mục) trên PR #7 (1.3.3 / 016) còn ba lỗi: (A) vùng xuất Excel của Mục #2 nhỏ hơn khối Sau
+thật; (B) crop của Mục #1 chứa phần cuối của tiêu đề Mục #2 (thấy như một nhãn "Daoltech" lẻ — không có đối tượng nào
+tên như vậy; không lọc chữ); (C) xem trước Learning khác PowerPoint (chữ đậm/tối hơn, xuống dòng và khoảng cách khác,
+hiện "Bản xem trước đơn giản"). Không có file PPTX thật trong môi trường này: mọi nguyên nhân dưới đây được chứng minh
+trên fixture tái tạo đúng bố cục đã báo cáo (log `REGION_*` + ảnh crop + điểm ảnh), và cần xác nhận lại trên Windows.
+
+- Nguyên nhân gốc (mỗi cơ chế có test/log riêng; không tăng ngưỡng toàn cục, không lọc chữ, không dùng pixel):
+  - **M1 — phân loại thời gian sai**: dòng `+ Sau:` sở hữu mọi ảnh BÊN DƯỚI nó (không giới hạn) và được xét trước
+    mũi tên, nên ảnh Trước thứ hai (không caption) thành Sau. Sửa: dòng inline phải khớp phiếu mũi tên có cấu trúc;
+    xung đột → ambiguous, chỉ được giải bằng hàng lân cận.
+  - **M2 — caption gán vượt ranh giới mục**: caption "Sau cải tiến" của Mục #1 nhận ảnh của Mục #2 qua nhánh
+    "column header" (cách 1,4") dù tiêu đề Mục #2 nằm giữa → Mục #2 mất ảnh (vùng nhỏ) và crop Mục #1 chứa ảnh Mục #2.
+    Sửa: caption không gán qua khoảng có ảnh/caption/tiêu đề khác; owner của caption phải khớp span của mục chứa ảnh,
+    nếu không → ambiguous (fail closed).
+  - **M3 — phân cụm bằng ngưỡng toàn slide**: ngưỡng 8% chiều rộng slide tách một khối Sau liền hàng thành 3 vùng.
+    Sửa: khoảng cách còn so với kích thước ảnh (1,0×) và chỉ nối khi không có vật cản cấu trúc trong khoảng hở;
+    ảnh Sau có caption khác phía (trên/dưới cùng phía) là khối khác.
+  - **M4 — đưa cả khối chữ bằng giao hộp**: khối thân bài của Mục #2 chạm vùng caption nên được đưa nguyên hộp vào crop
+    (kéo theo ảnh Trước và chữ thân bài). Sửa: chữ phải nằm ≥ 60% trong vùng bằng chứng; hình ≥ 50% hoặc chồng ảnh thành viên.
+  - **M5 — kẹp đáy chỉ theo ảnh**: điều kiện "ảnh chồng ngang tiêu đề" bỏ qua tiêu đề khi chỉ crop cuối (chú thích,
+    dấu khoanh) chồng ngang tiêu đề → phần cuối tiêu đề lọt vào crop. Sửa: kẹp đáy theo mọi tiêu đề bên dưới mà crop
+    cuối chạm ngang; thành viên luôn được giữ (xung đột được báo cáo `REGION_BOUNDARY_CONFLICT`).
+  - **Thêm — nhãn ngắn trên/dưới ảnh bị coi là tiêu đề mục** (`CHECK`, `120 mm`): tạo mục giả, cắt span mục thật, làm
+    sai chủ sở hữu caption. Sửa: nhánh tiêu đề heuristic (không dấu hai chấm, không mở đầu bằng tên lỗi) bỏ qua dòng nằm
+    trên ảnh hoặc trong cột ảnh ngay dưới nó.
+  - **C/D — xem trước**: `blur(2px) brightness(0.82) saturate(0.85)` áp lên TOÀN ảnh slide + lớp cắt sắc thứ hai → chữ
+    xám bị đậm/tối và mờ. Hiện "Trình vẽ tích hợp" nghĩa là PowerPoint COM không được chọn trên máy tester; nguyên nhân
+    cụ thể trên máy đó chưa xác định (log mới `SLIDE_RENDER_BACKEND_FAILED ... stage=` sẽ cho biết).
+
+- Sửa:
+  - `app/improvement_pictures.py`: `ItemRegion.heading_bounds` (dòng tiêu đề, không phải span); `structural_obstacles()`,
+    `gap_is_clear()`; `_caption_distance`/`_claims`/`classify_picture` nhận obstacles; xung đột inline↔mũi tên → ambiguous;
+    `_span_owner()` + kiểm tra owner caption ↔ span; `_line_on_visual()`/`_label_beneath_picture()` cho nhánh heuristic;
+    log `PICTURE_DECISION` cho mọi ảnh (đủ scope/slide/item/shape/source_order/bbox/temporal/semantic/owner/confident/eligible/group).
+  - `app/improvement_visual.py`: phân cụm có cấu trúc (`_cluster_with_reasons`: hàng/cột theo kích thước ảnh, khoảng hở
+    trống, caption khác phía, caption mở khối mới, group ancestry chỉ nới khoảng cách); span theo đúng tiêu chí
+    `slide_items`; kẹp đáy theo mọi tiêu đề/footer bên dưới theo x của crop cuối (`_clamp_bottom`); đối tượng: containment
+    (chữ ≥ 60%, hình ≥ 50% hoặc đè ảnh), loại đối tượng thuộc span/tiêu đề mục khác; `ImprovementVisualRegion` thêm
+    `span_top/span_bottom/boundary_source/boundary_item_id/boundary_top/raw_bbox/padding`.
+  - `app/pptx_parser.py`: `Block.group_path` (thứ tự nhóm, theo tài liệu) + `parent_group_id`/`group_root_id`; hình học không đổi.
+  - `app/qpn_renderer.py`: `powerpoint_probe()` (không khởi động PowerPoint): pywin32 → `CLSIDFromProgID` → HKCR ở view
+    mặc định/64/32-bit; `render_with_powerpoint()` dùng `DispatchEx` (instance riêng), mở read-only không cửa sổ, chỉ đóng
+    presentation đã mở và chỉ quit instance đã tạo, cân bằng CoInitialize/CoUninitialize; lỗi mang `stage`, `exception_type`,
+    `hresult`, lý do không có đường dẫn; `SlideRenderer.availability()`, `degraded`; `RENDER_SCHEMA_VERSION = 3`.
+  - `app/application_service.py`: khoá cache preview gồm kích thước + mtime_ns + khả dụng từng backend + định danh Learning
+    (nhãn đã lưu + mô hình); preview xuống cấp (faithful backend lỗi) hết hạn sau `DEGRADED_PREVIEW_TTL_S = 15`;
+    vùng bằng chứng tính bằng `select_with_learning` (đúng quyết định Excel); DTO thêm `evidenceRegionPictureIds`,
+    `evidenceRegionId`, `evidenceRegionBlockIndex`, `evidenceRegionBoundarySource`, `evidenceRegionNextHeadingTop`,
+    và `regionId/boundarySource/nextHeadingTop` trong `regions` (chỉ hiển thị/gỡ lỗi).
+  - `frontend/src/tabs/LearningTab.tsx`: bỏ hoàn toàn `filter`, lớp cắt thứ hai và overlay làm mờ; còn đúng MỘT bitmap
+    nguyên bản + hai khung viền từ DTO (`evidenceRegionBboxPct`, `targetBboxPct`); "Ảnh trong vùng" chỉ hiển thị.
+  - `app/image_learning.py`: obstacles dùng chung để đặc trưng học khớp quyết định production.
+  - Phiên bản: `app/__init__.py` → `1.3.4` / `BUILD_NUMBER = 17`; `frontend/package.json`, `package-lock.json` (chỉ hai
+    trường gốc), `index.html`, `public/mock/qpn-slide.svg`, fixture test. Test cũ đổi chuỗi phiên bản; fixture "bản mới hơn"
+    trong `test_updater.py` chuyển 1.3.5 / 18; nhãn bản từ xa `CUR+1/CUR+2` cập nhật theo build mới.
+- Không đổi: packaging (`ReportExtractor.spec`, `build_portable.bat`, `tools/build_portable.py`), updater, PROMPT-011,
+  015, 020, 021, 024R, 025, 026R, 027 (No Fill/No Line, text layout).
+
+- Chẩn đoán mới (grep được): `ITEM_SPAN` (start_y/end_y/next_item_id/next_heading_y/boundary_source),
+  `REGION_CLUSTERS` (joins), `REGION_MEMBER` (scope/slide/item/shape/source_order/bbox/temporal/semantic/owner/confident/
+  eligible/group), `REGION_CLAMP`, `REGION_EVIDENCE` (picture_ids, region_bottom_y, next_heading_y), `REGION_BOUNDARY_CONFLICT`,
+  `PICTURE_DECISION`, `SLIDE_RENDER purpose=… backend=… slide=… attempted_backend=… selected_backend=… faithful=…`,
+  `SLIDE_RENDER_BACKEND_FAILED … stage=… exception_type=… hresult=… reason=…`, `SLIDE_RENDER_CLEANUP`.
+
+- Test: `tests/test_prompt027r_regions.py` (20: CASE 1–9 + 10 quyết định người dùng, M1–M5, nhãn/callout, group, chẩn
+  đoán, ràng buộc biên), `tests/test_prompt027r_renderer.py` (22: chọn backend/faithful, probe theo stage, COM giả với
+  DispatchEx/cleanup/CoInitialize, cache theo khả dụng, TTL xuống cấp), `frontend/tests/prompt027r-regression.test.mjs` (7,
+  nguồn: không filter/clip, overlay từ DTO, pictureIds chỉ hiển thị, hook trước early return). `prompt027-overlays` và
+  `learning-hooks` đổi kỳ vọng từ hai bitmap sang một bitmap nguyên bản.
+- Kết quả: Python **1007 passed** (baseline 965, +42, không xoá test); `test:bridge` 14, `test:learning-hooks` 1,
+  `test:prompt027` 7, `test:prompt027r` 7, `typecheck`, `build` đều pass; `compileall app` pass; pyflakes: cùng tập
+  thông báo với baseline (chỉ các dòng "imported but unused" của probe, đã được bộ lọc build chấp nhận); `git diff --check` pass.
+- CHƯA xác minh trên Windows (bắt buộc trước khi kết luận): PowerPoint COM thật (`DispatchEx`, từng stage), so sánh
+  A/B/C (PowerPoint UI / PNG COM / Learning), PPTX thật (vùng Mục #1 chứa đủ ảnh Sau và kết thúc trên tiêu đề Mục #2;
+  Mục #2 độc lập; crop Excel), và máy không có PowerPoint/LibreOffice với bản đóng gói (probe `import`/`availability`).

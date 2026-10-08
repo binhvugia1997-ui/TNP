@@ -85,6 +85,20 @@ class Block:
     line_spacing: List[Optional[float]] = field(default_factory=list)   # per paragraph, multiple of line
     space_before: List[float] = field(default_factory=list)             # per paragraph, points
     space_after: List[float] = field(default_factory=list)              # per paragraph, points
+    # PROMPT-027R §8: structural group ancestry.  Ordinals of every enclosing ``p:grpSp`` on this slide, outermost
+    # first, in document order (empty for top-level shapes).  Association evidence only: geometry is unchanged and
+    # group membership never overrides semantic eligibility.
+    group_path: Tuple[int, ...] = ()
+
+    @property
+    def parent_group_id(self) -> int:
+        """Ordinal of the innermost enclosing group (0 = not grouped)."""
+        return self.group_path[-1] if self.group_path else 0
+
+    @property
+    def group_root_id(self) -> int:
+        """Ordinal of the outermost enclosing group (0 = not grouped)."""
+        return self.group_path[0] if self.group_path else 0
 
     @property
     def is_text(self) -> bool:
@@ -262,14 +276,21 @@ def shape_geometry(shape, offset) -> Tuple[int, int, int, int]:
     return int(shape.left or 0) + dx, int(shape.top or 0) + dy, int(shape.width or 0), int(shape.height or 0)
 
 
-def _iter_shapes(shapes, offset=None) -> Iterator[Tuple[Any, GroupXform]]:
-    """Yield (shape, GroupXform) flattening groups recursively (nested groups compose their transforms)."""
+def _iter_shapes(shapes, offset=None, path: Tuple[int, ...] = (),
+                 counter: Optional[List[int]] = None) -> Iterator[Tuple[Any, GroupXform, Tuple[int, ...]]]:
+    """Yield (shape, GroupXform, group_path) flattening groups recursively (nested groups compose their transforms).
+
+    ``group_path`` is the ordinal of every enclosing group, outermost first (PROMPT-027R §8).  Ordinals follow the
+    document order of one slide, so they are stable for one file and never alter geometry.
+    """
     xf = offset if isinstance(offset, GroupXform) else GroupXform.IDENTITY
+    counter = counter if counter is not None else [0]
     for shape in shapes:
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            yield from _iter_shapes(shape.shapes, xf.child(shape))
+            counter[0] += 1
+            yield from _iter_shapes(shape.shapes, xf.child(shape), path + (counter[0],), counter)
         else:
-            yield shape, xf
+            yield shape, xf, path
 
 
 _THEME_SLOTS = {"TEXT_1": "dk1", "DARK_1": "dk1", "BACKGROUND_1": "lt1", "LIGHT_1": "lt1", "TEXT_2": "dk2",
@@ -951,7 +972,7 @@ def parse_pptx(path: str | Path) -> ReportData:
                 title_shape_id = slide.shapes.title.shape_id
         except Exception:
             title_shape_id = None
-        for z_order, (shape, offset) in enumerate(_iter_shapes(slide.shapes)):
+        for z_order, (shape, offset, group_path) in enumerate(_iter_shapes(slide.shapes)):
             try:
                 is_picture = (shape.shape_type in (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE)
                               or (shape.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER and hasattr(shape, "image")))
@@ -959,16 +980,19 @@ def parse_pptx(path: str | Path) -> ReportData:
                     pb = _picture_block(shape, offset)
                     if pb:
                         pb.z_order = z_order
+                        pb.group_path = group_path
                         blocks.append(pb)
                     continue
                 prst, rot = _shape_geometry(shape)
                 is_table = getattr(shape, "has_table", False) and shape.has_table
                 visual = _annotation_block(shape, offset, prst, rot, z_order, theme)
+                visual.group_path = group_path
                 annotations.append(visual)
                 if is_table:
                     tb = _table_block(shape, offset)
                     if tb:
                         tb.z_order = z_order
+                        tb.group_path = group_path
                         visual.text = tb.text
                         blocks.append(tb)
                     continue
@@ -977,12 +1001,14 @@ def parse_pptx(path: str | Path) -> ReportData:
                     ab = arrow_block(shape, offset, prst, rot)
                     if ab is not None:
                         ab.z_order = z_order
+                        ab.group_path = group_path
                         visual.direction = ab.direction
                         arrows.append(ab)
                 if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
                     text_blocks = _frame_blocks(shape, offset, shape.shape_id == title_shape_id, theme)
                     for text_block in text_blocks:
                         text_block.z_order = z_order
+                        text_block.group_path = group_path
                     blocks.extend(text_blocks)
                     continue
             except Exception:
