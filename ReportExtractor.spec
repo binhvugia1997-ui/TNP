@@ -161,7 +161,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=ICON if os.path.exists(ICON) else None,
-    version=None,
 )
 coll = COLLECT(
     exe,
