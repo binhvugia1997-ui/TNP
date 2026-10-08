@@ -94,7 +94,7 @@ def build_improvement_image(report: ReportData, slide_numbers: Sequence[int], ta
         return None, ""
     renderer = renderer or SlideRenderer()
     with tempfile.TemporaryDirectory(prefix="re_imp_") as tmp:
-        res = renderer.render(report, nums, Path(tmp))
+        res = renderer.render(report, nums, Path(tmp), purpose="improvement_sheet")
         imgs = [Image.open(res[n]).convert("RGB") for n in nums if n in res]
         labels = [f"Slide {n}" for n in nums if n in res]
         sheet = combine_vertically(imgs, width=width, labels=labels if len(imgs) > 1 else None)
@@ -261,7 +261,8 @@ def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_
     check_cancelled(should_cancel)
     with tempfile.TemporaryDirectory(prefix="re_visual_region_") as tmp:
         try:
-            render_paths = renderer.render(report, slides, Path(tmp), should_cancel=should_cancel)
+            render_paths = renderer.render(report, slides, Path(tmp), should_cancel=should_cancel,
+                                           purpose="after_evidence")
             LOG.info("REGION_RENDER MN=%s report=%s scope=%s slides=%s backend=%s result=ok",
                      management_number or "-", report.filename, report_scope_key(report.path), slides,
                      renderer.last_backend or "unknown")

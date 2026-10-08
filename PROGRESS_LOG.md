@@ -280,3 +280,85 @@
   (baseline 875 + 19 mới); compileall, pyflakes (file mới), `git diff --check`, frontend `tsc --noEmit` + `vite build`
   đều pass.
 - Chưa chạy xác minh Windows: cần chạy lại file PPTX 2 mục thật trên Windows (xem checklist trong báo cáo).
+
+## PROMPT-027 — Render trung thực PowerPoint + xem trước đúng vùng After thật + sửa No Fill/No Line (v1.3.3 / Build 016)
+
+Bối cảnh: chạy thử PPTX thật trên Windows lộ ra nhiều lỗi KHÁC nhau (không cùng một nguyên nhân), nên mỗi vấn đề
+được truy vết độc lập trước khi sửa (§58): xem trước toàn slide bị dồn lên trên; khung chữ tác giả để **No Fill /
+No Line** bị vẽ thành khung đen; khung học chỉ tô đúng MỘT ảnh trong khi Excel xuất cả vùng Sau của Mục; và cần
+kiểm chứng crop thật.
+
+- Nguyên nhân gốc (đã chứng minh bằng fixture, không suy đoán):
+  - **Khung đen (Problem B)** — `app/pptx_parser.py` đọc `line_visible = line.fill.type is not None`. Với
+    `<a:ln><a:noFill/></a:ln>`, python-pptx trả về `MSO_FILL.BACKGROUND` (giá trị 5, **khác None**) nên "No Line"
+    bị hiểu nhầm là "có nét"; vì không có màu tường minh, renderer fallback `line_color or "#000000"` → vẽ khung
+    đen. Nhánh fill đã có phép thử `!= MSO_FILL.BACKGROUND`, nhánh line thì thiếu → bất đối xứng. Đây đúng là điều
+    §7 cấm: suy diễn "thiếu màu" thành "nét đen nhìn thấy được".
+  - **Nội dung bị dồn lên trên (Problem A)** — `Block` hoàn toàn KHÔNG lưu `anchor` / text inset / line spacing,
+    còn `_draw_text` luôn bắt đầu vẽ ở `y0 + 3` (đỉnh khung). Slide thật có chữ căn giữa (`anchor="ctr"`) và nhiều
+    khoảng trắng tác giả chủ ý nên PowerPoint vẽ THẤP HƠN; renderer tích hợp vẽ sát đỉnh → lệch lên. Đo trên
+    fixture: chữ bị vẽ cao hơn tâm thật 82px. Không dùng bất kỳ offset cố định nào (§12).
+- `app/pptx_parser.py`:
+  - Thêm `ShapeStyle` + `_shape_style()`: phân biệt rành mạch **No Fill / No Line tường minh** (`fill_explicit_none`,
+    `line_explicit_none`) với **kế thừa / không khai báo / theme**; `BACKGROUND` = "không vẽ gì" cho CẢ hai nhánh
+    fill và line; chỉ khi tác giả không khai báo gì mới fallback `fillRef` / `lnRef`.
+  - Thêm `_text_frame_layout()` và các trường mới trên `Block`: `vertical_anchor`, `wrap`, 4 inset, `autofit_scale`
+    (`<a:normAutofit fontScale>`), `line_spacing` / `space_before` / `space_after` theo từng đoạn. Đây là gợi ý
+    render, KHÔNG phải viết lại font engine của PowerPoint (§11).
+- `app/qpn_renderer.py`:
+  - `_draw_visual_shape()` chỉ vẽ đúng slot được phép: `fill_visible=False` → không tô; `line_visible=False` →
+    không viền; cả hai false → không vẽ gì. Màu mặc định chỉ là hằng số đặt tên (`DEFAULT_SHAPE_FILL` /
+    `DEFAULT_SHAPE_LINE`) áp dụng CHO SLOT THẬT SỰ HIỂN THỊ nhưng không phân giải được màu. Connector/line: chỉ
+    `line_explicit_none` mới ẩn (nét là bản thân hình đó).
+  - `_draw_text()` tính vị trí chữ theo inset thật + `vertical_anchor` (t/ctr/b) + line/paragraph spacing +
+    `normAutofit`; shrink-to-fit có chặn dưới, suy ra từ chính khung đã trừ inset. Màu chữ lấy theo CHỈ SỐ ĐOẠN
+    (trước đây lấy theo chỉ số dòng đã wrap → lệch màu khi một đoạn xuống dòng).
+  - Chẩn đoán có cấu trúc (§3): `SLIDE_RENDER purpose=… backend=… faithful=… slide=… rendered=WxH
+    slide_emu=WxH schema=v…`, `SLIDE_RENDER_BACKEND_FAILED purpose=… backend=… reason=…` (kể cả
+    `reason=unavailable` — không rơi xuống âm thầm), `SLIDE_RENDER_FAILED` khi cả chuỗi thất bại. `_safe_reason()`
+    loại đường dẫn tuyệt đối khỏi lý do lỗi.
+  - `FAITHFUL_BACKENDS = {"powerpoint"}` + `is_faithful_backend()`; `RENDER_SCHEMA_VERSION = 2` để invalidate cache
+    preview cũ sau khi sửa hình học render (§29). `render(..., purpose=…)` là tham số bổ sung, không đổi hành vi.
+  - PowerPoint COM vẫn là backend ưu tiên và export NGUYÊN slide (`width_px` × `height` theo đúng tỉ lệ slide):
+    không trim khoảng trắng, không crop theo pixel khác trắng, không đổi tỉ lệ (§5). LibreOffice / built-in vẫn là
+    fallback hợp lệ nhưng được báo rõ là giảm độ trung thực (§6).
+- `app/application_service.py`:
+  - Cache preview giờ định danh theo (report scope, đường dẫn, slide, mtime, **chuỗi backend ưu tiên**, **width_px**,
+    **RENDER_SCHEMA_VERSION**) → renderer đổi là bỏ cache, không tái dùng ảnh sai cũ; vẫn cách ly tuyệt đối giữa các
+    báo cáo (không tái diễn PROMPT-020).
+  - `_slide_evidence_regions()` chạy ĐÚNG bộ dựng production (`select_after_pictures` +
+    `build_improvement_visual_regions`) và `_evidence_region_for()` chọn region sở hữu ảnh ứng viên theo chính danh
+    sách ảnh của region → React KHÔNG BAO GIỜ tự suy ra hình học từ `candidate.bounds` (§15). Region được tính
+    TRƯỚC khi render nên preview lỗi vẫn báo đúng sự thật vùng bằng chứng.
+  - DTO thêm (chỉ thêm, không bỏ trường cũ): `slidePreviewBackend`, `slidePreviewFaithful`, `evidenceRegionBbox`,
+    `evidenceRegionBboxPct`, `evidenceRegionKind`, `evidenceRegionItemId/ItemIndex/ItemHeading/PictureCount`.
+    Vẫn không lộ đường dẫn tuyệt đối ra browser.
+- `frontend/src/types.ts`, `frontend/src/components/AppHeader.tsx`, `frontend/src/tabs/LearningTab.tsx`:
+  - Header hiện **`v1.3.3 · Build 016`** (lấy từ Python qua bridge, không hardcode); Settings vẫn hiện
+    **`1.3.3 — Build 016`**. Tester Windows nhận diện ngay bản đang chạy (§50/§52).
+  - Preview học vẽ HAI khung phân biệt rõ (§13/§16): **Vùng xuất Excel** = viền liền đậm + nhãn
+    `Mục #n · Vùng xuất Excel` (chính), **Ảnh đang đánh giá** = viền nét đứt mảnh + nhãn `Ảnh #id` (phụ). Vùng làm
+    nét (clip) đi theo vùng xuất Excel. Toggle gọn 3 nút `[Vùng xuất Excel][Ảnh đang đánh giá][Cả hai]`, mặc định
+    "Cả hai" (§17) — KHÔNG redesign lại layout Học cải tiến (§43).
+  - Backend hiển thị dạng tên an toàn (`Render: PowerPoint` / `Trình vẽ tích hợp`); khi không phải PowerPoint thì có
+    dòng chú ý nhỏ KHÔNG chặn: "Bản xem trước đơn giản — bố cục có thể khác PowerPoint" (§6/§41). Panel phải liệt kê
+    toạ độ EMU + % của cả hai hình học để đối chiếu log Windows (§42).
+  - Hook `overlayMode` khai báo CÙNG các hook khác và TRƯỚC early-return theo candidate → giữ nguyên fix React #310
+    (§44). Làm mờ/làm nét chỉ là hiển thị React, không đổi ảnh nguồn, region, crop hay bytes Excel (§18).
+- Phiên bản: `app/__init__.py` → `__version__ = "1.3.3"`, `BUILD_NUMBER = 16`; `frontend/package.json` +
+  `package-lock.json` (chỉ 2 trường version gốc — KHÔNG đụng `fast-fifo@1.3.2`), `frontend/index.html`,
+  `frontend/public/mock/qpn-slide.svg`, fixtures test frontend. Tài liệu lịch sử (`PROGRESS_LOG.md` các mục cũ,
+  `DEVELOPMENT_WEBVIEW.md` dòng kết quả PROMPT-025) và `tests/test_console_encoding.py` (chuỗi mẫu test encoding)
+  giữ nguyên đúng §49. `backup/ReportExtractor_v1.0.4_Build004_STABLE/` KHÔNG đổi (§63). KHÔNG xuất bản LAN /
+  release / không đụng `main` (§62).
+- Giữ nguyên nghiệp vụ: PROMPT-015 gate ngữ nghĩa (AFTER / PRODUCTION_IMPROVEMENT / confident owner /
+  excel_output_eligible — nhãn học không vượt gate), PROMPT-020 isolation theo báo cáo, PROMPT-021 crop từ slide đã
+  render, PROMPT-025 nhiều mục trên một slide (region theo item, 3 ảnh After = MỘT vùng), PROMPT-024R huỷ hợp tác
+  (`should_cancel` vẫn được quan sát ở các điểm an toàn, `purpose` không đổi hành vi huỷ), PROMPT-026R bridge
+  (ping/polling gate/reconnect), an toàn transaction Excel, PROMPT-011 hình học group.
+- Test: `tests/test_prompt027_rendering.py` (54) + `frontend/tests/prompt027-overlays.test.mjs` (7). Tổng
+  **965 passed** (baseline 911 + 54 mới, không giảm, không xoá test cũ); compileall, pyflakes (theo đúng lời gọi và
+  bộ lọc của `tools/build_portable.py`), `git diff --check`, `npm run test:bridge` (14), `npm run
+  test:learning-hooks` (1), `npm run typecheck`, `npm run build` đều pass.
+- CHƯA xác minh trên Windows: độ trung thực PowerPoint thật, hành vi No Fill / No Line trên PowerPoint thật, và crop
+  Excel cuối cùng trên báo cáo thật — chỉ được kết luận sau khi chạy PPTX thật trên Windows với v1.3.3 / Build 016.

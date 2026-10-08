@@ -10,7 +10,16 @@ const TABS: { key: TabKey; label: string; icon: typeof FileSearch }[] = [
 ]
 
 export function AppHeader() {
-  const { tab, setTab, title } = useStore()
+  const { tab, setTab, title, appInfo } = useStore()
+  /* PROMPT-027 §50: the running build must be identifiable AT A GLANCE during Windows acceptance, so the
+     header shows version AND build together (for example "vX.Y.Z · Build NNN").  APP_TITLE already embeds
+     the bare version, so the h1 shows the product NAME and the badge carries version + build — no
+     duplication.  Both values come from the single authoritative Python source via the bridge; this file
+     must never hardcode a version or build literal of its own. */
+  const productName = appInfo.name || title
+  const versionText = appInfo.version
+    ? `v${appInfo.version}${appInfo.build ? ` · Build ${appInfo.build}` : ''}`
+    : ''
 
   return (
     <header className="shrink-0 border-b border-line bg-app">
@@ -23,7 +32,16 @@ export function AppHeader() {
             <path d="m13.6 16.6 2.4 2.4" strokeLinecap="round" />
           </svg>
         </span>
-        <h1 className="text-base2 font-semibold text-header">{title}</h1>
+        <h1 className="text-base2 font-semibold text-header">{productName}</h1>
+        {versionText && (
+          <span
+            data-testid="app-version-badge"
+            className="shrink-0 rounded-sm2 border border-line bg-white/70 px-1.5 py-[1px] text-xxs font-medium tabular-nums text-muted"
+            title="Phiên bản đang chạy (nguồn duy nhất: Python backend)"
+          >
+            {versionText}
+          </span>
+        )}
         <span className="ml-1 hidden text-xs2 text-muted sm:inline">PPTX → Bảng kiểm chứng</span>
       </div>
 

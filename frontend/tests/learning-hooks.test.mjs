@@ -127,7 +127,7 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
       update: { path: '', autoCheck: true },
     }
     const dashboard = {
-      app: { name: 'Report Extractor', title: 'Report Extractor v1.3.2', version: '1.3.2', build: '015', buildNumber: 15 },
+      app: { name: 'Report Extractor', title: 'Report Extractor v1.3.3', version: '1.3.3', build: '016', buildNumber: 16 },
       config,
       scan: { scanned: false, message: 'No reports selected.' },
       reports: [],
@@ -185,7 +185,7 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
       api: {
         ping: async () => bridgeEnvelope('Python bridge OK'),
         get_app_version: async () => bridgeEnvelope({
-          name: 'Report Extractor', title: 'Report Extractor v1.3.2', version: '1.3.2', build: '015',
+          name: 'Report Extractor', title: 'Report Extractor v1.3.3', version: '1.3.3', build: '016',
         }),
         get_current_config: async () => bridgeEnvelope(config),
         get_dashboard_state: async () => bridgeEnvelope(dashboard),

@@ -212,6 +212,26 @@ export type ImageCandidate = {
   slidePreview?: string
   slidePreviewWidth?: number
   slidePreviewHeight?: number
+  /**
+   * PROMPT-027 §4/§6: backend ĐÃ thật sự render ảnh xem trước ("powerpoint" | "libreoffice" | "builtin").
+   * Chỉ PowerPoint là trung thực từng điểm ảnh với slide gốc; backend dự phòng phải được báo rõ để UI
+   * hiện cảnh báo giảm độ trung thực thay vì giả vờ là kết quả PowerPoint. Không chứa đường dẫn file.
+   */
+  slidePreviewBackend?: string
+  slidePreviewFaithful?: boolean
+  /**
+   * PROMPT-027 §13/§14/§15: VÙNG XUẤT EXCEL — vùng "Sau cải tiến" theo ImprovementItem mà pipeline
+   * sản xuất SẼ crop đưa vào Excel nếu xử lý file này ngay bây giờ. Do Python tính từ
+   * ImprovementVisualRegion.bbox; React KHÔNG BAO GIỜ tự suy ra từ bounds của ảnh ứng viên.
+   * Một vùng có thể chứa nhiều ảnh After + caption + chú thích; null khi ảnh này không thuộc vùng nào.
+   */
+  evidenceRegionBbox?: { x: number; y: number; width: number; height: number } | null
+  evidenceRegionBboxPct?: { x: number; y: number; w: number; h: number } | null
+  evidenceRegionKind?: string
+  evidenceRegionItemId?: string
+  evidenceRegionItemIndex?: number
+  evidenceRegionItemHeading?: string
+  evidenceRegionPictureCount?: number
   /** PROMPT-025: định danh mục cải tiến (một slide có thể có nhiều mục). */
   itemId?: string
   itemIndex?: number

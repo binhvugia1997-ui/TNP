@@ -325,7 +325,7 @@ def test_configuration_ollama_update_state_and_disabled_install(sample_tree, tmp
 
     install = bridge.install_update()
     assert install["ok"] is True and install["data"]["status"] == "unavailable"
-    assert service.current_config()["app"]["version"] == "1.3.2"
+    assert service.current_config()["app"]["version"] == "1.3.3"
 
 
 def test_bridge_native_selection_tokens_dto_validation_and_error_sanitizing(sample_tree, tmp_path, monkeypatch):

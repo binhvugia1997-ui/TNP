@@ -359,7 +359,7 @@ test('normal ready path pings, loads version/config/dashboard, and adds no start
     fakeWindow.pywebview = {
       api: {
         ping: async () => { calls.push('ping'); return { ok: true, data: 'Python bridge OK' } },
-        get_app_version: async () => { calls.push('get_app_version'); return { ok: true, data: { version: '1.3.2', build: '015' } } },
+        get_app_version: async () => { calls.push('get_app_version'); return { ok: true, data: { version: '1.3.3', build: '016' } } },
         get_current_config: async () => { calls.push('get_current_config'); return { ok: true, data: { config: true } } },
         get_dashboard_state: async () => { calls.push('get_dashboard_state'); return { ok: true, data: { dashboard: true } } },
       },
@@ -369,7 +369,7 @@ test('normal ready path pings, loads version/config/dashboard, and adds no start
 
     assert.deepEqual(calls, ['ping', 'get_app_version', 'get_current_config', 'get_dashboard_state'])
     assert.deepEqual(initial, {
-      version: { version: '1.3.2', build: '015' },
+      version: { version: '1.3.3', build: '016' },
       config: { config: true },
       dashboard: { dashboard: true },
     })

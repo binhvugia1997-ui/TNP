@@ -2,11 +2,11 @@
 
 Single canonical source of the application version / build number (never duplicate these strings).
 ``BUILD_NUMBER`` is the authoritative, numeric update ordering (PROMPT-005); it is displayed zero-padded
-(e.g. ``Build 015``).  A Git revision – when available – is internal diagnostic metadata only, never the build number.
+(e.g. ``Build 016``).  A Git revision – when available – is internal diagnostic metadata only, never the build number.
 """
 
-__version__ = "1.3.2"
-BUILD_NUMBER = 15
+__version__ = "1.3.3"
+BUILD_NUMBER = 16
 
 
 def format_build(n) -> str:
@@ -18,5 +18,5 @@ BUILD_ID = format_build(BUILD_NUMBER)                         # zero-padded nume
 BUILD_LABEL = f"Build {BUILD_ID}"                             # numeric build label
 APP_NAME = "Report Extractor"
 APP_TITLE = f"{APP_NAME} v{__version__}"                      # window title / about
-VERSION_LABEL = f"{__version__} — {BUILD_LABEL}"              # e.g. "1.3.2 — Build 015"
+VERSION_LABEL = f"{__version__} — {BUILD_LABEL}"              # e.g. "1.3.3 — Build 016"
 VERSION_LINE = f"version={__version__} build={BUILD_ID}"      # diagnostics / log start-up line

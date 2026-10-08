@@ -1,7 +1,7 @@
 {
   "name": "report-extractor-prototype",
   "private": true,
-  "version": "1.3.2",
+  "version": "1.3.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "test:bridge": "node --test tests/bridge.test.mjs",
     "test:learning-hooks": "node --test tests/learning-hooks.test.mjs",
+    "test:prompt027": "node --test tests/prompt027-overlays.test.mjs",
+    "test:frontend": "node --test tests/bridge.test.mjs tests/learning-hooks.test.mjs tests/prompt027-overlays.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

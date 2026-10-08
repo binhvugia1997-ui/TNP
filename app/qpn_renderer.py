@@ -31,6 +31,25 @@ from .pptx_parser import Block, ReportData, SlideData
 
 LOG = logging.getLogger("report_extractor.renderer")
 EMU_PER_INCH = 914400
+EMU_PER_PT = 12700
+
+# PROMPT-027: bump whenever the rendered full-slide bitmap's GEOMETRY or paint semantics change, so a
+# cached preview produced by older (wrong) rendering can never be reused (§29).
+RENDER_SCHEMA_VERSION = 2
+
+# Fallback paint used ONLY for a slot that is genuinely visible but whose colour could not be resolved
+# from the PPTX/theme.  Never applied to a slot the author hid (No Fill / No Line) — §7/§9.
+DEFAULT_SHAPE_FILL = "#4f81bd"
+DEFAULT_SHAPE_LINE = "#000000"
+DEFAULT_LINE_WIDTH_EMU = 12700
+DEFAULT_TEXT_COLOR = "black"
+
+# Text-frame layout defaults (ECMA-376).  Calibrated so 1pt of authored text maps to the same visual
+# size PowerPoint uses at the rendered scale; MIN_TEXT_PX bounds the shrink-to-fit fallback.
+DEFAULT_TEXT_PT = 14.0
+DEFAULT_LINE_SPACING = 1.2
+TEXT_SIZE_CALIBRATION = 1.05
+MIN_TEXT_PX = 10
 
 
 # ----------------------------------------------------------------------------
@@ -77,6 +96,33 @@ def renderer_status() -> Dict[str, str]:
         "libreoffice": "OK" if (find_soffice() and pymupdf_available()) else "Unavailable",
         "builtin": "OK",
     }
+
+
+# PROMPT-027 §5/§6: only Microsoft PowerPoint COM exports the COMPLETE authored slide pixel-faithfully
+# (no trimming, no repositioning, no whitespace normalization).  LibreOffice and the built-in renderer
+# are honest fallbacks: they must be reported as reduced fidelity, never presented as PowerPoint output.
+FAITHFUL_BACKENDS = frozenset({"powerpoint"})
+
+
+def is_faithful_backend(backend: str) -> bool:
+    """True when ``backend`` reproduces the authored slide faithfully (drives the UI fidelity notice)."""
+    return str(backend or "") in FAITHFUL_BACKENDS
+
+
+def _safe_reason(report: ReportData, exc: BaseException) -> str:
+    """Concise, log-safe failure reason: exception class + message with local paths removed (§3/§42).
+
+    Renderer errors routinely embed absolute Windows paths from COM/LibreOffice.  Diagnostics must stay
+    useful without leaking the tester's filesystem into logs that can reach the UI layer.
+    """
+    text = str(exc).strip()
+    for secret in (str(getattr(report, "path", "") or ""), getattr(report, "filename", "") or ""):
+        if secret:
+            text = text.replace(secret, "<report>")
+    text = " ".join(text.split())
+    if len(text) > 180:
+        text = text[:177] + "..."
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 # ----------------------------------------------------------------------------
@@ -333,45 +379,133 @@ def _draw_line_arrowhead(draw: ImageDraw.ImageDraw, tip: Tuple[float, float], di
 
 
 def _draw_visual_shape(draw: ImageDraw.ImageDraw, block: Block, px, scale: float, arrow=None) -> None:
-    line_color = block.line_color or ("#000000" if block.line_visible else None)
-    fill_color = block.fill_color or ("#4f81bd" if block.fill_visible else None)
-    stroke = max(1, int(round((block.line_width or 12700) * scale))) if block.line_visible else 0
+    """Paint one vector shape strictly according to its resolved style (PROMPT-027 §9).
+
+    ``fill_visible``/``line_visible`` are authoritative: when a slot is invisible NO pixels are painted
+    for it, and no colour is invented.  A shape authored ``No Fill`` + ``No Line`` therefore contributes
+    nothing at all — the previous code turned such a shape into a black rectangle because an unresolved
+    line colour fell back to ``#000000`` while the line was still (wrongly) considered visible.
+    """
+    fill_color = (block.fill_color or DEFAULT_SHAPE_FILL) if block.fill_visible else None
+    line_color = (block.line_color or DEFAULT_SHAPE_LINE) if block.line_visible else None
+    stroke = max(1, int(round((block.line_width or DEFAULT_LINE_WIDTH_EMU) * scale))) if block.line_visible else 0
     if block.line_endpoints:
+        # A straight connector/line has no fill concept: its stroke IS the shape.  An explicit No Line
+        # hides it; otherwise it stays visible (an invisible connector would carry no meaning at all).
+        if block.line_explicit_none or (not block.line_visible and not fill_color):
+            return
+        paint = line_color or fill_color or DEFAULT_SHAPE_LINE
         x0, y0, x1, y1 = block.line_endpoints
         start, end = (px(x0), px(y0)), (px(x1), px(y1))
-        draw.line((start, end), fill=line_color or fill_color or "#000000", width=stroke or 1)
+        draw.line((start, end), fill=paint, width=max(1, stroke))
         if arrow is not None and arrow.direction:
             direction = arrow.direction
             tip = max((start, end), key=lambda p: p[0]) if direction == "right" else \
                 min((start, end), key=lambda p: p[0]) if direction == "left" else \
                 max((start, end), key=lambda p: p[1]) if direction == "down" else \
                 min((start, end), key=lambda p: p[1])
-            _draw_line_arrowhead(draw, tip, direction, max(5, stroke * 5), line_color or "#000000")
+            _draw_line_arrowhead(draw, tip, direction, max(5, stroke * 5), paint)
         return
+    if fill_color is None and line_color is None:
+        return                                                 # No Fill + No Line -> nothing to paint
     points = _visual_polygon(block, px)
-    if block.fill_visible or block.line_visible:
-        draw.polygon(points, fill=fill_color, outline=line_color, width=stroke or 1)
+    draw.polygon(points, fill=fill_color, outline=line_color, width=max(1, stroke))
+
+
+def _text_layout_lines(b: Block, font, box_w: int, draw: ImageDraw.ImageDraw,
+                       wrap: bool) -> List[Tuple[str, int]]:
+    """Wrapped display lines of ``b.text`` tagged with their source paragraph index.
+
+    The paragraph index is what makes per-paragraph spacing and per-paragraph colour correct: indexing
+    those lists by the wrapped-line number (as before) desynchronizes them as soon as any paragraph
+    wraps onto more than one line.
+    """
+    out: List[Tuple[str, int]] = []
+    for index, paragraph in enumerate(b.text.split("\n")):
+        if not paragraph.strip():
+            out.append(("", index))
+            continue
+        if not wrap:                                           # <a:bodyPr wrap="none">
+            out.append((paragraph, index))
+            continue
+        current = ""
+        for word in paragraph.split(" "):
+            trial = (current + " " + word).strip()
+            if draw.textlength(trial, font=font) <= box_w or not current:
+                current = trial
+            else:
+                out.append((current, index))
+                current = word
+        if current:
+            out.append((current, index))
+    return out
+
+
+def _spacing(b: Block, values: Sequence[float], index: int) -> float:
+    return float(values[index]) if index < len(values) else 0.0
 
 
 def _draw_text(draw: ImageDraw.ImageDraw, b: Block, px, scale: float) -> None:
+    """Draw a text frame at its AUTHORED position inside its box (PROMPT-027 §11).
+
+    PowerPoint places text using the body insets, the vertical anchor (``t``/``ctr``/``b``), the
+    ``normAutofit`` font scale and per-paragraph line/paragraph spacing.  Ignoring those pinned every
+    run to the top-left corner, which is exactly why real slides with authored whitespace and centred
+    labels rendered as if their content had been shifted upward.  All geometry here derives from the
+    PPTX values — there is no fixed offset, no per-slide and no per-report correction.
+    """
     x0, y0, x1, y1 = px(b.left), px(b.top), px(b.right), px(b.bottom)
-    box_w = max(20, x1 - x0 - 8)
-    size_pt = b.size_pt or 14
-    size = max(10, int(size_pt * 12700 * scale * 1.05))
-    font = get_font(size, b.bold)
-    lines = _wrap(b.text, font, box_w, draw)
-    line_h = int(size * 1.25)
-    # shrink to fit if text overflows badly
-    while line_h * len(lines) > (y1 - y0) * 1.6 and size > 10:
-        size -= 1
+    ins_l, ins_t = px(b.inset_left), px(b.inset_top)
+    ins_r, ins_b = px(b.inset_right), px(b.inset_bottom)
+    area_x = x0 + ins_l
+    area_y = y0 + ins_t
+    area_w = max(8, x1 - ins_r - area_x)
+    area_h = max(8, y1 - ins_b - area_y)
+    wrap = b.wrap != "none"
+
+    def measure(size: int) -> Tuple[List[Tuple[str, int]], List[float], float]:
+        """Return (lines, per-line advance, total height) for one candidate font size."""
         font = get_font(size, b.bold)
-        lines = _wrap(b.text, font, box_w, draw)
-        line_h = int(size * 1.25)
-    y = y0 + 3
-    for i, ln in enumerate(lines):
-        color = b.line_colors[i] if i < len(b.line_colors) and b.line_colors[i] else "black"
-        draw.text((x0 + 4, y), ln, fill=color, font=font)
-        y += line_h
+        lines = _text_layout_lines(b, font, area_w, draw, wrap)
+        advances: List[float] = []
+        total = 0.0
+        previous_paragraph = None
+        for _text, paragraph in lines:
+            multiple = b.line_spacing[paragraph] if paragraph < len(b.line_spacing) else None
+            line_h = size * (multiple if isinstance(multiple, float) and multiple > 0 else DEFAULT_LINE_SPACING)
+            advance = line_h
+            if paragraph != previous_paragraph:
+                advance += _spacing(b, b.space_before, paragraph) * 12700 * scale
+                if previous_paragraph is not None:
+                    advance += _spacing(b, b.space_after, previous_paragraph) * 12700 * scale
+            previous_paragraph = paragraph
+            advances.append(advance)
+            total += advance
+        return lines, advances, total
+
+    size_pt = b.size_pt or DEFAULT_TEXT_PT
+    size = max(MIN_TEXT_PX, int(size_pt * EMU_PER_PT * scale * b.autofit_scale * TEXT_SIZE_CALIBRATION))
+    lines, advances, total = measure(size)
+    # Bounded shrink-to-fit: only when the authored text genuinely overflows the authored box, and only
+    # down to MIN_TEXT_PX.  This is a fallback-renderer approximation of PowerPoint's autofit, never a
+    # positional correction.
+    while total > area_h and size > MIN_TEXT_PX:
+        size -= 1
+        lines, advances, total = measure(size)
+
+    anchor = b.vertical_anchor
+    if anchor == "ctr":
+        cursor = area_y + max(0.0, (area_h - total) / 2.0)
+    elif anchor == "b":
+        cursor = area_y + max(0.0, area_h - total)
+    else:
+        cursor = float(area_y)
+    for (line, paragraph), advance in zip(lines, advances):
+        if line:
+            color = b.line_colors[paragraph] if paragraph < len(b.line_colors) and b.line_colors[paragraph] \
+                else DEFAULT_TEXT_COLOR
+            draw.text((area_x, cursor), line, fill=color, font=get_font(size, b.bold))
+        cursor += advance
 
 
 def _draw_table(draw: ImageDraw.ImageDraw, b: Block, px) -> None:
@@ -403,7 +537,14 @@ def _draw_table(draw: ImageDraw.ImageDraw, b: Block, px) -> None:
 # Public API
 # ----------------------------------------------------------------------------
 class SlideRenderer:
-    """Renders slides with the best available backend; caches per file."""
+    """Renders slides with the best available backend; caches per file.
+
+    PROMPT-027 §3: every backend attempt is logged with a ``purpose`` so Windows acceptance can tell
+    which renderer actually produced the learning preview and the final After evidence, and why a
+    higher-fidelity backend was not used.  Only ``powerpoint`` is pixel-faithful to PowerPoint
+    (:data:`FAITHFUL_BACKENDS`); LibreOffice and the built-in renderer are honest fallbacks and are
+    reported as reduced fidelity rather than pretending to be PowerPoint output (§6).
+    """
 
     def __init__(self, prefer: Sequence[str] = ("powerpoint", "libreoffice", "builtin"),
                  width_px: int = 1920, dpi: int = 150):
@@ -411,13 +552,20 @@ class SlideRenderer:
         self.width_px = width_px
         self.dpi = dpi
         self.last_backend = ""
+        self.last_purpose = ""
+        self.backend_tried: List[str] = []
 
     def render(self, report: ReportData, slide_numbers: Sequence[int], out_dir: Path,
-               should_cancel: Optional[Callable[[], bool]] = None) -> Dict[int, Path]:
+               should_cancel: Optional[Callable[[], bool]] = None,
+               purpose: str = "") -> Dict[int, Path]:
         """Render slides. ``should_cancel`` is only observed BEFORE a backend starts and BETWEEN
         individual builtin slide renders; a running PowerPoint/LibreOffice/builtin render of one slide is
         never interrupted mid-operation (PROMPT-024R §15). Cancellation therefore raises at the nearest
-        safe boundary and leaves no partially written render behind."""
+        safe boundary and leaves no partially written render behind.
+
+        ``purpose`` labels the consumer (``learning_preview`` / ``after_evidence`` / ``qpn_panel``) in
+        the structured ``SLIDE_RENDER`` diagnostics; it never changes rendering behaviour.
+        """
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         wanted = [n for n in slide_numbers if report.slide(n)]
@@ -425,15 +573,21 @@ class SlideRenderer:
             return {}
         check_cancelled(should_cancel)
         errors: List[str] = []
+        self.backend_tried = []
+        slide_width = int(report.slide_width or 0)
+        slide_height = int(report.slide_height or 0)
         for backend in self.prefer:
             check_cancelled(should_cancel)
+            self.backend_tried.append(backend)
             try:
                 if backend == "powerpoint":
                     if not powerpoint_available():
+                        self._log_backend_failed(purpose, backend, report, "unavailable")
                         continue
                     res = render_with_powerpoint(report.path, wanted, out_dir, self.width_px)
                 elif backend == "libreoffice":
                     if not (find_soffice() and pymupdf_available()):
+                        self._log_backend_failed(purpose, backend, report, "unavailable")
                         continue
                     res = render_with_libreoffice(report.path, wanted, out_dir, self.dpi)
                 elif backend == "builtin":
@@ -445,17 +599,48 @@ class SlideRenderer:
                         img.save(target, "PNG")
                         res[n] = target
                 else:
+                    self._log_backend_failed(purpose, backend, report, "unknown-backend")
                     continue
                 if res and all(n in res for n in wanted):
                     self.last_backend = backend
+                    self.last_purpose = purpose
+                    self._log_render(purpose, backend, report, res, slide_width, slide_height)
                     return res
+                self._log_backend_failed(purpose, backend, report, "incomplete-result")
                 errors.append(f"{backend}: incomplete result")
             except CancellationRequested:
                 raise                                    # cooperative cancel is never a renderer failure
             except Exception as e:  # noqa: BLE001
+                reason = _safe_reason(report, e)
                 LOG.warning("Renderer %s failed for %s: %s", backend, report.filename, e)
+                self._log_backend_failed(purpose, backend, report, reason)
                 errors.append(f"{backend}: {e}")
+        LOG.error("SLIDE_RENDER_FAILED purpose=%s report=%s slides=%s tried=%s errors=%s",
+                  purpose or "-", report.filename, wanted, ",".join(self.backend_tried) or "-",
+                  "; ".join(errors) or "-")
         raise RuntimeError("Không render được slide: " + "; ".join(errors))
+
+    # ------------------------------------------------------------------ diagnostics (PROMPT-027 §3)
+    @staticmethod
+    def _log_render(purpose: str, backend: str, report: ReportData, res: Dict[int, Path],
+                    slide_width: int, slide_height: int) -> None:
+        for number in sorted(res):
+            width = height = 0
+            try:
+                with Image.open(res[number]) as image:     # header only; pixels are never loaded here
+                    width, height = image.size
+            except Exception:  # noqa: BLE001
+                pass
+            LOG.info("SLIDE_RENDER purpose=%s backend=%s faithful=%s report=%s slide=%s "
+                     "rendered=%sx%s slide_emu=%sx%s schema=v%s",
+                     purpose or "-", backend, str(backend in FAITHFUL_BACKENDS).lower(),
+                     report.filename, number, width, height, slide_width, slide_height,
+                     RENDER_SCHEMA_VERSION)
+
+    @staticmethod
+    def _log_backend_failed(purpose: str, backend: str, report: ReportData, reason: str) -> None:
+        LOG.warning("SLIDE_RENDER_BACKEND_FAILED purpose=%s backend=%s report=%s reason=%s",
+                    purpose or "-", backend, report.filename, reason)
 
 
 @dataclass
@@ -497,7 +682,7 @@ def render_qpn_panel(report: ReportData, qpn_slide: int, target_png: Path,
             LOG.debug("QPN picture blob not decodable (%s) – cropping rendered slide instead", e)
     renderer = renderer or SlideRenderer()
     with tempfile.TemporaryDirectory(prefix="re_qpn_") as tmp:
-        res = renderer.render(report, [qpn_slide], Path(tmp))
+        res = renderer.render(report, [qpn_slide], Path(tmp), purpose="qpn_panel")
         with Image.open(res[qpn_slide]) as im:
             im = im.convert("RGB")
             box = crop_box_px(region, W, H, im.width, im.height)

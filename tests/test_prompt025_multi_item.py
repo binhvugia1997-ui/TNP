@@ -393,15 +393,20 @@ def test_slide_rendered_once_for_two_item_regions(tmp_path):
         def __init__(self):
             super().__init__(prefer=("builtin",), width_px=1200)
             self.calls = []
+            self.purposes = []
 
-        def render(self, report, slide_numbers, out_dir, should_cancel=None):
+        def render(self, report, slide_numbers, out_dir, should_cancel=None, purpose=""):
+            # mirrors the production SlideRenderer.render signature (PROMPT-027 added ``purpose``)
             self.calls.append(tuple(slide_numbers))
-            return super().render(report, slide_numbers, out_dir, should_cancel=should_cancel)
+            self.purposes.append(purpose)
+            return super().render(report, slide_numbers, out_dir, should_cancel=should_cancel,
+                                  purpose=purpose)
 
     renderer = CountingRenderer()
     grouped, problems = _export(report, sel, tmp_path / "crops4", renderer=renderer)
     assert problems == [] and len(grouped.groups) == 2
     assert renderer.calls == [(3,)]                          # ONE render shared by both item crops
+    assert renderer.purposes == ["after_evidence"]           # PROMPT-027 §3: labelled for diagnostics
 
 
 # ================================================================== §43/§45 cooperative cancellation hook
