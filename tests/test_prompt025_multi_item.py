@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from openpyxl import load_workbook
 from PIL import Image
 from pptx.dml.color import RGBColor
@@ -19,6 +20,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Inches, Pt
 
 from app.batch_processor import BatchOptions, BatchProcessor
+from app.cancellation import CancellationRequested
 from app.classifier import heuristic_classify
 from app.extractor import extract_record
 from app.image_extractor import export_after_pictures
@@ -392,9 +394,9 @@ def test_slide_rendered_once_for_two_item_regions(tmp_path):
             super().__init__(prefer=("builtin",), width_px=1200)
             self.calls = []
 
-        def render(self, report, slide_numbers, out_dir):
+        def render(self, report, slide_numbers, out_dir, should_cancel=None):
             self.calls.append(tuple(slide_numbers))
-            return super().render(report, slide_numbers, out_dir)
+            return super().render(report, slide_numbers, out_dir, should_cancel=should_cancel)
 
     renderer = CountingRenderer()
     grouped, problems = _export(report, sel, tmp_path / "crops4", renderer=renderer)
@@ -402,7 +404,10 @@ def test_slide_rendered_once_for_two_item_regions(tmp_path):
     assert renderer.calls == [(3,)]                          # ONE render shared by both item crops
 
 
-# ================================================================== §43 cooperative cancellation hook
+# ================================================================== §43/§45 cooperative cancellation hook
+# PROMPT-024R supersedes the PROMPT-025 "partial group" behavior: a cancel-all acknowledged BETWEEN
+# improvement items must cancel the CURRENT report (CancellationRequested propagates to the batch),
+# so a half-processed report is never committed as a complete Excel row.
 def test_cancellation_hook_between_item_regions(tmp_path):
     deck = _deck(tmp_path / NAME, [_two_item_slide()])
     report = _report(deck)
@@ -413,11 +418,9 @@ def test_cancellation_hook_between_item_regions(tmp_path):
         calls["n"] += 1
         return calls["n"] > 1                                 # stop before the 2nd item region
 
-    grouped, problems = _export(report, sel, tmp_path / "crops5", renderer=_builtin_renderer(),
-                                should_cancel=should_cancel)
-    assert len(grouped.groups) == 1                          # first item finished, nothing half-done
-    assert any("REGION_CANCELLED" in p and "đã dừng" in p for p in problems)
-    assert all(path.exists() for group in grouped.groups for path in group)
+    with pytest.raises(CancellationRequested):
+        _export(report, sel, tmp_path / "crops5", renderer=_builtin_renderer(),
+                should_cancel=should_cancel)
 
 
 # ================================================================== §26 Excel mapping: one row, both items in order, 2 image groups

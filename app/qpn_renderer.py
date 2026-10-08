@@ -21,10 +21,11 @@ import tempfile
 from io import BytesIO
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
+from .cancellation import CancellationRequested, check_cancelled
 from .qpn_region import QpnRegion, crop_box_px, locate_qpn_region
 from .pptx_parser import Block, ReportData, SlideData
 
@@ -411,14 +412,21 @@ class SlideRenderer:
         self.dpi = dpi
         self.last_backend = ""
 
-    def render(self, report: ReportData, slide_numbers: Sequence[int], out_dir: Path) -> Dict[int, Path]:
+    def render(self, report: ReportData, slide_numbers: Sequence[int], out_dir: Path,
+               should_cancel: Optional[Callable[[], bool]] = None) -> Dict[int, Path]:
+        """Render slides. ``should_cancel`` is only observed BEFORE a backend starts and BETWEEN
+        individual builtin slide renders; a running PowerPoint/LibreOffice/builtin render of one slide is
+        never interrupted mid-operation (PROMPT-024R §15). Cancellation therefore raises at the nearest
+        safe boundary and leaves no partially written render behind."""
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         wanted = [n for n in slide_numbers if report.slide(n)]
         if not wanted:
             return {}
+        check_cancelled(should_cancel)
         errors: List[str] = []
         for backend in self.prefer:
+            check_cancelled(should_cancel)
             try:
                 if backend == "powerpoint":
                     if not powerpoint_available():
@@ -431,6 +439,7 @@ class SlideRenderer:
                 elif backend == "builtin":
                     res = {}
                     for n in wanted:
+                        check_cancelled(should_cancel)
                         img = render_builtin(report, report.slide(n), self.width_px)
                         target = out_dir / f"slide_{n:03d}.png"
                         img.save(target, "PNG")
@@ -441,6 +450,8 @@ class SlideRenderer:
                     self.last_backend = backend
                     return res
                 errors.append(f"{backend}: incomplete result")
+            except CancellationRequested:
+                raise                                    # cooperative cancel is never a renderer failure
             except Exception as e:  # noqa: BLE001
                 LOG.warning("Renderer %s failed for %s: %s", backend, report.filename, e)
                 errors.append(f"{backend}: {e}")

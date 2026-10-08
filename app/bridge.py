@@ -65,6 +65,10 @@ class BridgeService:
     def stop_after_current(self) -> dict:
         return self._respond(self.service.stop_after_current)
 
+    def cancel_all(self) -> dict:
+        """PROMPT-024R: cooperative "Dừng tất cả" (never kills threads/processes)."""
+        return self._respond(self.service.cancel_all)
+
     def exclude_reports(self, report_ids: Any) -> dict:
         return self._respond(lambda: self.service.exclude_reports(self._string_list(report_ids, "reportIds"), False))
 
