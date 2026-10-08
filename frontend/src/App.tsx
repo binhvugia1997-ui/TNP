@@ -9,6 +9,7 @@ import { cn } from './lib/utils'
 function messageCategory(code: string) {
   if (code === 'EXCEL_LOCKED') return 'Excel đang bị khóa'
   if (code === 'BRIDGE_UNAVAILABLE') return 'Python bridge chưa sẵn sàng'
+  if (code === 'BRIDGE_METHOD_MISSING' || code === 'BRIDGE_CONTRACT_ERROR') return 'Lỗi hợp đồng Python bridge'
   if (code === 'BUSY') return 'Ứng dụng đang bận'
   if (code === 'WORKER_FAILED') return 'Lỗi tiến trình xử lý'
   if (code.startsWith('OLLAMA')) return 'Ollama không khả dụng'
@@ -25,7 +26,7 @@ export default function App() {
   return (
     <div className="flex h-full min-h-0 flex-col bg-app">
       <AppHeader />
-      {!s.connected && (
+      {!s.connected && !s.errorCode.startsWith('BRIDGE_') && (
         <div className="flex items-center gap-2 border-b border-warn-500/30 bg-warn-50 px-3 py-1.5 text-xs2 text-warn-600" role="status">
           <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
           <span>Chưa kết nối ứng dụng Python. Chế độ demo không được bật; hãy khởi chạy bằng <code>python -m app.desktop</code>.</span>
