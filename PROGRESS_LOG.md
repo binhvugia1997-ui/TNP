@@ -436,3 +436,87 @@ WebView2, PowerPoint vẫn là TÙY CHỌN, máy đích không cần Python/Node
   test_15_cancel_stops_early_and_reports_partial` trượt 1 lần trong 4 lần chạy full-suite (chạy riêng luôn pass;
   4/4 lần chạy ở commit gốc cũng pass) — đây là race có sẵn của test đó (phụ thuộc lịch thread), KHÔNG thuộc
   phạm vi đã sửa và không bị thay đổi.
+
+## PROMPT-028R — Gói Portable không khởi động được: `Failed to resolve Python.Runtime.Loader.Initialize` (v1.3.3 / Build 016, không đổi version)
+
+Lỗi thật do nghiệm thu Windows báo về (bản 1.3.3 / Build 016, python 3.12.10, gói ở
+`H:\ReportExtractor_v1.3.3_Portable\`): bấm đúp `ReportExtractor.exe` thì tiến trình chết TRƯỚC khi UI React
+hiện ra. Chuỗi lỗi: `webview.platforms.winforms` → `import clr` → `pythonnet.load()` →
+`clr_loader.get_netfx()` → `clr_loader/netfx.py:50` → `RuntimeError: Failed to resolve
+Python.Runtime.Loader.Initialize from _internal\pythonnet\runtime\Python.Runtime.dll`.
+
+- **Điểm mấu chốt về thông báo lỗi**: `netfx.py:50` ném lỗi này khi hàm native `pyclr_get_function()` trả về
+  `NULL`. Đường dẫn trong thông báo là đường dẫn **pythonnet HỎI**, không phải đường dẫn **có tồn tại** — nên
+  lỗi này tương thích với cả ba khả năng: file thiếu, file sai bản, hoặc file có đó nhưng CLR không nạp được.
+  Vì vậy không được suy đoán; từng nguyên nhân phải đo trên mã nguồn đã cài.
+- **NGUYÊN NHÂN ĐÃ LOẠI TRỪ (có bằng chứng thực thi, không phải giả thuyết)**: "DLL bị trùng", "sai category
+  PyInstaller", "`collect_data_files` phá hook-clr", "`collect_dynamic_libs` gây nhiễu". `Analysis` kết thúc
+  bằng `normalize_toc(self.datas + self.binaries)` (`building/build_main.py`), và `_TOC_TYPE_PRIORITIES` của
+  `normalize_toc` cho `BINARY`/`EXTENSION` mức 1 còn `DATA` mức 0 → entry `datas` trùng đích bị LOẠI, entry
+  `binaries` của hook-clr luôn thắng ở `pythonnet/runtime`. Đã chạy thử `normalize_toc` thật với cả hai thứ tự
+  để chốt (`test_pyinstaller_normalize_toc_gives_binaries_priority_over_same_dest_datas`). Hai dòng
+  `collect_data_files(...)`/`collect_dynamic_libs(...)` cũ vì thế là THỪA chứ không phải nguyên nhân; vẫn xoá
+  để hook chính thức là chủ sở hữu duy nhất, nhờ đó cổng kiểm tra "đúng 1 bản, đúng chỗ, đúng SHA256" có nghĩa.
+- **NGUYÊN NHÂN CÒN MỞ → đã dựng cổng kiểm soát để Windows tự kết luận**:
+  1. `.venv-build` cũ / lệch phiên bản: `requirements-webview.txt` giờ ghim `clr-loader==0.2.10` (pythonnet
+     3.0.5 chỉ khai báo `clr_loader<0.3.0,>=0.2.7`, không ai ghim nên venv tái sử dụng sẽ trôi phiên bản).
+     `verify_runtime_imports()` import THẬT `webview`/`pythonnet`/`clr`/`clr_loader` trong venv build TRƯỚC khi
+     đóng gói và kiểm tra clr-loader cài đặt có thoả yêu cầu của pythonnet; thêm cờ `--fresh-venv` để tạo lại
+     `.venv-build` tất định. Trên Windows thiếu gói nào là DỪNG BUILD, không để tới lúc bấm đúp mới biết.
+  2. hook-clr gom DLL SAI THƯ MỤC: khi `importlib.metadata.files('pythonnet')` không trả về đúng 1 kết quả
+     (dist-info cũ/sửa tay trong venv tái sử dụng), hook rơi xuống
+     `ctypes.util.find_library('Python.Runtime')` và gom với đích `'.'` → DLL nằm ở
+     `_internal/Python.Runtime.dll`, LỆCH MỘT THƯ MỤC so với chỗ pythonnet tìm. Đã chạy thật hook với metadata
+     rỗng để chứng minh (`test_hook_clr_legacy_fallback_would_collect_the_dll_one_directory_too_high`);
+     `validate_pythonnet_runtime()` bắt đúng layout này ("sai vị trí").
+  3. DLL sai bản/sửa byte: `validate_pythonnet_runtime()` yêu cầu ĐÚNG 1 `Python.Runtime.dll` trong cả gói, ở
+     đúng `_internal/pythonnet/runtime/`, GIỐNG HỆT (SHA256) bản trong venv build, và in cả hai đường dẫn +
+     size + SHA256 ra log build; trên Windows còn kiểm `clr_loader/ffi/dlls/<arch>/ClrLoader.dll`.
+  4. Thiếu .NET Framework trên máy đích — **yêu cầu thật, nay được phát hiện rõ**: `Python.Runtime.dll` của
+     pythonnet 3.0.5 biên dịch cho `.NETStandard,Version=v2.0` (theo chính `deps.json` của nó), nên cần facade
+     netstandard của **.NET Framework 4.7.2+** (registry `Release >= 461808`). `dotnet_framework_report()` đọc
+     `HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full` và ghi vào log; `explain_clr_failure()` nêu đích
+     danh yêu cầu này. Đã bổ sung vào `release_docs/README.txt` mục 1 và mục 5.
+  5. `clr_loader` nạp netfx kiểu lười: `clr_loader/__init__.py` KHÔNG import netfx ở cấp module — thân
+     `get_netfx()` mở đầu bằng `from .netfx import NetFx`. spec nay khai báo tường minh
+     `clr_loader.ffi/netfx/types/util` + `cffi` thay vì trông vào phân tích bytecode.
+- **Chẩn đoán lúc chạy (`app/desktop.py`)**: `runtime_diagnostics()` ghi MỘT dòng `WEBVIEW_RUNTIME key=value …`
+  vào `logs/app.log` TRƯỚC khi tạo cửa sổ, gồm `frozen`, `python`, `platform`, `pywebview`, `pythonnet`,
+  `clr_loader`, `backend`, `python_runtime_dll`, `python_runtime_dll_exists`, `dotnet_runtime`,
+  `dotnet_framework` — nên exe chết ngay vẫn tự giải thích được. Khi probe `import clr` thất bại thì ghi thêm
+  `WEBVIEW_DOTNET_PROBLEM … | HINT:`; `webview_start()` ném lại kèm hint. `pythonnet_runtime_dll()` tính đúng
+  công thức của pythonnet (`Path(__file__).parent/"runtime"/"Python.Runtime.dll"`). Không đưa đường dẫn nhạy
+  cảm của người dùng lên UI React; `startup_error.log` vẫn giữ nguyên vẹn exception.
+- **pywebview**: giữ nguyên backend Microsoft Edge WebView2 (React + pywebview vẫn là mặc định, KHÔNG lùi về
+  Tkinter để che lỗi). Chỉ giữ đúng MỘT thao tác gom tay: `collect_data_files("webview", subdir="js")` —
+  hook-webview dùng `subdir='lib'` nên không bao giờ gom cầu nối JS↔Python (`api.js`/`dom_json.js`/`state.js`,
+  6 file). Cố ý giới hạn ở `js` để không chồng lấn `webview/lib` của hook. Thêm `webview.platforms.winforms`
+  vào hiddenimports và loại các backend `qt/gtk/cocoa/android/mshtml`.
+- **Phiên bản phụ thuộc**: TRƯỚC — `pywebview==6.2.1`, `pythonnet==3.0.5 ; win32`, clr-loader KHÔNG ghim,
+  `pyinstaller>=6.6,<7`. SAU — thêm `clr-loader==0.2.10 ; sys_platform == "win32"` (không nâng cấp gì khác;
+  thay đổi duy nhất này có test hồi quy `test_requirements_pin_clr_loader_inside_pythonnets_declared_range`).
+  Môi trường đã đo ở đây: python 3.11.2, pywebview 6.2.1, pythonnet 3.0.5, clr-loader 0.2.10,
+  pyinstaller 6.22.3, pyinstaller-hooks-contrib 2026.8.
+- **`Python.Runtime.dll` nguồn (đo thật trong venv)**: `…/site-packages/pythonnet/runtime/Python.Runtime.dll`,
+  size **450048**, SHA256 **`d204ad74dc18cd07320c8e665bd32ec6549b555ce97e61e4d3cf88437a64988e`**, target
+  `.NETStandard,Version=v2.0`. SHA256 của bản ĐÓNG GÓI phải in ra từ `validate_pythonnet_runtime()` khi build
+  trên Windows và phải TRÙNG giá trị này — chưa có vì chưa build được ở đây.
+- File đã sửa: `ReportExtractor.spec`, `app/desktop.py`, `tools/build_portable.py`, `requirements-webview.txt`,
+  `tests/test_prompt028_portable.py`, `tests/test_publish_update.py`, `release_docs/README.txt`,
+  `release_docs/FIRST_RUN.txt`, `DEVELOPMENT_WEBVIEW.md`.
+- KHÔNG đổi: version (vẫn 1.3.3 / Build 016 — PROMPT-027R sở hữu 1.3.4), toàn bộ logic vùng bằng chứng của
+  PROMPT-027R (`improvement_visual.py`, clustering, `item_span`), `backup/…STABLE/`. KHÔNG merge PR #7, KHÔNG
+  xuất bản LAN, KHÔNG sửa `version.json` triển khai, KHÔNG chạy `BUILD_AND_PUBLISH.bat`.
+- Test: `tests/test_prompt028_portable.py` 47 → **80**; toàn bộ **1044 passed** (1012 + 32 mới/mở rộng),
+  `compileall` + `pyflakes` sạch, `git diff --check` sạch, frontend `test:frontend` **22/22** và
+  `tsc --noEmit` sạch. `tests/test_publish_update.py` được bổ sung stub `subprocess.run` cho bước 3 mới (trả
+  JSON khi được gọi với `-c`) — giữ nguyên ý nghĩa kiểm tra "không publish sau khi cổng test thất bại".
+- **GIỚI HẠN (quan trọng, phải nói rõ)**: sandbox là **Linux x86_64**. PyInstaller KHÔNG cross-compile nên ở
+  đây **không tạo và không chạy được `ReportExtractor.exe`**. Đã cài PyInstaller 6.22.3 trên Linux chỉ để ĐỌC
+  và CHẠY THẬT các hook chính thức; đã chạy spec tới hết pha gom (log: `.NET runtime module registered …
+  clr/clr_loader/pythonnet`, `webview JS bridge files collected: 6`) nhưng pha Analysis dừng vì thiếu
+  `libpython3.11.so.1.0` của Python hệ thống. Vì vậy nghiệm thu bắt buộc trên Windows —
+  `build_portable.bat --no-publish` (không dùng `--skip-tests`), chạy
+  `dist\ReportExtractor_v1.3.3_Portable\ReportExtractor.exe`, chép cả thư mục sang ổ/đường dẫn khác rồi chạy
+  lại, kiểm cầu nối JS↔Python, Settings, "Học cải tiến", và cuối cùng là backend `powerpoint` với PPTX thật —
+  **CHƯA THỰC HIỆN** và không được báo là đã đạt.

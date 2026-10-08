@@ -102,10 +102,62 @@ UI reports which backend produced the preview.
 Confirm the running build in the header (`vX.Y.Z · Build NNN`), in Settings → *Phiên bản hiện tại*, and in
 `VERSION.txt` before trusting any acceptance result.
 
+## PROMPT-028R — packaged .NET start-up failure (`Failed to resolve Python.Runtime.Loader.Initialize`)
+
+Real failure observed on Windows with the 1.3.3 / Build 016 Portable package: double-clicking
+`ReportExtractor.exe` died before the React UI appeared. Chain:
+`webview.platforms.winforms` → `import clr` → `pythonnet.load()` → `clr_loader.get_netfx()` →
+`clr_loader/netfx.py:50` → `RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize from
+_internal\pythonnet\runtime\Python.Runtime.dll`.
+
+That message is raised whenever the native `pyclr_get_function()` returns `NULL`. It reports the path
+**pythonnet asked for**, not a path that exists, so it is equally consistent with the assembly being absent,
+being a different build, or being present but unloadable. Every candidate cause was therefore measured
+against installed source rather than assumed:
+
+| Candidate | Verdict | Evidence |
+|---|---|---|
+| Duplicate `Python.Runtime.dll` in the package | **Eliminated as a cause of wrong content** | `Analysis` ends with `normalize_toc(self.datas + self.binaries)`; `_TOC_TYPE_PRIORITIES` gives `BINARY`/`EXTENSION` priority 1 over `DATA` 0, so a same-destination `datas` entry is discarded in favour of hook-clr's `binaries` entry. Pinned by `test_pyinstaller_normalize_toc_gives_binaries_priority_over_same_dest_datas`. |
+| Wrong PyInstaller category | **Eliminated** | Same mechanism — the hook's `BINARY` entry always wins at `pythonnet/runtime`. |
+| `collect_data_files("pythonnet")` interfering with hook-clr | **Eliminated (redundant, not fatal)** | Measured: it returns `pythonnet/runtime/Python.Runtime.dll` as DATA; normalization drops it. Removed anyway so the hook is the single owner. |
+| `collect_dynamic_libs(...)` interference | **Eliminated** | Returns the *same* file at the *same* destination; also dropped by normalization. `collect_dynamic_libs` is no longer even imported by the spec. |
+| Version mismatch / stale `.venv-build` | **Open — now gated** | `requirements-webview.txt` pinned `clr-loader==0.2.10` (pythonnet 3.0.5 only declares `clr_loader<0.3.0,>=0.2.7`). `verify_runtime_imports()` imports `webview`/`pythonnet`/`clr`/`clr_loader` in the build venv **before** freezing and checks the installed clr-loader satisfies pythonnet's own range. `build_portable.py --fresh-venv` recreates `.venv-build` deterministically. |
+| `clr_loader` netfx module missing | **Open — now hardened** | `clr_loader/__init__.py` has no module-level netfx import; `get_netfx()` starts with `from .netfx import NetFx`. The spec now declares `clr_loader.ffi/netfx/types/util` explicitly. |
+| DLL collected to the wrong directory | **Concrete, now caught** | hook-clr falls back to `ctypes.util.find_library('Python.Runtime')` with destination `'.'` when `importlib.metadata.files('pythonnet')` does not yield exactly one match — landing the DLL at `_internal/Python.Runtime.dll`, one directory away from where pythonnet looks. Executed in `test_hook_clr_legacy_fallback_would_collect_the_dll_one_directory_too_high`; rejected by `validate_pythonnet_runtime()`. |
+| Wrong/modified DLL bytes | **Open — now gated** | `validate_pythonnet_runtime()` requires exactly one `Python.Runtime.dll`, at `_internal/pythonnet/runtime/`, byte-identical (SHA256) to the build venv's copy, and prints both hashes into the build log. |
+| Missing .NET on the target | **Real prerequisite, now detected** | `Python.Runtime.dll` targets `.NETStandard,Version=v2.0` (its own `deps.json`), so it needs the netstandard facade of **.NET Framework 4.7.2+** (registry `Release >= 461808`). `desktop.dotnet_framework_report()` reads `HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full` and logs it; `explain_clr_failure()` names the requirement. Documented in `release_docs/README.txt` §1 and §5. |
+| Unsupported combination / wrong clr_loader runtime | **Not reproducible here** | pythonnet's default on win32 is `netfx`; `runtime_diagnostics()` logs the selected runtime as `dotnet_runtime`. |
+| Stale PyInstaller cache | **Addressed** | `build_portable.py` already cleans `build/`+`dist/`; `--fresh-venv` covers the venv. |
+
+Runtime facts are written to `logs/app.log` as a single `WEBVIEW_RUNTIME key=value …` line **before** any
+window is created, so a build that dies instantly still explains itself: `frozen`, `python`, `platform`,
+`pywebview`, `pythonnet`, `clr_loader`, `backend`, `python_runtime_dll`, `python_runtime_dll_exists`,
+`dotnet_runtime`, `dotnet_framework`, and — when the probe fails — `clr_import` / `clr_import_error`.
+A `WEBVIEW_DOTNET_PROBLEM … | HINT:` line follows when `import clr` fails, and `webview_start()` re-raises
+with the hint attached. Nothing user-sensitive is added to the React UI.
+
+The one manual pywebview collection kept is `collect_data_files("webview", subdir="js")`: hook-webview uses
+`subdir='lib'` and therefore never collects the JS↔Python bridge injection. It is deliberately restricted to
+`js` so it cannot overlap hook-webview's handling of `webview/lib`. React + pywebview/EdgeChromium remains the
+default UI; the spec never falls back to Tkinter to mask a start-up failure.
+
+**Windows acceptance still required.** This analysis was performed on Linux, where PyInstaller cannot
+cross-compile and `import clr` legitimately fails for want of a .NET host. Run on the Windows build machine:
+
+```
+build_portable.bat --no-publish
+```
+
+Step 3 now prints the dependency versions and the pre-freeze import results; step 10 fails the build unless
+the packaged `Python.Runtime.dll` is unique, correctly placed and byte-identical to the source. If the exe
+still does not open, read the `WEBVIEW_RUNTIME` line in `logs/app.log` — it states which of the open causes
+above applies instead of leaving it to guesswork.
+
 ## Acceptance status
 
 | Status | Scope |
 |---|---|
+| **WINDOWS ACCEPTANCE REQUIRED — PROMPT-028R** | On Linux: **1044 Python tests passed** (1012 baseline + 33 new/extended in `tests/test_prompt028_portable.py`, now 80 in that file), `compileall` and configured `pyflakes` passed, `git diff --check` passed, frontend `test:frontend` 22/22 and `tsc --noEmit` passed. The shipped `hook-clr.py`, `hook-clr_loader.py`, `hook-webview.py` were executed directly and PyInstaller's `normalize_toc` priority behaviour was measured, so the duplicate-DLL / wrong-category / `collect_*`-interference hypotheses are **eliminated with evidence** rather than assumed. Version stays **1.3.3 / Build 016** and no PROMPT-027R evidence-region file was touched. **No Windows EXE was built or launched here** — PyInstaller cannot cross-compile from Linux, so the mandated acceptance (`build_portable.bat --no-publish`, launch from `dist\`, launch again after copying the folder to another drive, bridge/Settings/Học cải tiến, then the real-PPTX `powerpoint` backend check) is **NOT DONE** and must not be reported as passed until it is performed on Windows. |
 | **AUTOMATED TESTED — PROMPT-023** | 875 Python tests passed (82 targeted picker/runtime-isolation/updater tests); compileall and configured pyflakes passed; frontend typecheck and production build passed. The build emits a hashed local favicon referenced through `./assets/...`; `git diff --check` passed. The suite covers the bridge filter/cancel/path contracts, isolated persistent state, and prior extraction, evidence, learning, Excel safety/lock-retry, force-reprocessing, Ollama, and updater regressions. |
 | **AUTOMATED TESTED — PROMPT-025** | 894 Python tests passed (875 baseline + 19 new in `tests/test_prompt025_multi_item.py`); compileall, pyflakes (new/changed files), and `git diff --check` passed; frontend typecheck and production build passed. Multi-improvement segmentation + item-scoped After regions are covered by the §30 two-item fixture (3-picture After block = one region, item #1 crop excludes item #2 text, whitespace policy, caption/arrow association, Before exclusion), heading-style variants (defect-style "Lỗi … sau ép nhỰA", mid-block non-bold colon heading), 3-item and 1-item slides, report isolation, force-reprocess, learning identity per report+slide+item, render-once-per-slide with two item crops, the cooperative cancellation hook, file-atomic stop-after-current with a multi-item slide, Excel mapping (one row, both items in order, two image groups), temporary-action exclusion, and the `cải進` caption fold. All prior PROMPT-014/015/020/021/023/024 regressions still pass. |
 | **AUTOMATED TESTED — PROMPT-027** | 965 Python tests passed (911 baseline + 54 new in `tests/test_prompt027_rendering.py`); compileall, configured pyflakes and `git diff --check` passed; frontend `test:bridge` (14), `test:learning-hooks` (1) and the new `test:prompt027` (7) passed; typecheck and production build passed. Covered headlessly: `No Fill` / `No Line` parsed as *paints nothing* (`<a:noFill/>` → `MSO_FILL.BACKGROUND`, which is **not** `None`) and no black frame in the built-in renderer, including grouped children; full-slide render keeps the authored aspect ratio, whitespace and object pixel position with no white-trim; the built-in renderer honours the authored vertical anchor / text insets / line spacing / `normAutofit` scale (the cause of the vertically shifted preview); EMU→pixel crop conversion against the ACTUAL rendered dimensions; item-scoped region ownership with no cross-item contamination (pixel-level); authored whitespace preserved between two After pictures; bounded deterministic region padding; `SLIDE_RENDER` / `SLIDE_RENDER_BACKEND_FAILED` diagnostics; preview-cache identity now includes renderer chain + width + render schema version with report isolation and mtime invalidation; the learning DTO exposes the preview backend, faithfulness and the authoritative evidence-region bbox; overlay alignment for BOTH geometries under fit/resize/letterbox/zoom/DPI; frontend/backend version agreement at 1.3.3 / Build 016. |

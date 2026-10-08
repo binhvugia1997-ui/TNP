@@ -13,7 +13,8 @@ LẦN CHẠY ĐẦU TIÊN – REPORT EXTRACTOR {version}
    ReportExtractor.exe. Không có gì được ghi vào _internal\.
 
 3b. Máy đích KHÔNG cần Python, Node.js, npm hay Git. Cần Microsoft Edge WebView2 Runtime
-   (thường có sẵn). Microsoft PowerPoint là TÙY CHỌN: không có thì chương trình vẫn chạy
+   (thường có sẵn) và .NET Framework 4.7.2+ (Windows 10 1803+/Windows 11 có sẵn) —
+   pywebview tạo cửa sổ qua pythonnet, không phải qua tkinter. Microsoft PowerPoint là TÙY CHỌN: không có thì chương trình vẫn chạy
    và tự dùng backend render dự phòng, có báo rõ trong tab "Học cải tiến".
    Kiểm tra phiên bản đang chạy ngay trên thanh tiêu đề trước khi báo lỗi.
 

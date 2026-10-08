@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import platform
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -158,6 +159,143 @@ FRONTEND_INDEX = FRONTEND_DIST / FRONTEND_INDEX_NAME
 FRONTEND_URL = frontend_url(FRONTEND_DIST if FRONTEND_INDEX.is_file() else None, assumed_app_root())
 
 
+def _module_version(name: str) -> str:
+    """Best-effort version string for diagnostics; never raises and never imports heavy side effects."""
+    try:
+        from importlib import metadata
+        return metadata.version(name)
+    except Exception:                                    # noqa: BLE001
+        try:
+            module = __import__(name, fromlist=["__version__"])
+            return str(getattr(module, "__version__", "unknown"))
+        except Exception:                                # noqa: BLE001
+            return "absent"
+
+
+def pythonnet_runtime_dll() -> Optional[Path]:
+    """Where pythonnet.load() will look for Python.Runtime.dll — computed the same way pythonnet does.
+
+    ``pythonnet/__init__.py`` uses ``Path(__file__).parent / "runtime" / "Python.Runtime.dll"``, so in a
+    frozen build this is ``_internal/pythonnet/runtime/Python.Runtime.dll``.  Reporting the exact path is
+    what makes a packaging mistake diagnosable from ``logs/app.log`` alone.
+    """
+    try:
+        import pythonnet                                 # noqa: PLC0415 – optional, Windows-only in practice
+        return Path(pythonnet.__file__).resolve().parent / "runtime" / "Python.Runtime.dll"
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+#: Python.Runtime.dll (pythonnet 3.0.5) targets .NETStandard,Version=v2.0 — see its deps.json.  Loading a
+#: netstandard2.0 assembly into the .NET Framework CLR needs the `netstandard.dll` facade, which ships with
+#: .NET Framework 4.7.2 == registry Release 461808.  Below that, Assembly.LoadFrom throws and
+#: clr_loader/netfx.py surfaces it as "Failed to resolve Python.Runtime.Loader.Initialize".
+DOTNET_FX_MIN_RELEASE = 461808
+#: The registry key Windows uses to report the installed .NET Framework 4.x version.
+DOTNET_FX_REG_KEY = r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
+
+
+def dotnet_framework_release() -> Optional[int]:
+    """Installed .NET Framework 4.x `Release` number, or None when it cannot be determined.
+
+    Never raises: a missing/unreadable key must not be the reason the app fails to start.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg                                    # noqa: PLC0415 – Windows only
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, DOTNET_FX_REG_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, "Release")
+            return int(value)
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def dotnet_framework_report() -> str:
+    """Human-readable .NET Framework status, including whether it can host Python.Runtime.dll."""
+    release = dotnet_framework_release()
+    if sys.platform != "win32":
+        return "not-applicable"
+    if release is None:
+        return "undetected(.NET Framework 4.x not found or registry unreadable)"
+    return f"Release={release}({'ok' if release >= DOTNET_FX_MIN_RELEASE else 'TOO-OLD: need 4.7.2+/461808'})"
+
+
+def runtime_diagnostics(probe_dotnet: bool = True) -> dict:
+    """Everything needed to explain a pywebview/.NET start-up failure, as safe short strings.
+
+    Versions and the resolved DLL path only — no report data, no user documents.  Paths do appear here
+    because this goes to ``logs/app.log`` and ``logs/startup_error.log``, never to the React UI.
+    """
+    dll = pythonnet_runtime_dll()
+    info = {
+        "frozen": str(is_packaged()),
+        "python": platform.python_version(),
+        "platform": sys.platform,
+        "pywebview": _module_version("pywebview"),
+        "pythonnet": _module_version("pythonnet"),
+        "clr_loader": _module_version("clr-loader"),
+        "backend": "edgechromium" if sys.platform == "win32" else "auto",
+        "python_runtime_dll": str(dll) if dll else "pythonnet-absent",
+        "python_runtime_dll_exists": str(bool(dll and dll.is_file())),
+    }
+    # On Windows the default pythonnet runtime is .NET Framework ("netfx"); name it explicitly so a missing
+    # or unsuitable .NET installation is obvious instead of surfacing as an opaque resolve error.
+    if sys.platform == "win32":
+        try:
+            import pythonnet
+            spec = pythonnet.get_runtime_info()
+            info["dotnet_runtime"] = (spec.kind if spec else "not-loaded-yet")
+        except Exception:                                # noqa: BLE001
+            info["dotnet_runtime"] = "netfx(default-on-windows)"
+        info["dotnet_framework"] = dotnet_framework_report()
+        if probe_dotnet:
+            try:
+                import clr  # noqa: F401  – triggers pythonnet.load(); idempotent once loaded
+                info["clr_import"] = "ok"
+            except BaseException as exc:                 # noqa: BLE001 – the whole point is to capture it
+                info["clr_import"] = f"{type(exc).__name__}"
+                info["clr_import_error"] = _safe_error(exc)
+    return info
+
+
+#: The two failure signatures that mean "the packaged .NET runtime is wrong", translated for a human.
+_CLR_HINTS = (
+    ("Failed to resolve Python.Runtime.Loader.Initialize",
+     "clr_loader created a .NET Framework app domain but Assembly.LoadFrom could not produce a usable "
+     "Python.Runtime.Loader type. Check, in order: (1) does the exact path printed as python_runtime_dll "
+     "exist in logs/app.log? hook-clr's legacy fallback collects the DLL to '.' instead of "
+     "'pythonnet/runtime', which leaves that path empty; (2) is it byte-identical to the build venv's "
+     "pythonnet/runtime/Python.Runtime.dll (tools/build_portable.py validate_pythonnet_runtime prints both "
+     "SHA256)? (3) is .NET Framework 4.7.2+ installed? Python.Runtime.dll targets .NETStandard 2.0 and "
+     "needs the netstandard facade from 4.7.2 (registry Release >= 461808) — see dotnet_framework in the "
+     "same log line."),
+    ("Python.Runtime.dll not found",
+     "pythonnet is not packaged correctly; _internal/pythonnet/runtime/Python.Runtime.dll is missing."),
+    ("Could not find a suitable hostfxr",
+     "clr_loader tried the .NET Core host; the packaged build should use .NET Framework (netfx) on Windows."),
+    ("netstandard",
+     "The .NET Framework on this PC is older than 4.7.2, so it cannot load the .NETStandard 2.0 assembly "
+     "Python.Runtime.dll. Install the .NET Framework 4.8 Runtime and start again."),
+    ("BadImageFormatException",
+     "Python.Runtime.dll or ClrLoader.dll does not match this process' architecture (32- vs 64-bit)."),
+)
+
+
+def _safe_error(exc: BaseException, limit: int = 400) -> str:
+    """Exception text for logs: type + message, truncated, with no embedded traceback objects."""
+    text = f"{type(exc).__name__}: {exc}".replace("\n", " ")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def explain_clr_failure(text: str) -> str:
+    """Actionable hint for a known .NET/pywebview packaging failure, or '' when the text is unfamiliar."""
+    for needle, hint in _CLR_HINTS:
+        if needle.lower() in text.lower():
+            return hint
+    return ""
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Run the local React + pywebview desktop application.")
     parser.add_argument("--debug", action="store_true", help="Enable pywebview developer tools and verbose logs.")
@@ -176,6 +314,15 @@ def main(argv=None) -> int:
         import webview
     except ImportError:
         parser.error("pywebview is missing. Install `requirements-webview.txt` into the development environment.")
+
+    # PROMPT-028R: record the .NET/pywebview facts BEFORE anything can fail, so a packaged app that dies
+    # while initialising the Windows backend explains itself in logs/app.log instead of vanishing.
+    diagnostics = runtime_diagnostics()
+    LOG.info("WEBVIEW_RUNTIME %s", " ".join(f"{k}={v}" for k, v in diagnostics.items()))
+    hint = explain_clr_failure(" ".join(str(v) for v in diagnostics.values()))
+    if diagnostics.get("clr_import") not in (None, "ok") or diagnostics.get("python_runtime_dll_exists") == "False":
+        LOG.error("WEBVIEW_DOTNET_PROBLEM %s%s", diagnostics.get("clr_import_error", ""),
+                  (" | HINT: " + hint) if hint else "")
 
     # Resolve against pywebview's OWN app root (sys._MEIPASS when frozen) and log both, so a packaged app
     # that cannot find its bundle explains itself in logs/ instead of opening a blank window.
@@ -219,7 +366,15 @@ def main(argv=None) -> int:
         return False
 
     window.events.closing += on_closing
-    webview.start(debug=args.debug, gui="edgechromium" if sys.platform == "win32" else None)
+    try:
+        webview.start(debug=args.debug, gui="edgechromium" if sys.platform == "win32" else None)
+    except BaseException as exc:                         # noqa: BLE001 – re-raised with context attached
+        detail = _safe_error(exc)
+        advice = explain_clr_failure(detail)
+        LOG.error("WEBVIEW_START_FAILED %s%s", detail, (" | HINT: " + advice) if advice else "")
+        if advice:
+            raise RuntimeError(f"{detail}\n\n{advice}") from exc
+        raise
     return 0
 
 

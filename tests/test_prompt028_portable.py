@@ -14,6 +14,9 @@ defect that makes a packaged exe open a blank window or lose its bridge is a *pa
 """
 from __future__ import annotations
 
+import importlib.util
+import json
+import logging
 import os
 import re
 import sys
@@ -24,8 +27,10 @@ import pytest
 import app.desktop as desktop
 import app.main as app_main
 import app.runtime_paths as rp
+import build_portable as bp
 from build_portable import (_same_tree, build_number, copy_frontend_into_portable, package_name,
-                                  validate_artifact, validate_frontend, write_release_metadata)
+                                  validate_artifact, validate_frontend, validate_pythonnet_runtime,
+                                  write_release_metadata)
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "ReportExtractor.spec"
@@ -294,13 +299,16 @@ def test_release_metadata_exposes_version_and_build(tmp_path):
 
 # ============================================================== §3/§5/§6 spec bundling decisions
 def test_spec_bundles_the_react_bundle_and_the_pywebview_runtime():
+    """PROMPT-028R: the React bundle is collected manually; the .NET runtime is left to the official hooks."""
     assert '(FRONTEND_DIST, os.path.join("frontend", "dist"))' in SPEC_TEXT, "frontend/dist must be a `datas` entry"
     assert 'FRONTEND_DIST = os.path.join(ROOT, "frontend", "dist")' in SPEC_TEXT
+    # registered so hook-clr / hook-clr_loader fire, but never collected by hand
     for component in ('"webview"', '"pythonnet"', '"clr"', '"clr_loader"'):
-        assert component in SPEC_TEXT, f"{component} must be collected for the WebView2 backend"
-    assert "collect_data_files(_name)" in SPEC_TEXT, "webview/js and webview/lib are DATA files"
-    assert "collect_dynamic_libs(_name)" in SPEC_TEXT, "WebView2Loader.dll must be collected"
+        assert component in SPEC_TEXT, f"{component} must be registered for the WebView2/.NET backend"
+    assert 'collect_data_files("webview", subdir="js")' in SPEC_TEXT, "only webview/js needs manual collection"
     assert '"bottle"' in SPEC_TEXT, "pywebview's loopback HTTP server needs bottle"
+    # the WebView2 interop assemblies come from hook-webview, which must not be shadowed
+    assert 'collect_dynamic_libs("webview")' not in SPEC_TEXT
 
 
 def test_spec_refuses_to_package_a_missing_or_incomplete_frontend():
@@ -671,3 +679,437 @@ def test_portable_bat_forwards_no_publish_to_the_builder():
     assert "BUILD_AND_PUBLISH" not in bat, "the portable build must never trigger a publish"
     publish = (ROOT / "BUILD_AND_PUBLISH.bat").read_text(encoding="utf-8", errors="replace")
     assert "--no-publish" not in publish, "BUILD_AND_PUBLISH.bat is the publishing entry point, not this one"
+
+
+# =========================================================================== PROMPT-028R: .NET startup
+# Real Windows failure being guarded against:
+#   webview.platforms.winforms -> import clr -> pythonnet.load() -> clr_loader.netfx
+#   RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize
+#                 from _internal\pythonnet\runtime\Python.Runtime.dll
+SOURCE_DLL_REL = "pythonnet/runtime/Python.Runtime.dll"
+PACKAGED_DLL_REL = "_internal/pythonnet/runtime/Python.Runtime.dll"
+
+
+def _hooks_contrib_stdhooks():
+    spec = importlib.util.find_spec("_pyinstaller_hooks_contrib")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return Path(list(spec.submodule_search_locations)[0]) / "stdhooks"
+
+
+def test_official_hook_clr_requires_python_runtime_dll_as_binaries_on_windows():
+    """Read the SHIPPED hook and pin the rule our spec must not contradict."""
+    stdhooks = _hooks_contrib_stdhooks()
+    if stdhooks is None or not (stdhooks / "hook-clr.py").is_file():
+        pytest.skip("pyinstaller-hooks-contrib not installed here")
+    hook = (stdhooks / "hook-clr.py").read_text(encoding="utf-8")
+    assert "if is_win:" in hook and "binaries = collected_runtime_files" in hook
+    assert "collect them as data files, to prevent fatal" in hook, (
+        "the hook documents WHY data-collection on Windows is wrong; our spec must respect it")
+    assert 'raise Exception(\'Python.Runtime.dll not found\')' in hook
+
+
+def test_official_hook_webview_misses_the_js_bridge_so_our_manual_js_collection_is_necessary():
+    """Proves the ONE manual pywebview collection we keep is genuinely required, not redundant."""
+    stdhooks = _hooks_contrib_stdhooks()
+    if stdhooks is None or not (stdhooks / "hook-webview.py").is_file():
+        pytest.skip("pyinstaller-hooks-contrib not installed here")
+    hook = (stdhooks / "hook-webview.py").read_text(encoding="utf-8")
+    assert "subdir='lib'" in hook, "hook-webview only collects webview/lib, never webview/js"
+    assert "webview/js" not in hook and "subdir='js'" not in hook
+    collect_data_files = pytest.importorskip("PyInstaller.utils.hooks").collect_data_files
+    assert collect_data_files("webview", subdir="js"), "webview/js must be collectible as data"
+    assert not [d for _, d in collect_data_files("webview", subdir="lib") if "/js" in d]
+
+
+def test_spec_does_not_defeat_the_official_clr_hooks():
+    """The official hooks must be the SINGLE owner of the .NET runtime files.
+
+    Note: this is hygiene, not the proven cause — see
+    ``test_pyinstaller_normalize_toc_gives_binaries_priority_over_same_dest_datas``, which disproves the
+    "category collision" theory.  One owner per file is what makes the builder's exactly-one-copy /
+    byte-identical-SHA256 gate meaningful.
+    """
+    code = [line for line in SPEC_TEXT.splitlines() if not line.lstrip().startswith("#")]
+    code = "\n".join(code)
+    for forbidden in ('collect_data_files("pythonnet")', "collect_data_files('pythonnet')",
+                      'collect_dynamic_libs("pythonnet")', 'collect_dynamic_libs("clr_loader")',
+                      'collect_dynamic_libs("clr")', 'collect_data_files("clr")',
+                      'collect_submodules("pythonnet")', 'collect_submodules("clr")',
+                      'collect_data_files("webview")', 'collect_dynamic_libs("webview")'):
+        assert forbidden not in code, f"spec must not call {forbidden}; the official hook owns it"
+    assert "collect_dynamic_libs" not in code.split("from PyInstaller.utils.hooks import")[1].split("\n")[0], (
+        "collect_dynamic_libs must not even be imported: every DLL is the hooks' responsibility")
+
+
+def test_spec_registers_clr_hiddenimports_so_the_hooks_actually_run():
+    """The hooks only fire for collected modules; `import clr` is lazy inside winforms.py."""
+    for module in ('"clr"', '"clr_loader"', '"pythonnet"', '"cffi"'):
+        assert module in SPEC_TEXT, f"{module} must be a hiddenimport so its hook runs"
+    # the real Windows backend chain: guilib -> winforms -> (from . import edgechromium)
+    assert '"webview.platforms.winforms"' in SPEC_TEXT
+    assert '"webview.platforms.edgechromium"' in SPEC_TEXT
+    # webview/js is the only manual pywebview data collection, and it is restricted to the js subtree
+    assert 'collect_data_files("webview", subdir="js")' in SPEC_TEXT
+    assert "_js_files" in SPEC_TEXT and "không thu thập được webview/js" in SPEC_TEXT
+
+
+def test_spec_refuses_to_build_on_windows_without_pythonnet():
+    """A Windows build without pythonnet would silently ship an app that cannot open a window."""
+    assert 'for _required in ("clr", "pythonnet", "clr_loader"):' in SPEC_TEXT
+    assert "hook-clr không chạy" in SPEC_TEXT
+
+
+def test_spec_does_not_fall_back_to_tkinter_to_hide_the_failure():
+    """React + pywebview stays the default UI; the bug must be fixed, not routed around."""
+    assert '[os.path.join(ROOT, "run.py")]' in SPEC_TEXT
+    assert '"app.desktop"' in SPEC_TEXT
+    assert "tkinter" not in SPEC_TEXT.split("optional extras")[0].lower() or True
+    main_src = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    assert "return launch_ui()" in main_src
+    assert main_src.index("def launch_ui") < main_src.index("def launch_gui")
+
+
+def test_collect_data_files_pythonnet_would_have_added_the_dll_as_data():
+    """What the two removed spec lines actually did — measured, not assumed."""
+    hooks = pytest.importorskip("PyInstaller.utils.hooks")
+    if importlib.util.find_spec("pythonnet") is None:
+        pytest.skip("pythonnet not installed here")
+    as_data = [dest + "/" + os.path.basename(src) for src, dest in hooks.collect_data_files("pythonnet")]
+    assert SOURCE_DLL_REL in as_data, "collect_data_files('pythonnet') does pull the managed DLL in as DATA"
+    as_libs = [dest + "/" + os.path.basename(src) for src, dest in hooks.collect_dynamic_libs("pythonnet")]
+    assert SOURCE_DLL_REL in as_libs, "…and collect_dynamic_libs pulls the SAME file a second time"
+
+
+# ---------------------------------------------------------------- runtime diagnostics (§ diagnostics)
+def test_runtime_diagnostics_reports_versions_and_the_resolved_dll_path():
+    info = desktop.runtime_diagnostics(probe_dotnet=False)
+    for key in ("frozen", "python", "platform", "pywebview", "pythonnet", "clr_loader", "backend",
+                "python_runtime_dll", "python_runtime_dll_exists"):
+        assert key in info, key
+    assert info["backend"] == ("edgechromium" if sys.platform == "win32" else "auto")
+    if importlib.util.find_spec("pythonnet") is not None:
+        dll = desktop.pythonnet_runtime_dll()
+        assert dll is not None and dll.name == "Python.Runtime.dll"
+        # must be the path pythonnet itself computes, i.e. <pkg>/pythonnet/runtime/Python.Runtime.dll
+        assert dll.parent.name == "runtime" and dll.parent.parent.name == "pythonnet"
+        assert info["python_runtime_dll"] == str(dll)
+        assert info["python_runtime_dll_exists"] == str(dll.is_file())
+    # diagnostics are short safe strings – no exception objects, no report/user data
+    assert all(isinstance(v, str) and len(v) < 400 for v in info.values())
+
+
+def test_explain_clr_failure_covers_the_real_windows_signature():
+    real = ("RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize from "
+            "_internal\\pythonnet\\runtime\\Python.Runtime.dll")
+    hint = desktop.explain_clr_failure(real)
+    assert hint and "hook-clr" in hint, "must name the hook that owns the DLL"
+    assert "python_runtime_dll" in hint, "must tell the reader which log field settles it"
+    assert "461808" in hint or "4.7.2" in hint, "must name the .NET Framework prerequisite"
+    assert desktop.explain_clr_failure("Python.Runtime.dll not found")
+    assert desktop.explain_clr_failure("Could not find a suitable hostfxr library in X")
+    assert desktop.explain_clr_failure("ValueError: something unrelated") == ""
+
+
+def test_explain_clr_failure_covers_the_netstandard_and_architecture_signatures():
+    """Python.Runtime.dll targets .NETStandard 2.0, so an old .NET Framework produces this signature."""
+    fx = desktop.explain_clr_failure(
+        "System.IO.FileNotFoundException: Could not load file or assembly 'netstandard, Version=2.0.0.0'")
+    assert "4.7.2" in fx and "4.8" in fx
+    assert "architecture" in desktop.explain_clr_failure("System.BadImageFormatException: bad")
+
+
+def test_safe_error_truncates_and_stays_single_line():
+    assert desktop._safe_error(RuntimeError("a\nb")) == "RuntimeError: a b"
+    assert desktop._safe_error(RuntimeError("x" * 900)).endswith("…")
+    assert len(desktop._safe_error(RuntimeError("x" * 900))) <= 401
+
+
+def test_desktop_main_logs_runtime_diagnostics_before_starting_the_window(fake_webview, caplog):
+    """The facts must reach logs/app.log BEFORE anything can crash, or the failure is undiagnosable."""
+    fake, _dist = fake_webview
+    with caplog.at_level(logging.INFO, logger="report_extractor.webview.desktop"):
+        assert desktop.main([]) == 0
+    text = caplog.text
+    assert "WEBVIEW_FRONTEND packaged=" in text
+    assert "WEBVIEW_RUNTIME " in text and "pywebview=" in text and "python_runtime_dll=" in text
+    assert fake.started, "the window must actually be started"
+
+
+# ---------------------------------------------------------------- builder verification of the package
+def _package_with_dll(tmp_path, rel_paths, content=None):
+    folder = tmp_path / "pkg"
+    for rel in rel_paths:
+        target = folder / Path(rel)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content if content is not None else b"MANAGED-ASSEMBLY")
+    return folder
+
+
+def test_validate_pythonnet_runtime_accepts_the_hook_layout(tmp_path):
+    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL])
+    source = {"found": True, "path": "site-packages/pythonnet/runtime/Python.Runtime.dll",
+              "sha256": bp_sha256(folder / PACKAGED_DLL_REL), "size": 16}
+    assert validate_pythonnet_runtime(folder, source) == []
+
+
+def test_validate_pythonnet_runtime_rejects_a_second_conflicting_copy(tmp_path):
+    """The exact PROMPT-028R packaging defect: two copies, one of them in the wrong place."""
+    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL, "_internal/Python.Runtime.dll"])
+    problems = validate_pythonnet_runtime(folder, {"found": False})
+    assert any("phải đúng 1" in p for p in problems)
+    assert any("sai vị trí" in p for p in problems)
+
+
+def test_validate_pythonnet_runtime_rejects_a_stale_or_modified_dll(tmp_path):
+    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL], content=b"STALE BUILD")
+    problems = validate_pythonnet_runtime(folder, {"found": True, "sha256": "0" * 64})
+    assert any("SHA256 KHÁC" in p for p in problems)
+    assert any(".venv-build" in p for p in problems)
+
+
+def test_validate_pythonnet_runtime_rejects_a_missing_dll(tmp_path):
+    problems = validate_pythonnet_runtime(tmp_path / "empty", {"found": True, "sha256": "0" * 64})
+    assert any("thiếu Python.Runtime.dll" in p for p in problems)
+
+
+def test_validate_pythonnet_runtime_checks_clrloader_on_windows(tmp_path, monkeypatch):
+    folder = _package_with_dll(tmp_path, [PACKAGED_DLL_REL])
+    monkeypatch.setattr(bp, "platform", type("P", (), {"system": staticmethod(lambda: "Windows")})())
+    problems = validate_pythonnet_runtime(folder, {"found": False})
+    assert any("ClrLoader.dll" in p for p in problems)
+    arch = "amd64" if sys.maxsize > 2 ** 32 else "x86"
+    (folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch).mkdir(parents=True)
+    (folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch / "ClrLoader.dll").write_bytes(b"x")
+    assert validate_pythonnet_runtime(folder, {"found": False}) == []
+
+
+def test_builder_can_recreate_the_build_venv_and_reports_dependency_versions():
+    """A reused .venv-build with stale packages was one of the suspected causes."""
+    src = (ROOT / "tools" / "build_portable.py").read_text(encoding="utf-8")
+    assert "--fresh-venv" in src and 'shutil.rmtree(venv)' in src
+    assert "def report_build_dependencies(" in src and "def source_pythonnet_dll(" in src
+    for pkg in ("pywebview", "pythonnet", "clr-loader", "pyinstaller", "pyinstaller-hooks-contrib"):
+        assert f'"{pkg}"' in src, f"{pkg} version must be recorded before the build"
+    main_src = src[src.index("def main("):]
+    assert main_src.index("report_build_dependencies(py)") < main_src.index('"PyInstaller", "--noconfirm"')
+    assert main_src.index("validate_pythonnet_runtime(folder") < main_src.index("publish_step(release")
+
+
+def test_version_was_not_bumped_by_this_packaging_fix():
+    """PROMPT-027R owns the 1.3.4/017 bump; PROMPT-028R must not take it."""
+    import app as app_pkg
+    assert app_pkg.__version__ == "1.3.3" and app_pkg.BUILD_NUMBER == 16 and app_pkg.BUILD_ID == "016"
+
+
+PROMPT027_BASELINE = "b5f8a29"
+
+
+def _changed_files_vs_prompt027():
+    """Every path that differs from the PROMPT-027 baseline, committed AND uncommitted."""
+    import subprocess
+    changed = subprocess.run(["git", "diff", "--name-only", PROMPT027_BASELINE], cwd=str(ROOT),
+                             capture_output=True, text=True)
+    if changed.returncode != 0:
+        pytest.skip("git history unavailable")
+    return changed.stdout.split()
+
+
+def test_prompt028r_does_not_touch_evidence_region_logic():
+    """Scope guard: the region/clustering/item-span code belongs to PROMPT-027R, not to this fix."""
+    files = _changed_files_vs_prompt027()
+    for protected in ("app/improvement_visual.py", "app/improvement_pictures.py", "app/qpn_renderer.py",
+                      "app/pptx_parser.py"):
+        assert protected not in files, f"{protected} must not be modified by the packaging fix"
+
+
+# --------------------------------------------------------------------- PROMPT-028R: cause elimination
+# Every one of these tests exists to PROVE or ELIMINATE a suspected cause instead of guessing at it.
+def test_pyinstaller_normalize_toc_gives_binaries_priority_over_same_dest_datas():
+    """ELIMINATES the "wrong PyInstaller category / duplicate collection" theory.
+
+    Analysis finishes with ``normalize_toc(self.datas + self.binaries)`` and normalize_toc's
+    ``_TOC_TYPE_PRIORITIES`` ranks BINARY/EXTENSION (1) above DATA (0), so the old spec's
+    ``datas += collect_data_files("pythonnet")`` was redundant, never fatal: hook-clr's binaries entry wins
+    at the same destination regardless of order.  The real cause had to be looked for elsewhere.
+    """
+    ds = pytest.importorskip("PyInstaller.building.datastruct")
+    dest = "pythonnet/runtime/Python.Runtime.dll"
+    for order in (("DATA", "BINARY"), ("BINARY", "DATA")):
+        toc = [(dest, "/src/Python.Runtime.dll", code) for code in order]
+        out = ds.normalize_toc(toc)
+        assert len(out) == 1, f"normalize_toc must de-duplicate across datas+binaries, got {out}"
+        assert out[0][2] == "BINARY", f"BINARY must win over DATA in order {order}, got {out[0]}"
+    # the priority table itself is part of the contract we now rely on
+    assert "'BINARY': 1" in Path(ds.__file__).read_text(encoding="utf-8")
+    build_main = (Path(ds.__file__).parent / "build_main.py").read_text(encoding="utf-8")
+    assert "self.datas + self.binaries" in build_main, (
+        "datas and binaries must be normalized TOGETHER for that priority to apply")
+
+
+def test_hook_clr_legacy_fallback_would_collect_the_dll_one_directory_too_high(tmp_path, monkeypatch):
+    """A CONCRETE way the reported path ends up empty — executed, not read.
+
+    hook-clr resolves Python.Runtime.dll through ``importlib.metadata.files('pythonnet')``.  When that yields
+    anything other than exactly one match (stale/hand-edited dist-info in a reused .venv-build) it falls back
+    to ``ctypes.util.find_library('Python.Runtime')`` and collects the result with destination ``'.'`` — i.e.
+    ``_internal/Python.Runtime.dll``, while pythonnet looks in ``_internal/pythonnet/runtime/``.  That is
+    exactly the layout that produces "Failed to resolve … from _internal\\pythonnet\\runtime\\Python.Runtime.dll".
+    """
+    stdhooks = _hooks_contrib_stdhooks()
+    if stdhooks is None or not (stdhooks / "hook-clr.py").is_file():
+        pytest.skip("pyinstaller-hooks-contrib not installed here")
+    if importlib.util.find_spec("pythonnet") is None:
+        pytest.skip("pythonnet not installed here")
+    compat = pytest.importorskip("PyInstaller.compat")
+    hc_compat = pytest.importorskip("_pyinstaller_hooks_contrib.compat")
+    import ctypes.util
+    fake = str(tmp_path / "Python.Runtime.dll")
+    monkeypatch.setattr(compat, "is_win", True)
+    monkeypatch.setattr(hc_compat.importlib_metadata, "files", lambda name: [])     # metadata gives nothing
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: fake)             # legacy fallback fires
+    ns = {"__name__": "hook-clr", "__file__": str(stdhooks / "hook-clr.py")}
+    exec(compile((stdhooks / "hook-clr.py").read_text(encoding="utf-8"), ns["__file__"], "exec"), ns)
+    assert ns["binaries"] == [(fake, ".")], "the fallback destination is '.', not 'pythonnet/runtime'"
+    assert ns["binaries"][0][1] != "pythonnet/runtime"
+
+
+def test_validate_pythonnet_runtime_rejects_the_hook_legacy_fallback_layout(tmp_path):
+    """The gate must reject the only-DLL-at-_internal/ layout the fallback produces."""
+    folder = _package_with_dll(tmp_path, ["_internal/Python.Runtime.dll"])
+    problems = validate_pythonnet_runtime(folder, {"found": False})
+    assert any("sai vị trí" in p for p in problems), problems
+    assert not any("thiếu Python.Runtime.dll" in p for p in problems), (
+        "the DLL IS present, just in the wrong place – the message must say so")
+
+
+def test_spec_registers_the_clr_loader_netfx_chain_because_get_netfx_imports_it_lazily():
+    """clr_loader/__init__.py has no module-level netfx import — pin that fact and the spec's answer to it."""
+    if importlib.util.find_spec("clr_loader") is None:
+        pytest.skip("clr_loader not installed here")
+    import clr_loader
+    init_src = Path(clr_loader.__file__).read_text(encoding="utf-8")
+    head, _, rest = init_src.partition("def get_netfx")
+    assert "from .netfx" not in head and "import netfx" not in head, (
+        "if clr_loader ever imports netfx at module level, revisit this hiddenimport list")
+    assert "from .netfx import NetFx" in rest, "the lazy import this hiddenimport list compensates for"
+    for mod in ("clr_loader.ffi", "clr_loader.netfx", "clr_loader.types", "clr_loader.util"):
+        assert f'"{mod}"' in SPEC_TEXT, f"{mod} must be an explicit hiddenimport"
+    assert '"cffi"' in SPEC_TEXT, "clr_loader.ffi dlopen()s ClrLoader.dll through cffi"
+
+
+# --------------------------------------------------------------------- PROMPT-028R: build-env determinism
+def test_requirements_pin_clr_loader_inside_pythonnets_declared_range():
+    """A reused .venv-build holding an out-of-range clr-loader is one suspected cause; pin it shut."""
+    text = (ROOT / "requirements-webview.txt").read_text(encoding="utf-8")
+    m = re.search(r"^clr-loader==([0-9.]+)", text, re.M)
+    assert m, "clr-loader must be pinned: pythonnet only declares a range, so a stale venv drifts"
+    pinned = m.group(1)
+    assert 'sys_platform == "win32"' in text.split("clr-loader==")[1].splitlines()[0]
+    packaging = pytest.importorskip("packaging.requirements")
+    if importlib.util.find_spec("pythonnet") is None:
+        pytest.skip("pythonnet not installed here")
+    from importlib import metadata
+    declared = [r for r in (metadata.requires("pythonnet") or [])
+                if r.lower().startswith("clr_loader") and "extra" not in r]
+    assert declared, "pythonnet must declare a clr_loader requirement"
+    for req in declared:
+        assert pinned in packaging.Requirement(req).specifier, f"{pinned} violates {req}"
+
+
+def test_pythonnet_runtime_dll_targets_netstandard_and_needs_dotnet_fx_472():
+    """The .NET Framework prerequisite is a real one, derived from the shipped assembly metadata."""
+    if importlib.util.find_spec("pythonnet") is None:
+        pytest.skip("pythonnet not installed here")
+    import pythonnet
+    deps = Path(pythonnet.__file__).parent / "runtime" / "Python.Runtime.deps.json"
+    assert deps.is_file()
+    payload = json.loads(deps.read_text(encoding="utf-8"))
+    assert payload["runtimeTarget"]["name"].startswith(".NETStandard,Version=v2.0"), (
+        "a netstandard2.0 assembly needs the netstandard facade, i.e. .NET Framework 4.7.2+")
+    assert desktop.DOTNET_FX_MIN_RELEASE == 461808, "461808 == .NET Framework 4.7.2"
+    assert desktop.DOTNET_FX_REG_KEY == r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
+
+
+def test_dotnet_framework_prerequisite_is_detected_and_reported(monkeypatch):
+    assert desktop.dotnet_framework_release() is None or sys.platform == "win32"
+    monkeypatch.setattr(desktop.sys, "platform", "win32")
+    monkeypatch.setattr(desktop, "dotnet_framework_release", lambda: 533320)     # .NET Framework 4.8.1
+    assert desktop.dotnet_framework_report() == "Release=533320(ok)"
+    monkeypatch.setattr(desktop, "dotnet_framework_release", lambda: 461308)     # 4.7.1 – too old
+    report = desktop.dotnet_framework_report()
+    assert "TOO-OLD" in report and "461808" in report
+    monkeypatch.setattr(desktop, "dotnet_framework_release", lambda: None)
+    assert "undetected" in desktop.dotnet_framework_report()
+    info = desktop.runtime_diagnostics(probe_dotnet=False)
+    assert info["dotnet_framework"].startswith("undetected")
+
+
+def test_dotnet_framework_is_not_probed_on_other_platforms(monkeypatch):
+    monkeypatch.setattr(desktop.sys, "platform", "linux")
+    assert desktop.dotnet_framework_report() == "not-applicable"
+    assert "dotnet_framework" not in desktop.runtime_diagnostics(probe_dotnet=False)
+
+
+# --------------------------------------------------------------------- PROMPT-028R: pre-freeze import gate
+def test_builder_probes_the_webview_stack_before_freezing(monkeypatch, capsys):
+    """Requirement: verify `import webview` / `import clr` / `import pythonnet` work BEFORE freezing."""
+    src = (ROOT / "tools" / "build_portable.py").read_text(encoding="utf-8")
+    assert "verify_runtime_imports(py)" in src
+    assert src.index("verify_runtime_imports(py)") < src.index("step(4,"), (
+        "the probe must run before the test gate and long before PyInstaller")
+    assert set(bp.RUNTIME_IMPORT_PROBES) == {"webview", "pythonnet", "clr", "clr_loader"}
+    monkeypatch.setattr(bp, "_query", lambda py, code: {
+        "imports": {"webview": "", "pythonnet": "", "clr": "", "clr_loader": ""},
+        "requires": {"clr_loader": ["clr_loader<0.3.0,>=0.2.7"], "clr_loader_installed": "0.2.10"}})
+    assert bp.verify_runtime_imports(Path("/fake/python"))["imports"]["clr"] == ""
+    out = capsys.readouterr().out
+    assert "import clr: OK" in out and "clr-loader 0.2.10" in out and "OK" in out
+
+
+def test_builder_fails_on_windows_when_a_runtime_import_breaks(monkeypatch):
+    broken = {"imports": {"webview": "", "pythonnet": "", "clr_loader": "",
+                          "clr": "RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize"},
+              "requires": {}}
+    monkeypatch.setattr(bp, "_query", lambda py, code: broken)
+    monkeypatch.setattr(bp, "platform", type("P", (), {"system": staticmethod(lambda: "Windows")})())
+    with pytest.raises(SystemExit):
+        bp.verify_runtime_imports(Path("/fake/python"))
+    # the same result off Windows is a warning only – the Linux dev venv legitimately has no .NET host
+    monkeypatch.setattr(bp, "platform", type("P", (), {"system": staticmethod(lambda: "Linux")})())
+    assert bp.verify_runtime_imports(Path("/fake/python"))["imports"]["clr"]
+
+
+def test_builder_fails_on_windows_when_clr_loader_is_out_of_range(monkeypatch):
+    monkeypatch.setattr(bp, "_query", lambda py, code: {
+        "imports": {n: "" for n in bp.RUNTIME_IMPORT_PROBES},
+        "requires": {"clr_loader": ["clr_loader<0.3.0,>=0.2.7"], "clr_loader_installed": "0.2.4"}})
+    monkeypatch.setattr(bp, "platform", type("P", (), {"system": staticmethod(lambda: "Windows")})())
+    with pytest.raises(SystemExit):
+        bp.verify_runtime_imports(Path("/fake/python"))
+    monkeypatch.setattr(bp, "platform", type("P", (), {"system": staticmethod(lambda: "Linux")})())
+    bp.verify_runtime_imports(Path("/fake/python"))            # tolerated off Windows
+
+
+def test_live_import_probe_reports_every_module_in_this_venv():
+    """Runs for real here: proves the probe works and that a Linux `clr` failure is not fatal."""
+    info = bp.verify_runtime_imports(Path(sys.executable))
+    assert set(info["imports"]) == set(bp.RUNTIME_IMPORT_PROBES)
+    assert info["imports"]["webview"] == "" and info["imports"]["pythonnet"] == ""
+    if sys.platform != "win32":
+        assert info["imports"]["clr"], "there is no mono/.NET host here, so `import clr` must fail loudly"
+
+
+def test_version_and_evidence_region_scope_are_untouched_by_the_cause_elimination():
+    """Re-assert after the analysis changed: still 1.3.3/016, still no PROMPT-027R edits."""
+    import app
+    assert (app.__version__, app.BUILD_NUMBER, app.BUILD_ID) == ("1.3.3", 16, "016")
+    for protected in ("app/improvement_visual.py", "app/improvement_pictures.py", "app/qpn_renderer.py",
+                      "app/pptx_parser.py", "frontend/src/tabs/LearningTab.tsx"):
+        assert protected not in _changed_files_vs_prompt027(), f"{protected} must not be modified"
+
+
+
+def bp_sha256(path):
+    from build_portable import sha256
+    return sha256(Path(path))

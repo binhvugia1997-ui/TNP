@@ -10,6 +10,12 @@ trên máy nội bộ. Không cần cài đặt, không cần quyền Administra
   - Microsoft Edge WebView2 Runtime (đã có sẵn trên Windows 11 và hầu hết Windows 10).
     Nếu cửa sổ hiện ra trắng/rỗng: cài "Microsoft Edge WebView2 Runtime" từ trang chính
     thức của Microsoft rồi chạy lại.
+  - .NET Framework 4.7.2 trở lên (khuyến nghị 4.8). Đây là yêu cầu THẬT SỰ của
+    pywebview trên Windows: cửa sổ WebView2 được tạo qua pythonnet, và
+    Python.Runtime.dll của pythonnet biên dịch cho .NETStandard 2.0 nên cần .NET
+    Framework 4.7.2+. Windows 10 1803+ và Windows 11 đã có sẵn. Nếu thiếu, chương
+    trình KHÔNG im lặng: logs\app.log có dòng WEBVIEW_RUNTIME ... dotnet_framework=...
+    và logs\startup_error.log ghi rõ "cần .NET Framework 4.7.2+".
   - Microsoft PowerPoint là TÙY CHỌN. Có PowerPoint → dùng PowerPoint để render slide
     đúng nhất. Không có PowerPoint → chương trình vẫn chạy, tự chuyển sang LibreOffice
     hoặc trình vẽ tích hợp, và báo rõ backend đã dùng (không bao giờ im lặng).
@@ -56,7 +62,15 @@ Chương trình KHÔNG kèm Ollama hay model. Không có Ollama vẫn chạy bì
 
 5. KHẮC PHỤC SỰ CỐ
 -------------------
-  - Không khởi động được: xem logs\startup_error.log.
+  - Không khởi động được: xem logs\startup_error.log, và dòng WEBVIEW_RUNTIME trong
+    logs\app.log (ghi TRƯỚC khi tạo cửa sổ: phiên bản python/pywebview/pythonnet/
+    clr-loader, backend, đường dẫn Python.Runtime.dll đã tìm thấy hay chưa, và
+    dotnet_framework=Release=... (ok/TOO-OLD)).
+  - Lỗi "Failed to resolve Python.Runtime.Loader.Initialize": Python.Runtime.dll không
+    nạp được. Ba nguyên nhân theo thứ tự kiểm tra: (1) thiếu file
+    _internal\pythonnet\runtime\Python.Runtime.dll; (2) file đó khác bản trong môi
+    trường build (.venv-build cũ); (3) .NET Framework < 4.7.2. Xem đúng dòng
+    WEBVIEW_RUNTIME để biết là nguyên nhân nào, không phải đoán.
   - Cửa sổ mở ra nhưng TRẮNG/RỖNG: thiếu Microsoft Edge WebView2 Runtime, hoặc thiếu
     frontend\dist\ (xem logs\app.log, dòng WEBVIEW_FRONTEND).
   - Cần giao diện Tk cổ điển để so sánh: chạy `ReportExtractor.exe --legacy-gui`.

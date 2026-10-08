@@ -259,6 +259,180 @@ REQUIRED_WEBVIEW_WINDOWS_FILES = (
 )
 
 
+# --------------------------------------------------------------------------- .NET runtime (PROMPT-028R)
+# A packaged pywebview app dies at start-up with
+#     RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize
+#                   from _internal\pythonnet\runtime\Python.Runtime.dll
+# when pythonnet's managed assembly is not exactly where clr_loader expects, or when a second conflicting
+# copy exists.  Both are packaging mistakes, so the BUILD verifies them instead of the tester discovering
+# them by double-clicking the exe.
+PYTHONNET_RUNTIME_DLL = "Python.Runtime.dll"
+PYTHONNET_RUNTIME_RELPATH = Path("_internal") / "pythonnet" / "runtime" / PYTHONNET_RUNTIME_DLL
+#: pywebview's Windows backend (winforms -> edgechromium) needs these to be reachable at start-up.
+REQUIRED_BUILD_PACKAGES = ("pywebview", "pythonnet", "clr-loader", "pyinstaller", "pyinstaller-hooks-contrib")
+
+
+def _query(py: Path, code: str) -> dict:
+    """Run ``code`` in the BUILD interpreter and parse the single JSON object it prints."""
+    r = subprocess.run([str(py), "-c", code], cwd=str(ROOT), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=child_env())
+    if r.returncode != 0:
+        fail(f"không truy vấn được môi trường build: {r.stderr.strip()[:400]}")
+    try:
+        return json.loads((r.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        fail(f"môi trường build trả về kết quả không phải JSON: {r.stdout.strip()[:400]}")
+        return {}                                       # unreachable – fail() exits
+
+
+def report_build_dependencies(py: Path) -> dict:
+    """Print the exact versions the package will be built with, and fail on a missing Windows essential.
+
+    A reused ``.venv-build`` with stale or half-installed packages is one of the suspected causes of the
+    PROMPT-028R failure, so the versions are recorded in the build log before anything is compiled.
+    """
+    code = (
+        "import importlib.metadata as md, importlib.util, json\n"
+        f"names = {REQUIRED_BUILD_PACKAGES!r}\n"
+        "out = {}\n"
+        "for n in names:\n"
+        "    try:\n"
+        "        out[n] = md.version(n)\n"
+        "    except Exception:\n"
+        "        out[n] = None\n"
+        "out['_python'] = __import__('sys').version.split()[0]\n"
+        "print(json.dumps(out))\n"
+    )
+    info = _query(py, code)
+    for name in REQUIRED_BUILD_PACKAGES:
+        print(f"   {name}: {info.get(name) or 'KHÔNG CÓ'}")
+    print(f"   python (build venv): {info.get('_python')}")
+    if platform.system() == "Windows":
+        missing = [n for n in ("pywebview", "pythonnet", "clr-loader") if not info.get(n)]
+        if missing:
+            fail("thiếu gói bắt buộc để đóng gói UI React trên Windows: " + ", ".join(missing)
+                 + ". Chạy lại với --fresh-venv, hoặc: pip install -r requirements-webview.txt")
+    return info
+
+
+#: Modules that MUST import cleanly in the build venv before anything is frozen.  A frozen app can only
+#: contain what the build venv could import, so this is the cheapest possible reproduction of the
+#: PROMPT-028R start-up failure — it runs BEFORE PyInstaller instead of after a double-click on Windows.
+RUNTIME_IMPORT_PROBES = ("webview", "pythonnet", "clr", "clr_loader")
+
+
+def verify_runtime_imports(py: Path) -> dict:
+    """Import the pywebview/.NET stack inside the build venv and fail the build if any import breaks.
+
+    Also checks that the installed ``clr-loader`` still satisfies pythonnet's own declared requirement
+    (``clr_loader<0.3.0,>=0.2.7`` for pythonnet 3.0.5).  A reused ``.venv-build`` holding an out-of-range
+    clr-loader produces exactly the runtime symptom PROMPT-028R had to explain, and nothing else in the
+    pipeline would notice.
+    """
+    code = (
+        "import importlib, importlib.metadata as md, json\n"
+        f"names = {RUNTIME_IMPORT_PROBES!r}\n"
+        "out = {'imports': {}, 'requires': {}}\n"
+        "for n in names:\n"
+        "    try:\n"
+        "        importlib.import_module(n)\n"
+        "        out['imports'][n] = ''\n"
+        "    except BaseException as e:\n"
+        "        out['imports'][n] = f'{type(e).__name__}: {e}'[:300]\n"
+        "try:\n"
+        "    reqs = md.requires('pythonnet') or []\n"
+        "    out['requires'] = {'clr_loader': [r for r in reqs if r.lower().startswith('clr_loader')] or [],\n"
+        "                       'clr_loader_installed': md.version('clr-loader')}\n"
+        "except Exception as e:\n"
+        "    out['requires'] = {'error': f'{type(e).__name__}: {e}'[:200]}\n"
+        "print(json.dumps(out))\n"
+    )
+    info = _query(py, code)
+    imports = info.get("imports") or {}
+    for name in RUNTIME_IMPORT_PROBES:
+        err = imports.get(name)
+        print(f"   import {name}: " + ("OK" if err is not None and not err else f"LỖI – {err}"))
+    broken = [n for n in RUNTIME_IMPORT_PROBES if imports.get(n)]
+    if broken and platform.system() == "Windows":
+        detail = "; ".join(f"{n}: {imports[n]}" for n in broken)
+        fail("môi trường build không import được UI React/.NET: " + detail
+             + ". Chạy lại với --fresh-venv, hoặc: pip install -r requirements-webview.txt")
+    req = info.get("requires") or {}
+    installed = req.get("clr_loader_installed")
+    declared = [r for r in (req.get("clr_loader") or []) if "extra" not in r]
+    if installed and declared:
+        try:
+            from packaging.requirements import Requirement
+            ok = all(installed in Requirement(d).specifier for d in declared)
+        except Exception:                                  # noqa: BLE001 – an unverifiable constraint is a warning
+            ok, declared = True, declared
+        print(f"   clr-loader {installed} vs pythonnet yêu cầu {declared or '?'}: "
+              + ("OK" if ok else "KHÔNG THOẢ"))
+        if not ok and platform.system() == "Windows":
+            fail(f"clr-loader {installed} không thoả yêu cầu của pythonnet ({', '.join(declared)}). "
+                 f"Chạy lại với --fresh-venv.")
+    return info
+
+
+def source_pythonnet_dll(py: Path) -> dict:
+    """Path / size / SHA256 of Python.Runtime.dll in the BUILD environment (the intended source copy)."""
+    code = (
+        "import hashlib, importlib.util, json, pathlib\n"
+        "spec = importlib.util.find_spec('pythonnet')\n"
+        "if not spec or not spec.origin:\n"
+        "    print(json.dumps({'found': False}))\n"
+        "else:\n"
+        "    p = pathlib.Path(spec.origin).parent / 'runtime' / 'Python.Runtime.dll'\n"
+        "    ok = p.is_file()\n"
+        "    print(json.dumps({'found': ok, 'path': str(p),\n"
+        "                      'size': p.stat().st_size if ok else 0,\n"
+        "                      'sha256': hashlib.sha256(p.read_bytes()).hexdigest() if ok else ''}))\n"
+    )
+    return _query(py, code)
+
+
+def validate_pythonnet_runtime(folder: Path, source: dict | None = None) -> list[str]:
+    """Prove the packaged .NET runtime is the one the build environment intended.
+
+    Checks: exactly ONE ``Python.Runtime.dll`` in the whole package, at the path pythonnet itself computes
+    (``<bundle>/pythonnet/runtime/``), byte-identical to the source install, plus the native
+    ``ClrLoader.dll`` that ``clr_loader.ffi.load_netfx()`` dlopen()s.  Source and packaged SHA256 are
+    printed so the acceptance record can compare them.
+    """
+    problems: list[str] = []
+    found = sorted(folder.rglob(PYTHONNET_RUNTIME_DLL))
+    if source and source.get("found"):
+        print(f"   nguồn {PYTHONNET_RUNTIME_DLL}: {source.get('path')}")
+        print(f"        size={source.get('size')} sha256={source.get('sha256')}")
+    if not found:
+        problems.append(f"thiếu {PYTHONNET_RUNTIME_DLL} trong gói – pywebview sẽ không khởi động được "
+                        "(hook-clr của PyInstaller phải đóng gói nó dạng BINARY)")
+        return problems
+    if len(found) > 1:
+        problems.append(f"có {len(found)} bản {PYTHONNET_RUNTIME_DLL} trong gói (phải đúng 1): "
+                        + ", ".join(str(p.relative_to(folder)) for p in found))
+    expected = (folder / PYTHONNET_RUNTIME_RELPATH).resolve()
+    for dll in found:
+        rel = dll.relative_to(folder)
+        packaged_sha = sha256(dll)
+        print(f"   gói  {rel}: size={dll.stat().st_size} sha256={packaged_sha}")
+        if dll.resolve() != expected:
+            problems.append(f"{PYTHONNET_RUNTIME_DLL} sai vị trí: {rel} (pythonnet tìm ở "
+                            f"{PYTHONNET_RUNTIME_RELPATH.as_posix()})")
+        if source and source.get("found") and packaged_sha != source.get("sha256"):
+            problems.append(f"{rel} có SHA256 KHÁC bản pythonnet trong môi trường build "
+                            f"(gói={packaged_sha[:16]}… nguồn={str(source.get('sha256'))[:16]}…) "
+                            "- có thể .venv-build cũ hoặc hook đã sửa file")
+    if platform.system() == "Windows":
+        import struct
+        arch = "amd64" if struct.calcsize("P") * 8 > 32 else "x86"
+        clr_loader_dll = folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch / "ClrLoader.dll"
+        if not clr_loader_dll.is_file():
+            problems.append(f"thiếu clr_loader/ffi/dlls/{arch}/ClrLoader.dll (hook-clr_loader) – "
+                            "clr_loader.netfx không nạp được .NET Framework")
+    return problems
+
+
 def _same_tree(left: Path, right: Path) -> bool:
     """True when two directories hold byte-identical files under identical relative paths."""
     if not left.is_dir() or not right.is_dir():
@@ -345,6 +519,8 @@ def main() -> int:
     ap.add_argument("--skip-tests", action="store_true", help="không chạy pytest (chỉ dùng khi đã chạy riêng)")
     ap.add_argument("--no-venv", action="store_true", help="dùng interpreter hiện tại thay vì .venv-build")
     ap.add_argument("--allow-non-windows", action="store_true", help="cho phép chạy trên Linux/macOS (chỉ thử nghiệm)")
+    ap.add_argument("--fresh-venv", action="store_true",
+                    help="xoá và tạo lại .venv-build (tránh gói cũ/hỏng trong môi trường build dùng lại)")
     ap.add_argument("--skip-frontend", action="store_true",
                     help="không chạy `npm run build`, dùng frontend/dist đã có sẵn")
     ap.add_argument("--no-publish", action="store_true", help="không tự động xuất bản vào thư mục cập nhật LAN")
@@ -368,10 +544,16 @@ def main() -> int:
     else:
         venv = ROOT / ".venv-build"
         py = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if args.fresh_venv and venv.exists():
+            print("   --fresh-venv: xoá .venv-build cũ để build lại từ đầu")
+            shutil.rmtree(venv)
         if not py.exists():
             run([base_py, "-m", "venv", str(venv)])
         run([py, "-m", "pip", "install", "--upgrade", "pip", "--quiet"])
         run([py, "-m", "pip", "install", "-r", str(ROOT / "requirements-build.txt"), "pytest", "pyflakes", "--quiet"])
+
+    report_build_dependencies(py)
+    verify_runtime_imports(py)
 
     step(4, "Kiểm tra mã nguồn (pyflakes) và test (pytest)")
     flakes = subprocess.run([str(py), "-m", "pyflakes", "app", "tools", "run.py"], cwd=str(ROOT),
@@ -411,7 +593,9 @@ def main() -> int:
     print(f"  Git revision: {git_rev}")
 
     step(10, "Kiểm tra gói (không chứa file dev, không config máy dev, không Ollama/model)")
-    problems = validate_artifact(folder) + validate_frontend(folder)
+    source_dll = source_pythonnet_dll(py)
+    problems = (validate_artifact(folder) + validate_frontend(folder)
+                + validate_pythonnet_runtime(folder, source_dll))
     if problems:
         fail("gói không hợp lệ:\n   - " + "\n   - ".join(problems))
     print("   OK")

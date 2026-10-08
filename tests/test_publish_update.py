@@ -245,7 +245,15 @@ def test_no_publish_after_failed_test_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(pu, "publish_release", lambda *a, **k: calls.append(1))
     monkeypatch.setattr(bp, "run", lambda cmd, cwd=None: (_ for _ in ()).throw(SystemExit(1))
                         if "pytest" in " ".join(map(str, cmd)) else None)
-    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": "", "stderr": ""})())
+    # PROMPT-028R: step 3 now queries the build venv's versions through subprocess.run([py, "-c", ...]),
+    # so the stub must answer those queries with the JSON shape the builder parses.
+    def fake_subprocess_run(*a, **k):
+        cmd = list(a[0]) if a and isinstance(a[0], (list, tuple)) else []
+        out = ('{"pywebview": "6.2.1", "pythonnet": "3.0.5", "clr-loader": "0.2.10",'
+               ' "pyinstaller": "6.22.3", "pyinstaller-hooks-contrib": "2026.8",'
+               ' "_python": "3.12.10"}' if "-c" in cmd else "")
+        return type("R", (), {"stdout": out, "stderr": "", "returncode": 0})()
+    monkeypatch.setattr(bp.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(bp, "check_python", lambda py: None)
     monkeypatch.setattr(sys, "argv", ["build_portable.py", "--no-venv", "--allow-non-windows"])
     with pytest.raises(SystemExit) as ex:
