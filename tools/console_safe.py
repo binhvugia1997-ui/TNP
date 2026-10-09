@@ -19,10 +19,31 @@ _GLYPH_FALLBACKS = str.maketrans({
 })
 
 
+def _stream_encoding(stream) -> Optional[str]:
+    """The byte encoding ``stream`` declares, or ``None`` when it declares none.
+
+    ``None`` is a MEANINGFUL answer, not missing information: ``io.StringIO`` -- and any ``TextIOBase`` that
+    stores ``str`` instead of bytes -- reports ``encoding is None`` precisely because it has no byte encoding
+    at all.  Such a stream is Unicode-native and can hold every character, so it must never be judged by an
+    unrelated global setting (PROMPT-029W §3).  Reading ``encoding is None`` as "ask the locale" is what made
+    ``safe_text("✓", stream=StringIO())`` return ``"[OK]"`` on a Windows host, whose
+    ``locale.getpreferredencoding()`` is cp1252.
+    """
+    if stream is None:
+        return None
+    declared = getattr(stream, "encoding", None)
+    return str(declared) if declared else None
+
+
 def _encoding_for(stream=None, encoding: Optional[str] = None) -> str:
-    value = encoding or getattr(stream, "encoding", None)
+    """Best-effort encoding NAME, for the current-console path where a ``str`` is required.
+
+    Behaviour is unchanged when no stream is supplied (§6): that call means "the console I am writing to
+    now", so the locale's preferred encoding is still the right answer there.
+    """
+    value = encoding or _stream_encoding(stream)
     if value:
-        return str(value)
+        return value
     try:
         return locale.getpreferredencoding(False) or "utf-8"
     except Exception:  # noqa: BLE001 -- console configuration must be best effort
@@ -32,11 +53,26 @@ def _encoding_for(stream=None, encoding: Optional[str] = None) -> str:
 def safe_text(text, stream=None, encoding: Optional[str] = None) -> str:
     """Return text that can be written to ``stream`` without encoding errors.
 
-    Unicode-capable streams retain the original text. For restricted streams, common UI
-glyphs become readable ASCII tokens, then accents are transliterated and any remaining
-    unrepresentable characters are replaced rather than raising.
+    STREAM-AWARE contract (PROMPT-029W §2): an explicitly supplied ``stream`` is authoritative for that call
+    -- safety is decided from THAT stream, never from ``sys.stdout``, the Windows console code page, the
+    locale's preferred encoding or any other global.
+
+      * the stream declares no byte encoding (``io.StringIO`` and friends) -> it is Unicode-native, so the
+        original text is returned EXACTLY (§3);
+      * the stream declares an encoding (a legacy cp1252 console) and the text is not representable in it ->
+        the existing fallback applies: common UI glyphs become readable ASCII tokens, then accents are
+        transliterated and any remaining unrepresentable characters are replaced rather than raising (§4/§5).
+
+    Unicode-capable streams retain the original text. For restricted streams, common UI glyphs become readable
+    ASCII tokens, then accents are transliterated and any remaining unrepresentable characters are replaced
+    rather than raising.
     """
     value = str(text)
+    if encoding is None and stream is not None and _stream_encoding(stream) is None:
+        # Unicode-native destination: nothing to fall back from.  This is NOT an unconditional pass-through --
+        # every stream that declares an encoding still goes through the representability check below, so
+        # cp1252 console output stays safe and status glyphs keep their ASCII fallbacks.
+        return value
     codec = _encoding_for(stream, encoding)
     try:
         value.encode(codec, errors="strict")
@@ -57,7 +93,9 @@ class _SafeTextStream:
 
     def __init__(self, stream: TextIO):
         self._stream = stream
-        self.encoding = _encoding_for(stream)
+        # Faithful to the wrapped stream: None for a Unicode-native one, so the proxy does not re-inject the
+        # locale's encoding and mangle text the destination could have held (PROMPT-029W §2/§3).
+        self.encoding = _stream_encoding(stream)
         self.errors = "replace"
 
     def write(self, text):
