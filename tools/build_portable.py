@@ -527,6 +527,30 @@ def prove_clr_loader(folder: Path, arch: str, problems: list[str]) -> Path | Non
 #: root/current-domain sentinel, NOT an AppDomain failure.  Success is judged on positive evidence — the
 #: resolved function pointer and Initialize returning 0 — exactly the two things pythonnet's own ``load()``
 #: requires (``func = get_function(...); if func(b"") != 0: raise``).
+#:
+#: PROMPT-030T — initialization is only HALF of the lifecycle those pinned sources define, and stopping
+#: there is what killed the probe subprocess on Windows:
+#:
+#:   pythonnet 3.0.5 ``pythonnet/__init__.py``
+#:     load()   :142-152  Initialize must return 0, then ``atexit.register(unload)``
+#:     unload() :160-167  ``Loader.Shutdown(b"full_shutdown")`` must return 0, THEN ``_RUNTIME.shutdown()``
+#:   pythonnet 3.0.5 ``src/runtime/Loader.cs:40-60``
+#:     ``Shutdown``: ``if (command == "full_shutdown") { using var _ = Py.GIL(); PythonEngine.Shutdown(); }``
+#:   pythonnet 3.0.5 ``src/runtime/PythonEngine.cs``
+#:     ``Initialize`` :218-219 subscribes ``AppDomain.CurrentDomain.DomainUnload``/``ProcessExit``
+#:     ``Shutdown``   :387-394 unsubscribes them, runs the shutdown handlers and ``Runtime.Shutdown()``
+#:   clr-loader 0.2.10 ``clr_loader/netfx.py``
+#:     :66-68 ``pyclr_initialize()`` then ``atexit.register(_release)``;  :74 ``_release`` → ``pyclr_finalize()``
+#:     :56-57 ``shutdown()`` calls ``pyclr_close_appdomain`` ONLY for a truthy handle, so the root/NULL
+#:            domain deliberately skips it (``ClrLoader.CloseAppDomain`` also no-ops on ``IntPtr.Zero``)
+#:
+#: Skipping the shutdown half leaves those AppDomain handlers subscribed and pythonnet's managed
+#: Finalizer queue full, so the CLR tears the runtime down from its own ``ProcessExit`` path instead;
+#: ``Py.cs:41``'s ``~GILState()`` then throws ``GIL must always be released, and it must be released from
+#: the same thread that acquired it`` off the finalizer thread, which is unhandled on .NET Framework — the
+#: subprocess exits nonzero AFTER healthy-looking JSON is already on stdout.  So this probe now runs
+#: Initialize → Shutdown → ``pyclr_finalize`` in the order ``atexit`` (LIFO) would, with ``pyclr_finalize``
+#: in a ``finally`` so a probe never abandons a CLR it started, and reports positive evidence per stage.
 PROBE_PACKAGED_RUNTIME = r"""
 import json, sys
 from pathlib import Path
@@ -545,6 +569,11 @@ entry_point pyclr_get_function(pyclr_domain domain, const char* assembly_path,
 void pyclr_close_appdomain(pyclr_domain domain);
 void pyclr_finalize();
 ''')
+# The lifecycle stage actually reached, so cleanup is attempted only for state this probe really created:
+# start -> clr-initialized (pyclr_initialize ran) -> appdomain -> pythonnet-initialized (Loader.Initialize
+# returned 0, so Loader.Shutdown is now obligatory) -> pythonnet-shutdown (Loader.Shutdown returned 0).
+stage = "start"
+fw = None
 try:
     host = folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch / "ClrLoader.dll"
     assembly = folder / "_internal" / "pythonnet" / "runtime" / "Python.Runtime.dll"
@@ -552,22 +581,75 @@ try:
     out["assembly"] = str(assembly)
     fw = ffi.dlopen(str(host))
     fw.pyclr_initialize()
+    stage = "clr-initialized"
     domain = fw.pyclr_create_appdomain(ffi.NULL, ffi.NULL)
     out["appdomain"] = "NULL" if domain == ffi.NULL else "created"
+    stage = "appdomain"
     func = fw.pyclr_get_function(domain, str(assembly).encode("utf8"),
                                  b"Python.Runtime.Loader", b"Initialize")
     out["resolved"] = func != ffi.NULL
     if out["resolved"]:
         buffer = ffi.from_buffer("char[]", b"")
         out["initialize_rc"] = int(func(ffi.cast("void*", buffer), 0))
+        if out["initialize_rc"] == 0:
+            # pythonnet.load() registers atexit(unload) at this exact moment, and unload() is
+            # Loader.Shutdown(b"full_shutdown") BEFORE _RUNTIME.shutdown().  Only a runtime that actually
+            # initialized may be shut down.
+            stage = "pythonnet-initialized"
+            shutdown = fw.pyclr_get_function(domain, str(assembly).encode("utf8"),
+                                             b"Python.Runtime.Loader", b"Shutdown")
+            out["shutdown_resolved"] = shutdown != ffi.NULL
+            if out["shutdown_resolved"]:
+                command = ffi.from_buffer("char[]", b"full_shutdown")
+                out["shutdown_rc"] = int(shutdown(ffi.cast("void*", command), len(command)))
+                if out["shutdown_rc"] == 0:
+                    stage = "pythonnet-shutdown"
 except BaseException as exc:
+    # The native chain threw (e.g. dlopen refused the packaged ClrLoader.dll): the exception IS the
+    # finding, and no lifecycle evidence can exist past it — report exactly that, nothing invented.  This
+    # is the ONLY assignment to out["error"], so the finally block cannot bury it under a cleanup error.
     out["error"] = f"{type(exc).__name__}: {exc}"[:400]
+    out["error_stage"] = stage
+finally:
+    # clr_loader/netfx.py registers atexit(_release) -> pyclr_finalize() as soon as pyclr_initialize()
+    # runs, and atexit is LIFO, so finalization is the LAST step of the real lifecycle.  ClrLoader.Close()
+    # disposes every registered DomainData; for the root/current domain DomainData.Dispose() only clears
+    # the functor table (Domain == AppDomain.CurrentDomain, so there is no AppDomain.Unload).  Guarded on
+    # the stage, so it runs exactly once and only when a CLR was actually started.
+    if stage != "start":
+        try:
+            fw.pyclr_finalize()
+            out["finalized"] = True
+        except BaseException as exc:
+            out["finalized"] = False
+            out["finalize_error"] = f"{type(exc).__name__}: {exc}"[:400]
+    out["stage"] = stage
 print(json.dumps(out))
 """
 
 
+def _lifecycle_rc(out: dict, key: str, subject: str, consequence: str, problems: list[str]) -> bool:
+    """Validate one lifecycle stage's ``int Func(IntPtr, int)`` result; True only for the integer 0.
+
+    Both entry points pythonnet binds (``Loader.Initialize``, ``Loader.Shutdown``) return 0 on success and
+    1 after catching an exception, so a missing key, a JSON boolean, or any nonzero value is ignorance or
+    failure — never a pass.  ``bool`` is rejected explicitly because JSON ``true``/``false`` arrive as
+    Python ``bool``, which ``isinstance(..., int)`` would otherwise accept as 1/0.
+    """
+    rc = out.get(key, None)
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        problems.append(f"{subject} chưa có kết quả hợp lệ "
+                        f"({key}={out.get(key, '<thiếu>')!r} không phải số nguyên) "
+                        "— resolved mà không có rc là output không đầy đủ, cổng build fail closed")
+        return False
+    if rc != 0:
+        problems.append(f"{subject} trả về {rc} (khác 0): {consequence}")
+        return False
+    return True
+
+
 def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
-    """Actually resolve ``Python.Runtime.Loader.Initialize`` out of the finished package (Windows only).
+    """Prove the finished package runs pythonnet's WHOLE lifecycle, not just its start (Windows only).
 
     Returns the problems it found.  A failure here means the shipped exe WILL die at start-up, so the build
     stops instead of publishing it.  Where the probe cannot run (non-Windows, no build interpreter) it says
@@ -578,11 +660,22 @@ def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
     ``pyclr_create_appdomain(ffi.NULL, ...)`` and ClrLoader.cs answers that unnamed request with index 0 —
     the ROOT/CURRENT ``AppDomain`` it registered in ``Initialize()``.  ``appdomain NULL`` is therefore the
     normal sentinel of the production default path, NOT a creation failure (0.2.10 has no failure return at
-    all: a NAMED domain either gets an index or the constructor never completes).  A pass still requires
-    every applicable positive result — subprocess exit 0, well-formed JSON object, no ``error``, the
-    requested architecture echoed, ``resolved is True`` and ``initialize_rc == 0`` (pythonnet's own success
-    condition).  Anything missing, malformed, non-True or non-zero fails the gate: this check exists to
-    stop broken packages, so it fails CLOSED.
+    all: a NAMED domain either gets an index or the constructor never completes).
+
+    PROMPT-030T — and initialization alone is not a pass.  pythonnet 3.0.5's ``load()`` registers
+    ``atexit(unload)`` as soon as ``Loader.Initialize`` returns 0, and ``unload()`` is
+    ``Loader.Shutdown(b"full_shutdown")`` before ``_RUNTIME.shutdown()``; clr-loader's own ``atexit``
+    ``_release()`` then calls ``pyclr_finalize()``.  A probe that stops after ``Initialize`` leaves
+    pythonnet's ``AppDomain.CurrentDomain.ProcessExit`` handler subscribed and its managed Finalizer queue
+    full, so the CLR tears the runtime down from its own process-exit path and ``Py.cs``'s ``~GILState()``
+    throws ``GIL must always be released…`` off the finalizer thread — unhandled on .NET Framework, i.e. a
+    nonzero subprocess exit AFTER healthy JSON was printed.  So a pass requires positive evidence for every
+    stage the probe relies on — subprocess exit 0, well-formed JSON object, no ``error``, the requested
+    architecture echoed, ``resolved is True``, ``initialize_rc == 0`` and then, only once initialization
+    actually succeeded, ``shutdown_resolved is True``, ``shutdown_rc == 0``, ``finalized is True`` and no
+    ``finalize_error``.  Anything missing, malformed, non-True or non-zero fails the gate: this check
+    exists to stop broken packages, so it fails CLOSED.  The nonzero-exit gate is deliberately NOT relaxed
+    by any of that evidence.
     """
     if platform.system() != "Windows":
         print("   probe loadability: BỎ QUA — .NET Framework chỉ có trên Windows; phần chứng minh "
@@ -602,11 +695,13 @@ def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
         note = f" ({exc})" if isinstance(exc, ValueError) else ""
         return [f"probe nạp runtime đã đóng gói không trả về JSON hợp lệ (rc={proc.returncode}){note}: "
                 f"{(proc.stdout or '').strip()[-300:]} {(proc.stderr or '').strip()[-300:]}".strip()]
-    for key in ("arch", "appdomain", "resolved", "initialize_rc", "error"):
+    for key in ("arch", "appdomain", "resolved", "initialize_rc",
+                "shutdown_resolved", "shutdown_rc", "finalized", "stage",
+                "finalize_error", "error_stage", "error"):
         if key in out:
-            print(f"   probe {key:14} {out[key]}")
+            print(f"   probe {key:17} {out[key]}")
     if out.get("appdomain") == "NULL":
-        print("   probe domain     root/current AppDomain — clr_loader gọi pyclr_create_appdomain(ffi.NULL) "
+        print("   probe domain        root/current AppDomain — clr_loader gọi pyclr_create_appdomain(ffi.NULL) "
               "theo mặc định và ClrLoader.cs trả về index 0 (AppDomain.CurrentDomain); đây là sentinel hợp "
               "lệ, KHÔNG phải lỗi tạo AppDomain")
     problems: list[str] = []
@@ -616,7 +711,8 @@ def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
     if out.get("error"):
         problems.append(f"probe nạp runtime đã đóng gói thất bại: {out['error']}")
         # The native chain threw (e.g. dlopen refused the packaged ClrLoader.dll): the exception IS the
-        # finding, and no resolution evidence can exist past it — report exactly that, nothing invented.
+        # finding, and no lifecycle evidence can exist past it — report exactly that, nothing invented.
+        # In particular no shutdown/finalization claim is derived for state the probe never created.
         return problems
     if out.get("arch") != arch:
         problems.append(f"probe trả về kiến trúc {out.get('arch')!r} thay vì {arch!r} — output không phải "
@@ -626,6 +722,7 @@ def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
                         "'NULL' = root/current domain theo mặc định của clr_loader, 'created' = domain đặt "
                         "tên — mọi giá trị khác là output hỏng)")
     resolved = out.get("resolved", None)
+    initialized = False
     if resolved is False:
         problems.append("pyclr_get_function trả về NULL cho Python.Runtime.Loader.Initialize trong gói "
                         "đã build — chính là lỗi làm ReportExtractor.exe chết khi khởi động. Kiểm tra "
@@ -636,14 +733,41 @@ def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
         problems.append(f"probe không xuất ra bằng chứng phân giải (resolved={shown}) — không có gì được "
                         "chứng minh thì cổng build fail closed")
     else:
-        rc = out.get("initialize_rc", None)
-        if isinstance(rc, bool) or not isinstance(rc, int):
-            problems.append("Python.Runtime.Loader.Initialize chưa có kết quả hợp lệ "
-                            f"(initialize_rc={out.get('initialize_rc', '<thiếu>')!r} không phải số nguyên) "
-                            "— resolved mà không có rc là output không đầy đủ, cổng build fail closed")
-        elif rc != 0:
-            problems.append(f"Python.Runtime.Loader.Initialize trả về {rc} (khác 0): pythonnet không khởi "
-                            "động được trong gói đã build")
+        initialized = _lifecycle_rc(out, "initialize_rc", "Python.Runtime.Loader.Initialize",
+                                    "pythonnet không khởi động được trong gói đã build", problems)
+    if not initialized:
+        # Loader.Shutdown is pythonnet's obligation ONLY after Initialize returned 0; demanding shutdown
+        # evidence here would bury the real cause under complaints about a runtime that never started.
+        return problems
+    # --- the second half of the verified lifecycle (PROMPT-030T) -------------------------------
+    shutdown_resolved = out.get("shutdown_resolved", None)
+    shutdown_ok = False
+    if shutdown_resolved is False:
+        problems.append("pyclr_get_function trả về NULL cho Python.Runtime.Loader.Shutdown dù "
+                        "Initialize đã trả về 0 — pythonnet/unload() không thể tắt runtime, gói sẽ bị "
+                        "finalizer .NET giết khi tiến trình kết thúc (Py.cs ~GILState: 'GIL must always "
+                        "be released')")
+    elif shutdown_resolved is not True:
+        shown = "<thiếu>" if "shutdown_resolved" not in out else repr(shutdown_resolved)
+        problems.append(f"probe không xuất ra bằng chứng Shutdown (shutdown_resolved={shown}) — runtime "
+                        "đã khởi động mà chưa được chứng minh là tắt sạch, cổng build fail closed")
+    else:
+        shutdown_ok = _lifecycle_rc(out, "shutdown_rc", "Python.Runtime.Loader.Shutdown",
+                                    "pythonnet không tắt được sạch trong gói đã build — tiến trình sẽ "
+                                    "chết ở finalizer .NET (Py.cs ~GILState) sau khi JSON đã in ra",
+                                    problems)
+    if not shutdown_ok:
+        # A runtime that could not be shut down must not then be judged on its finalization evidence.
+        return problems
+    finalized = out.get("finalized", None)
+    if finalized is not True:
+        shown = "<thiếu>" if "finalized" not in out else repr(finalized)
+        problems.append(f"probe không chứng minh được pyclr_finalize() đã chạy thành công "
+                        f"(finalized={shown}) — clr_loader/netfx.py đăng ký atexit(_release) ngay khi "
+                        "pyclr_initialize() chạy, nên bỏ qua hoặc hỏng bước này là lifecycle chưa hoàn "
+                        "tất, cổng build fail closed")
+    if out.get("finalize_error"):
+        problems.append(f"pyclr_finalize() thất bại: {out['finalize_error']}")
     return problems
 
 
