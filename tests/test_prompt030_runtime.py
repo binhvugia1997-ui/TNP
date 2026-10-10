@@ -93,6 +93,43 @@ def _real_dll(relative: str):
     return None
 
 
+def _validate_only_interpreter() -> Path:
+    """Mirror validate_existing_package()'s preference for the build venv on Windows."""
+    candidate = ROOT / ".venv-build" / "Scripts" / "python.exe"
+    return candidate if candidate.is_file() else Path(sys.executable)
+
+
+def _package_from_installed_runtime(tmp_path, py: Path):
+    """Stage exact DLL bytes discoverable by the same interpreter used for the live probe."""
+    arch = _build_arch()
+    runtime = bp.source_pythonnet_dll(py)
+    loader_code = (
+        "import importlib.util, json\n"
+        "from pathlib import Path\n"
+        "spec = importlib.util.find_spec('clr_loader')\n"
+        "host = (Path(spec.origin).parent / 'ffi' / 'dlls' / "
+        f"{arch!r} / 'ClrLoader.dll') if spec and spec.origin else None\n"
+        "print(json.dumps({'found': bool(host and host.is_file()), "
+        "'path': str(host) if host else None, "
+        "'cffi': importlib.util.find_spec('cffi') is not None}))\n"
+    )
+    loader = bp._query(py, loader_code)
+    missing = []
+    if not runtime.get("found"):
+        missing.append("pythonnet/runtime/Python.Runtime.dll")
+    if not loader.get("found"):
+        missing.append(f"clr_loader/ffi/dlls/{arch}/ClrLoader.dll")
+    if not loader.get("cffi"):
+        missing.append("cffi in the live-probe interpreter")
+    if missing:
+        pytest.fail("Windows live-runtime integration prerequisites are missing from "
+                    f"{py}: {', '.join(missing)}")
+
+    return _package(tmp_path,
+                    runtime=Path(runtime["path"]).read_bytes(),
+                    host=Path(loader["path"]).read_bytes())
+
+
 # =========================================================================== the ECMA-335 reader itself
 def test_reader_rejects_a_file_that_is_not_a_pe(tmp_path):
     target = tmp_path / "Python.Runtime.dll"
@@ -675,19 +712,50 @@ def test_gate_runs_the_probe_only_when_a_build_interpreter_is_known(tmp_path, mo
 
 # ============================================================================== re-proving a shipped folder
 def test_validate_only_reuses_the_same_gate_and_reports_a_real_cause(tmp_path, monkeypatch, capsys):
-    """The crash was reported from H:\\, i.e. AFTER the build — the gate has to run against that folder."""
+    """The H:\\ report is post-build; this structural case must not send its fake host to Windows."""
+    _force_windows(monkeypatch)
     folder = _package(tmp_path, runtime=python_runtime_image(assembly_name="Wrong.Payload"))
     monkeypatch.setattr(bp, "source_pythonnet_dll", lambda py: {"found": False})
+    monkeypatch.setattr(bp, "probe_packaged_runtime", lambda *args, **kwargs: [])
     assert bp.validate_existing_package(folder, Path(sys.executable)) == 1
     out = capsys.readouterr().out
     assert "KHÔNG thể khởi động" in out and "Wrong.Payload" in out
 
 
-def test_validate_only_passes_a_healthy_folder(tmp_path, monkeypatch, capsys):
-    folder = _package(tmp_path)
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="Windows-only: exercises real CFFI/CLR DLL loading; Linux cannot claim native loadability")
+def test_validate_only_passes_a_healthy_folder(tmp_path, capsys):
+    """The Windows live-probe case uses installed, genuinely loadable runtime payloads."""
+    py = _validate_only_interpreter()
+    folder = _package_from_installed_runtime(tmp_path, py)
+    assert bp.validate_existing_package(folder, py) == 0
+    output = capsys.readouterr().out
+    assert "OK: Python.Runtime.Loader.Initialize phân giải được" in output
+    assert "probe appdomain" in output and "probe resolved" in output and "probe initialize_rc" in output
+
+
+@pytest.mark.parametrize(
+    ("probe_problems", "expected_status"),
+    [([], 0), (["injected live-probe failure"], 1)],
+)
+def test_validate_only_obeys_injected_probe_result_for_structural_fixture(
+        tmp_path, monkeypatch, capsys, probe_problems, expected_status):
+    """Exercise validate-only's decision contract; the injected result makes no native-loadability claim."""
+    _force_windows(monkeypatch)
+    folder = _package(tmp_path)  # PE/metadata fixture only; never passed to the real Windows loader.
     monkeypatch.setattr(bp, "source_pythonnet_dll", lambda py: {"found": False})
-    assert bp.validate_existing_package(folder, Path(sys.executable)) == 0
-    assert "OK: Python.Runtime.Loader.Initialize phân giải được" in capsys.readouterr().out
+    calls = []
+
+    def injected_probe(probe_folder, py, arch):
+        calls.append((probe_folder, py, arch))
+        return probe_problems
+
+    monkeypatch.setattr(bp, "probe_packaged_runtime", injected_probe)
+    assert bp.validate_existing_package(folder, Path(sys.executable)) == expected_status
+    assert len(calls) == 1 and calls[0][0] == folder
+    output = capsys.readouterr().out
+    if probe_problems:
+        assert "injected live-probe failure" in output
 
 
 def test_validate_only_refuses_a_folder_that_is_not_there(tmp_path):
