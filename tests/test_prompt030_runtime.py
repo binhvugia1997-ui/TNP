@@ -9,22 +9,31 @@ That string is the *only* thing ``clr_loader/netfx.py`` reports: its cdef declar
 ``pyclr_initialize`` / ``pyclr_create_appdomain`` / ``pyclr_get_function`` / ``pyclr_close_appdomain`` /
 ``pyclr_finalize`` and **no error accessor**, so whatever the CLR actually threw is discarded, and
 ``NetFx.__init__`` stores whatever ``pyclr_create_appdomain`` returned without checking it for NULL while
-``NetFx.info()`` hardcodes ``initialized=True``.  PROMPT-028R's gate proved presence, uniqueness, location
-and SHA256 — and the build passed it, so the exe shipped and crashed anyway.
+``NetFx.info()`` hardcodes ``initialized=True``.  PROMPT-030S-R fixes what that first PROMPT-030 gate then
+got WRONG: in clr-loader 0.2.10 ``get_netfx()`` defaults to ``domain=None``, ``NetFx.__init__`` passes
+``ffi.NULL``, and ``ClrLoader.cs`` deliberately answers the unnamed request with index 0 — the
+ROOT/CURRENT ``AppDomain`` it registered in ``Initialize()``.  So the probe's ``appdomain NULL`` is the
+root-domain SENTINEL, never by itself an AppDomain creation failure; success and failure are decided by
+positive evidence (resolved pointer + ``Initialize()==0``, matching pythonnet's own ``load()`` contract)
+and the gate fails CLOSED on missing or malformed probe output.
 
-These tests pin what PROMPT-030 adds:
+These tests pin what PROMPT-030 adds (as corrected by PROMPT-030R and PROMPT-030S-R):
 
 * the packaged payload's **managed identity** — assembly name, IL-only/any-cpu, target framework, and a
   ``Python.Runtime.Loader.Initialize`` that is ``static int32 (native int, int32)``, which is precisely the
   ``entry_point`` typedef clr_loader turns into a delegate;
 * the packaged netfx host's **architecture, mixed-mode-ness and five ``pyclr_*`` exports**;
-* a **Mark-of-the-Web block**, the one condition that appears AFTER the build (a folder extracted from
-  ``release/*.zip`` or copied from another PC): ``LoadLibrary`` ignores ``Zone.Identifier`` so the native
-  host loads and the app domain is created, while ``Assembly.LoadFrom`` refuses the managed assembly with
-  0x80131515 — a DLL that exists at the right path with the right SHA256 and still cannot initialize;
-* a **real loadability probe** that performs the failing call against the packaged bytes and checks the
-  app-domain handle for NULL, which ``clr_loader`` itself never does;
-* startup diagnostics that report the discriminating facts instead of asserting an unprovable one.
+* **Mark-of-the-Web reporting**, a candidate post-build cause (a folder extracted from ``release/*.zip``
+  or copied from another PC): ``LoadLibrary`` ignores ``Zone.Identifier`` so the native host loads and
+  clr_loader reaches the root AppDomain, while ``Assembly.LoadFrom`` can refuse the managed assembly with
+  0x80131515.  This is an evidence-based HYPOTHESIS — no A/B proof exists that it caused the original
+  H:\\ failure — so the tests pin the safe observe-and-unblock behavior, not a proven causal claim;
+* a **real loadability probe** that performs the failing call chain against the packaged bytes, reads the
+  app-domain handle that ``clr_loader`` itself never inspects, and treats its NULL root-domain sentinel as
+  the NORMAL case while demanding positive evidence (``resolved True`` + ``initialize_rc == 0``) and
+  failing CLOSED on missing, malformed, erroring, nonzero-exit or timed-out probe output;
+* startup diagnostics that report the discriminating facts — root/current vs named AppDomain, blocked
+  runtime, .NET Framework release — instead of asserting an unprovable one.
 
 Nothing here needs Windows, a .NET installation, PyInstaller or a built artifact: the managed images are
 synthesized from ECMA-335 by ``tests/dotnet_image_fixtures.py``, and the real shipped DLLs are asserted
@@ -33,6 +42,7 @@ against the same reader whenever ``pythonnet`` happens to be installed.
 from __future__ import annotations
 
 import importlib.util
+import json
 import struct
 import sys
 import types
@@ -516,22 +526,48 @@ def test_packaged_runtime_files_names_both_files_the_frozen_app_loads(monkeypatc
 
 
 # ================================================================== diagnostics must not lie about CLR
-def _fake_pythonnet(monkeypatch, domain):
-    runtime = None if domain == "no-runtime" else types.SimpleNamespace(_domain=domain)
+def _fake_pythonnet(monkeypatch, domain, domain_name=None, with_name=False):
+    """A stand-in for ``pythonnet._RUNTIME`` shaped like clr_loader 0.2.10's ``NetFx``.
+
+    ``NetFx`` stores BOTH the handle (``_domain``) and what it was asked to create (``_domain_name``);
+    ``with_name`` reproduces the named-domain request that turns a NULL handle into a genuine failure.
+    """
+    if domain == "no-runtime":
+        runtime = None
+    else:
+        attrs = {"_domain": domain}
+        if with_name:
+            attrs["_domain_name"] = domain_name
+        runtime = types.SimpleNamespace(**attrs)
     monkeypatch.setitem(sys.modules, "pythonnet", types.SimpleNamespace(_RUNTIME=runtime))
 
 
 def test_appdomain_report_reads_the_handle_instead_of_trusting_runtime_info(monkeypatch):
-    """NetFx.info() hardcodes initialized=True, so get_runtime_info() cannot answer this question."""
+    """NetFx.info() hardcodes initialized=True, so get_runtime_info() cannot answer this question.
+
+    PROMPT-030S-R corrected the VALUES reported from the handle: the NULL/unnamed combination is
+    clr-loader's ROOT/CURRENT-domain success sentinel — never "the CLR itself would not start" — while a
+    non-NULL handle still names the created domain and only 'no-runtime-selected' marks a real startup gap.
+    """
     null = object()
     monkeypatch.setattr(desktop.sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "clr_loader", types.ModuleType("clr_loader"))
     monkeypatch.setitem(sys.modules, "clr_loader.ffi", types.SimpleNamespace(
         ffi=types.SimpleNamespace(NULL=null)))
     _fake_pythonnet(monkeypatch, 0x1234)
-    assert desktop.appdomain_report() == "created"
+    assert desktop.appdomain_report() == "created(named AppDomain)"
+    _fake_pythonnet(monkeypatch, 0x1234, with_name=True, domain_name="TNP-ReportExtractor")
+    assert desktop.appdomain_report() == "created(named AppDomain 'TNP-ReportExtractor')"
     _fake_pythonnet(monkeypatch, null)
-    assert desktop.appdomain_report().startswith("NULL(")
+    report = desktop.appdomain_report()
+    assert report.startswith("root("), report
+    assert "AppDomain.CurrentDomain" in report
+    for forbidden in ("failed", "would not start", "NULL("):
+        assert forbidden not in report, f"root-domain NULL must not be reported as {forbidden!r}"
+    _fake_pythonnet(monkeypatch, null, with_name=True, domain_name="TNP-ReportExtractor")
+    failure = desktop.appdomain_report()
+    assert failure.startswith("NULL(") and "named domain" in failure, \
+        "a NAMED request whose handle came back zero is a real anomaly and stays reported as one"
     _fake_pythonnet(monkeypatch, "no-runtime")
     assert desktop.appdomain_report() == "no-runtime-selected"
     monkeypatch.setitem(sys.modules, "pythonnet", types.SimpleNamespace(
@@ -547,7 +583,7 @@ def test_appdomain_report_falls_back_when_cffi_is_unavailable(monkeypatch):
     monkeypatch.delitem(sys.modules, "clr_loader.ffi", raising=False)
     sys.modules.pop("clr_loader.ffi", None)
     _fake_pythonnet(monkeypatch, 0)
-    assert desktop.appdomain_report().startswith("NULL(")
+    assert desktop.appdomain_report().startswith("root(")
 
 
 def test_appdomain_report_never_raises_when_pythonnet_is_absent(monkeypatch):
@@ -589,6 +625,20 @@ def test_hint_no_longer_asserts_an_app_domain_was_created():
         assert field in hint, f"the hint must point at {field}"
 
 
+def test_hint_does_not_misread_the_root_domain_sentinel_as_a_CLR_failure():
+    """PROMPT-030's other half: the hint told readers dotnet_appdomain=NULL meant the CLR would not
+    start / .NET Framework too old.  clr-loader 0.2.10 uses NULL to MEAN the root/current AppDomain,
+    so the hint must teach the real discriminator instead of repeating that false inference."""
+    hint = desktop.explain_clr_failure(
+        "RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize from X")
+    assert "the CLR itself would not start, i.e. .NET Framework older than 4.7.2" not in hint
+    assert "root(AppDomain.CurrentDomain" in hint, "must name the normal default value"
+    assert "NOT a startup failure" in hint
+    assert "no-runtime-selected" in hint, "must point at the value that DOES mark a startup failure"
+    assert "says NOTHING about the .NET Framework version" in hint, \
+        "must stop inferring the framework age from the domain handle alone"
+
+
 def test_hint_still_covers_the_older_signatures():
     assert "4.7.2" in desktop.explain_clr_failure("Could not load file or assembly 'netstandard, Version=2.0.0.0'")
     assert desktop.explain_clr_failure("System.BadImageFormatException: bad")
@@ -619,11 +669,15 @@ def test_probe_declares_the_same_native_interface_clr_loader_declares():
     assert "pyclr_create_appdomain" in cdef and "pyclr_get_function" in cdef
 
 
-def test_probe_checks_the_domain_handle_that_clr_loader_never_checks():
-    """NetFx.__init__ stores whatever pyclr_create_appdomain returned; the probe must notice a NULL."""
+def test_probe_checks_the_domain_handle_that_clr_loader_never_reads():
+    """NetFx.__init__ stores whatever pyclr_create_appdomain returned; the probe must report a NULL —
+    as PROMPT-030S-R established, to NAME the root/current-domain sentinel the unnamed request is meant
+    to produce, not to treat that sentinel as a failure (see the accept/reject tests below)."""
     assert '"appdomain"] = "NULL"' in bp.PROBE_PACKAGED_RUNTIME
     assert "domain == ffi.NULL" in bp.PROBE_PACKAGED_RUNTIME
     assert '"Python.Runtime.Loader"' in bp.PROBE_PACKAGED_RUNTIME and '"Initialize"' in bp.PROBE_PACKAGED_RUNTIME
+    # The probe deliberately asks for the UNNAMED domain — the production pythonnet path (get_netfx()).
+    assert "pyclr_create_appdomain(ffi.NULL, ffi.NULL)" in bp.PROBE_PACKAGED_RUNTIME
 
 
 def test_probe_is_skipped_outside_windows_and_says_so(tmp_path, monkeypatch, capsys):
@@ -645,47 +699,116 @@ def test_probe_turns_a_null_resolution_into_a_build_failure(tmp_path, monkeypatc
     assert any("pyclr_get_function trả về NULL" in p for p in problems), problems
 
 
-def test_probe_turns_a_null_appdomain_into_a_build_failure(tmp_path, monkeypatch):
+#: PROMPT-030S-R: the reproduction.  The verified healthy Windows evidence (root-domain NULL, real
+#: resolution, Initialize 0) must be accepted — the old gate failed it, and the old test below encoded
+#: that wrong expectation.  A NULL appdomain on the probe's unnamed/default request is clr-loader's
+#: ROOT/CURRENT-domain sentinel (ClrLoader.cs answers index 0 = AppDomain.CurrentDomain), not a failure.
+HEALTHY_ROOT_DOMAIN_EVIDENCE = {"arch": "amd64", "appdomain": "NULL", "resolved": True, "initialize_rc": 0}
+
+
+def _feed_probe(monkeypatch, payload_text, returncode=0, stderr=""):
     _force_windows(monkeypatch)
-    payload = {"arch": "amd64", "appdomain": "NULL", "resolved": False}
     monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
-        returncode=0, stdout=__import__("json").dumps(payload), stderr=""))
+        returncode=returncode, stdout=payload_text, stderr=stderr))
+
+
+def test_probe_accepts_the_root_appdomain_null_sentinel(tmp_path, monkeypatch, capsys):
+    """The reproduced Windows defect: appdomain=NULL + resolved=True + initialize_rc=0 must PASS."""
+    _feed_probe(monkeypatch, json.dumps(HEALTHY_ROOT_DOMAIN_EVIDENCE))
+    assert bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64") == []
+    printed = capsys.readouterr().out
+    assert "probe appdomain" in printed and "NULL" in printed, "the sentinel stays visible in the build log"
+    assert "root/current AppDomain" in printed, "…and must be DESCRIBED as the root/current domain, not a failure"
+
+
+def test_probe_turns_null_appdomain_plus_failed_resolution_into_a_build_failure(tmp_path, monkeypatch):
+    """NULL domain is fine; NULL domain AND unresolved function is still the real PROMPT-030 crash."""
+    _feed_probe(monkeypatch, json.dumps({"arch": "amd64", "appdomain": "NULL", "resolved": False}))
     problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
-    assert any("pyclr_create_appdomain trả về NULL" in p for p in problems), problems
+    assert any("pyclr_get_function trả về NULL" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("mutate, expected", [
+    pytest.param(lambda p: p.pop("resolved"), "không xuất ra bằng chứng phân giải",
+                 id="resolved-missing-fails-closed"),
+    pytest.param(lambda p: p.pop("initialize_rc"), "chưa có kết quả hợp lệ",
+                 id="initialize_rc-missing-fails-closed"),
+    pytest.param(lambda p: p.update(initialize_rc=False), "chưa có kết quả hợp lệ",
+                 id="initialize_rc-JSON-false-is-not-zero"),
+    pytest.param(lambda p: p.update(initialize_rc=True), "chưa có kết quả hợp lệ",
+                 id="initialize_rc-JSON-true-is-not-zero"),
+    pytest.param(lambda p: p.update(arch="x86"), "kiến trúc", id="arch-echo-mismatch-fails"),
+    pytest.param(lambda p: p.update(appdomain="weird"), "AppDomain hợp lệ",
+                 id="malformed-appdomain-field-fails"),
+    pytest.param(lambda p: p.update(error="OSError: cannot load library"), "thất bại",
+                 id="probe-error-fails"),
+])
+def test_probe_fails_closed_on_incomplete_or_malformed_evidence(tmp_path, monkeypatch, mutate, expected):
+    payload = dict(HEALTHY_ROOT_DOMAIN_EVIDENCE)
+    mutate(payload)
+    _feed_probe(monkeypatch, json.dumps(payload))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any(expected in p for p in problems), problems
+
+
+def test_probe_fails_closed_on_nonzero_exit_with_parseable_json(tmp_path, monkeypatch):
+    """The exact healthy payload with exit code 1: a completed-looking JSON line must NOT rescue it."""
+    _feed_probe(monkeypatch, json.dumps(HEALTHY_ROOT_DOMAIN_EVIDENCE), returncode=1)
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any("mã lỗi 1" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("stdout", [
+    pytest.param("not json at all", id="non-JSON"),
+    pytest.param("42", id="JSON-int-instead-of-object"),
+    pytest.param("null", id="JSON-null-instead-of-object"),
+    pytest.param("", id="empty-stdout"),
+])
+def test_probe_fails_closed_on_unparseable_output(tmp_path, monkeypatch, stdout):
+    """A gate that cannot read the probe's evidence must stop the build, never pass on ignorance."""
+    _feed_probe(monkeypatch, stdout)
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert problems and any("không trả về JSON hợp lệ" in p for p in problems), problems
+    assert not any("Traceback" in p for p in problems), "the validator itself must not raise"
+
+
+def test_gate_accepts_the_healthy_root_domain_probe_end_to_end(tmp_path, monkeypatch):
+    """The Windows acceptance shape, decision-tested on any host: every structural proof plus the real
+    root-domain probe evidence (NULL sentinel, resolved True, initialize_rc 0) yields NO problems —
+    while each structural check below the probe stays independently enforced by the tests above."""
+    _feed_probe(monkeypatch, json.dumps(HEALTHY_ROOT_DOMAIN_EVIDENCE))
+    problems = validate_pythonnet_runtime(_package(tmp_path), {"found": False}, Path(sys.executable))
+    assert problems == [], problems
 
 
 def test_probe_accepts_a_runtime_that_resolves(tmp_path, monkeypatch):
-    _force_windows(monkeypatch)
-    payload = {"arch": "amd64", "appdomain": "created", "resolved": True, "initialize_rc": 0}
-    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
-        returncode=0, stdout=__import__("json").dumps(payload), stderr=""))
+    """The named-domain shape of success (a NON-NULL handle stays valid evidence where it applies)."""
+    _feed_probe(monkeypatch, json.dumps({"arch": "amd64", "appdomain": "created",
+                                         "resolved": True, "initialize_rc": 0}))
     assert bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64") == []
 
 
 def test_probe_rejects_a_nonzero_initialize_result(tmp_path, monkeypatch):
-    _force_windows(monkeypatch)
-    payload = {"arch": "amd64", "appdomain": "created", "resolved": True, "initialize_rc": 3}
-    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
-        returncode=0, stdout=__import__("json").dumps(payload), stderr=""))
+    _feed_probe(monkeypatch, json.dumps({"arch": "amd64", "appdomain": "created",
+                                         "resolved": True, "initialize_rc": 3}))
     problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
     assert any("Initialize trả về 3" in p for p in problems), problems
 
 
 def test_probe_reports_a_crash_instead_of_a_silent_pass(tmp_path, monkeypatch):
-    _force_windows(monkeypatch)
-    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
-        returncode=1, stdout="", stderr="Traceback: OSError: cannot load library"))
+    """Exit 1 with NO JSON: still a named failure, and the native stderr excerpt survives into the report."""
+    _feed_probe(monkeypatch, "", returncode=1, stderr="Traceback: OSError: cannot load library")
     problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
-    assert any("không trả về JSON" in p and "cannot load library" in p for p in problems), problems
+    assert any("không trả về JSON hợp lệ" in p and "cannot load library" in p for p in problems), problems
+    assert any("rc=1" in p for p in problems), "the reported exit code must not be hidden"
 
 
 def test_probe_reports_its_own_exception(tmp_path, monkeypatch):
-    _force_windows(monkeypatch)
-    payload = {"error": "OSError: cannot load library 'ClrLoader.dll'"}
-    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
-        returncode=0, stdout=__import__("json").dumps(payload), stderr=""))
+    """A native-load exception (dlopen refusing the packaged host) fails the gate by itself."""
+    _feed_probe(monkeypatch, json.dumps({"error": "OSError: cannot load library 'ClrLoader.dll'"}))
     problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
     assert any("probe nạp runtime đã đóng gói thất bại" in p for p in problems), problems
+    assert len(problems) == 1, "the exception is the finding; no invented secondary complaints"
 
 
 def test_probe_reports_a_timeout_as_a_failure(tmp_path, monkeypatch):
