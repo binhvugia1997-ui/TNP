@@ -56,9 +56,17 @@ export type UpdateState = {
   installEnabled?: boolean
 }
 
+export type LearningCandidateAvailability = {
+  state: 'ready' | 'processing' | 'no_run' | 'unavailable'
+  reason: 'available' | 'empty' | 'processing' | 'no_run' | 'unavailable'
+  count: number
+  message: string
+}
+
 export type LearningState = {
   images: ImageCandidate[]
   contents: ContentCandidate[]
+  candidateStatus: { image: LearningCandidateAvailability; content: LearningCandidateAvailability }
   counts: { image: { total: number; labeled: number }; content: { total: number; labeled: number } }
   modelStatus: { image: string; content: string }
   excelPending: number
@@ -158,10 +166,42 @@ const EMPTY_RUN: ProcessingRun = {
 }
 const EMPTY_LEARNING: LearningState = {
   images: [], contents: [],
+  candidateStatus: {
+    image: { state: 'no_run', reason: 'no_run', count: 0, message: 'Chưa tải trạng thái ảnh ứng viên.' },
+    content: { state: 'no_run', reason: 'no_run', count: 0, message: 'Chưa tải trạng thái nội dung.' },
+  },
   counts: { image: { total: 0, labeled: 0 }, content: { total: 0, labeled: 0 } },
   modelStatus: { image: 'Chưa tải trạng thái mô hình.', content: 'Chưa tải trạng thái mô hình.' },
   excelPending: 0,
   excelLastResult: { kind: 'none', message: '' },
+}
+
+export type LearningLoadState = { status: 'idle' | 'loading' | 'ready' | 'error'; message: string }
+
+function normalizeLearning(raw: unknown): LearningState {
+  if (!raw || typeof raw !== 'object') throw new BridgeProtocolError()
+  const value = raw as Partial<LearningState>
+  if (!Array.isArray(value.images) || !Array.isArray(value.contents)) throw new BridgeProtocolError()
+  const states = new Set(['ready', 'processing', 'no_run', 'unavailable'])
+  const reasons = new Set(['available', 'empty', 'processing', 'no_run', 'unavailable'])
+  const image = value.candidateStatus?.image
+  const content = value.candidateStatus?.content
+  for (const [status, candidates] of [[image, value.images], [content, value.contents]] as const) {
+    if (!status || !states.has(status.state) || !reasons.has(status.reason)
+      || !Number.isInteger(status.count) || status.count < 0 || typeof status.message !== 'string'
+      || status.count !== candidates.length) {
+      throw new BridgeProtocolError()
+    }
+  }
+  if (!value.counts?.image || !value.counts?.content || !value.modelStatus
+    || typeof value.modelStatus.image !== 'string' || typeof value.modelStatus.content !== 'string') {
+    throw new BridgeProtocolError()
+  }
+  return { ...EMPTY_LEARNING, ...value, images: value.images, contents: value.contents,
+    candidateStatus: {
+      image: image as LearningCandidateAvailability,
+      content: content as LearningCandidateAvailability,
+    } }
 }
 const EMPTY_OLLAMA: OllamaConnection = {
   server: '', port: '11434', model: '', checked: 'unchecked', models: [], message: 'Chưa kiểm tra kết nối.',
@@ -258,6 +298,7 @@ function useStoreValue() {
   const [diagRows, setDiagRows] = useState<DiagnosticRow[]>([])
   const [diagRunning, setDiagRunning] = useState(false)
   const [learningState, setLearningState] = useState<LearningState>(EMPTY_LEARNING)
+  const [learningLoad, setLearningLoad] = useState<LearningLoadState>({ status: 'idle', message: '' })
   const [imageReviewIndex, setImageReviewIndex] = useState(0)
   const [contentReviewIndex, setContentReviewIndex] = useState(0)
   const [training, setTraining] = useState(false)
@@ -394,15 +435,21 @@ function useStoreValue() {
     if (learningInFlight.current || !bridgeReadyRef.current) return
     learningInFlight.current = true
     lastLearningRefresh.current = Date.now()
+    if (alive.current) setLearningLoad({ status: 'loading', message: '' })
     try {
-      const raw = await callBridgeWithOptions<LearningState & { training?: boolean }>('get_learning_state', [], {
+      const raw = await callBridgeWithOptions<unknown>('get_learning_state', [], {
         signal: signal ?? bridgeLifetimeRef.current?.signal,
       })
       if (!alive.current) return
-      setLearningState({ ...EMPTY_LEARNING, ...raw })
-      setTraining(Boolean(raw.training))
+      const next = normalizeLearning(raw)
+      setLearningState(next)
+      setTraining(Boolean(next.training))
+      setLearningLoad({ status: 'ready', message: '' })
     } catch (error) {
-      if (alive.current) recordError(error)
+      if (alive.current && !isAbortError(error)) {
+        recordError(error)
+        setLearningLoad({ status: 'error', message: safeErrorDetails(error).message })
+      }
     } finally {
       learningInFlight.current = false
     }
@@ -749,14 +796,14 @@ function useStoreValue() {
     const candidate = learningState.images.find((item) => item.id === id)
     try {
       const next = await callNative<LearningState>('set_learning_label', 'image', id, label, candidate?.note || '')
-      setLearningState(next)
+      setLearningState(normalizeLearning(next))
     } catch (error) { recordError(error) }
   }, [learningState.images, recordError])
   const labelContent = useCallback(async (id: string, label: string) => {
     const candidate = learningState.contents.find((item) => item.id === id)
     try {
       const next = await callNative<LearningState>('set_learning_label', 'content', id, label, candidate?.note || '')
-      setLearningState(next)
+      setLearningState(normalizeLearning(next))
     } catch (error) { recordError(error) }
   }, [learningState.contents, recordError])
   const setNote = useCallback((kind: 'image' | 'content', id: string, note: string) => {
@@ -770,7 +817,7 @@ function useStoreValue() {
       : Object.fromEntries(learningState.contents.map((candidate) => [candidate.id, candidate.note]))
     try {
       const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, notes)
-      setLearningState({ ...EMPTY_LEARNING, ...result.state })
+      setLearningState(normalizeLearning(result.state))
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
       setTraining(false)
@@ -782,7 +829,7 @@ function useStoreValue() {
     try {
       await callNative<LearningState>('set_learning_label', kind, id, label, note)
       const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, { [id]: note })
-      setLearningState({ ...EMPTY_LEARNING, ...result.state })
+      setLearningState(normalizeLearning(result.state))
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
     } catch (error) { recordError(error) }
@@ -794,7 +841,7 @@ function useStoreValue() {
   const trainModels = useCallback(async () => {
     try {
       const result = await callNative<LearningState & { training?: boolean }>('train_models')
-      setLearningState({ ...EMPTY_LEARNING, ...result })
+      setLearningState(normalizeLearning(result))
       setTraining(Boolean(result.training))
     } catch (error) { recordError(error) }
   }, [recordError])
@@ -808,7 +855,7 @@ function useStoreValue() {
   const applyLabelsToExcel = useCallback(async (_retry = false) => {
     try {
       const result = await callNative<{ message: string; state: LearningState }>('retry_learning_excel')
-      setLearningState({ ...EMPTY_LEARNING, ...result.state })
+      setLearningState(normalizeLearning(result.state))
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
     } catch (error) { recordError(error) }
@@ -816,7 +863,7 @@ function useStoreValue() {
   const dismissExcelResult = useCallback(async () => {
     try {
       const next = await callNative<LearningState>('dismiss_learning_excel_notice')
-      setLearningState({ ...EMPTY_LEARNING, ...next })
+      setLearningState(normalizeLearning(next))
     } catch (error) { recordError(error) }
   }, [recordError])
 
@@ -843,7 +890,8 @@ function useStoreValue() {
     checkConnection, refreshModels, saveOllamaConfig,
     update, setUpdate, checkUpdate, installUpdate, chooseUpdateFolder,
     diagRows, diagRunning, runDiagnostics,
-    learning: learningState, refreshLearning, imageReviewIndex, setImageReviewIndex, contentReviewIndex, setContentReviewIndex,
+    learning: learningState, learningLoad, refreshLearning,
+    imageReviewIndex, setImageReviewIndex, contentReviewIndex, setContentReviewIndex,
     labelImage, labelContent, setNote, saveImageLabels, saveContentLabels, saveImageCandidate, saveContentCandidate,
     trainModels, exportLearningData,
     openLearningFolder, applyLabelsToExcel, dismissExcelResult, training,

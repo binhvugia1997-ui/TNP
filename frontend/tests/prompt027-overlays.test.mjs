@@ -27,10 +27,16 @@ const SLIDE_W = 9144000
 const SLIDE_H = 5143500
 const PREVIEW = 'data:image/svg+xml;base64,PHN2ZyBpZD0ic2xpZGUiLz4='
 
-function emptyLearningState() {
+function emptyLearningState(imageCount = 0, contentCount = 0) {
   return {
     images: [],
     contents: [],
+    candidateStatus: {
+      image: { state: 'ready', reason: imageCount ? 'available' : 'empty', count: imageCount,
+        message: imageCount ? `Đã tải ${imageCount} ảnh ứng viên từ lượt xử lý hiện tại.` : 'Lượt xử lý hiện tại không có ảnh ứng viên cần kiểm tra.' },
+      content: { state: 'ready', reason: contentCount ? 'available' : 'empty', count: contentCount,
+        message: contentCount ? `Đã tải ${contentCount} khối nội dung từ lượt xử lý hiện tại.` : 'Lượt xử lý hiện tại không có khối nội dung cần kiểm tra.' },
+    },
     counts: { image: { total: 0, labeled: 0 }, content: { total: 0, labeled: 0 } },
     modelStatus: { image: 'Ready', content: 'Ready' },
     excelPending: 0,
@@ -237,7 +243,7 @@ async function mountLearningHarness() {
     }
     const setLearning = async (images) => {
       state.learning = {
-        ...emptyLearningState(),
+        ...emptyLearningState(images.length),
         images,
         counts: { image: { total: images.length, labeled: 0 }, content: { total: 0, labeled: 0 } },
       }
@@ -469,7 +475,7 @@ test('hook order stays stable when the review has no candidate (React #310 prese
     await harness.openImageReview()
     await harness.setLearning([])
     await harness.waitFor(
-      () => /Python backend chưa trả về ảnh ứng viên cần kiểm tra\./.test(harness.container.textContent),
+      () => /Lượt xử lý hiện tại không có ảnh ứng viên cần kiểm tra\./.test(harness.container.textContent),
       'the empty-state render',
     )
     // toggling overlay mode while there is no candidate must not crash the hook order

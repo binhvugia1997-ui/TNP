@@ -8,15 +8,40 @@ import { fileURLToPath } from 'node:url'
 const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
 const delay = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms))
 
-function emptyLearningState() {
+function emptyLearningState(imageCount = 0, contentCount = 0) {
   return {
     images: [],
     contents: [],
+    candidateStatus: {
+      image: { state: 'ready', reason: imageCount ? 'available' : 'empty', count: imageCount,
+        message: imageCount ? `Đã tải ${imageCount} ảnh ứng viên từ lượt xử lý hiện tại.` : 'Lượt xử lý hiện tại không có ảnh ứng viên cần kiểm tra.' },
+      content: { state: 'ready', reason: contentCount ? 'available' : 'empty', count: contentCount,
+        message: contentCount ? `Đã tải ${contentCount} khối nội dung từ lượt xử lý hiện tại.` : 'Lượt xử lý hiện tại không có khối nội dung cần kiểm tra.' },
+    },
     counts: { image: { total: 0, labeled: 0 }, content: { total: 0, labeled: 0 } },
     modelStatus: { image: 'Ready', content: 'Ready' },
     excelPending: 0,
     excelLastResult: { kind: 'none', message: '' },
     training: false,
+  }
+}
+
+function contentCandidate(id = 'content-1') {
+  return {
+    id,
+    sourceFile: 'improvement-report.pptx',
+    managementNumber: 'TNP-001',
+    slide: 3,
+    blockId: 'shape-17',
+    text: 'Nội dung cải tiến nguyên văn từ PowerPoint',
+    decision: 'include',
+    confidenceBand: 'high',
+    confidence: 0.96,
+    evidence: ['Thuộc vùng cải tiến trong sản xuất'],
+    section: 'improvement',
+    nearestTitle: 'Cải tiến trong sản xuất',
+    userLabel: 'UNLABELED',
+    note: '',
   }
 }
 
@@ -146,6 +171,7 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
     }
 
     let learningResponse = emptyLearningState()
+    let learningFailure = null
     let learningCalls = 0
     // Start disconnected, just as the desktop UI does before pywebview injects its API.
 
@@ -155,6 +181,11 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
         React.Fragment,
         null,
         React.createElement('output', { 'data-testid': 'bridge-state' }, store.connected ? 'ready' : 'disconnected'),
+        React.createElement('button', {
+          type: 'button',
+          'data-testid': 'enter-learning',
+          onClick: () => { store.setTab('learning') },
+        }, 'Enter Learning'),
         React.createElement('button', {
           type: 'button',
           'data-testid': 'refresh-learning',
@@ -191,7 +222,9 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
         get_dashboard_state: async () => bridgeEnvelope(dashboard),
         get_learning_state: async () => {
           learningCalls += 1
-          return bridgeEnvelope(learningResponse)
+          return learningFailure
+            ? { ok: false, error: { code: 'LEARNING_FAILED', message: learningFailure } }
+            : bridgeEnvelope(learningResponse)
         },
       },
     }
@@ -203,25 +236,35 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
       'the pywebview startup handshake',
     )
 
-    // Ready with no candidates remains a valid render; then populate the same mounted component.
+    // Entering Learning and the manual control each perform a real backend read. A successful zero-candidate
+    // snapshot is visible as valid empty state, never as "Python did not return a field".
+    await React.act(async () => {
+      container.querySelector('[data-testid="enter-learning"]').dispatchEvent(
+        new dom.window.MouseEvent('click', { bubbles: true }),
+      )
+      await delay(0)
+    })
+    await waitFor(() => learningCalls > 0, 'the Learning-entry refresh')
+    const callsAfterEntry = learningCalls
     await React.act(async () => {
       container.querySelector('[data-testid="refresh-learning"]').dispatchEvent(
         new dom.window.MouseEvent('click', { bubbles: true }),
       )
       await delay(0)
     })
-    await waitFor(() => learningCalls > 0, 'the empty learning-state response')
-    assert.match(container.textContent, /Python backend chưa trả về ảnh ứng viên cần kiểm tra\./)
+    await waitFor(() => learningCalls > callsAfterEntry, 'the manual learning-state refresh')
+    assert.match(container.textContent, /Lượt xử lý hiện tại không có ảnh ứng viên cần kiểm tra\./)
 
     const previewOne = 'data:image/svg+xml;base64,PHN2ZyBpZD0ib25lIi8+'
     const previewTwo = 'data:image/svg+xml;base64,PHN2ZyBpZD0idHdvIi8+'
     learningResponse = {
-      ...emptyLearningState(),
+      ...emptyLearningState(2, 1),
       images: [
         imageCandidate('image-1', 1, 0, previewOne),
         imageCandidate('image-2', 2, 1, previewTwo),
       ],
-      counts: { image: { total: 2, labeled: 0 }, content: { total: 0, labeled: 0 } },
+      contents: [contentCandidate()],
+      counts: { image: { total: 2, labeled: 0 }, content: { total: 1, labeled: 0 } },
     }
     await React.act(async () => {
       container.querySelector('[data-testid="refresh-learning"]').dispatchEvent(
@@ -268,6 +311,63 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
       () => container.querySelector('section[aria-label="Slide ngữ cảnh"] h2')?.textContent === 'Slide 1',
       'switching back to the first candidate',
     )
+
+    const openLearningSection = async (label) => {
+      const button = [...container.querySelectorAll('aside nav button')]
+        .find((entry) => entry.textContent.trim() === label)
+      assert.ok(button, `${label} section button should render`)
+      await React.act(async () => {
+        button.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
+      })
+    }
+    const refresh = async () => {
+      const before = learningCalls
+      await React.act(async () => {
+        container.querySelector('[data-testid="refresh-learning"]').dispatchEvent(
+          new dom.window.MouseEvent('click', { bubbles: true }),
+        )
+        await delay(0)
+      })
+      await waitFor(() => learningCalls > before, 'a fresh manual Learning bridge call')
+    }
+
+    // Content data is independently visible and remains verbatim.
+    await openLearningSection('Kiểm tra nội dung cải tiến')
+    await waitFor(() => container.textContent.includes('Nội dung cải tiến nguyên văn từ PowerPoint'),
+      'the populated content candidate')
+
+    // Successful zero-candidate image/content snapshots have explicit, truthful feedback.
+    learningResponse = emptyLearningState()
+    await refresh()
+    await waitFor(() => container.querySelector('[data-testid="learning-content-feedback"]')
+      ?.textContent.includes('không có khối nội dung cần kiểm tra'), 'valid empty content feedback')
+    await openLearningSection('Kiểm tra ảnh cải tiến')
+    assert.match(container.querySelector('[data-testid="learning-image-feedback"]').textContent,
+      /không có ảnh ứng viên cần kiểm tra/)
+
+    // A successful envelope missing a required field is a contract failure, not valid empty.
+    learningResponse = emptyLearningState()
+    delete learningResponse.contents
+    await refresh()
+    await waitFor(() => container.querySelector('[data-testid="learning-image-feedback"]')
+      ?.textContent.includes('Không thể tải trạng thái học'), 'missing-field image failure feedback')
+    await openLearningSection('Kiểm tra nội dung cải tiến')
+    assert.match(container.querySelector('[data-testid="learning-content-feedback"]').textContent,
+      /Không thể tải trạng thái học/)
+
+    // A backend rejection is visible in both paths, and the same manual control can recover with a fresh call.
+    learningResponse = emptyLearningState()
+    learningFailure = 'Không đọc được trạng thái học hiện tại.'
+    await refresh()
+    await waitFor(() => container.querySelector('[data-testid="learning-content-feedback"]')
+      ?.textContent.includes('Không đọc được trạng thái học hiện tại'), 'backend content failure feedback')
+    await openLearningSection('Kiểm tra ảnh cải tiến')
+    assert.match(container.querySelector('[data-testid="learning-image-feedback"]').textContent,
+      /Không đọc được trạng thái học hiện tại/)
+    learningFailure = null
+    await refresh()
+    await waitFor(() => container.querySelector('[data-testid="learning-image-feedback"]')
+      ?.textContent.includes('không có ảnh ứng viên cần kiểm tra'), 'manual refresh recovery')
   } finally {
     if (root) {
       await React.act(async () => { root.unmount() })

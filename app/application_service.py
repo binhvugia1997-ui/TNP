@@ -7,6 +7,7 @@ backend.  The browser receives bounded DTOs and opaque IDs; it never receives an
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -106,6 +107,9 @@ class ApplicationService:
         # report+slide; never shared across reports (§40/§54).  Value: {"src", "width", "height",
         # "backend", "faithful", "regions"} — see :meth:`_slide_preview_for`.
         self._slide_preview_cache: Dict[tuple, Dict[str, Any]] = {}
+        # PROMPT-032: Learning is polled while its tab is open.  Emit one diagnostic only when the lifecycle/count
+        # signature changes, never one per poll; values are counts/states only and contain no paths or payloads.
+        self._last_learning_diag_signature: Optional[tuple] = None
         self._last_scan_metrics: Optional[ScanMetrics] = None  # bounded diagnostics for the most recent Quét call
         # PROMPT-031R: scan work remains one synchronous bridge operation, while the existing bounded dashboard
         # poll reads immutable snapshots published once per completed containing folder.
@@ -874,7 +878,20 @@ class ApplicationService:
     def learning_state(self) -> dict:
         with self._lock:
             c = self.controller
+            # PROMPT-032: this read is authoritative on its own.  Worker completion is delivered through the
+            # controller queue, so waiting for an unrelated dashboard poll could otherwise leave a dead worker
+            # marked "running" and make both review methods suppress already-retained candidates.
+            c.pump()
+            c.reconcile()
+            c.pump()
+
+            processor = c.processor
+            results = list(getattr(processor, "results", []) or []) if processor is not None else []
+            raw_image_count = sum(len(getattr(result, "image_candidates", []) or []) for result in results)
+            raw_content_count = sum(len(getattr(result, "content_candidates", []) or []) for result in results)
             lrn = c.learning
+            image_candidates: list = []
+            content_candidates: list = []
             if lrn is None:
                 image_status, content_status = "Không khả dụng.", "Không khả dụng."
                 images: List[dict] = []
@@ -883,6 +900,10 @@ class ApplicationService:
                 image_labeled_ids: set = set()
                 content_total_ids: set = set()
                 content_labeled_ids: set = set()
+                candidate_status = {
+                    "image": self._learning_candidate_status("unavailable", "unavailable", 0, "image"),
+                    "content": self._learning_candidate_status("unavailable", "unavailable", 0, "content"),
+                }
             else:
                 image_status = self._model_status(lrn.model, lrn.model_status, "ảnh")
                 content_status = self._model_status(lrn.content.model, lrn.content.model_status, "nội dung")
@@ -896,14 +917,63 @@ class ApplicationService:
                 content_labeled_ids = saved_content_ids | set(c.pending_content_labels)
                 image_total_ids = saved_image_ids | {x.candidate_id for x in image_candidates}
                 content_total_ids = saved_content_ids | {x.candidate_id for x in content_candidates}
+                if c.is_running():
+                    state, reason = "processing", "processing"
+                elif processor is None:
+                    state, reason = "no_run", "no_run"
+                else:
+                    state, reason = "ready", "available"
+                candidate_status = {
+                    "image": self._learning_candidate_status(
+                        state, "empty" if state == "ready" and not images else reason, len(images), "image"),
+                    "content": self._learning_candidate_status(
+                        state, "empty" if state == "ready" and not contents else reason, len(contents), "content"),
+                }
+
+            is_running_method = getattr(processor, "is_running", None) if processor is not None else None
+            worker_alive = bool(is_running_method()) if callable(is_running_method) else False
+            diagnostic = (
+                c.state, worker_alive, len(results), raw_image_count, raw_content_count,
+                len(image_candidates), len(content_candidates),
+                candidate_status["image"]["state"], candidate_status["image"]["reason"],
+                candidate_status["content"]["state"], candidate_status["content"]["reason"],
+            )
+            if diagnostic != self._last_learning_diag_signature:
+                LOG.info(
+                    "LEARNING_STATE lifecycle=%s worker_alive=%s reports=%d image_raw=%d image_reviewable=%d "
+                    "content_raw=%d content_reviewable=%d image_state=%s image_reason=%s "
+                    "content_state=%s content_reason=%s",
+                    c.state, worker_alive, len(results), raw_image_count, len(image_candidates),
+                    raw_content_count, len(content_candidates), candidate_status["image"]["state"],
+                    candidate_status["image"]["reason"], candidate_status["content"]["state"],
+                    candidate_status["content"]["reason"],
+                )
+                self._last_learning_diag_signature = diagnostic
+
             pending = c.image_reapply_pending + c.content_reapply_pending
-            return {"images": images, "contents": contents,
+            return {"images": images, "contents": contents, "candidateStatus": candidate_status,
                     "counts": {"image": {"total": len(image_total_ids), "labeled": len(image_labeled_ids)},
                                "content": {"total": len(content_total_ids), "labeled": len(content_labeled_ids)}},
                     "modelStatus": {"image": image_status, "content": content_status},
                     "excelPending": pending, "excelLastResult": dict(self._last_excel_result),
                     "training": self._training, "trainingMessage": self._training_message,
                     "reviewSummary": c.review_summary_text(), "contentReviewSummary": c.content_review_summary_text()}
+
+    @staticmethod
+    def _learning_candidate_status(state: str, reason: str, count: int, kind: str) -> dict:
+        """JSON-safe availability separate from candidate arrays (valid empty is not a transport failure)."""
+        noun = "ảnh ứng viên" if kind == "image" else "khối nội dung"
+        if state == "processing":
+            message = "Đang xử lý báo cáo; danh sách học sẽ cập nhật khi lượt chạy hoàn tất."
+        elif state == "no_run":
+            message = f"Chưa có lượt xử lý hoàn tất để tạo {noun}."
+        elif state == "unavailable":
+            message = "Dữ liệu học cục bộ không khả dụng. Hãy kiểm tra nhật ký ứng dụng."
+        elif count:
+            message = f"Đã tải {count} {noun} từ lượt xử lý hiện tại."
+        else:
+            message = f"Lượt xử lý hiện tại không có {noun} cần kiểm tra."
+        return {"state": state, "reason": reason, "count": int(count), "message": message}
 
     def set_learning_label(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
         kind = self._choice(kind, "kind", {"image", "content"})
@@ -1362,7 +1432,12 @@ class ApplicationService:
         pending_note = self.controller.pending_label_notes.get(candidate.candidate_id)
         # PROMPT-024R: full-slide context + authoritative target geometry for the review workspace.
         fx, fy, fw, fh = slide_fraction_box((x, y, w, h), bw, bh)
-        preview = self._slide_preview_for(candidate, learning)
+        try:
+            preview = self._slide_preview_for(candidate, learning)
+        except Exception as exc:  # noqa: BLE001 – display-only preview must never erase truthful metadata
+            opaque_id = hashlib.sha256(str(candidate.candidate_id).encode("utf-8")).hexdigest()[:12]
+            LOG.warning("LEARNING_IMAGE_PREVIEW_FAILED candidate=%s error=%s", opaque_id, type(exc).__name__)
+            preview = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "regions": []}
         # PROMPT-027 §13/§15: the picture candidate and the FINAL Excel evidence region are two different
         # review geometries.  The region below is the production ImprovementVisualRegion that owns this
         # candidate — never a React-side derivation from candidate.bounds.

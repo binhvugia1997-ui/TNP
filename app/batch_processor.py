@@ -30,6 +30,7 @@ from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPL
                       FastScanCache, MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, normalize_source_path,
                       prescan)
 from .qpn_renderer import SlideRenderer, render_qpn_panel
+from .report_identity import report_scope_key
 
 LOG = logging.getLogger("report_extractor.batch")
 
@@ -472,6 +473,16 @@ class BatchProcessor:
                 rec.occurrence_date = date.fromisoformat(value) if value else None
             fr.image_candidates = list(rec.image_candidates)
             fr.content_candidates = list(rec.content_candidates)
+            # PROMPT-032: one bounded record per processed report proves candidate creation/retention without
+            # logging source paths, candidate payloads, text, image data, or evidence bytes.
+            LOG.info(
+                "LEARNING_CANDIDATES_RETAINED report=%s image_raw=%d image_reviewable=%d "
+                "content_raw=%d content_reviewable=%d",
+                report_scope_key(path), len(fr.image_candidates),
+                sum(not candidate.hard_excluded for candidate in fr.image_candidates),
+                len(fr.content_candidates),
+                sum(not candidate.hard_excluded for candidate in fr.content_candidates),
+            )
             for diagnostic in getattr(rec, "cause_diagnostics", []):
                 LOG.info("%s: %s", path.name, diagnostic)
             fr.management_number = rec.management_number

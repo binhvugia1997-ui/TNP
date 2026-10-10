@@ -22,7 +22,12 @@ import {
   Upload,
 } from 'lucide-react'
 import { Button, Card, KeyValue, ProgressBar, TextInput, ToneChip } from '../components/ui'
-import { useStore, type LearningState } from '../state/store'
+import {
+  useStore,
+  type LearningCandidateAvailability,
+  type LearningLoadState,
+  type LearningState,
+} from '../state/store'
 import { CONFIDENCE_LABEL, IMAGE_LABELS, type ImageCandidate } from '../types'
 import { cn } from '../lib/utils'
 
@@ -183,6 +188,32 @@ function LearningGroup({
 
 /* ------------------------------------------------------------------ Kiểm tra ảnh */
 
+function candidateFeedback(
+  connected: boolean,
+  load: LearningLoadState,
+  status: LearningCandidateAvailability,
+): { message: string; failed: boolean } {
+  if (!connected) return { message: 'Đang chờ kết nối Python backend.', failed: false }
+  if (load.status === 'error') {
+    return { message: `Không thể tải trạng thái học từ Python backend: ${load.message}`, failed: true }
+  }
+  if (load.status === 'loading') return { message: 'Đang tải trạng thái học mới nhất từ Python backend…', failed: false }
+  return { message: status.message, failed: status.state === 'unavailable' }
+}
+
+function LearningRefreshFailure({ load }: { load: LearningLoadState }) {
+  if (load.status !== 'error') return null
+  return (
+    <div
+      className="rounded-sm2 border border-danger-500/30 bg-danger-50 px-2.5 py-2 text-base2 text-danger-600"
+      role="alert"
+      data-testid="learning-refresh-failure"
+    >
+      Không thể làm mới trạng thái học từ Python backend: {load.message} Dữ liệu đang hiển thị là lần tải thành công gần nhất.
+    </div>
+  )
+}
+
 /** PROMPT-024R §20: target rectangle in slide-% space, straight from the authoritative Python DTO. */
 function targetRect(c: ImageCandidate): { x: number; y: number; w: number; h: number } {
   const pct = c.targetBboxPct
@@ -287,10 +318,11 @@ function ImageReview() {
     return () => mq.removeEventListener('change', onChange)
   }, [])
 
+  const emptyFeedback = candidateFeedback(s.connected, s.learningLoad, s.learning.candidateStatus.image)
   if (!cand) return (
     <Card title="Kiểm tra ảnh cải tiến">
       <div className="flex flex-col items-start gap-2 text-base2 text-muted">
-        <p>{s.connected ? 'Python backend chưa trả về ảnh ứng viên cần kiểm tra.' : 'Đang chờ kết nối Python backend.'}</p>
+        <p role={emptyFeedback.failed ? 'alert' : 'status'} data-testid="learning-image-feedback">{emptyFeedback.message}</p>
         <Button icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => void s.refreshLearning()}>Làm mới trạng thái học</Button>
       </div>
     </Card>
@@ -690,6 +722,7 @@ function ImageReview() {
      §36: below xl the preview + info stack under a compact list instead of squeezing three columns. */
   return (
     <div className="flex min-h-0 flex-col gap-3 xl:h-[calc(100dvh-132px)] xl:min-h-[540px]">
+      <LearningRefreshFailure load={s.learningLoad} />
       <div className="flex min-h-0 flex-1 flex-col gap-3 xl:flex-row xl:gap-0">
         {leftPanel}
         <div
@@ -719,17 +752,22 @@ function ContentReview() {
   const index = list.length ? Math.min(Math.max(s.contentReviewIndex, 0), list.length - 1) : -1
   const cand = list[index]
 
-  if (!cand) return (
-    <Card title="Kiểm tra nội dung cải tiến">
-      <div className="flex flex-col items-start gap-2 text-base2 text-muted">
-        <p>{s.connected ? 'Python backend chưa trả về khối nội dung cần kiểm tra.' : 'Đang chờ kết nối Python backend.'}</p>
-        <Button icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => void s.refreshLearning()}>Làm mới trạng thái học</Button>
-      </div>
-    </Card>
-  )
+  if (!cand) {
+    const feedback = candidateFeedback(s.connected, s.learningLoad, s.learning.candidateStatus.content)
+    return (
+      <Card title="Kiểm tra nội dung cải tiến">
+        <div className="flex flex-col items-start gap-2 text-base2 text-muted">
+          <p role={feedback.failed ? 'alert' : 'status'} data-testid="learning-content-feedback">{feedback.message}</p>
+          <Button icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => void s.refreshLearning()}>Làm mới trạng thái học</Button>
+        </div>
+      </Card>
+    )
+  }
 
   return (
-    <div className="grid grid-cols-1 gap-3 xl:grid-cols-[300px_1fr]">
+    <>
+      <LearningRefreshFailure load={s.learningLoad} />
+      <div className="grid grid-cols-1 gap-3 xl:grid-cols-[300px_1fr]">
       <Card title="Vùng nội dung" actions={<span className="text-xs2 text-muted">{list.filter((c) => c.userLabel === 'UNLABELED').length} chưa xác nhận · {list.length} tổng</span>} dense>
         <ul className="divide-y divide-lineSoft">
           {list.map((c, i) => (
@@ -848,7 +886,8 @@ function ContentReview() {
           </div>
         </Card>
       </div>
-    </div>
+      </div>
+    </>
   )
 }
 
