@@ -18,6 +18,8 @@ The synthetic fixture is now confined to structural and injected-decision tests,
 | New / updated tests | `.venv/bin/python -m pytest -q tests/test_prompt030_runtime.py` | pass | 59 passed, 1 skipped; the skipped case is the Windows-only live integration. |
 | Regression suite | `.venv/bin/python -m pytest -q tests/test_prompt028_portable.py tests/test_prompt027r_renderer.py` | pass | 104 passed, 7 skipped. |
 | Full Linux suite | `.venv/bin/python -m pytest -q` | pass | 1156 passed, 8 skipped in 112.18s. **LINUX DEVELOPMENT TESTS — not Windows acceptance.** |
+| Frontend regression suite | `(cd frontend && npm run test:frontend)` | pass | 29 passed; frontend was not changed. |
+| Frontend typecheck | `(cd frontend && npm run typecheck)` | pass | `tsc --noEmit` completed successfully; frontend was not changed. |
 | Compile check | `.venv/bin/python -m compileall -q tests/test_prompt030_runtime.py tests/dotnet_image_fixtures.py` | pass | No syntax errors. |
 | Lint | `.venv/bin/python -m pyflakes tests/test_prompt030_runtime.py tests/dotnet_image_fixtures.py` | pass | No findings. |
 
