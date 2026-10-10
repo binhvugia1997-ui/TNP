@@ -30,6 +30,7 @@ from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPL
                       ACTION_PROCESS, ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, normalize_source_path)
 from .preview_geometry import slide_fraction_box
 from .runtime_paths import config_dir, logs_dir
+from .scan_diagnostics import ScanMetrics
 
 LOG = logging.getLogger("report_extractor.webview")
 
@@ -40,6 +41,27 @@ LEARNING_PREVIEW_WIDTH_PX = 1600
 # PROMPT-027R §30: a preview rendered while a higher-fidelity backend FAILED (not merely absent) is reused only
 # for this many seconds, so a transient COM failure can never pin the fallback for the whole session.
 DEGRADED_PREVIEW_TTL_S = 15.0
+
+
+class _SourcePathRedactor:
+    """One response-scoped, lexical path sanitizer.
+
+    Building the old replacement list once per output string made list construction
+    quadratic and repeatedly touched the source filesystem through ``Path.resolve``.
+    This object is built once per dashboard response, performs no filesystem access,
+    and scans each output string once with one compiled pattern.
+    """
+
+    def __init__(self, replacements: Dict[str, str]):
+        self.replacements = {source.casefold(): name for source, name in replacements.items() if source}
+        variants = sorted(replacements, key=len, reverse=True)
+        self.pattern = re.compile("|".join(re.escape(source) for source in variants), re.IGNORECASE) if variants else None
+
+    def redact(self, value: Any) -> str:
+        text = str(value)
+        if self.pattern is None:
+            return text
+        return self.pattern.sub(lambda match: self.replacements.get(match.group(0).casefold(), match.group(0)), text)
 
 
 class ServiceError(RuntimeError):
@@ -84,6 +106,7 @@ class ApplicationService:
         # report+slide; never shared across reports (§40/§54).  Value: {"src", "width", "height",
         # "backend", "faithful", "regions"} — see :meth:`_slide_preview_for`.
         self._slide_preview_cache: Dict[tuple, Dict[str, Any]] = {}
+        self._last_scan_metrics: Optional[ScanMetrics] = None  # bounded diagnostics for the most recent Quét call
         self._load_manual_fields()
 
     # ------------------------------------------------------------------ static app/config DTOs
@@ -171,51 +194,104 @@ class ApplicationService:
     # ------------------------------------------------------------------ scan and reports
     def scan_reports(self, config: dict, input_file_token: str = "") -> dict:
         data = self._object(config, "configuration")
-        with self._lock:
-            self._assert_idle("Không thể quét trong khi đang xử lý báo cáo.")
-            self._apply_configuration_for_scan(data)
-            selected: Optional[Path] = None
-            if input_file_token:
-                token = self._text(input_file_token, "inputFileToken", 128)
-                selected = self._file_tokens.get(token)
-                if selected is None or token != self._active_file_token:
-                    raise ServiceError("Lựa chọn file đã hết hạn. Hãy chọn lại file PPTX.", "INVALID_SELECTION")
-                if selected.suffix.lower() != ".pptx" or not selected.is_file():
-                    raise ServiceError("File PPTX đã chọn không còn tồn tại.", "INVALID_SELECTION")
-                self.controller.input_files_override = [selected]
-                self.controller.report_folder = str(selected.parent)
-            else:
-                self.controller.input_files_override = None
-                folder = Path(self.controller.report_folder).expanduser() if self.controller.report_folder else None
-                if folder is None or not folder.is_dir():
-                    raise ServiceError("Thư mục báo cáo không tồn tại hoặc chưa được chọn.", "INVALID_REPORT_FOLDER")
-                self.controller.report_folder = str(folder.resolve())
-            result = self.controller.scan()
-            self.controller.save_settings()
-            if result is None:
-                message = self.controller.scan_message or "Không thể hoàn tất bước quét trước xử lý."
-            else:
-                message = self.controller.queue_text()
-            LOG.info("WEBVIEW_SCAN finished=%s files=%d", bool(result), len(self.controller.all_files))
-            return self.dashboard_state(message_override=message)
+        metrics = ScanMetrics()
+        self._last_scan_metrics = metrics
+        metrics.start_watchdog()
+        period_dto = data.get("period", {})
+        period_mode = period_dto.get("mode", "") if isinstance(period_dto, dict) else "invalid"
+        LOG.info("SCAN_START period_mode=%s single_file=%s", period_mode, bool(input_file_token))
+        finished = False
+        response_count = 0
+        try:
+            with self._lock:
+                self._assert_idle("Không thể quét trong khi đang xử lý báo cáo.")
+                self._apply_configuration_for_scan(data)
+                selected: Optional[Path] = None
+                if input_file_token:
+                    token = self._text(input_file_token, "inputFileToken", 128)
+                    selected = self._file_tokens.get(token)
+                    if selected is None or token != self._active_file_token:
+                        raise ServiceError("Lựa chọn file đã hết hạn. Hãy chọn lại file PPTX.", "INVALID_SELECTION")
+                    if selected.suffix.lower() != ".pptx" or not selected.is_file():
+                        raise ServiceError("File PPTX đã chọn không còn tồn tại.", "INVALID_SELECTION")
+                    self.controller.input_files_override = [selected]
+                    self.controller.report_folder = str(selected.parent)
+                else:
+                    self.controller.input_files_override = None
+                    folder = Path(self.controller.report_folder).expanduser() if self.controller.report_folder else None
+                    if folder is None or not folder.is_dir():
+                        raise ServiceError("Thư mục báo cáo không tồn tại hoặc chưa được chọn.", "INVALID_REPORT_FOLDER")
+                    self.controller.report_folder = str(folder.resolve())
+                result = self.controller.scan(metrics=metrics)
+                self.controller.save_settings()
+                if result is None:
+                    message = self.controller.scan_message or "Không thể hoàn tất bước quét trước xử lý."
+                else:
+                    message = self.controller.queue_text()
+                LOG.info("WEBVIEW_SCAN finished=%s files=%d", bool(result), len(self.controller.all_files))
+                LOG.info("SCAN_BUILD_RESPONSE_START files=%d", len(self.controller.all_files))
+                build_started = time.perf_counter()
+                build_token = metrics.begin("SCAN_BUILD_RESPONSE")
+                try:
+                    response = self.dashboard_state(message_override=message, scan_metrics=metrics)
+                finally:
+                    metrics.end(build_token[0], build_token[1])
+                    metrics.build_response_ms = (time.perf_counter() - build_started) * 1000.0
+                response_count = len(response.get("reports", []))
+                LOG.info("SCAN_BUILD_RESPONSE_END elapsed_ms=%.3f files=%d redaction_contexts=%d redaction_sources=%d",
+                         metrics.build_response_ms, response_count, metrics.redaction_context_builds,
+                         metrics.redaction_sources)
+                finished = True
+                return response
+        finally:
+            metrics.stop_watchdog()
+            LOG.info("SCAN_PER_FILE elapsed_ms=%.3f operations=%d sequential=true",
+                     metrics.per_file_ms, metrics.per_file_operations)
+            LOG.info("SCAN_METADATA elapsed_ms=%.3f reads=%d errors=%d master_open_ms=%.3f",
+                     metrics.metadata_ms + metrics.master_open_ms, metrics.metadata_reads,
+                     metrics.metadata_errors, metrics.master_open_ms)
+            LOG.info("SCAN_PARSE_PPTX elapsed_ms=%.3f opens=%d", metrics.parse_pptx_ms, metrics.pptx_opens)
+            LOG.info("SCAN_POWERPOINT_COM elapsed_ms=%.3f starts=%d",
+                     metrics.powerpoint_com_ms, metrics.powerpoint_com_starts)
+            for rank, (elapsed_ms, phase, index, label) in enumerate(metrics.slowest_operations(), 1):
+                LOG.info("SCAN_SLOW_OP rank=%d phase=%s index=%d file=%s elapsed_ms=%.3f",
+                         rank, phase, index, label, elapsed_ms)
+            LOG.info("SCAN_TOTAL elapsed_ms=%.3f finished=%s entries=%d candidates=%d accepted=%d "
+                     "rejected=%d unrelated=%d status_skipped=%d returned=%d traversals=%d largest_measured_stage=%s",
+                     metrics.elapsed_ms, finished, metrics.entries_inspected, metrics.candidate_files,
+                     metrics.accepted_files, metrics.structural_rejected_files, metrics.unrelated_files,
+                     metrics.status_skipped_files, response_count, metrics.directory_traversals,
+                     self._largest_scan_stage(metrics))
 
-    def dashboard_state(self, message_override: Optional[str] = None) -> dict:
+    @staticmethod
+    def _largest_scan_stage(metrics: ScanMetrics) -> str:
+        stages = (("SCAN_ENUMERATE", metrics.enumerate_ms),
+                  ("SCAN_FILTER", metrics.filter_ms),
+                  ("SCAN_BUILD_RESPONSE", metrics.build_response_ms))
+        return max(stages, key=lambda item: item[1])[0]
+
+    def dashboard_state(self, message_override: Optional[str] = None,
+                        scan_metrics: Optional[ScanMetrics] = None) -> dict:
         with self._lock:
             c = self.controller
             c.pump()
             c.reconcile()
             c.pump()
-            self._collect_logs()
+            self._report_paths = {}  # drop the previous scan before building this response's sanitizer
             rows = c.scan_rows("Tất cả file đã quét")
+            redactor = self._source_path_redactor(
+                scan_metrics, normalized_paths=[(row.normalized_path, row.path.name) for row in rows])
+            self._collect_logs(redactor)
             reports = []
-            self._report_paths = {}
             for row in rows:
                 report_id = str(row.index)
                 self._report_paths[report_id] = Path(row.path)
-                self._manual_fields.setdefault(normalize_source_path(Path(row.path)), {})
-                fields = self._manual_fields.get(normalize_source_path(Path(row.path)), {})
+                source_key = row.normalized_path or normalize_source_path(Path(row.path))
+                self._manual_fields.setdefault(source_key, {})
+                fields = self._manual_fields.get(source_key, {})
                 result = self._result_for_path(Path(row.path))
-                reports.append(self._report_dto(report_id, row, result, fields, len(reports) + 1))
+                reports.append(self._report_dto(report_id, row, result, fields, len(reports) + 1,
+                                                source_key=source_key, redactor=redactor))
             progress = c.progress
             # PROMPT-024R: distinct job states for the two stop modes. "cancelling" is shown while the
             # worker has not yet acknowledged cancel-all; the UI only shows "Đã dừng" after "done".
@@ -235,7 +311,8 @@ class ApplicationService:
                 "config": self.current_config(),
                 "scan": {"scanned": c.scan_result is not None,
                          "message": self._redact_source_paths(message_override or c.scan_message or
-                                                             (c.queue_text() if c.scan_result else "Chưa quét thư mục."))},
+                                                             (c.queue_text() if c.scan_result else "Chưa quét thư mục."),
+                                                             redactor)},
                 "reports": reports,
                 "job": {"status": run_status, "queue": candidate_ids if run_status == "idle" else
                         [str(i) for i in range(progress.total)],
@@ -249,7 +326,7 @@ class ApplicationService:
                         "cancelRequested": (c.state == "cancelling"
                                             or bool(c.summary and getattr(c.summary, "cancel_requested", False))),
                         "cancelledCount": int(getattr(c.summary, "cancelled", 0)) if c.summary else 0,
-                        "error": self._redact_source_paths(c.worker_failure or "")},
+                        "error": self._redact_source_paths(c.worker_failure or "", redactor)},
                 "logs": list(self._log_entries[-500:]),
                 "ollama": {"host": c.host, "port": c.port, "model": c.model,
                            "checked": "ok" if c.ollama_ok is True else "fail" if c.ollama_ok is False else "unchecked",
@@ -262,10 +339,10 @@ class ApplicationService:
                            "serverApplyMessage": self._server_apply_message},
                 "update": self._update_dto(),
                 "diagnostics": {"running": self._diagnostics_running,
-                                "rows": [{**row, "label": self._redact_source_paths(row.get("label", "")),
-                                          "value": self._redact_source_paths(row.get("value", ""))}
+                                "rows": [{**row, "label": self._redact_source_paths(row.get("label", ""), redactor),
+                                          "value": self._redact_source_paths(row.get("value", ""), redactor)}
                                          for row in self._diagnostics],
-                                "error": self._redact_source_paths(self._diagnostics_error)},
+                                "error": self._redact_source_paths(self._diagnostics_error, redactor)},
             }
 
     def _apply_configuration_for_scan(self, data: dict) -> None:
@@ -292,7 +369,8 @@ class ApplicationService:
         c.set_update_path(self._text(update.get("path", c.update_path), "update.path", 32767))
         c.set_auto_update_check(self._boolean(update.get("autoCheck", c.auto_update_check), "update.autoCheck"))
 
-    def _report_dto(self, report_id: str, row, fr, manual_fields: dict, stt: int) -> dict:
+    def _report_dto(self, report_id: str, row, fr, manual_fields: dict, stt: int,
+                    source_key: str = "", redactor: Optional[_SourcePathRedactor] = None) -> dict:
         status = self._status_key(row.action, row.excluded, row.run_stage)
         warning = row.reason or row.note or ""
         if fr is not None and fr.review_reasons:
@@ -314,12 +392,13 @@ class ApplicationService:
                 short = "; ".join(fr.review_reasons)
             elif fr.status == "skipped":
                 short = fr.error or short
-        short = self._redact_source_paths(short)
-        warning = self._redact_source_paths(warning)
+        short = self._redact_source_paths(short, redactor)
+        warning = self._redact_source_paths(warning, redactor)
         return {"id": report_id, "stt": stt, "managementNumber": row.management_number,
                 "fileName": row.path.name, "path": "", "occurrenceDate": date_text,
                 "manualFields": {k: v for k, v in manual_fields.items()},
-                "manualPending": normalize_source_path(Path(row.path)) in self._pending_manual, "vendor": vendor_text,
+                "manualPending": (source_key or normalize_source_path(Path(row.path))) in self._pending_manual,
+                "vendor": vendor_text,
                 "slides": fr.slide_count if fr is not None else 0, "status": status,
                 "shortResult": short, "warning": warning or None,
                 "processedAt": getattr(fr, "finished_at", "") if fr is not None else "",
@@ -906,7 +985,7 @@ class ApplicationService:
                 return False, "Một tác vụ nền đang chạy. Hãy đợi tác vụ hoàn tất rồi đóng cửa sổ."
             return True, ""
 
-    def _collect_logs(self) -> None:
+    def _collect_logs(self, redactor: Optional[_SourcePathRedactor] = None) -> None:
         lines = self.controller.log_lines
         if self._log_cursor > len(lines):
             self._log_cursor = 0
@@ -917,33 +996,51 @@ class ApplicationService:
                 "WARN" if "WARN" in upper or "WARNING" in upper or "CẢNH BÁO" in upper else "INFO")
             self._log_sequence += 1
             self._log_entries.append({"id": self._log_sequence, "time": datetime.now().strftime("%H:%M:%S"),
-                                     "level": level, "text": self._redact_source_paths(line)})
+                                     "level": level, "text": self._redact_source_paths(line, redactor)})
         self._log_cursor = len(lines)
         if len(self._log_entries) > 1000:
             del self._log_entries[:-1000]
 
-    def _redact_source_paths(self, value: Any) -> str:
-        """Keep user-selected PPTX source paths in Python; expose filenames, never absolute paths, to React."""
-        text = str(value)
+    def _source_path_redactor(self, metrics: Optional[ScanMetrics] = None,
+                              normalized_paths: Optional[Sequence[tuple[str, str]]] = None) -> _SourcePathRedactor:
+        """Build one lexical, filesystem-free sanitizer for the current dashboard response."""
         paths = list(self._report_paths.values())
         paths.extend(Path(path) for path in getattr(self.controller, "all_files", []))
-        replacements = set()
+        replacements: Dict[str, str] = {}
         for source in paths:
             try:
                 path = Path(source)
                 name = path.name
                 if not name:
                     continue
-                variants = {str(path), path.as_posix(), str(path.resolve()), path.resolve().as_posix()}
+                # ``abspath``/``normpath`` are lexical.  Unlike ``Path.resolve`` they do not issue
+                # lstat/stat calls against a UNC, removable, or otherwise slow source folder.
+                raw = str(path)
+                absolute = os.path.abspath(os.path.expanduser(raw))
+                variants = {raw, path.as_posix(), absolute, Path(absolute).as_posix()}
                 variants.update(item.replace("/", chr(92)) for item in tuple(variants))
                 for variant in variants:
                     if variant:
-                        replacements.add((variant, name))
+                        replacements.setdefault(variant, name)
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
-        for source, name in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
-            text = re.sub(re.escape(source), lambda _match, replacement=name: replacement, text, flags=re.IGNORECASE)
-        return text
+        # ``scan_rows`` already computed canonical identities once for report isolation/manual
+        # fields.  Reuse those strings to cover symlink/canonical path variants without another
+        # filesystem lookup solely for redaction.
+        for normalized, name in normalized_paths or ():
+            if not normalized or not name:
+                continue
+            replacements.setdefault(str(normalized), str(name))
+            replacements.setdefault(str(normalized).replace("/", chr(92)), str(name))
+        if metrics is not None:
+            metrics.redaction_context_builds += 1
+            metrics.redaction_sources = len({str(Path(path)) for path in paths})
+        return _SourcePathRedactor(replacements)
+
+    def _redact_source_paths(self, value: Any,
+                             redactor: Optional[_SourcePathRedactor] = None) -> str:
+        """Keep user-selected PPTX source paths in Python; expose filenames, never absolute paths, to React."""
+        return (redactor or self._source_path_redactor()).redact(value)
 
     # ------------------------------------------------------------------ DTO helpers
     def _result_for_path(self, path: Path):

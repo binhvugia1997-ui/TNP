@@ -32,6 +32,7 @@ from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSID
                       prescan, range_period)
 from .excel_writer import ExcelWriter
 from .scanner import scan_inputs
+from .scan_diagnostics import ScanMetrics
 from . import updater
 from .runtime_paths import portable_root
 from .updater import UpdateCheck, version_label
@@ -221,6 +222,7 @@ class ScanRow:
     run_stage: str = ""               # live/final pipeline stage of the current batch for this file ('' = none)
     vendor: str = ""                  # Vendor known from the current batch (display only)
     note: str = ""                    # batch note (diagnostics only – not a main-table column)
+    normalized_path: str = ""         # computed once while building this view; internal identity only
 
     @property
     def is_candidate(self) -> bool:
@@ -823,7 +825,7 @@ class GuiController:
         self._invalidate_scan()
         return len(self.all_files)
 
-    def discover(self) -> int:
+    def discover(self, metrics: Optional[ScanMetrics] = None) -> int:
         """Cheap name-only discovery; opens no PPTX and honors an explicit selected file when present."""
         folder = Path(self.report_folder) if self.report_folder else None
         self.scan_rejections: List[Tuple[Path, str]] = []
@@ -831,7 +833,25 @@ class GuiController:
             sources = list(self.input_files_override)
         else:
             sources = [folder] if folder and folder.is_dir() else []
-        self.all_files = scan_inputs(sources, on_reject=lambda p, why: self.scan_rejections.append((p, why)))
+        if metrics is not None:
+            LOG.info("SCAN_ENUMERATE_START sources=%d", len(sources))
+            token, started = metrics.begin("SCAN_ENUMERATE")
+        else:
+            token = started = None
+        try:
+            self.all_files = scan_inputs(sources,
+                                         on_reject=lambda p, why: self.scan_rejections.append((p, why)),
+                                         metrics=metrics)
+        finally:
+            elapsed_ms = metrics.end(token, started) if metrics is not None else 0.0
+        if metrics is not None:
+            metrics.enumerate_ms = elapsed_ms
+            LOG.info("SCAN_ENUMERATE_END elapsed_ms=%.3f entries=%d candidates=%d rejected=%d unrelated=%d "
+                     "directories=%d skipped_directories=%d traversals=%d",
+                     elapsed_ms, metrics.entries_inspected, metrics.candidate_files,
+                     metrics.structural_rejected_files, metrics.unrelated_files,
+                     metrics.directories_inspected, metrics.directories_skipped,
+                     metrics.directory_traversals)
         for p, why in self.scan_rejections:                  # every rejected PowerPoint-like entry is reported
             self.log_lines.append(f"Bỏ qua khi quét thư mục: {p.name} – {why}")
         self._set_files(self.all_files)
@@ -870,13 +890,13 @@ class GuiController:
     def candidate_key(path: Path, mgmt: str) -> str:
         return f"{normalize_source_path(Path(path))}|{(mgmt or '').strip().upper()}"
 
-    def scan(self) -> Optional[PreScanResult]:
+    def scan(self, metrics: Optional[ScanMetrics] = None) -> Optional[PreScanResult]:
         """Run the REAL pre-scan (same function the batch uses) on the discovered files with the current folder /
         Excel / period / cache / force settings.  Resets manual exclusions.  Nothing is opened or written.
         Never runs while a batch is active: ``discover()`` would replace the live rows/progress from another thread."""
         if self.is_running():
             return self.scan_result
-        self.discover()
+        self.discover(metrics=metrics)
         per, err = self.effective_period()
         # manual exclusions survive an ordinary rescan of the same folder (keyed by normalised path + Management
         # Number, so a renamed/moved file simply becomes a new candidate); a folder change clears them
@@ -886,25 +906,48 @@ class GuiController:
             return None
         master = None
         writer = None
+        master_started = time.perf_counter()
+        master_token = metrics.begin("SCAN_METADATA", phase="master") if metrics is not None else None
         try:
-            tpl, out = Path(self.template) if self.template else None, Path(self.output) if self.output else None
-            if tpl and tpl.is_file() and out and (self.cfg.row_mode or "match") == "match":
-                writer = ExcelWriter(tpl, out, probe=True)
-                master = MasterLookup.from_writer(writer)
-        except Exception as e:  # noqa: BLE001
-            self.log_lines.append(f"Không đọc được file Excel để quét: {e}")
+            try:
+                tpl, out = Path(self.template) if self.template else None, Path(self.output) if self.output else None
+                if tpl and tpl.is_file() and out and (self.cfg.row_mode or "match") == "match":
+                    writer = ExcelWriter(tpl, out, probe=True)
+                    master = MasterLookup.from_writer(writer)
+            except Exception as e:  # noqa: BLE001
+                self.log_lines.append(f"Không đọc được file Excel để quét: {e}")
+        finally:
+            if metrics is not None:
+                metrics.end(master_token[0], master_token[1])
+                metrics.master_open_ms += (time.perf_counter() - master_started) * 1000.0
         cache = None
         try:
             if self.output:
                 cache = FastScanCache(Path(self.output).parent / "logs" / CACHE_FILE_NAME)
         except Exception:  # noqa: BLE001
             cache = None
+        filter_started = time.perf_counter()
+        filter_token = metrics.begin("SCAN_FILTER") if metrics is not None else None
+        LOG.info("SCAN_FILTER_START candidates=%d sequential=true", len(self.all_files))
         try:
             self.scan_result = prescan(self.all_files, per, cache, master, force=self.force_reprocess,
-                                       today=self._today(), on_stage=lambda m: self.log_lines.append(m))
+                                       today=self._today(), on_stage=lambda m: self.log_lines.append(m),
+                                       metrics=metrics)
         finally:
             if writer is not None:
                 writer.close()
+            if metrics is not None:
+                metrics.end(filter_token[0], filter_token[1])
+        filter_ms = (time.perf_counter() - filter_started) * 1000.0
+        if metrics is not None and self.scan_result is not None:
+            metrics.filter_ms = filter_ms
+            metrics.accepted_files = len(self.scan_result.candidates)
+            metrics.status_skipped_files = len(self.scan_result.items) - metrics.accepted_files
+        LOG.info("SCAN_FILTER_END elapsed_ms=%.3f candidates=%d accepted=%d skipped=%d sequential=true",
+                 filter_ms, len(self.all_files),
+                 metrics.accepted_files if metrics is not None else len(self.scan_result.candidates),
+                 metrics.status_skipped_files if metrics is not None else
+                 len(self.scan_result.items) - len(self.scan_result.candidates))
         for line in self.scan_result.summary_lines_vi():
             self.log_lines.append(line)
         return self.scan_result
@@ -928,13 +971,15 @@ class GuiController:
         rows: List[ScanRow] = []
         live = {normalize_source_path(Path(r.path)): r for r in self.rows} if self.rows else {}
         for it in self.scan_result.items:
-            key = self.candidate_key(it.path, it.management_number)
-            rs = live.get(normalize_source_path(Path(it.path)))
+            normalized = normalize_source_path(Path(it.path))
+            key = f"{normalized}|{(it.management_number or '').strip().upper()}"
+            rs = live.get(normalized)
             rows.append(ScanRow(index=it.index, key=key, path=it.path, management_number=it.management_number,
                                 occurrence_date=f"{it.occurrence_date:%d/%m/%Y}" if it.occurrence_date else "",
                                 action=it.action, excluded=key in self.excluded_keys, reason=it.reason,
                                 excel_row=it.excel_row, run_stage=rs.stage if rs else "",
-                                vendor=rs.vendor if rs else "", note=rs.note if rs else ""))
+                                vendor=rs.vendor if rs else "", note=rs.note if rs else "",
+                                normalized_path=normalized))
         if filter_name == SCAN_FILTERS_VI[0]:
             rows = [r for r in rows if (r.is_candidate or r.needs_attention) and not r.excluded]   # problems never hidden
         elif filter_name == SCAN_FILTERS_VI[2]:

@@ -20,11 +20,15 @@ import logging
 import os
 import re
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .scan_diagnostics import ScanMetrics
 
 from .extractor import derive_occurrence_date, management_number_from_filename
 
@@ -436,7 +440,8 @@ class MasterLookup:
 # ----------------------------------------------------------------------------
 def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Optional[FastScanCache],
             master: Optional[MasterLookup], force: bool = False, today: Optional[date] = None,
-            on_stage: Optional[Callable[[str], None]] = None) -> PreScanResult:
+            on_stage: Optional[Callable[[str], None]] = None,
+            metrics: Optional["ScanMetrics"] = None) -> PreScanResult:
     """Classify every discovered file WITHOUT opening it (see module doc for the order)."""
     period = period or ALL_PERIOD
     today = today or date.today()
@@ -448,35 +453,50 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
     stage("Đang lọc theo thời gian...")
     for i, p in enumerate(files):
         p = Path(p)
-        it = PreScanItem(index=i, path=p, filename=p.name)
+        file_started = time.perf_counter()
+        file_token = metrics.begin("SCAN_FILE", index=i, path=p, phase="metadata") if metrics is not None else None
         try:
-            st = p.stat()
-            it.size, it.mtime = st.st_size, round(st.st_mtime, 3)
-        except OSError:
-            pass
-        it.management_number = management_number_from_filename(p.name)
-        res.items.append(it)
-        if not it.management_number:
-            it.period_decision = "n/a"
-            if master is not None or not period.is_all:
-                # match mode keeps the existing "not written" outcome; a period filter cannot be applied either
-                it.action, it.reason = ACTION_INVALID_MGMT, ACTION_LABELS_VI[ACTION_INVALID_MGMT]
-            continue                     # append mode without a period: legacy behaviour, file is processed
-        it.occurrence_date, why = derive_occurrence_date(it.management_number)
-        if it.occurrence_date is None:
-            it.period_decision = "no_date"
-            if not period.is_all:
-                it.action, it.reason = ACTION_OUTSIDE_PERIOD, f"Bỏ qua ngoài thời gian xử lý ({why})"
-                LOG.info("PERIOD_SKIP management_number=%s occurrence_date=invalid reason=%s", it.management_number, why)
-            continue
-        if period.contains(it.occurrence_date):
-            it.period_decision = "inside"
-        else:
-            it.period_decision = "outside"
-            it.action = ACTION_OUTSIDE_PERIOD
-            it.reason = f"Bỏ qua ngoài thời gian xử lý (ngày phát sinh {fmt_date(it.occurrence_date)})"
-            LOG.info("PERIOD_SKIP management_number=%s occurrence_date=%s period=%s",
-                     it.management_number, it.occurrence_date.isoformat(), period.iso())
+            it = PreScanItem(index=i, path=p, filename=p.name)
+            metadata_started = time.perf_counter()
+            if metrics is not None:
+                metrics.metadata_reads += 1
+            try:
+                st = p.stat()
+                it.size, it.mtime = st.st_size, round(st.st_mtime, 3)
+            except OSError:
+                if metrics is not None:
+                    metrics.metadata_errors += 1
+            finally:
+                if metrics is not None:
+                    metrics.metadata_ms += (time.perf_counter() - metadata_started) * 1000.0
+            it.management_number = management_number_from_filename(p.name)
+            res.items.append(it)
+            if not it.management_number:
+                it.period_decision = "n/a"
+                if master is not None or not period.is_all:
+                    # match mode keeps the existing "not written" outcome; a period filter cannot be applied either
+                    it.action, it.reason = ACTION_INVALID_MGMT, ACTION_LABELS_VI[ACTION_INVALID_MGMT]
+                continue                     # append mode without a period: legacy behaviour, file is processed
+            it.occurrence_date, why = derive_occurrence_date(it.management_number)
+            if it.occurrence_date is None:
+                it.period_decision = "no_date"
+                if not period.is_all:
+                    it.action, it.reason = ACTION_OUTSIDE_PERIOD, f"Bỏ qua ngoài thời gian xử lý ({why})"
+                    LOG.info("PERIOD_SKIP management_number=%s occurrence_date=invalid reason=%s", it.management_number, why)
+                continue
+            if period.contains(it.occurrence_date):
+                it.period_decision = "inside"
+            else:
+                it.period_decision = "outside"
+                it.action = ACTION_OUTSIDE_PERIOD
+                it.reason = f"Bỏ qua ngoài thời gian xử lý (ngày phát sinh {fmt_date(it.occurrence_date)})"
+                LOG.info("PERIOD_SKIP management_number=%s occurrence_date=%s period=%s",
+                         it.management_number, it.occurrence_date.isoformat(), period.iso())
+        finally:
+            elapsed_ms = (time.perf_counter() - file_started) * 1000.0
+            if metrics is not None:
+                metrics.end(file_token[0], file_token[1])
+                metrics.record_file_operation(i, p, "metadata", elapsed_ms)
 
     # 2. source duplicates (same Management Number in the folder tree) ------------------------
     groups: Dict[str, List[PreScanItem]] = {}
@@ -501,9 +521,9 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
 
     # 3. recent-success cache + 4. master Excel -----------------------------------------------
     stage("Đang kiểm tra dữ liệu đã xử lý...")
-    for it in res.items:
-        if it.action != ACTION_PROCESS or not it.management_number:
-            continue
+
+    def apply_status(it: PreScanItem) -> None:
+        """Apply cache/master status to one survivor; kept separate so one timed operation has one exit."""
         mgmt = it.management_number
         cache_hit = False
         if force:
@@ -524,7 +544,7 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
             if cache_hit:
                 it.action, it.reason = ACTION_FAST_SKIP, ACTION_LABELS_VI[ACTION_FAST_SKIP]
                 LOG.info("FAST_SKIP management_number=%s reason=recent_success_cache", mgmt)
-            continue
+            return
 
         rows = master.rows(mgmt)
         if not rows:
@@ -538,7 +558,7 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
             it.action = ACTION_PROCESS_NEW_ROW
             it.reason = f"Sẽ thêm dòng mới cho Management Number {mgmt}"
             LOG.info("MASTER_MISS management_number=%s reason=not_found action=PROCESS_NEW_ROW", mgmt)
-            continue
+            return
         it.excel_row = rows[0]
         missing = master.missing(rows[0])
         if missing:
@@ -547,17 +567,31 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
                 it.cache_decision = "miss:master_row_incomplete"        # Excel row state is authoritative
                 LOG.info("CACHE_MISS management_number=%s reason=master_row_incomplete", mgmt)
             it.action = ACTION_PROCESS
-            continue
+            return
         it.master_decision = "found_complete"
         if force:
             it.action = ACTION_PROCESS                                 # --force rewrites complete rows
-            continue
+            return
         if cache_hit:
             it.action, it.reason = ACTION_FAST_SKIP, ACTION_LABELS_VI[ACTION_FAST_SKIP]
             LOG.info("FAST_SKIP management_number=%s reason=recent_success_cache", mgmt)
         else:
             it.action, it.reason = ACTION_MASTER_COMPLETE, f"Bỏ qua — đã cập nhật (dòng {rows[0]})"
             LOG.info("MASTER_SKIP management_number=%s reason=row_complete row=%s", mgmt, rows[0])
+
+    for it in res.items:
+        if it.action != ACTION_PROCESS or not it.management_number:
+            continue
+        status_started = time.perf_counter()
+        status_token = (metrics.begin("SCAN_FILE", index=it.index, path=it.path, phase="status")
+                        if metrics is not None else None)
+        try:
+            apply_status(it)
+        finally:
+            elapsed_ms = (time.perf_counter() - status_started) * 1000.0
+            if metrics is not None:
+                metrics.end(status_token[0], status_token[1])
+                metrics.record_file_operation(it.index, it.path, "status", elapsed_ms)
 
     c = res.counts()
     LOG.info("PRESCAN done %s", " ".join(f"{k}={v}" for k, v in c.items()))

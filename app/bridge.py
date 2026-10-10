@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -50,8 +51,15 @@ class BridgeService:
         return self._respond(lambda: self.service.save_configuration(self._bounded_object(dto, "configuration")))
 
     def scan_reports(self, dto: Any, input_file_token: str = "") -> dict:
-        return self._respond(lambda: self.service.scan_reports(self._bounded_object(dto, "configuration"),
-                                                              self._string(input_file_token, "inputFileToken", 128)))
+        started = time.perf_counter()
+        result = self._respond(lambda: self.service.scan_reports(self._bounded_object(dto, "configuration"),
+                                                                 self._string(input_file_token, "inputFileToken", 128)))
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        # pywebview serializes the returned envelope only after this Python method returns.  Mark that
+        # boundary honestly; timing it here would measure a second json.dumps, not the real transport.
+        LOG.info("SCAN_SERIALIZE elapsed_ms=unavailable boundary=pywebview_after_python_return")
+        LOG.info("SCAN_RETURN elapsed_ms=%.3f ok=%s bridge_calls=1", elapsed_ms, bool(result.get("ok")))
+        return result
 
     def get_report_details(self, report_id: str) -> dict:
         return self._respond(lambda: self.service.report_details(self._string(report_id, "reportId", 24)))
