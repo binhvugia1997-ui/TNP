@@ -417,11 +417,13 @@ def mark_of_the_web(path: Path) -> str | None:
     Windows attaches that stream when a ZIP is extracted or a file arrives from another machine, and the
     .NET Framework then REFUSES ``Assembly.LoadFrom`` on it (``COR_E_FILELOAD``, HRESULT 0x80131515,
     "Operation is not supported") unless the hosting AppDomain enables ``loadFromRemoteSources`` — while
-    ``LoadLibrary`` on the NATIVE ``ClrLoader.dll`` ignores the stream completely.  That asymmetry is the
-    one mechanism which lets clr_loader create its app domain and still fail to resolve
+    ``LoadLibrary`` on the NATIVE ``ClrLoader.dll`` ignores the stream completely.  That asymmetry is a
+    mechanism that COULD let clr_loader reach the root AppDomain and still fail to resolve
     ``Python.Runtime.Loader.Initialize`` from a DLL that exists at the right path with the right SHA256,
-    i.e. from a package that passes every presence/hash check.  Reading the stream is harmless everywhere:
-    on a filesystem without ADS support the open simply fails.
+    i.e. from a package that passes every presence/hash check — which is why PROMPT-030 added this
+    reporting.  It remains a HYPOTHESIS for the original H:\\ failure: no A/B (blocked vs unblocked)
+    evidence on that folder was ever captured, and PROMPT-030S-R neither proves nor disproves it.
+    Reading the stream is harmless everywhere: on a filesystem without ADS support the open simply fails.
     """
     if not path.is_file():
         return None
@@ -518,7 +520,13 @@ def prove_clr_loader(folder: Path, arch: str, problems: list[str]) -> Path | Non
 #: (``ffi.dlopen(ClrLoader.dll)`` → ``pyclr_initialize`` → ``pyclr_create_appdomain`` →
 #: ``pyclr_get_function(Python.Runtime.dll, "Python.Runtime.Loader", "Initialize")``), so the build proves
 #: LOADABILITY instead of only presence/hash.  ``clr_loader`` never checks whether the app-domain handle
-#: came back NULL and its netfx cdef has no error accessor, so both are read directly here.
+#: came back NULL and its netfx cdef has no error accessor, so both are read directly here.  The handle's
+#: MEANING is fixed by clr-loader 0.2.10 (netfx_loader/ClrLoader.cs): this probe — like production
+#: pythonnet — requests the UNNAMED root domain, for which ``CreateAppDomain`` deliberately answers index
+#: 0 (``AppDomain.CurrentDomain``, registered by ``Initialize()``); a NULL handle here is therefore the
+#: root/current-domain sentinel, NOT an AppDomain failure.  Success is judged on positive evidence — the
+#: resolved function pointer and Initialize returning 0 — exactly the two things pythonnet's own ``load()``
+#: requires (``func = get_function(...); if func(b"") != 0: raise``).
 PROBE_PACKAGED_RUNTIME = r"""
 import json, sys
 from pathlib import Path
@@ -564,6 +572,17 @@ def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
     Returns the problems it found.  A failure here means the shipped exe WILL die at start-up, so the build
     stops instead of publishing it.  Where the probe cannot run (non-Windows, no build interpreter) it says
     so explicitly rather than reporting a pass it never performed.
+
+    PROMPT-030S-R — the probe succeeds on POSITIVE evidence, never on the app-domain handle alone:
+    ``clr_loader.get_netfx()`` defaults to ``domain=None``, so ``NetFx.__init__`` calls
+    ``pyclr_create_appdomain(ffi.NULL, ...)`` and ClrLoader.cs answers that unnamed request with index 0 —
+    the ROOT/CURRENT ``AppDomain`` it registered in ``Initialize()``.  ``appdomain NULL`` is therefore the
+    normal sentinel of the production default path, NOT a creation failure (0.2.10 has no failure return at
+    all: a NAMED domain either gets an index or the constructor never completes).  A pass still requires
+    every applicable positive result — subprocess exit 0, well-formed JSON object, no ``error``, the
+    requested architecture echoed, ``resolved is True`` and ``initialize_rc == 0`` (pythonnet's own success
+    condition).  Anything missing, malformed, non-True or non-zero fails the gate: this check exists to
+    stop broken packages, so it fails CLOSED.
     """
     if platform.system() != "Windows":
         print("   probe loadability: BỎ QUA — .NET Framework chỉ có trên Windows; phần chứng minh "
@@ -577,27 +596,54 @@ def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
         return [f"không chạy được probe nạp runtime đã đóng gói: {type(exc).__name__}: {exc}"]
     try:
         out = json.loads((proc.stdout or "").strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return [f"probe nạp runtime đã đóng gói không trả về JSON (rc={proc.returncode}): "
+        if not isinstance(out, dict):
+            raise ValueError(f"JSON phải là một object, nhận được {type(out).__name__}")
+    except (ValueError, IndexError) as exc:
+        note = f" ({exc})" if isinstance(exc, ValueError) else ""
+        return [f"probe nạp runtime đã đóng gói không trả về JSON hợp lệ (rc={proc.returncode}){note}: "
                 f"{(proc.stdout or '').strip()[-300:]} {(proc.stderr or '').strip()[-300:]}".strip()]
     for key in ("arch", "appdomain", "resolved", "initialize_rc", "error"):
         if key in out:
             print(f"   probe {key:14} {out[key]}")
+    if out.get("appdomain") == "NULL":
+        print("   probe domain     root/current AppDomain — clr_loader gọi pyclr_create_appdomain(ffi.NULL) "
+              "theo mặc định và ClrLoader.cs trả về index 0 (AppDomain.CurrentDomain); đây là sentinel hợp "
+              "lệ, KHÔNG phải lỗi tạo AppDomain")
     problems: list[str] = []
+    if proc.returncode != 0:
+        problems.append(f"probe nạp runtime đã đóng gói kết thúc với mã lỗi {proc.returncode}: "
+                        f"{(proc.stderr or '').strip()[-300:]}".strip())
     if out.get("error"):
         problems.append(f"probe nạp runtime đã đóng gói thất bại: {out['error']}")
-    if out.get("appdomain") == "NULL":
-        problems.append("pyclr_create_appdomain trả về NULL: clr_loader không tạo được AppDomain .NET "
-                        "Framework (clr_loader/netfx.py KHÔNG kiểm tra điều này và vẫn báo "
-                        "initialized=True). Nguyên nhân thường gặp: .NET Framework < 4.7.2 hoặc "
-                        "ClrLoader.dll sai kiến trúc")
-    if out.get("resolved") is False and not out.get("error"):
+        # The native chain threw (e.g. dlopen refused the packaged ClrLoader.dll): the exception IS the
+        # finding, and no resolution evidence can exist past it — report exactly that, nothing invented.
+        return problems
+    if out.get("arch") != arch:
+        problems.append(f"probe trả về kiến trúc {out.get('arch')!r} thay vì {arch!r} — output không phải "
+                        f"của probe này trên đúng gói vừa build, cổng build fail closed")
+    if out.get("appdomain") not in ("NULL", "created"):
+        problems.append(f"probe không báo cáo AppDomain hợp lệ (nhận được {out.get('appdomain')!r}; "
+                        "'NULL' = root/current domain theo mặc định của clr_loader, 'created' = domain đặt "
+                        "tên — mọi giá trị khác là output hỏng)")
+    resolved = out.get("resolved", None)
+    if resolved is False:
         problems.append("pyclr_get_function trả về NULL cho Python.Runtime.Loader.Initialize trong gói "
                         "đã build — chính là lỗi làm ReportExtractor.exe chết khi khởi động. Kiểm tra "
-                        "Zone.Identifier (file bị Windows chặn) và .NET Framework Release")
-    if isinstance(out.get("initialize_rc"), int) and out["initialize_rc"] != 0:
-        problems.append(f"Python.Runtime.Loader.Initialize trả về {out['initialize_rc']} (khác 0): "
-                        "pythonnet không khởi động được trong gói đã build")
+                        "Zone.Identifier (file bị Windows chặn — ứng viên số một, chưa được chứng minh "
+                        "bằng A/B trên H:) và .NET Framework Release")
+    elif resolved is not True:
+        shown = "<thiếu>" if "resolved" not in out else repr(resolved)
+        problems.append(f"probe không xuất ra bằng chứng phân giải (resolved={shown}) — không có gì được "
+                        "chứng minh thì cổng build fail closed")
+    else:
+        rc = out.get("initialize_rc", None)
+        if isinstance(rc, bool) or not isinstance(rc, int):
+            problems.append("Python.Runtime.Loader.Initialize chưa có kết quả hợp lệ "
+                            f"(initialize_rc={out.get('initialize_rc', '<thiếu>')!r} không phải số nguyên) "
+                            "— resolved mà không có rc là output không đầy đủ, cổng build fail closed")
+        elif rc != 0:
+            problems.append(f"Python.Runtime.Loader.Initialize trả về {rc} (khác 0): pythonnet không khởi "
+                            "động được trong gói đã build")
     return problems
 
 
@@ -655,7 +701,8 @@ def validate_pythonnet_runtime(folder: Path, source: dict | None = None,
         if blocked:
             problems.append(f"{rel.as_posix()} đang BỊ WINDOWS CHẶN (Zone.Identifier: {blocked[:120]}). "
                             "LoadLibrary bỏ qua cờ này nhưng Assembly.LoadFrom của .NET Framework thì "
-                            "KHÔNG, nên clr_loader tạo được AppDomain mà vẫn không phân giải được "
+                            "KHÔNG — đây là cơ chế ứng viên (chưa được chứng minh A/B trên H:) khiến "
+                            "clr_loader vẫn vào được root AppDomain mà không phân giải được "
                             "Python.Runtime.Loader.Initialize. Gỡ bằng: chuột phải → Properties → "
                             "Unblock, hoặc PowerShell: Unblock-File -Path '<đường dẫn>'")
     host = prove_clr_loader(folder, arch, problems)

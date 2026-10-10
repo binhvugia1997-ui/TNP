@@ -231,7 +231,9 @@ def dotnet_framework_report() -> str:
 # pyclr_create_appdomain, pyclr_get_function, pyclr_close_appdomain, pyclr_finalize — and NO error
 # accessor, so whatever the CLR really threw is discarded and every distinct failure collapses into that
 # string.  ``NetFx.__init__`` also stores whatever ``pyclr_create_appdomain`` returned without checking it
-# for NULL.
+# for NULL — which, since clr-loader 0.2.10 ANSWERS an unnamed (default) request with NULL on purpose to
+# mean "the root/current AppDomain" (ClrLoader.cs: ``_domains[0]``), is harmless for clr_loader itself and
+# only became a defect when PROMPT-030's tooling read that NULL as failure (fixed in PROMPT-030S-R).
 #
 # The classes that a BUILD can settle are now settled there (``tools/build_portable.py`` proves the payload
 # is pythonnet's own managed assembly — ``Python.Runtime 3.0.5.0``, IL-only/any-cpu, targeting
@@ -241,15 +243,18 @@ def dotnet_framework_report() -> str:
 # ``pyclr_*`` symbols).  A wrong or renamed payload, a pythonnet↔clr-loader signature skew and an
 # architecture mismatch therefore stop the build instead of the exe.
 #
-# What remains is a property of the machine the package LANDED on, and the one that fits every observed
-# fact is a blocked assembly.  Windows attaches a ``Zone.Identifier`` alternate data stream when a folder
-# is extracted from ``release/ReportExtractor_<version>.zip`` or copied from another PC or USB stick —
+# What remains is a property of the machine the package LANDED on, and a leading CANDIDATE that fits the
+# observed facts is a blocked assembly — a hypothesis, NOT a proven cause: no A/B evidence (same folder,
+# blocked vs unblocked) was ever captured on the failing H:\\ machine, and PROMPT-030S-R neither confirms
+# nor refutes it.  Windows attaches a ``Zone.Identifier`` alternate data stream when a folder is
+# extracted from ``release/ReportExtractor_<version>.zip`` or copied from another PC or USB stick —
 # i.e. AFTER the build gate ran.  ``LoadLibrary`` ignores that stream, so the native ``ClrLoader.dll``
-# loads and the app domain is created; ``Assembly.LoadFrom`` does NOT, so the managed
-# ``Python.Runtime.dll`` is refused with ``COR_E_FILELOAD`` / 0x80131515 "Operation is not supported".
-# That is exactly a DLL which exists at the right path with the right SHA256 and still cannot initialize,
-# and it is why the same bytes work from ``.venv-build`` (pip never attaches the stream) but not from the
-# Portable folder.
+# loads and clr_loader reaches the root AppDomain (its unnamed default, see ``appdomain_report``);
+# ``Assembly.LoadFrom`` does NOT, so the managed ``Python.Runtime.dll`` WOULD be refused with
+# ``COR_E_FILELOAD`` / 0x80131515 "Operation is not supported".  That profile matches a DLL which exists
+# at the right path with the right SHA256 and still cannot initialize, and is why the same bytes work from
+# ``.venv-build`` (pip never attaches the stream); whether it explains the original H:\\ death is
+# unproven — which is exactly why the block is reported and cleared up front instead of assumed.
 ZONE_IDENTIFIER_STREAM = "Zone.Identifier"
 
 
@@ -320,13 +325,28 @@ def unblock_packaged_runtime(remediate: bool = True) -> dict:
 
 
 def appdomain_report() -> str:
-    """Whether clr_loader REALLY holds a .NET Framework AppDomain handle.
+    """What clr_loader REALLY holds as its .NET Framework AppDomain — with clr-loader's own semantics.
 
     ``pythonnet.get_runtime_info()`` cannot answer this: ``clr_loader/netfx.py::NetFx.info()`` returns
     ``RuntimeInfo(kind=".NET Framework", version="<undefined>", initialized=True, …)`` with
     ``initialized`` HARDCODED and no version at all.  A log line reading "Runtime: .NET Framework /
-    Initialized: True" is therefore NOT evidence that an app domain exists — the PROMPT-028R hint text
-    asserted exactly that and misled the diagnosis.  Read the handle instead.
+    Initialized: True" is therefore NOT evidence about the domain — the PROMPT-028R hint text asserted
+    exactly that and misled the diagnosis.  Read the handle, but read it the way clr-loader 0.2.10 MEANS
+    it (verified against the exact upstream tag, PROMPT-030S-R): ``get_netfx()`` defaults to
+    ``domain=None``, ``NetFx.__init__`` hands ``ffi.NULL`` to ``pyclr_create_appdomain``, and
+    ``ClrLoader.cs`` registers ``AppDomain.CurrentDomain`` as index 0 and DELIBERATELY answers an unnamed
+    request with ``IntPtr.Zero``.  A NULL handle on the default path is therefore the ROOT/CURRENT
+    AppDomain — a normal success value — and NOT "the CLR itself would not start"; inferring failure from
+    it was PROMPT-030's own defect.  The distinct results:
+
+      * ``no-runtime-selected``      – pythonnet never built a runtime: THAT is the startup-failure case;
+      * ``not-a-netfx-runtime(…)``   – a coreclr/mono runtime, which has no ``_domain`` attribute;
+      * ``root(…)``                  – the netfx root/current AppDomain (clr-loader's unnamed default);
+      * ``created(…)``               – a named AppDomain (ClrLoader.cs gives those index ≥ 1);
+      * ``NULL(…)``                  – a NAMED domain whose handle came back zero: a real creation
+        failure — impossible in clr-loader 0.2.10's normal flow (named domains get an index or the
+        constructor raises), so it stays reported as an anomaly;
+      * ``unknown``                  – the diagnostic itself failed; diagnostics must never be the crash.
     """
     if sys.platform != "win32":
         return "not-applicable"
@@ -338,14 +358,17 @@ def appdomain_report() -> str:
         if not hasattr(runtime, "_domain"):
             return f"not-a-netfx-runtime({type(runtime).__name__})"
         domain = runtime._domain                         # noqa: SLF001 – the only place the truth lives
+        name = getattr(runtime, "_domain_name", None)   # noqa: SLF001 – the domain NetFx was ASKED for
         try:
             from clr_loader.ffi import ffi               # noqa: PLC0415
             is_null = bool(domain == ffi.NULL)
         except Exception:                                # noqa: BLE001 – cffi missing must not hide the answer
             is_null = not domain
         if is_null:
-            return "NULL(pyclr_create_appdomain failed – the CLR itself would not start)"
-        return "created"
+            if name:
+                return f"NULL(pyclr_create_appdomain failed for named domain {name!r})"
+            return "root(AppDomain.CurrentDomain — clr-loader's unnamed default; a normal, successful value)"
+        return f"created(named AppDomain {name!r})" if name else "created(named AppDomain)"
     except Exception:                                    # noqa: BLE001 – diagnostics must never be the crash
         return "unknown"
 
@@ -383,9 +406,10 @@ def runtime_diagnostics(probe_dotnet: bool = True, remediate_block: bool = True)
         except Exception:                                # noqa: BLE001
             info["dotnet_runtime"] = "netfx(default-on-windows)"
         info["dotnet_framework"] = dotnet_framework_report()
-        # Clear a Windows block BEFORE anything loads the assembly: LoadLibrary ignores Zone.Identifier but
-        # Assembly.LoadFrom does not, which is how a DLL that exists and hashes correctly still fails to
-        # initialize (PROMPT-030).
+        # Clear a Windows block BEFORE anything loads the assembly: LoadLibrary ignores Zone.Identifier
+        # but Assembly.LoadFrom does not — the mechanism by which a DLL that exists and hashes correctly
+        # CAN still fail to initialize (PROMPT-030's leading, unproven hypothesis for the original
+        # H:\ death; the remediation is kept because it is safe and the block is directly observable).
         block = unblock_packaged_runtime(remediate=remediate_block)
         info["runtime_files_checked"] = str(block["checked"])
         info["blocked_runtime"] = ",".join(block["blocked"]) or "none"
@@ -400,7 +424,9 @@ def runtime_diagnostics(probe_dotnet: bool = True, remediate_block: bool = True)
             except BaseException as exc:                 # noqa: BLE001 – the whole point is to capture it
                 info["clr_import"] = f"{type(exc).__name__}"
                 info["clr_import_error"] = _safe_error(exc)
-            # Only meaningful after the attempt: get_runtime_info() cannot distinguish a NULL domain.
+            # Only recorded after the attempt, so it reflects the handle NetFx really holds; for the
+            # default unnamed request that handle is NULL and means the ROOT/CURRENT AppDomain (see
+            # appdomain_report) — it must never be read as a CLR startup failure.
             info["dotnet_appdomain"] = appdomain_report()
     return info
 
@@ -416,8 +442,14 @@ _CLR_HINTS = (
      "this folder came out of a ZIP or from another PC/USB stick; LoadLibrary ignores it so ClrLoader.dll "
      "loads, Assembly.LoadFrom refuses it with 0x80131515. The app clears it automatically when it can "
      "(see unblocked_runtime / unblock_failed); otherwise right-click the Portable folder → Properties → "
-     "Unblock, or Unblock-File on it. (2) dotnet_appdomain=NULL — the CLR itself would not start, i.e. "
-     ".NET Framework older than 4.7.2. (3) dotnet_framework=Release=…(TOO-OLD) — Python.Runtime.dll "
+     "Unblock, or Unblock-File on it. (2) dotnet_appdomain — root(AppDomain.CurrentDomain …) IS the "
+     "normal value: clr-loader 0.2.10's default netfx path requests the UNNAMED domain and ClrLoader.cs "
+     "answers it with its root-domain sentinel, so NULL here (or 'root(...)') is NOT a startup failure and "
+     "says NOTHING about the .NET Framework version (that reading was PROMPT-030's bug, fixed in "
+     "PROMPT-030S-R); created(...) is a named AppDomain, equally alive. A root/created value proves the "
+     "native host loaded, so the refusal sits on the managed-load side — keep reading (1), (3) and (4). "
+     "Only no-runtime-selected / unknown / not-a-netfx-runtime describe the runtime never starting. "
+     "(3) dotnet_framework=Release=…(TOO-OLD) — Python.Runtime.dll "
      "targets .NETStandard 2.0 and needs Release >= 461808; install the .NET Framework 4.8 Runtime. "
      "(4) python_runtime_dll_exists=False, or a SHA256 that differs from the build venv — a packaging "
      "mistake; run `python tools/build_portable.py --validate-only <portable folder>` to see which. "
