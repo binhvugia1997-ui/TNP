@@ -244,7 +244,7 @@ def test_build_and_publish_bat_exists_and_wires_everything():
     assert '"--ff-only"' in joined
 
 
-def test_identity_build_017():
-    assert app.__version__ == "1.3.4" and app.BUILD_NUMBER == 17 and app.BUILD_LABEL == "Build 017"
+def test_identity_build_018():
+    assert app.__version__ == "1.3.5" and app.BUILD_NUMBER == 18 and app.BUILD_LABEL == "Build 018"
     import build_portable as bp
-    assert bp.package_name(app.__version__) == "ReportExtractor_1.3.4.zip" and bp._version() == ("1.3.4", "017")
+    assert bp.package_name(app.__version__) == "ReportExtractor_1.3.5.zip" and bp._version() == ("1.3.5", "018")

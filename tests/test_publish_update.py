@@ -275,4 +275,4 @@ def test_destination_is_centralised_and_configurable(monkeypatch):
 
 
 def test_build_010_identity():
-    assert app.__version__ == "1.3.4" and app.BUILD_NUMBER == 17 and app.BUILD_LABEL == "Build 017"
+    assert app.__version__ == "1.3.5" and app.BUILD_NUMBER == 18 and app.BUILD_LABEL == "Build 018"

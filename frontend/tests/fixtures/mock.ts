@@ -7,8 +7,8 @@ import type {
   Report,
 } from '../../src/types'
 
-export const APP_VERSION = '1.3.4'
-export const APP_BUILD = '017'
+export const APP_VERSION = '1.3.5'
+export const APP_BUILD = '018'
 export const APP_TITLE = `Report Extractor — ${APP_VERSION} — Build ${APP_BUILD}`
 
 export const DEFAULT_FOLDER = 'D:\\Reports'
