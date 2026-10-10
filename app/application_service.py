@@ -107,6 +107,14 @@ class ApplicationService:
         # "backend", "faithful", "regions"} — see :meth:`_slide_preview_for`.
         self._slide_preview_cache: Dict[tuple, Dict[str, Any]] = {}
         self._last_scan_metrics: Optional[ScanMetrics] = None  # bounded diagnostics for the most recent Quét call
+        # PROMPT-031R: scan work remains one synchronous bridge operation, while the existing bounded dashboard
+        # poll reads immutable snapshots published once per completed containing folder.
+        self._scan_active = False
+        self._scan_generation = 0
+        self._scan_revision = 0
+        self._scan_snapshot: Optional[dict] = None
+        self._scan_pending_reports: List[dict] = []
+        self._scan_redactor: Optional[_SourcePathRedactor] = None
         self._load_manual_fields()
 
     # ------------------------------------------------------------------ static app/config DTOs
@@ -202,7 +210,10 @@ class ApplicationService:
         LOG.info("SCAN_START period_mode=%s single_file=%s", period_mode, bool(input_file_token))
         finished = False
         response_count = 0
+        generation = 0
         try:
+            # Configure and publish an empty generation under one short lock.  The expensive sequential scan runs
+            # outside this lock, allowing the existing 750-ms dashboard poll to read immutable leaf snapshots.
             with self._lock:
                 self._assert_idle("Không thể quét trong khi đang xử lý báo cáo.")
                 self._apply_configuration_for_scan(data)
@@ -222,29 +233,104 @@ class ApplicationService:
                     if folder is None or not folder.is_dir():
                         raise ServiceError("Thư mục báo cáo không tồn tại hoặc chưa được chọn.", "INVALID_REPORT_FOLDER")
                     self.controller.report_folder = str(folder.resolve())
-                result = self.controller.scan(metrics=metrics)
-                self.controller.save_settings()
-                if result is None:
-                    message = self.controller.scan_message or "Không thể hoàn tất bước quét trước xử lý."
-                else:
-                    message = self.controller.queue_text()
-                LOG.info("WEBVIEW_SCAN finished=%s files=%d", bool(result), len(self.controller.all_files))
-                LOG.info("SCAN_BUILD_RESPONSE_START files=%d", len(self.controller.all_files))
-                build_started = time.perf_counter()
-                build_token = metrics.begin("SCAN_BUILD_RESPONSE")
-                try:
-                    response = self.dashboard_state(message_override=message, scan_metrics=metrics)
-                finally:
-                    metrics.end(build_token[0], build_token[1])
-                    metrics.build_response_ms = (time.perf_counter() - build_started) * 1000.0
-                response_count = len(response.get("reports", []))
-                LOG.info("SCAN_BUILD_RESPONSE_END elapsed_ms=%.3f files=%d redaction_contexts=%d redaction_sources=%d",
-                         metrics.build_response_ms, response_count, metrics.redaction_context_builds,
-                         metrics.redaction_sources)
-                finished = True
-                return response
+                self._scan_generation += 1
+                generation = self._scan_generation
+                self._scan_revision = 0
+                self._scan_active = True
+                self._scan_redactor = None
+                self._scan_pending_reports = []
+                self.controller.scan_result = None
+                self._scan_snapshot = self._dashboard_state_unlocked(
+                    message_override="Đang quét danh sách bằng bộ quét Python…",
+                    scan_meta={"generation": generation, "revision": 0, "inProgress": True,
+                               "incremental": True, "completedLeaves": 0, "totalLeaves": 0,
+                               "firstLeafMs": None})
+
+            def publish_leaf(_partial, leaf_index: int, leaf_total: int, _folder: Path) -> None:
+                with self._lock:
+                    if not self._scan_active or generation != self._scan_generation:
+                        return
+                    if self._scan_redactor is None:
+                        # One scan-wide lexical context is reused by every leaf snapshot and the final response;
+                        # never rebuild all N source variants once per leaf (the PROMPT-031 O(N²) regression).
+                        self._scan_redactor = self._source_path_redactor(metrics)
+                    self._scan_revision += 1
+                    revision = self._scan_revision
+                    snapshot = self._dashboard_state_unlocked(
+                        message_override=f"Đã hoàn tất {leaf_index}/{leaf_total} thư mục chứa báo cáo.",
+                        scan_meta={"generation": generation, "revision": revision, "inProgress": True,
+                                   "incremental": True, "completedLeaves": leaf_index,
+                                   "totalLeaves": leaf_total, "firstLeafMs": metrics.first_leaf_ms},
+                        redactor_override=self._scan_redactor)
+                    leaf_reports = snapshot.get("reports", [])
+                    delivered_ms = metrics.record_leaf_delivery(len(leaf_reports))
+                    snapshot["scan"]["firstLeafMs"] = metrics.first_leaf_ms
+                    self._scan_pending_reports.extend(leaf_reports)
+                    self._scan_snapshot = snapshot  # immutable-by-replacement; readers never see a torn build
+                    LOG.info("SCAN_LEAF_DELIVER index=%d total=%d rows=%d elapsed_ms=%.3f generation=%d revision=%d",
+                             leaf_index, leaf_total, len(snapshot.get("reports", [])), delivered_ms,
+                             generation, revision)
+
+            result = self.controller.scan(metrics=metrics, on_leaf_complete=publish_leaf)
+            self.controller.save_settings()
+            if result is None:
+                message = self.controller.scan_message or "Không thể hoàn tất bước quét trước xử lý."
+            else:
+                message = self.controller.queue_text()
+            LOG.info("WEBVIEW_SCAN finished=%s files=%d", bool(result), len(self.controller.all_files))
+            LOG.info("SCAN_BUILD_RESPONSE_START files=%d", len(self.controller.all_files))
+            build_started = time.perf_counter()
+            build_token = metrics.begin("SCAN_BUILD_RESPONSE")
+            try:
+                with self._lock:
+                    if self._scan_redactor is None:
+                        self._scan_redactor = self._source_path_redactor(metrics)
+                    self._scan_revision += 1
+                    response = self._dashboard_state_unlocked(
+                        message_override=message,
+                        scan_meta={"generation": generation, "revision": self._scan_revision,
+                                   "inProgress": False, "incremental": False,
+                                   "completedLeaves": metrics.leaf_completed,
+                                   "totalLeaves": metrics.leaf_folders, "firstLeafMs": metrics.first_leaf_ms},
+                        redactor_override=self._scan_redactor)
+                    self._scan_snapshot = response
+                    self._scan_pending_reports = []
+                    self._scan_active = False
+            finally:
+                metrics.end(build_token[0], build_token[1])
+                metrics.build_response_ms = (time.perf_counter() - build_started) * 1000.0
+            response_count = len(response.get("reports", []))
+            LOG.info("SCAN_BUILD_RESPONSE_END elapsed_ms=%.3f files=%d redaction_contexts=%d redaction_sources=%d",
+                     metrics.build_response_ms, response_count, metrics.redaction_context_builds,
+                     metrics.redaction_sources)
+            finished = True
+            return response
+        except Exception:
+            # A failed/cancelled scan generation never leaves a partial list looking final.  The next dashboard
+            # read rebuilds a non-scanned state; already published snapshots cannot overwrite a future generation.
+            with self._lock:
+                if generation and generation == self._scan_generation:
+                    self.controller.scan_result = None
+                    self._report_paths = {}
+                    self._scan_active = False
+                    self._scan_snapshot = None
+                    self._scan_pending_reports = []
+                    self._scan_redactor = None
+            raise
         finally:
             metrics.stop_watchdog()
+            LOG.info("SCAN_CACHE_SUMMARY hits=%d misses=%d invalidations=%d unavailable=%d stores=%d entries=%d "
+                     "evictions=%d intrinsic_derivations=%d",
+                     metrics.intrinsic_cache_hits, metrics.intrinsic_cache_misses,
+                     metrics.intrinsic_cache_invalidations, metrics.intrinsic_cache_unavailable,
+                     metrics.intrinsic_cache_stores, metrics.intrinsic_cache_entries,
+                     metrics.intrinsic_cache_evictions, metrics.intrinsic_derivations)
+            LOG.info("SCAN_INCREMENTAL_SUMMARY leaf_folders=%d leaf_completed=%d leaf_deliveries=%d "
+                     "rows_delivered=%d first_leaf_ms=%s leaf_ms=%.3f",
+                     metrics.leaf_folders, metrics.leaf_completed, metrics.leaf_deliveries,
+                     metrics.leaf_rows_delivered,
+                     f"{metrics.first_leaf_ms:.3f}" if metrics.first_leaf_ms is not None else "unavailable",
+                     metrics.leaf_ms)
             LOG.info("SCAN_PER_FILE elapsed_ms=%.3f operations=%d sequential=true",
                      metrics.per_file_ms, metrics.per_file_operations)
             LOG.info("SCAN_METADATA elapsed_ms=%.3f reads=%d errors=%d master_open_ms=%.3f",
@@ -273,77 +359,95 @@ class ApplicationService:
     def dashboard_state(self, message_override: Optional[str] = None,
                         scan_metrics: Optional[ScanMetrics] = None) -> dict:
         with self._lock:
-            c = self.controller
-            c.pump()
-            c.reconcile()
-            c.pump()
-            self._report_paths = {}  # drop the previous scan before building this response's sanitizer
-            rows = c.scan_rows("Tất cả file đã quét")
-            redactor = self._source_path_redactor(
-                scan_metrics, normalized_paths=[(row.normalized_path, row.path.name) for row in rows])
-            self._collect_logs(redactor)
-            reports = []
-            for row in rows:
-                report_id = str(row.index)
-                self._report_paths[report_id] = Path(row.path)
-                source_key = row.normalized_path or normalize_source_path(Path(row.path))
-                self._manual_fields.setdefault(source_key, {})
-                fields = self._manual_fields.get(source_key, {})
-                result = self._result_for_path(Path(row.path))
-                reports.append(self._report_dto(report_id, row, result, fields, len(reports) + 1,
-                                                source_key=source_key, redactor=redactor))
-            progress = c.progress
-            # PROMPT-024R: distinct job states for the two stop modes. "cancelling" is shown while the
-            # worker has not yet acknowledged cancel-all; the UI only shows "Đã dừng" after "done".
-            run_status = ("cancelling" if c.state == "cancelling" else
-                          "stopping" if c.state == "stopping" else
-                          "processing" if c.state == "running" else
-                          ("done" if progress.finished else "idle"))
-            current_name = ""
-            if progress.current_index is not None and 0 <= progress.current_index < len(c.rows):
-                current_name = c.rows[progress.current_index].path.name
-            candidate_ids = [str(row.index) for row in rows
-                             if row.action in (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW) and not row.excluded]
-            done_at = int(c.finished_at * 1000) if c.finished_at is not None else None
-            started_at = int(c.started_at * 1000) if c.started_at is not None else None
-            return {
-                "app": self.app_version(),
-                "config": self.current_config(),
-                "scan": {"scanned": c.scan_result is not None,
-                         "message": self._redact_source_paths(message_override or c.scan_message or
-                                                             (c.queue_text() if c.scan_result else "Chưa quét thư mục."),
-                                                             redactor)},
-                "reports": reports,
-                "job": {"status": run_status, "queue": candidate_ids if run_status == "idle" else
-                        [str(i) for i in range(progress.total)],
-                        "index": (progress.current_index or 0), "doneCount": progress.done,
-                        "stage": progress.current_stage or "waiting", "percent": progress.percent,
-                        "currentFile": current_name, "elapsedSec": c.elapsed_seconds(),
-                        "remainSec": c.eta_seconds(), "startedAt": started_at, "finishedAt": done_at,
-                        "hasSamples": c.average_report_seconds() is not None,
-                        "stopped": bool(c.summary and c.summary.stopped),
-                        # PROMPT-024R: cancel-all acknowledgement is surfaced separately from graceful stop.
-                        "cancelRequested": (c.state == "cancelling"
-                                            or bool(c.summary and getattr(c.summary, "cancel_requested", False))),
-                        "cancelledCount": int(getattr(c.summary, "cancelled", 0)) if c.summary else 0,
-                        "error": self._redact_source_paths(c.worker_failure or "", redactor)},
-                "logs": list(self._log_entries[-500:]),
-                "ollama": {"host": c.host, "port": c.port, "model": c.model,
-                           "checked": "ok" if c.ollama_ok is True else "fail" if c.ollama_ok is False else "unchecked",
-                           "message": c.ollama_status or c.ai_status_text(), "aiStatus": c.ai_status_text(),
-                           "models": list(c.available_models), "discovering": c.discovery_running,
-                           "discoveryMessage": c.discovery_progress_text(),
-                           "discoveryResults": [self._discovery_dto(x) for x in c.discovery_results],
-                           "discoveryChecked": c.discovery_checked, "discoveryTotal": c.discovery_total,
-                           "serverApplyRunning": self._server_apply_running,
-                           "serverApplyMessage": self._server_apply_message},
-                "update": self._update_dto(),
-                "diagnostics": {"running": self._diagnostics_running,
-                                "rows": [{**row, "label": self._redact_source_paths(row.get("label", ""), redactor),
-                                          "value": self._redact_source_paths(row.get("value", ""), redactor)}
-                                         for row in self._diagnostics],
-                                "error": self._redact_source_paths(self._diagnostics_error, redactor)},
-            }
+            if self._scan_active and self._scan_snapshot is not None:
+                # Coalesce every completed leaf since the previous bounded poll.  Each row DTO is built once at
+                # leaf completion, so many one-file folders cannot reintroduce cumulative O(N²) response work.
+                response = {**self._scan_snapshot, "reports": list(self._scan_pending_reports)}
+                self._scan_pending_reports.clear()
+                return response
+            return self._dashboard_state_unlocked(message_override=message_override, scan_metrics=scan_metrics)
+
+    def _dashboard_state_unlocked(self, message_override: Optional[str] = None,
+                                  scan_metrics: Optional[ScanMetrics] = None,
+                                  scan_meta: Optional[dict] = None,
+                                  redactor_override: Optional[_SourcePathRedactor] = None) -> dict:
+        c = self.controller
+        c.pump()
+        c.reconcile()
+        c.pump()
+        self._report_paths = {}  # drop the previous scan before building this response's sanitizer
+        rows = c.scan_rows("Tất cả file đã quét")
+        redactor = redactor_override or self._source_path_redactor(
+            scan_metrics, normalized_paths=[(row.normalized_path, row.path.name) for row in rows])
+        self._collect_logs(redactor)
+        reports = []
+        for row in rows:
+            report_id = str(row.index)
+            self._report_paths[report_id] = Path(row.path)
+            source_key = row.normalized_path or normalize_source_path(Path(row.path))
+            self._manual_fields.setdefault(source_key, {})
+            fields = self._manual_fields.get(source_key, {})
+            result = self._result_for_path(Path(row.path))
+            reports.append(self._report_dto(report_id, row, result, fields, len(reports) + 1,
+                                            source_key=source_key, redactor=redactor))
+        progress = c.progress
+        # PROMPT-024R: distinct job states for the two stop modes. "cancelling" is shown while the
+        # worker has not yet acknowledged cancel-all; the UI only shows "Đã dừng" after "done".
+        run_status = ("cancelling" if c.state == "cancelling" else
+                      "stopping" if c.state == "stopping" else
+                      "processing" if c.state == "running" else
+                      ("done" if progress.finished else "idle"))
+        current_name = ""
+        if progress.current_index is not None and 0 <= progress.current_index < len(c.rows):
+            current_name = c.rows[progress.current_index].path.name
+        candidate_ids = [str(row.index) for row in rows
+                         if row.action in (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW) and not row.excluded]
+        done_at = int(c.finished_at * 1000) if c.finished_at is not None else None
+        started_at = int(c.started_at * 1000) if c.started_at is not None else None
+        scan_state = {"scanned": c.scan_result is not None,
+                      "message": self._redact_source_paths(message_override or c.scan_message or
+                                                          (c.queue_text() if c.scan_result else "Chưa quét thư mục."),
+                                                          redactor),
+                      "generation": self._scan_generation, "revision": self._scan_revision,
+                      "inProgress": False, "incremental": False,
+                      "completedLeaves": 0, "totalLeaves": 0,
+                      "firstLeafMs": None}
+        scan_state.update(scan_meta or {})
+        return {
+            "app": self.app_version(),
+            "config": self.current_config(),
+            "scan": scan_state,
+            "reports": reports,
+            "job": {"status": run_status, "queue": candidate_ids if run_status == "idle" else
+                    [str(i) for i in range(progress.total)],
+                    "index": (progress.current_index or 0), "doneCount": progress.done,
+                    "stage": progress.current_stage or "waiting", "percent": progress.percent,
+                    "currentFile": current_name, "elapsedSec": c.elapsed_seconds(),
+                    "remainSec": c.eta_seconds(), "startedAt": started_at, "finishedAt": done_at,
+                    "hasSamples": c.average_report_seconds() is not None,
+                    "stopped": bool(c.summary and c.summary.stopped),
+                    # PROMPT-024R: cancel-all acknowledgement is surfaced separately from graceful stop.
+                    "cancelRequested": (c.state == "cancelling"
+                                        or bool(c.summary and getattr(c.summary, "cancel_requested", False))),
+                    "cancelledCount": int(getattr(c.summary, "cancelled", 0)) if c.summary else 0,
+                    "error": self._redact_source_paths(c.worker_failure or "", redactor)},
+            "logs": list(self._log_entries[-500:]),
+            "ollama": {"host": c.host, "port": c.port, "model": c.model,
+                       "checked": "ok" if c.ollama_ok is True else "fail" if c.ollama_ok is False else "unchecked",
+                       "message": c.ollama_status or c.ai_status_text(), "aiStatus": c.ai_status_text(),
+                       "models": list(c.available_models), "discovering": c.discovery_running,
+                       "discoveryMessage": c.discovery_progress_text(),
+                       "discoveryResults": [self._discovery_dto(x) for x in c.discovery_results],
+                       "discoveryChecked": c.discovery_checked, "discoveryTotal": c.discovery_total,
+                       "serverApplyRunning": self._server_apply_running,
+                       "serverApplyMessage": self._server_apply_message},
+            "update": self._update_dto(),
+            "diagnostics": {"running": self._diagnostics_running,
+                            "rows": [{**row, "label": self._redact_source_paths(row.get("label", ""), redactor),
+                                      "value": self._redact_source_paths(row.get("value", ""), redactor)}
+                                     for row in self._diagnostics],
+                            "error": self._redact_source_paths(self._diagnostics_error, redactor)},
+        }
 
     def _apply_configuration_for_scan(self, data: dict) -> None:
         c = self.controller
@@ -477,6 +581,8 @@ class ApplicationService:
 
     def report_details(self, report_id: str) -> dict:
         with self._lock:
+            if self._scan_active:
+                raise ServiceError("Danh sách đang được quét. Hãy đợi thư mục hiện tại hoàn tất.", "BUSY")
             rid = self._text(report_id, "reportId", 24)
             if not rid.isdigit() or rid not in self._report_paths:
                 raise ServiceError("Báo cáo không còn trong danh sách đã quét.", "REPORT_NOT_FOUND")
@@ -981,6 +1087,8 @@ class ApplicationService:
             if self.controller.is_running():
                 self.controller.request_stop()
                 return False, "Đã yêu cầu dừng sau báo cáo hiện tại. Hãy đợi xử lý kết thúc rồi đóng cửa sổ."
+            if self._scan_active:
+                return False, "Đang quét thư mục. Hãy đợi danh sách hoàn tất rồi đóng cửa sổ."
             if self._training or self._diagnostics_running or self._server_apply_running:
                 return False, "Một tác vụ nền đang chạy. Hãy đợi tác vụ hoàn tất rồi đóng cửa sổ."
             return True, ""
@@ -1486,5 +1594,6 @@ class ApplicationService:
         return ids
 
     def _assert_idle(self, message: str) -> None:
-        if self.controller.is_running() or self._training or self._diagnostics_running or self._server_apply_running:
+        if (self._scan_active or self.controller.is_running() or self._training
+                or self._diagnostics_running or self._server_apply_running):
             raise ServiceError(message, "BUSY")

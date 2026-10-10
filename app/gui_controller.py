@@ -27,9 +27,9 @@ from .ollama_discovery import (OllamaDiscovery, OllamaDiscoveryResult, discovery
                                model_available)
 from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS,
                       ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
-                      CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, MasterLookup, PreScanItem,
-                      PreScanResult, ProcessingPeriod, auto_period_from_excel, month_period, normalize_source_path,
-                      prescan, range_period)
+                      CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, IntrinsicScanCache,
+                      MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, auto_period_from_excel,
+                      month_period, normalize_source_path, prescan, range_period)
 from .excel_writer import ExcelWriter
 from .scanner import scan_inputs
 from .scan_diagnostics import ScanMetrics
@@ -421,6 +421,8 @@ class GuiController:
         self.all_files: List[Path] = []                # every discovered PPT/PPTX (recursive)
         self.input_files_override: Optional[List[Path]] = None  # explicit native file selection, otherwise folder scan
         self.scan_result: Optional[PreScanResult] = None
+        # Session-memory only.  Values contain context-free filename/date facts, never final row decisions.
+        self.intrinsic_scan_cache = IntrinsicScanCache()
         self.scan_stale: bool = False
         self.scan_message: str = ""
         self.excluded_keys: set = set()
@@ -890,7 +892,9 @@ class GuiController:
     def candidate_key(path: Path, mgmt: str) -> str:
         return f"{normalize_source_path(Path(path))}|{(mgmt or '').strip().upper()}"
 
-    def scan(self, metrics: Optional[ScanMetrics] = None) -> Optional[PreScanResult]:
+    def scan(self, metrics: Optional[ScanMetrics] = None,
+             on_leaf_complete: Optional[Callable[[PreScanResult, int, int, Path], None]] = None
+             ) -> Optional[PreScanResult]:
         """Run the REAL pre-scan (same function the batch uses) on the discovered files with the current folder /
         Excel / period / cache / force settings.  Resets manual exclusions.  Nothing is opened or written.
         Never runs while a batch is active: ``discover()`` would replace the live rows/progress from another thread."""
@@ -929,15 +933,27 @@ class GuiController:
         filter_started = time.perf_counter()
         filter_token = metrics.begin("SCAN_FILTER") if metrics is not None else None
         LOG.info("SCAN_FILTER_START candidates=%d sequential=true", len(self.all_files))
+
+        def publish_leaf(partial: PreScanResult, leaf_index: int, leaf_total: int, folder: Path) -> None:
+            # The scan thread owns controller mutation.  Service consumers receive an immutable DTO snapshot;
+            # no worker thread ever calls JavaScript and no per-file event crosses the bridge.
+            self.scan_result = partial
+            if on_leaf_complete is not None:
+                on_leaf_complete(partial, leaf_index, leaf_total, folder)
+
         try:
-            self.scan_result = prescan(self.all_files, per, cache, master, force=self.force_reprocess,
-                                       today=self._today(), on_stage=lambda m: self.log_lines.append(m),
-                                       metrics=metrics)
+            result = prescan(self.all_files, per, cache, master, force=self.force_reprocess,
+                             today=self._today(), on_stage=lambda m: self.log_lines.append(m),
+                             metrics=metrics, intrinsic_cache=self.intrinsic_scan_cache,
+                             on_leaf_complete=publish_leaf)
+            self.scan_result = result
         finally:
             if writer is not None:
                 writer.close()
             if metrics is not None:
                 metrics.end(filter_token[0], filter_token[1])
+                metrics.intrinsic_cache_entries = self.intrinsic_scan_cache.entry_count
+                metrics.intrinsic_cache_evictions = self.intrinsic_scan_cache.evictions
         filter_ms = (time.perf_counter() - filter_started) * 1000.0
         if metrics is not None and self.scan_result is not None:
             metrics.filter_ms = filter_ms
@@ -971,7 +987,7 @@ class GuiController:
         rows: List[ScanRow] = []
         live = {normalize_source_path(Path(r.path)): r for r in self.rows} if self.rows else {}
         for it in self.scan_result.items:
-            normalized = normalize_source_path(Path(it.path))
+            normalized = it.normalized_path or normalize_source_path(Path(it.path))
             key = f"{normalized}|{(it.management_number or '').strip().upper()}"
             rs = live.get(normalized)
             rows.append(ScanRow(index=it.index, key=key, path=it.path, management_number=it.management_number,

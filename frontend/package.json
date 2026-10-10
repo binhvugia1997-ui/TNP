@@ -11,7 +11,7 @@
     "test:learning-hooks": "node --test tests/learning-hooks.test.mjs",
     "test:prompt027": "node --test tests/prompt027-overlays.test.mjs",
     "test:prompt027r": "node --test tests/prompt027r-regression.test.mjs",
-    "test:frontend": "node --test tests/bridge.test.mjs tests/learning-hooks.test.mjs tests/prompt027-overlays.test.mjs tests/prompt027r-regression.test.mjs",
+    "test:frontend": "node --test tests/bridge.test.mjs tests/learning-hooks.test.mjs tests/prompt027-overlays.test.mjs tests/prompt027r-regression.test.mjs tests/prompt031r-incremental.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -19,7 +19,7 @@ from app.application_service import ApplicationService
 from app.bridge import BridgeService
 from app.config import AppConfig
 from app.gui_controller import GuiController
-from app.prescan import ACTION_OUTSIDE_PERIOD, ACTION_PROCESS, month_period, prescan
+from app.prescan import ACTION_OUTSIDE_PERIOD, ACTION_PROCESS, IntrinsicScanCache, month_period, prescan
 from app.scan_diagnostics import ScanMetrics
 
 INSIDE = 133
@@ -125,6 +125,11 @@ def test_large_quiet_scan_is_one_bounded_batch_with_identical_rescan(realistic_s
     assert metrics.metadata_errors == 0
     assert metrics.redaction_context_builds == 1
     assert metrics.redaction_sources == POWERPOINT_CANDIDATES
+    assert metrics.intrinsic_cache_hits == 0
+    assert metrics.intrinsic_cache_misses == POWERPOINT_CANDIDATES
+    assert metrics.intrinsic_derivations == POWERPOINT_CANDIDATES
+    assert metrics.leaf_folders == metrics.leaf_deliveries == 1
+    assert metrics.leaf_rows_delivered == POWERPOINT_CANDIDATES
     assert metrics.pptx_opens == 0 and metrics.powerpoint_com_starts == 0
     assert parse_calls == [] and com_calls == []
 
@@ -132,7 +137,8 @@ def test_large_quiet_scan_is_one_bounded_batch_with_identical_rescan(realistic_s
     for marker in ("SCAN_START", "SCAN_ENUMERATE_START", "SCAN_ENUMERATE_END",
                    "SCAN_FILTER_START", "SCAN_FILTER_END", "SCAN_BUILD_RESPONSE_START",
                    "SCAN_BUILD_RESPONSE_END", "SCAN_PER_FILE", "SCAN_METADATA",
-                   "SCAN_PARSE_PPTX", "SCAN_POWERPOINT_COM", "SCAN_SERIALIZE",
+                   "SCAN_CACHE_SUMMARY", "SCAN_LEAF_START", "SCAN_LEAF_END", "SCAN_LEAF_DELIVER",
+                   "SCAN_INCREMENTAL_SUMMARY", "SCAN_PARSE_PPTX", "SCAN_POWERPOINT_COM", "SCAN_SERIALIZE",
                    "SCAN_RETURN", "SCAN_TOTAL"):
         assert any(message.startswith(marker) for message in messages), marker
     assert any("entries=610" in message and "candidates=200" in message and
@@ -146,6 +152,9 @@ def test_large_quiet_scan_is_one_bounded_batch_with_identical_rescan(realistic_s
     assert service._last_scan_metrics.directory_traversals == 1
     assert service._last_scan_metrics.metadata_reads == POWERPOINT_CANDIDATES
     assert service._last_scan_metrics.redaction_context_builds == 1
+    assert service._last_scan_metrics.intrinsic_cache_hits == POWERPOINT_CANDIDATES
+    assert service._last_scan_metrics.intrinsic_cache_misses == 0
+    assert service._last_scan_metrics.intrinsic_derivations == 0
 
 
 def test_redaction_context_is_lexical_and_reused_without_source_io(tmp_path, monkeypatch):
@@ -188,11 +197,14 @@ def test_stat_error_and_corrupt_pptx_are_isolated_and_scan_terminates(tmp_path, 
 
     monkeypatch.setattr(Path, "stat", isolated_stat)
     metrics = ScanMetrics()
+    intrinsic = IntrinsicScanCache()
     result = prescan([good, bad], month_period(2026, 9), None, None,
-                     today=date(2026, 9, 30), metrics=metrics)
+                     today=date(2026, 9, 30), metrics=metrics, intrinsic_cache=intrinsic)
     assert [item.path for item in result.items] == [good, bad]
     assert [item.action for item in result.items] == [ACTION_PROCESS, ACTION_PROCESS]
     assert metrics.metadata_reads == 2 and metrics.metadata_errors == 1
+    assert metrics.intrinsic_cache_misses == 1 and metrics.intrinsic_cache_unavailable == 1
+    assert intrinsic.entry_count == 1
     assert metrics.pptx_opens == 0 and metrics.powerpoint_com_starts == 0
 
 

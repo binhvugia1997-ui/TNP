@@ -68,6 +68,23 @@ class ScanMetrics:
         self.redaction_context_builds = 0
         self.redaction_sources = 0
 
+        # PROMPT-031R: bounded aggregate counters only.  Warm scans still stat every candidate because
+        # size+mtime are part of the authorized source identity; hits skip only context-free derivation.
+        self.intrinsic_cache_hits = 0
+        self.intrinsic_cache_misses = 0
+        self.intrinsic_cache_invalidations = 0
+        self.intrinsic_cache_unavailable = 0
+        self.intrinsic_cache_stores = 0
+        self.intrinsic_cache_entries = 0
+        self.intrinsic_cache_evictions = 0
+        self.intrinsic_derivations = 0
+        self.leaf_folders = 0
+        self.leaf_completed = 0
+        self.leaf_deliveries = 0
+        self.leaf_rows_delivered = 0
+        self.leaf_ms = 0.0
+        self.first_leaf_ms: Optional[float] = None
+
         self._lock = threading.Lock()
         self._active: List[Tuple[int, str, Optional[int], str, str, float]] = []
         self._next_token = 0
@@ -130,6 +147,16 @@ class ScanMetrics:
     def slowest_operations(self) -> List[Tuple[float, str, int, str]]:
         return [(elapsed, phase, index, label)
                 for elapsed, _seq, phase, index, label in sorted(self._slowest, reverse=True)]
+
+    def record_leaf_delivery(self, row_count: int = 0) -> float:
+        """Record one immutable folder-level snapshot publication and return elapsed milliseconds."""
+        elapsed = self.elapsed_ms
+        with self._lock:
+            self.leaf_deliveries += 1
+            self.leaf_rows_delivered += max(0, int(row_count))
+            if self.first_leaf_ms is None:
+                self.first_leaf_ms = elapsed
+        return elapsed
 
     def start_watchdog(self) -> None:
         if self._watchdog_thread is not None:

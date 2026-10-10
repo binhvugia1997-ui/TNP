@@ -22,6 +22,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from .scan_diagnostics import ScanMetrics
 
 from .extractor import derive_occurrence_date, management_number_from_filename
+from .scan_diagnostics import safe_file_label
 
 LOG = logging.getLogger("report_extractor.prescan")
 
@@ -230,6 +232,92 @@ def cache_cutoff(today: date, days: int = CACHE_DAYS) -> date:
     return today - timedelta(days=days)
 
 
+# ----------------------------------------------------------------------------
+# Session-local intrinsic scan cache (PROMPT-031R)
+# ----------------------------------------------------------------------------
+INTRINSIC_CACHE_MAX_ENTRIES = 20_000
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    """Complete identity of source facts that may be reused without changing scan semantics.
+
+    Path and Management Number distinguish duplicate sources.  Size and mtime make an in-place source
+    change a miss even when a filesystem preserves one of those metadata values.  Dynamic scan context
+    (period, duplicate winner, master/cache state, force) deliberately does not belong here because it is
+    recomputed on every Quét.
+    """
+
+    normalized_path: str
+    management_number: str
+    size: int
+    mtime: float
+
+
+@dataclass(frozen=True)
+class IntrinsicScanFacts:
+    """Only context-free facts derived from one source identity."""
+
+    occurrence_date: Optional[date]
+    occurrence_reason: str
+
+
+@dataclass(frozen=True)
+class IntrinsicCacheEntry:
+    identity: SourceIdentity
+    facts: IntrinsicScanFacts
+
+
+class IntrinsicScanCache:
+    """Bounded process/session-memory cache for context-free filename facts.
+
+    Entries are indexed by normalized path and validate the full authorized source identity.  The value never
+    contains a final action/status, duplicate decision, master row, force decision, or recent-success decision.
+    """
+
+    def __init__(self, max_entries: int = INTRINSIC_CACHE_MAX_ENTRIES):
+        self.max_entries = max(1, int(max_entries))
+        self._entries: "OrderedDict[str, IntrinsicCacheEntry]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.evictions = 0
+
+    @property
+    def entry_count(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def lookup(self, identity: SourceIdentity) -> Tuple[Optional[IntrinsicScanFacts], str]:
+        """Return facts plus ``hit`` / a bounded miss reason; never inspect source contents."""
+        with self._lock:
+            entry = self._entries.get(identity.normalized_path)
+            if entry is None:
+                return None, "not_cached"
+            if entry.identity == identity:
+                self._entries.move_to_end(identity.normalized_path)
+                return entry.facts, "hit"
+            previous = entry.identity
+            if previous.management_number != identity.management_number:
+                reason = "management_changed"
+            elif previous.size != identity.size:
+                reason = "size_changed"
+            elif previous.mtime != identity.mtime:
+                reason = "mtime_changed"
+            else:
+                reason = "identity_changed"
+            return None, reason
+
+    def record(self, identity: SourceIdentity, facts: IntrinsicScanFacts) -> bool:
+        """Insert/replace one immutable intrinsic value.  ``True`` means an older path entry was replaced."""
+        with self._lock:
+            replaced = identity.normalized_path in self._entries
+            self._entries[identity.normalized_path] = IntrinsicCacheEntry(identity, facts)
+            self._entries.move_to_end(identity.normalized_path)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+                self.evictions += 1
+            return replaced
+
+
 class FastScanCache:
     """Tiny JSON cache of recently *successful* reports (optimisation only, never business data).
 
@@ -353,6 +441,7 @@ class PreScanItem:
     index: int
     path: Path
     filename: str = ""
+    normalized_path: str = ""
     management_number: str = ""
     occurrence_date: Optional[date] = None
     size: Optional[int] = None
@@ -441,7 +530,9 @@ class MasterLookup:
 def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Optional[FastScanCache],
             master: Optional[MasterLookup], force: bool = False, today: Optional[date] = None,
             on_stage: Optional[Callable[[str], None]] = None,
-            metrics: Optional["ScanMetrics"] = None) -> PreScanResult:
+            metrics: Optional["ScanMetrics"] = None,
+            intrinsic_cache: Optional[IntrinsicScanCache] = None,
+            on_leaf_complete: Optional[Callable[[PreScanResult, int, int, Path], None]] = None) -> PreScanResult:
     """Classify every discovered file WITHOUT opening it (see module doc for the order)."""
     period = period or ALL_PERIOD
     today = today or date.today()
@@ -449,14 +540,16 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
     res = PreScanResult(period=period)
     LOG.info("PRESCAN start files=%d period=%s force=%s", len(files), period.iso(), force)
 
-    # 1. file name -> Management Number -> occurrence date -> period ---------------------------
+    # 1. file name -> Management Number -> intrinsic date facts -> CURRENT period ----------------
+    # A metadata read remains mandatory on warm scans because size+mtime are part of the authorized identity.
+    # Only context-free date derivation is reused; period classification is intentionally performed every time.
     stage("Đang lọc theo thời gian...")
     for i, p in enumerate(files):
         p = Path(p)
         file_started = time.perf_counter()
         file_token = metrics.begin("SCAN_FILE", index=i, path=p, phase="metadata") if metrics is not None else None
         try:
-            it = PreScanItem(index=i, path=p, filename=p.name)
+            it = PreScanItem(index=i, path=p, filename=p.name, normalized_path=normalize_source_path(p))
             metadata_started = time.perf_counter()
             if metrics is not None:
                 metrics.metadata_reads += 1
@@ -472,12 +565,42 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
             it.management_number = management_number_from_filename(p.name)
             res.items.append(it)
             if not it.management_number:
+                if metrics is not None and intrinsic_cache is not None:
+                    metrics.intrinsic_cache_unavailable += 1
                 it.period_decision = "n/a"
                 if master is not None or not period.is_all:
                     # match mode keeps the existing "not written" outcome; a period filter cannot be applied either
                     it.action, it.reason = ACTION_INVALID_MGMT, ACTION_LABELS_VI[ACTION_INVALID_MGMT]
                 continue                     # append mode without a period: legacy behaviour, file is processed
-            it.occurrence_date, why = derive_occurrence_date(it.management_number)
+
+            facts = None
+            identity = None
+            cache_reason = "disabled"
+            if intrinsic_cache is not None and it.size is not None and it.mtime is not None:
+                identity = SourceIdentity(it.normalized_path, it.management_number, int(it.size), float(it.mtime))
+                facts, cache_reason = intrinsic_cache.lookup(identity)
+                if facts is not None:
+                    if metrics is not None:
+                        metrics.intrinsic_cache_hits += 1
+                else:
+                    if metrics is not None:
+                        metrics.intrinsic_cache_misses += 1
+                        if cache_reason != "not_cached":
+                            metrics.intrinsic_cache_invalidations += 1
+            elif metrics is not None and intrinsic_cache is not None:
+                metrics.intrinsic_cache_unavailable += 1
+
+            if facts is None:
+                occurrence, why = derive_occurrence_date(it.management_number)
+                facts = IntrinsicScanFacts(occurrence, why)
+                if metrics is not None:
+                    metrics.intrinsic_derivations += 1
+                if identity is not None:
+                    intrinsic_cache.record(identity, facts)
+                    if metrics is not None:
+                        metrics.intrinsic_cache_stores += 1
+            it.occurrence_date, why = facts.occurrence_date, facts.occurrence_reason
+
             if it.occurrence_date is None:
                 it.period_decision = "no_date"
                 if not period.is_all:
@@ -508,7 +631,7 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
             grp[0].duplicate_decision = "unique"
             continue
         # newest modified wins; ties -> deterministic (case-insensitive) path order
-        ordered = sorted(grp, key=lambda x: (-(x.mtime or 0.0), normalize_source_path(x.path)))
+        ordered = sorted(grp, key=lambda x: (-(x.mtime or 0.0), x.normalized_path))
         sel, ignored = ordered[0], ordered[1:]
         sel.duplicate_decision = "selected"
         for ig in ignored:
@@ -579,19 +702,47 @@ def prescan(files: Sequence[Path], period: Optional[ProcessingPeriod], cache: Op
             it.action, it.reason = ACTION_MASTER_COMPLETE, f"Bỏ qua — đã cập nhật (dòng {rows[0]})"
             LOG.info("MASTER_SKIP management_number=%s reason=row_complete row=%s", mgmt, rows[0])
 
+    # Complete status work by final containing folder.  Global metadata/period/duplicate decisions above are
+    # already final, so an early leaf can never be invalidated by a duplicate discovered in a later folder.
+    leaf_groups: Dict[str, List[PreScanItem]] = {}
     for it in res.items:
-        if it.action != ACTION_PROCESS or not it.management_number:
-            continue
-        status_started = time.perf_counter()
-        status_token = (metrics.begin("SCAN_FILE", index=it.index, path=it.path, phase="status")
-                        if metrics is not None else None)
-        try:
-            apply_status(it)
-        finally:
-            elapsed_ms = (time.perf_counter() - status_started) * 1000.0
-            if metrics is not None:
-                metrics.end(status_token[0], status_token[1])
-                metrics.record_file_operation(it.index, it.path, "status", elapsed_ms)
+        parent_key = it.normalized_path.rsplit("/", 1)[0] if "/" in it.normalized_path else ""
+        leaf_groups.setdefault(parent_key, []).append(it)
+    leaf_items = list(leaf_groups.values())
+    if metrics is not None:
+        metrics.leaf_folders = len(leaf_items)
+
+    for leaf_index, items in enumerate(leaf_items, 1):
+        folder = items[0].path.parent
+        folder_label = safe_file_label(folder)
+        leaf_started = time.perf_counter()
+        LOG.info("SCAN_LEAF_START index=%d total=%d folder=%s files=%d",
+                 leaf_index, len(leaf_items), folder_label, len(items))
+        for it in items:
+            if it.action != ACTION_PROCESS or not it.management_number:
+                continue
+            status_started = time.perf_counter()
+            status_token = (metrics.begin("SCAN_FILE", index=it.index, path=it.path, phase="status")
+                            if metrics is not None else None)
+            try:
+                apply_status(it)
+            finally:
+                elapsed_ms = (time.perf_counter() - status_started) * 1000.0
+                if metrics is not None:
+                    metrics.end(status_token[0], status_token[1])
+                    metrics.record_file_operation(it.index, it.path, "status", elapsed_ms)
+        leaf_ms = (time.perf_counter() - leaf_started) * 1000.0
+        if metrics is not None:
+            metrics.leaf_completed += 1
+            metrics.leaf_ms += leaf_ms
+        LOG.info("SCAN_LEAF_END index=%d total=%d folder=%s files=%d elapsed_ms=%.3f",
+                 leaf_index, len(leaf_items), folder_label, len(items), leaf_ms)
+        if on_leaf_complete is not None:
+            leaf_mgmt = {item.management_number for item in items if item.management_number}
+            leaf_result = PreScanResult(period=res.period, items=list(items),
+                                        duplicates={key: value for key, value in res.duplicates.items()
+                                                    if key in leaf_mgmt})
+            on_leaf_complete(leaf_result, leaf_index, len(leaf_items), folder)
 
     c = res.counts()
     LOG.info("PRESCAN done %s", " ".join(f"{k}={v}" for k, v in c.items()))

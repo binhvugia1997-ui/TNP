@@ -82,7 +82,17 @@ type NativeConfig = {
 type DashboardDTO = {
   app: { name: string; title: string; version: string; build: string; buildNumber: number }
   config: NativeConfig
-  scan: { scanned: boolean; message: string }
+  scan: {
+    scanned: boolean
+    message: string
+    generation?: number
+    revision?: number
+    inProgress?: boolean
+    incremental?: boolean
+    completedLeaves?: number
+    totalLeaves?: number
+    firstLeafMs?: number | null
+  }
   reports: Report[]
   job: ProcessingRun & { error?: string }
   logs: LogEntry[]
@@ -104,6 +114,42 @@ type DashboardDTO = {
   }
   update: UpdateState
   diagnostics: { running: boolean; rows: DiagnosticRow[]; error: string }
+}
+
+export type ScanSnapshotVersion = { generation: number; revision: number }
+
+function scanSnapshotVersion(scan: DashboardDTO['scan']): ScanSnapshotVersion {
+  return {
+    generation: Number.isFinite(scan?.generation) ? Number(scan.generation) : 0,
+    revision: Number.isFinite(scan?.revision) ? Number(scan.revision) : 0,
+  }
+}
+
+/** Reject delayed poll responses and the previous completed generation while a new Quét is pending. */
+export function shouldAcceptScanSnapshot(
+  current: ScanSnapshotVersion,
+  incoming: DashboardDTO['scan'],
+  pendingBaselineGeneration: number | null = null,
+): boolean {
+  const next = scanSnapshotVersion(incoming)
+  if (next.generation < current.generation) return false
+  if (next.generation === current.generation && next.revision < current.revision) return false
+  if (pendingBaselineGeneration !== null && next.generation <= pendingBaselineGeneration && !incoming.inProgress) {
+    return false
+  }
+  return true
+}
+
+function mergeIncrementalReports(current: Report[], incoming: Report[]): Report[] {
+  const byId = new Map(current.map((item) => [item.id, item]))
+  for (const item of incoming) byId.set(item.id, item)
+  return [...byId.values()]
+    .sort((left, right) => {
+      const a = Number(left.id)
+      const b = Number(right.id)
+      return Number.isFinite(a) && Number.isFinite(b) ? a - b : left.id.localeCompare(right.id)
+    })
+    .map((item, index) => ({ ...item, stt: index + 1 }))
 }
 
 const EMPTY_RUN: ProcessingRun = {
@@ -147,6 +193,10 @@ function normalizeDashboard(raw: DashboardDTO): DashboardDTO {
   const reports = (raw.reports || []).map(reportFromDto)
   return {
     ...raw,
+    scan: { ...raw.scan, generation: raw.scan?.generation ?? 0, revision: raw.scan?.revision ?? 0,
+      inProgress: raw.scan?.inProgress ?? false, incremental: raw.scan?.incremental ?? false,
+      completedLeaves: raw.scan?.completedLeaves ?? 0,
+      totalLeaves: raw.scan?.totalLeaves ?? 0, firstLeafMs: raw.scan?.firstLeafMs ?? null },
     reports,
     job: { ...EMPTY_RUN, ...(raw.job || {}), stage: stageKey(raw.job?.stage) },
     ollama: { ...EMPTY_OLLAMA, ...(raw.ollama || {}) },
@@ -174,6 +224,7 @@ function useStoreValue() {
   const [scanned, setScanned] = useState(false)
   const [scanDirty, setScanDirty] = useState(false)
   const [scanBusy, setScanBusy] = useState(false)
+  const [scanInProgress, setScanInProgress] = useState(false)
   const [scanMessage, setScanMessage] = useState('Chưa chọn thư mục báo cáo PPTX.')
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [activeId, setActiveIdValue] = useState('')
@@ -213,6 +264,10 @@ function useStoreValue() {
   const [inputFileToken, setInputFileToken] = useState('')
   const [inputFileName, setInputFileName] = useState('')
   const dashboardInFlight = useRef(false)
+  const reportsRef = useRef<Report[]>([])
+  const scanBusyRef = useRef(false)
+  const scanVersionRef = useRef<ScanSnapshotVersion>({ generation: 0, revision: 0 })
+  const scanBaselineGenerationRef = useRef<number | null>(null)
   const learningInFlight = useRef(false)
   const lastLearningRefresh = useRef(0)
   const bridgeReadyRef = useRef(false)
@@ -223,6 +278,7 @@ function useStoreValue() {
   const ollamaDirty = useRef(false)
   const updateDirty = useRef(false)
   const alive = useRef(true)
+  useEffect(() => { reportsRef.current = reports }, [reports])
   const publishError = useCallback((error: unknown) => {
     if (!alive.current || isAbortError(error)) return
     const details = safeErrorDetails(error)
@@ -272,8 +328,16 @@ function useStoreValue() {
   const acceptDashboard = useCallback((raw: DashboardDTO) => {
     if (!alive.current) return
     const data = normalizeDashboard(raw)
+    const pendingBaseline = scanBusyRef.current ? scanBaselineGenerationRef.current : null
+    if (!shouldAcceptScanSnapshot(scanVersionRef.current, data.scan, pendingBaseline)) return
+    scanVersionRef.current = scanSnapshotVersion(data.scan)
+    setScanInProgress(Boolean(data.scan.inProgress))
+    const nextReports = data.scan.incremental
+      ? mergeIncrementalReports(reportsRef.current, data.reports)
+      : data.reports
+    reportsRef.current = nextReports
     setAppInfo({ name: data.app.name, title: data.app.title, version: data.app.version, build: data.app.build })
-    setReports(data.reports)
+    setReports(nextReports)
     setScanned(Boolean(data.scan.scanned))
     setScanMessage(data.scan.message || '')
     setRun(data.job)
@@ -303,11 +367,11 @@ function useStoreValue() {
         || current.startsWith('Hợp đồng bridge Python') || current.startsWith('Python bridge trả về phản hồi') ? '' : current)
       setErrorCode((current) => ['BRIDGE_UNAVAILABLE', 'BRIDGE_METHOD_MISSING', 'BRIDGE_CONTRACT_ERROR'].includes(current) ? '' : current)
     }
-    if (data.reports.length === 0) {
+    if (nextReports.length === 0) {
       setActiveIdValue('')
       setSelectedIds([])
     } else {
-      setActiveIdValue((current) => data.reports.some((r) => r.id === current) ? current : data.reports[0].id)
+      setActiveIdValue((current) => nextReports.some((r) => r.id === current) ? current : nextReports[0].id)
     }
     if (data.job.error) { setErrorCode('WORKER_FAILED'); setErrorMessage(data.job.error) }
   }, [])
@@ -430,12 +494,13 @@ function useStoreValue() {
   }, [recordError])
 
   useEffect(() => {
-    if (!activeReport || !connected || ['waiting', 'new_row', 'processing'].includes(activeReport.status)) return
+    if (!activeReport || !connected || scanBusy || scanInProgress
+      || ['waiting', 'new_row', 'processing'].includes(activeReport.status)) return
     const signature = `${activeReport.status}:${activeReport.shortResult}:${activeReport.excelRow || ''}`
     if (detailStatus.current[activeReport.id] === signature) return
     detailStatus.current[activeReport.id] = signature
     void fetchReportDetails(activeReport)
-  }, [activeReport, connected, fetchReportDetails])
+  }, [activeReport, connected, fetchReportDetails, scanBusy, scanInProgress])
 
   const stats = useMemo(() => {
     const counts = { completed: 0, needs_review: 0, error: 0, skipped: 0, total: reports.length }
@@ -504,7 +569,14 @@ function useStoreValue() {
 
   const scan = useCallback(async () => {
     if (running) return
+    scanBaselineGenerationRef.current = scanVersionRef.current.generation
+    scanBusyRef.current = true
     setScanBusy(true)
+    setScanInProgress(true)
+    reportsRef.current = []
+    setReports([])
+    setActiveIdValue('')
+    setSelectedIds([])
     clearError()
     setScanMessage('Đang quét danh sách bằng bộ quét Python…')
     try {
@@ -519,7 +591,10 @@ function useStoreValue() {
     } catch (error) {
       recordError(error)
     } finally {
+      scanBusyRef.current = false
+      scanBaselineGenerationRef.current = null
       setScanBusy(false)
+      setScanInProgress(false)
     }
   }, [acceptDashboard, clearError, configDto, inputFileToken, recordError, running])
 
