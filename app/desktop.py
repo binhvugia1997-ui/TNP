@@ -221,11 +221,145 @@ def dotnet_framework_report() -> str:
     return f"Release={release}({'ok' if release >= DOTNET_FX_MIN_RELEASE else 'TOO-OLD: need 4.7.2+/461808'})"
 
 
-def runtime_diagnostics(probe_dotnet: bool = True) -> dict:
+# --------------------------------------------------------------------------- Mark-of-the-Web (PROMPT-030)
+# The packaged exe died with one opaque line:
+#
+#     RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize from
+#                   H:\...\_internal\pythonnet\runtime\Python.Runtime.dll
+#
+# ``clr_loader/ffi/netfx.py`` declares exactly five native functions — pyclr_initialize,
+# pyclr_create_appdomain, pyclr_get_function, pyclr_close_appdomain, pyclr_finalize — and NO error
+# accessor, so whatever the CLR really threw is discarded and every distinct failure collapses into that
+# string.  ``NetFx.__init__`` also stores whatever ``pyclr_create_appdomain`` returned without checking it
+# for NULL.
+#
+# The classes that a BUILD can settle are now settled there (``tools/build_portable.py`` proves the payload
+# is pythonnet's own managed assembly — ``Python.Runtime 3.0.5.0``, IL-only/any-cpu, targeting
+# ``.NETStandard,Version=v2.0`` — declaring ``Python.Runtime.Loader.Initialize`` as
+# ``static int32 (native int, int32)``, which is precisely clr_loader's ``entry_point`` typedef, and that
+# the packaged ``ClrLoader.dll`` is mixed-mode, matches the interpreter's architecture and exports all five
+# ``pyclr_*`` symbols).  A wrong or renamed payload, a pythonnet↔clr-loader signature skew and an
+# architecture mismatch therefore stop the build instead of the exe.
+#
+# What remains is a property of the machine the package LANDED on, and the one that fits every observed
+# fact is a blocked assembly.  Windows attaches a ``Zone.Identifier`` alternate data stream when a folder
+# is extracted from ``release/ReportExtractor_<version>.zip`` or copied from another PC or USB stick —
+# i.e. AFTER the build gate ran.  ``LoadLibrary`` ignores that stream, so the native ``ClrLoader.dll``
+# loads and the app domain is created; ``Assembly.LoadFrom`` does NOT, so the managed
+# ``Python.Runtime.dll`` is refused with ``COR_E_FILELOAD`` / 0x80131515 "Operation is not supported".
+# That is exactly a DLL which exists at the right path with the right SHA256 and still cannot initialize,
+# and it is why the same bytes work from ``.venv-build`` (pip never attaches the stream) but not from the
+# Portable folder.
+ZONE_IDENTIFIER_STREAM = "Zone.Identifier"
+
+
+def _read_zone_identifier(path: Path) -> Optional[str]:
+    """The ``Zone.Identifier`` stream of ``path``, or None when it is not blocked.
+
+    Never raises: a filesystem without alternate data streams simply reports "not blocked".
+    """
+    try:
+        with open(f"{path}:{ZONE_IDENTIFIER_STREAM}", "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(400).strip() or "present"
+    except OSError:
+        return None
+
+
+def _remove_zone_identifier(path: Path) -> bool:
+    """Delete the ``Zone.Identifier`` stream — what Windows' "Unblock" checkbox and Unblock-File do."""
+    try:
+        os.remove(f"{path}:{ZONE_IDENTIFIER_STREAM}")
+        return True
+    except OSError:
+        return False
+
+
+def packaged_runtime_files() -> List[Path]:
+    """The managed assembly and the native netfx host the frozen app must load — never anything outside it.
+
+    Both live under ``sys._MEIPASS``: ``pythonnet`` computes ``<bundle>/pythonnet/runtime/Python.Runtime.dll``
+    and ``clr_loader.ffi.load_netfx()`` computes ``<bundle>/clr_loader/ffi/dlls/<arch>/ClrLoader.dll``.
+    """
+    dll = pythonnet_runtime_dll()
+    if dll is None:
+        return []
+    arch = "amd64" if sys.maxsize > 2 ** 32 else "x86"
+    bundle = dll.parents[2]                     # …/pythonnet/runtime/Python.Runtime.dll → …/_internal
+    return [dll, bundle / "clr_loader" / "ffi" / "dlls" / arch / "ClrLoader.dll"]
+
+
+def unblock_packaged_runtime(remediate: bool = True) -> dict:
+    """Report — and by default clear — a Mark-of-the-Web block on the packaged .NET runtime files.
+
+    Only ever runs on Windows inside a frozen build, and only touches the two runtime files under
+    ``sys._MEIPASS``; a development install gets files from pip, which never attaches the stream, and
+    site-packages is left alone.  Clearing it is the same act as ticking "Unblock" on the folder, and
+    without it the exe cannot start at all, so it is done up front and recorded in the log.  Every failure
+    path degrades to a report: a read-only or locked file must never be the reason the app does not start.
+    """
+    report: dict = {"checked": 0, "blocked": [], "unblocked": [], "failed": []}
+    if sys.platform != "win32" or not is_packaged():
+        return report
+    for path in packaged_runtime_files():
+        try:
+            present = path.is_file()
+        except OSError:
+            continue
+        if not present:
+            continue
+        report["checked"] += 1
+        zone = _read_zone_identifier(path)
+        if zone is None:
+            continue
+        report["blocked"].append(path.name)
+        if remediate and _remove_zone_identifier(path):
+            report["unblocked"].append(path.name)
+        elif remediate:
+            report["failed"].append(path.name)
+    return report
+
+
+def appdomain_report() -> str:
+    """Whether clr_loader REALLY holds a .NET Framework AppDomain handle.
+
+    ``pythonnet.get_runtime_info()`` cannot answer this: ``clr_loader/netfx.py::NetFx.info()`` returns
+    ``RuntimeInfo(kind=".NET Framework", version="<undefined>", initialized=True, …)`` with
+    ``initialized`` HARDCODED and no version at all.  A log line reading "Runtime: .NET Framework /
+    Initialized: True" is therefore NOT evidence that an app domain exists — the PROMPT-028R hint text
+    asserted exactly that and misled the diagnosis.  Read the handle instead.
+    """
+    if sys.platform != "win32":
+        return "not-applicable"
+    try:
+        import pythonnet                                 # noqa: PLC0415 – optional, Windows-only in practice
+        runtime = getattr(pythonnet, "_RUNTIME", None)
+        if runtime is None:
+            return "no-runtime-selected"
+        if not hasattr(runtime, "_domain"):
+            return f"not-a-netfx-runtime({type(runtime).__name__})"
+        domain = runtime._domain                         # noqa: SLF001 – the only place the truth lives
+        try:
+            from clr_loader.ffi import ffi               # noqa: PLC0415
+            is_null = bool(domain == ffi.NULL)
+        except Exception:                                # noqa: BLE001 – cffi missing must not hide the answer
+            is_null = not domain
+        if is_null:
+            return "NULL(pyclr_create_appdomain failed – the CLR itself would not start)"
+        return "created"
+    except Exception:                                    # noqa: BLE001 – diagnostics must never be the crash
+        return "unknown"
+
+
+def runtime_diagnostics(probe_dotnet: bool = True, remediate_block: bool = True) -> dict:
     """Everything needed to explain a pywebview/.NET start-up failure, as safe short strings.
 
     Versions and the resolved DLL path only — no report data, no user documents.  Paths do appear here
     because this goes to ``logs/app.log`` and ``logs/startup_error.log``, never to the React UI.
+
+    Has one deliberate side effect: ``unblock_packaged_runtime()`` clears a Mark-of-the-Web block on the
+    packaged runtime files before anything tries to load them.  This function already probes ``import clr``
+    (which loads the runtime), so the remediation happens here — before that probe — rather than after the
+    failure it exists to prevent.  Pass ``remediate_block=False`` for a read-only report.
     """
     dll = pythonnet_runtime_dll()
     info = {
@@ -249,6 +383,16 @@ def runtime_diagnostics(probe_dotnet: bool = True) -> dict:
         except Exception:                                # noqa: BLE001
             info["dotnet_runtime"] = "netfx(default-on-windows)"
         info["dotnet_framework"] = dotnet_framework_report()
+        # Clear a Windows block BEFORE anything loads the assembly: LoadLibrary ignores Zone.Identifier but
+        # Assembly.LoadFrom does not, which is how a DLL that exists and hashes correctly still fails to
+        # initialize (PROMPT-030).
+        block = unblock_packaged_runtime(remediate=remediate_block)
+        info["runtime_files_checked"] = str(block["checked"])
+        info["blocked_runtime"] = ",".join(block["blocked"]) or "none"
+        if block["unblocked"]:
+            info["unblocked_runtime"] = ",".join(block["unblocked"])
+        if block["failed"]:
+            info["unblock_failed"] = ",".join(block["failed"])
         if probe_dotnet:
             try:
                 import clr  # noqa: F401  – triggers pythonnet.load(); idempotent once loaded
@@ -256,20 +400,29 @@ def runtime_diagnostics(probe_dotnet: bool = True) -> dict:
             except BaseException as exc:                 # noqa: BLE001 – the whole point is to capture it
                 info["clr_import"] = f"{type(exc).__name__}"
                 info["clr_import_error"] = _safe_error(exc)
+            # Only meaningful after the attempt: get_runtime_info() cannot distinguish a NULL domain.
+            info["dotnet_appdomain"] = appdomain_report()
     return info
 
 
 #: The two failure signatures that mean "the packaged .NET runtime is wrong", translated for a human.
 _CLR_HINTS = (
     ("Failed to resolve Python.Runtime.Loader.Initialize",
-     "clr_loader created a .NET Framework app domain but Assembly.LoadFrom could not produce a usable "
-     "Python.Runtime.Loader type. Check, in order: (1) does the exact path printed as python_runtime_dll "
-     "exist in logs/app.log? hook-clr's legacy fallback collects the DLL to '.' instead of "
-     "'pythonnet/runtime', which leaves that path empty; (2) is it byte-identical to the build venv's "
-     "pythonnet/runtime/Python.Runtime.dll (tools/build_portable.py validate_pythonnet_runtime prints both "
-     "SHA256)? (3) is .NET Framework 4.7.2+ installed? Python.Runtime.dll targets .NETStandard 2.0 and "
-     "needs the netstandard facade from 4.7.2 (registry Release >= 461808) — see dotnet_framework in the "
-     "same log line."),
+     "clr_loader/netfx.py maps EVERY failure of the native pyclr_get_function() onto this one string and "
+     "its cdef declares no error accessor, so the real .NET exception is discarded. It does NOT prove an "
+     "app domain was created (NetFx.info() hardcodes initialized=True and version='<undefined>'), and it "
+     "prints the path pythonnet ASKED for, not a path that exists. Read the same WEBVIEW_RUNTIME log line "
+     "instead, in this order: (1) blocked_runtime=<name> — Windows attached a Zone.Identifier stream when "
+     "this folder came out of a ZIP or from another PC/USB stick; LoadLibrary ignores it so ClrLoader.dll "
+     "loads, Assembly.LoadFrom refuses it with 0x80131515. The app clears it automatically when it can "
+     "(see unblocked_runtime / unblock_failed); otherwise right-click the Portable folder → Properties → "
+     "Unblock, or Unblock-File on it. (2) dotnet_appdomain=NULL — the CLR itself would not start, i.e. "
+     ".NET Framework older than 4.7.2. (3) dotnet_framework=Release=…(TOO-OLD) — Python.Runtime.dll "
+     "targets .NETStandard 2.0 and needs Release >= 461808; install the .NET Framework 4.8 Runtime. "
+     "(4) python_runtime_dll_exists=False, or a SHA256 that differs from the build venv — a packaging "
+     "mistake; run `python tools/build_portable.py --validate-only <portable folder>` to see which. "
+     "Assembly identity, architecture and the Initialize signature are proven at build time, so they are "
+     "not candidate causes here."),
     ("Python.Runtime.dll not found",
      "pythonnet is not packaged correctly; _internal/pythonnet/runtime/Python.Runtime.dll is missing."),
     ("Could not find a suitable hostfxr",
@@ -319,6 +472,12 @@ def main(argv=None) -> int:
     # while initialising the Windows backend explains itself in logs/app.log instead of vanishing.
     diagnostics = runtime_diagnostics()
     LOG.info("WEBVIEW_RUNTIME %s", " ".join(f"{k}={v}" for k, v in diagnostics.items()))
+    if diagnostics.get("blocked_runtime", "none") != "none":
+        LOG.warning("WEBVIEW_DOTNET_BLOCKED %s unblocked=%s failed=%s — Windows had marked the packaged "
+                    ".NET runtime as having come from another computer; Assembly.LoadFrom refuses such a "
+                    "file even though it exists at the right path with the right SHA256",
+                    diagnostics.get("blocked_runtime"), diagnostics.get("unblocked_runtime", "none"),
+                    diagnostics.get("unblock_failed", "none"))
     hint = explain_clr_failure(" ".join(str(v) for v in diagnostics.values()))
     if diagnostics.get("clr_import") not in (None, "ok") or diagnostics.get("python_runtime_dll_exists") == "False":
         LOG.error("WEBVIEW_DOTNET_PROBLEM %s%s", diagnostics.get("clr_import_error", ""),

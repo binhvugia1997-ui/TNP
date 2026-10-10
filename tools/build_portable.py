@@ -28,6 +28,7 @@ import json
 import os
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import zipfile
@@ -36,6 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from console_safe import child_env, configure_console, safe_text  # noqa: E402
+import dotnet_pe  # noqa: E402  (ECMA-335 reader: proves what a packaged .NET assembly IS – PROMPT-030)
 import publish_update  # noqa: E402  (centralised update-folder configuration + safe publisher)
 
 PUBLISH_FAILED_RC = 3          # build succeeded, publishing did not (distinct from build failures = 1)
@@ -268,6 +270,11 @@ REQUIRED_WEBVIEW_WINDOWS_FILES = (
 # them by double-clicking the exe.
 PYTHONNET_RUNTIME_DLL = "Python.Runtime.dll"
 PYTHONNET_RUNTIME_RELPATH = Path("_internal") / "pythonnet" / "runtime" / PYTHONNET_RUNTIME_DLL
+#: where clr_loader.ffi.load_netfx() dlopen()s its mixed-mode C++/CLI host from, inside the package.
+CLR_LOADER_RELPATH = Path("_internal") / "clr_loader" / "ffi" / "dlls"
+#: same key app/desktop.py reads to report the installed .NET Framework; kept literal here so the build
+#: gate stays importable without the app package.
+DOTNET_FX_REG_KEY = r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
 #: pywebview's Windows backend (winforms -> edgechromium) needs these to be reachable at start-up.
 REQUIRED_BUILD_PACKAGES = ("pywebview", "pythonnet", "clr-loader", "pyinstaller", "pyinstaller-hooks-contrib")
 
@@ -391,15 +398,233 @@ def source_pythonnet_dll(py: Path) -> dict:
     return _query(py, code)
 
 
-def validate_pythonnet_runtime(folder: Path, source: dict | None = None) -> list[str]:
-    """Prove the packaged .NET runtime is the one the build environment intended.
+#: The five native symbols ``clr_loader/ffi/netfx.py`` declares in its cdef.  ``ClrLoader.dll`` is the only
+#: thing that can supply them, and a package shipping a host without one of them fails at
+#: ``pyclr_get_function`` with exactly the PROMPT-030 error.
+PYCLR_EXPORTS = ("pyclr_initialize", "pyclr_create_appdomain", "pyclr_get_function",
+                 "pyclr_close_appdomain", "pyclr_finalize")
+#: .NET Framework ``Release`` (HKLM\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Full) that first
+#: ships the netstandard facade a ``.NETStandard,Version=v2.0`` assembly needs.  461808 == 4.7.2.
+NETFX_RELEASE_BY_TARGET = {"v4.7": 460798, "v4.7.1": 461308, "v4.7.2": 461808,
+                           "v4.8": 528040, "v4.8.1": 533320}
+#: ``Python.Runtime.dll`` targets ``.NETStandard,Version=v2.0`` (measured, not assumed) — see module comment.
+NETSTANDARD_MIN_NETFX_RELEASE = {"v2.0": 461808}
 
-    Checks: exactly ONE ``Python.Runtime.dll`` in the whole package, at the path pythonnet itself computes
-    (``<bundle>/pythonnet/runtime/``), byte-identical to the source install, plus the native
-    ``ClrLoader.dll`` that ``clr_loader.ffi.load_netfx()`` dlopen()s.  Source and packaged SHA256 are
-    printed so the acceptance record can compare them.
+
+def mark_of_the_web(path: Path) -> str | None:
+    """The ``Zone.Identifier`` alternate data stream of ``path``, or None when it is not blocked.
+
+    Windows attaches that stream when a ZIP is extracted or a file arrives from another machine, and the
+    .NET Framework then REFUSES ``Assembly.LoadFrom`` on it (``COR_E_FILELOAD``, HRESULT 0x80131515,
+    "Operation is not supported") unless the hosting AppDomain enables ``loadFromRemoteSources`` — while
+    ``LoadLibrary`` on the NATIVE ``ClrLoader.dll`` ignores the stream completely.  That asymmetry is the
+    one mechanism which lets clr_loader create its app domain and still fail to resolve
+    ``Python.Runtime.Loader.Initialize`` from a DLL that exists at the right path with the right SHA256,
+    i.e. from a package that passes every presence/hash check.  Reading the stream is harmless everywhere:
+    on a filesystem without ADS support the open simply fails.
+    """
+    if not path.is_file():
+        return None
+    try:
+        with open(f"{path}:Zone.Identifier", "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(400).strip() or "present"
+    except OSError:
+        return None
+
+
+def required_netfx_release(image) -> tuple[int | None, str]:
+    """Minimum .NET Framework ``Release`` that can host ``image``, derived from what it actually targets."""
+    for target in image.target_frameworks:
+        lowered = target.lower()
+        if "netstandard" in lowered:
+            version = lowered.split("version=")[-1].strip()
+            need = NETSTANDARD_MIN_NETFX_RELEASE.get(version)
+            if need is None:
+                return None, f"{target} (no .NET Framework release can host it)"
+            return need, f"{target} → .NET Framework Release ≥ {need} (4.7.2+)"
+        if "netframework" in lowered:
+            version = "v" + lowered.split("version=")[-1].strip().lstrip("v")
+            return NETFX_RELEASE_BY_TARGET.get(version), f"{target}"
+    return None, ", ".join(image.target_frameworks) or "<no TargetFrameworkAttribute>"
+
+
+def prove_runtime_identity(dll: Path, problems: list[str]) -> None:
+    """Prove the packaged payload IS pythonnet's managed runtime and declares the entry point clr_loader binds.
+
+    Presence and SHA256 cannot answer this: they say a file with the right name and the right bytes is
+    there, not that the bytes are a .NET assembly declaring ``Python.Runtime.Loader.Initialize`` with the
+    signature ``clr_loader/ffi/netfx.py``'s ``entry_point`` typedef requires.  Everything here is read out
+    of the PE itself, so it is decided identically on Windows and on Linux.
+    """
+    try:
+        image = dotnet_pe.inspect(dll)
+    except dotnet_pe.DotNetPEError as exc:
+        problems.append(f"{dll.name} không phải là một .NET assembly đọc được: {exc}")
+        return
+    print("   " + dotnet_pe.describe(image).replace("\n", "\n   "))
+    if image.assembly is None or image.assembly.name != "Python.Runtime":
+        problems.append(f"{dll.name} có danh tính assembly '{image.assembly}' chứ không phải "
+                        "'Python.Runtime' — file đúng tên/đúng vị trí nhưng không phải runtime của pythonnet")
+    ok, why = dotnet_pe.signature_matches_entry_point(image)
+    print(f"   entry point    {why}")
+    if not ok:
+        problems.append(f"{dll.name} không phân giải được entry point: {why}")
+    if not image.il_only or image.requires_32bit:
+        problems.append(f"{dll.name} không phải IL-only/any-cpu (machine={image.machine}, "
+                        f"IL-only={image.il_only}, 32-bit-required={image.requires_32bit}) — kiến trúc "
+                        "của nó sẽ xung đột với tiến trình ReportExtractor.exe")
+    need, because = required_netfx_release(image)
+    if need is None and "no .NET Framework" in because:
+        problems.append(f"{dll.name} nhắm tới {because}: .NET Framework (netfx) không bao giờ nạp được nó")
+    elif need is not None:
+        release = dotnet_framework_release_of_build_machine()
+        print(f"   .NET cần       {because}"
+              + (f"; máy này Release={release}" if release is not None else ""))
+        if release is not None and release < need:
+            problems.append(f"{dll.name} cần .NET Framework Release ≥ {need} nhưng máy này có {release} "
+                            "(4.7.2+): Assembly.LoadFrom sẽ ném và clr_loader/netfx.py chỉ báo "
+                            "'Failed to resolve Python.Runtime.Loader.Initialize'")
+
+
+def prove_clr_loader(folder: Path, arch: str, problems: list[str]) -> Path | None:
+    """Prove the packaged netfx host is the right architecture and exports what clr_loader dlopen()s."""
+    host = folder / CLR_LOADER_RELPATH / arch / "ClrLoader.dll"
+    if not host.is_file():
+        problems.append(f"thiếu clr_loader/ffi/dlls/{arch}/ClrLoader.dll (hook-clr_loader) – "
+                        "clr_loader.netfx không nạp được .NET Framework")
+        return None
+    print(f"   host netfx     {host.relative_to(folder).as_posix()} size={host.stat().st_size} "
+          f"sha256={sha256(host)}")
+    try:
+        image = dotnet_pe.inspect(host)
+    except dotnet_pe.DotNetPEError as exc:
+        problems.append(f"ClrLoader.dll ({arch}) không đọc được: {exc}")
+        return host
+    print("   " + dotnet_pe.describe(image).replace("\n", "\n   "))
+    missing = [name for name in PYCLR_EXPORTS if name not in image.exports]
+    if missing:
+        problems.append(f"ClrLoader.dll ({arch}) không export {', '.join(missing)} — cdef của "
+                        "clr_loader/ffi/netfx.py sẽ thất bại ngay khi dlopen")
+    if image.il_only:
+        problems.append(f"ClrLoader.dll ({arch}) là IL-only: nó phải là mixed-mode C++/CLI để cffi "
+                        "dlopen() được các hàm pyclr_*")
+    if image.machine != arch:
+        problems.append(f"ClrLoader.dll trong thư mục {arch}/ thực chất là {image.machine} — tiến trình "
+                        f"{arch} sẽ nhận BadImageFormatException")
+    return host
+
+
+#: Runs in the BUILD venv but against the PACKAGED bytes: the exact call chain that failed on Windows
+#: (``ffi.dlopen(ClrLoader.dll)`` → ``pyclr_initialize`` → ``pyclr_create_appdomain`` →
+#: ``pyclr_get_function(Python.Runtime.dll, "Python.Runtime.Loader", "Initialize")``), so the build proves
+#: LOADABILITY instead of only presence/hash.  ``clr_loader`` never checks whether the app-domain handle
+#: came back NULL and its netfx cdef has no error accessor, so both are read directly here.
+PROBE_PACKAGED_RUNTIME = r"""
+import json, sys
+from pathlib import Path
+from cffi import FFI
+
+folder, arch = Path(sys.argv[1]), sys.argv[2]
+out = {"arch": arch}
+ffi = FFI()
+ffi.cdef('''
+typedef void* pyclr_domain;
+typedef int (*entry_point)(void* buffer, int size);
+void pyclr_initialize();
+void* pyclr_create_appdomain(const char* name, const char* config_file);
+entry_point pyclr_get_function(pyclr_domain domain, const char* assembly_path,
+                               const char* class_name, const char* function);
+void pyclr_close_appdomain(pyclr_domain domain);
+void pyclr_finalize();
+''')
+try:
+    host = folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch / "ClrLoader.dll"
+    assembly = folder / "_internal" / "pythonnet" / "runtime" / "Python.Runtime.dll"
+    out["host"] = str(host)
+    out["assembly"] = str(assembly)
+    fw = ffi.dlopen(str(host))
+    fw.pyclr_initialize()
+    domain = fw.pyclr_create_appdomain(ffi.NULL, ffi.NULL)
+    out["appdomain"] = "NULL" if domain == ffi.NULL else "created"
+    func = fw.pyclr_get_function(domain, str(assembly).encode("utf8"),
+                                 b"Python.Runtime.Loader", b"Initialize")
+    out["resolved"] = func != ffi.NULL
+    if out["resolved"]:
+        buffer = ffi.from_buffer("char[]", b"")
+        out["initialize_rc"] = int(func(ffi.cast("void*", buffer), 0))
+except BaseException as exc:
+    out["error"] = f"{type(exc).__name__}: {exc}"[:400]
+print(json.dumps(out))
+"""
+
+
+def probe_packaged_runtime(folder: Path, py: Path, arch: str) -> list[str]:
+    """Actually resolve ``Python.Runtime.Loader.Initialize`` out of the finished package (Windows only).
+
+    Returns the problems it found.  A failure here means the shipped exe WILL die at start-up, so the build
+    stops instead of publishing it.  Where the probe cannot run (non-Windows, no build interpreter) it says
+    so explicitly rather than reporting a pass it never performed.
+    """
+    if platform.system() != "Windows":
+        print("   probe loadability: BỎ QUA — .NET Framework chỉ có trên Windows; phần chứng minh "
+              "danh tính/kiến trúc/entry point ở trên vẫn chạy trên mọi nền tảng")
+        return []
+    try:
+        proc = subprocess.run([str(py), "-c", PROBE_PACKAGED_RUNTIME, str(folder), arch],
+                              cwd=str(folder), capture_output=True, text=True, timeout=240,
+                              encoding="utf-8", errors="replace", env=child_env())
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"không chạy được probe nạp runtime đã đóng gói: {type(exc).__name__}: {exc}"]
+    try:
+        out = json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return [f"probe nạp runtime đã đóng gói không trả về JSON (rc={proc.returncode}): "
+                f"{(proc.stdout or '').strip()[-300:]} {(proc.stderr or '').strip()[-300:]}".strip()]
+    for key in ("arch", "appdomain", "resolved", "initialize_rc", "error"):
+        if key in out:
+            print(f"   probe {key:14} {out[key]}")
+    problems: list[str] = []
+    if out.get("error"):
+        problems.append(f"probe nạp runtime đã đóng gói thất bại: {out['error']}")
+    if out.get("appdomain") == "NULL":
+        problems.append("pyclr_create_appdomain trả về NULL: clr_loader không tạo được AppDomain .NET "
+                        "Framework (clr_loader/netfx.py KHÔNG kiểm tra điều này và vẫn báo "
+                        "initialized=True). Nguyên nhân thường gặp: .NET Framework < 4.7.2 hoặc "
+                        "ClrLoader.dll sai kiến trúc")
+    if out.get("resolved") is False and not out.get("error"):
+        problems.append("pyclr_get_function trả về NULL cho Python.Runtime.Loader.Initialize trong gói "
+                        "đã build — chính là lỗi làm ReportExtractor.exe chết khi khởi động. Kiểm tra "
+                        "Zone.Identifier (file bị Windows chặn) và .NET Framework Release")
+    if isinstance(out.get("initialize_rc"), int) and out["initialize_rc"] != 0:
+        problems.append(f"Python.Runtime.Loader.Initialize trả về {out['initialize_rc']} (khác 0): "
+                        "pythonnet không khởi động được trong gói đã build")
+    return problems
+
+
+def dotnet_framework_release_of_build_machine() -> int | None:
+    """``Release`` of the .NET Framework 4.x on THIS machine, or None when it cannot be read."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import winreg                                    # noqa: PLC0415 – Windows only
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, DOTNET_FX_REG_KEY) as key:
+            return int(winreg.QueryValueEx(key, "Release")[0])
+    except Exception:                                    # noqa: BLE001 – an unreadable key is not a build error
+        return None
+
+
+def validate_pythonnet_runtime(folder: Path, source: dict | None = None,
+                               py: Path | None = None) -> list[str]:
+    """Prove the packaged .NET runtime is present, unique, unmodified, loadable and not blocked.
+
+    PROMPT-028R proved the first three.  PROMPT-030 adds what the shipped exe actually needed: the payload
+    must BE pythonnet's managed assembly declaring the entry point clr_loader binds (``prove_runtime_identity``),
+    the netfx host must have the right architecture and exports (``prove_clr_loader``), neither file may be
+    blocked by a Mark-of-the-Web stream (``mark_of_the_web``), and on Windows the real
+    ``pyclr_get_function`` call must succeed against the packaged bytes (``probe_packaged_runtime``).
     """
     problems: list[str] = []
+    arch = "amd64" if struct.calcsize("P") * 8 > 32 else "x86"
     found = sorted(folder.rglob(PYTHONNET_RUNTIME_DLL))
     if source and source.get("found"):
         print(f"   nguồn {PYTHONNET_RUNTIME_DLL}: {source.get('path')}")
@@ -423,13 +648,27 @@ def validate_pythonnet_runtime(folder: Path, source: dict | None = None) -> list
             problems.append(f"{rel.as_posix()} có SHA256 KHÁC bản pythonnet trong môi trường build "
                             f"(gói={packaged_sha[:16]}… nguồn={str(source.get('sha256'))[:16]}…) "
                             "- có thể .venv-build cũ hoặc hook đã sửa file")
-    if platform.system() == "Windows":
-        import struct
-        arch = "amd64" if struct.calcsize("P") * 8 > 32 else "x86"
-        clr_loader_dll = folder / "_internal" / "clr_loader" / "ffi" / "dlls" / arch / "ClrLoader.dll"
-        if not clr_loader_dll.is_file():
-            problems.append(f"thiếu clr_loader/ffi/dlls/{arch}/ClrLoader.dll (hook-clr_loader) – "
-                            "clr_loader.netfx không nạp được .NET Framework")
+        if dll.resolve() == expected:
+            # Cross-platform: the proof below reads the PE, it does not need a Windows CLR.
+            prove_runtime_identity(dll, problems)
+        blocked = mark_of_the_web(dll)
+        if blocked:
+            problems.append(f"{rel.as_posix()} đang BỊ WINDOWS CHẶN (Zone.Identifier: {blocked[:120]}). "
+                            "LoadLibrary bỏ qua cờ này nhưng Assembly.LoadFrom của .NET Framework thì "
+                            "KHÔNG, nên clr_loader tạo được AppDomain mà vẫn không phân giải được "
+                            "Python.Runtime.Loader.Initialize. Gỡ bằng: chuột phải → Properties → "
+                            "Unblock, hoặc PowerShell: Unblock-File -Path '<đường dẫn>'")
+    host = prove_clr_loader(folder, arch, problems)
+    if host is None and platform.system() != "Windows":
+        # hook-clr_loader chỉ thu thập ClrLoader.dll khi is_win/is_cygwin, nên ngoài Windows sự vắng mặt
+        # này là đúng chứ không phải lỗi đóng gói.
+        problems = [p for p in problems if "ClrLoader.dll" not in p]
+    elif host is not None:
+        blocked = mark_of_the_web(host)
+        if blocked:
+            problems.append(f"ClrLoader.dll ({arch}) đang BỊ WINDOWS CHẶN (Zone.Identifier) — gỡ bằng "
+                            "Unblock-File cho cả thư mục Portable trước khi chạy")
+    problems += probe_packaged_runtime(folder, py, arch) if py is not None else []
     return problems
 
 
@@ -512,6 +751,35 @@ def validate_artifact(folder: Path, exe_name: str = "ReportExtractor.exe") -> li
     return problems
 
 
+def validate_existing_package(folder: Path, py: Path) -> int:
+    """Run the PROMPT-030 runtime gate against an ALREADY BUILT Portable folder and report the real cause.
+
+    The build gate proves a package PyInstaller just produced.  The crash PROMPT-030 fixes was reported
+    from ``H:\\ReportExtractor_v1.3.4_Portable`` — a copy that may have travelled through a ZIP, a USB
+    stick or a network share AFTER the build, which is exactly how a Windows Mark-of-the-Web block appears
+    on ``Python.Runtime.dll`` while every presence/hash check still passes.  So the same proof has to be
+    runnable against the folder that actually fails, without rebuilding anything.
+    """
+    print(f"[validate-only] thư mục: {folder}")
+    if not folder.is_dir():
+        fail(f"không thấy thư mục Portable: {folder}")
+    if not py.exists() or py == Path(sys.executable):
+        candidate = ROOT / ".venv-build" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        py = candidate if candidate.exists() else py
+    print(f"[validate-only] interpreter so sánh: {py}")
+    source = source_pythonnet_dll(py) if py.exists() else None
+    problems = validate_pythonnet_runtime(folder, source, py if py.exists() else None)
+    if problems:
+        print("\n[validate-only] KẾT LUẬN: gói này KHÔNG thể khởi động, vì:")
+        for problem in problems:
+            print("   - " + problem)
+        return 1
+    print("\n[validate-only] OK: Python.Runtime.Loader.Initialize phân giải được từ gói này.")
+    print("   Nếu ReportExtractor.exe vẫn chết thì nguyên nhân nằm NGOÀI gói (quyền thư mục, antivirus,")
+    print("   WebView2 Runtime) — gửi lại logs/app.log và logs/startup_error.log.")
+    return 0
+
+
 def main() -> int:
     configure_console()
     ap = argparse.ArgumentParser(description="Build Report Extractor Windows Portable")
@@ -524,9 +792,16 @@ def main() -> int:
     ap.add_argument("--skip-frontend", action="store_true",
                     help="không chạy `npm run build`, dùng frontend/dist đã có sẵn")
     ap.add_argument("--no-publish", action="store_true", help="không tự động xuất bản vào thư mục cập nhật LAN")
+    ap.add_argument("--validate-only", metavar="FOLDER", default=None,
+                    help="KHÔNG build: chạy cổng chứng minh runtime .NET (PROMPT-030) trên một thư mục "
+                         "Portable đã có — ví dụ H:\\ReportExtractor_v1.3.4_Portable — rồi thoát. Đây là "
+                         "cách xác định vì sao ReportExtractor.exe chết khi khởi động mà không cần build lại.")
     ap.add_argument("--publish-dir", default=None,
                     help=f"thư mục cập nhật cục bộ (mặc định {publish_update.update_folder()})")
     args = ap.parse_args()
+
+    if args.validate_only:
+        return validate_existing_package(Path(args.validate_only), Path(args.python))
 
     version, build_id = _version()
     name = f"ReportExtractor_v{version}_Portable"
@@ -595,7 +870,7 @@ def main() -> int:
     step(10, "Kiểm tra gói (không chứa file dev, không config máy dev, không Ollama/model)")
     source_dll = source_pythonnet_dll(py)
     problems = (validate_artifact(folder) + validate_frontend(folder)
-                + validate_pythonnet_runtime(folder, source_dll))
+                + validate_pythonnet_runtime(folder, source_dll, py))
     if problems:
         fail("gói không hợp lệ:\n   - " + "\n   - ".join(problems))
     print("   OK")

@@ -670,3 +670,83 @@ lại PROMPT-027R từ đầu.
   **CHƯA THỰC HIỆN** và không được báo là đã đạt.
 - KHÔNG đổi: `backup/…STABLE/`. KHÔNG merge PR #7 vào `main`, KHÔNG xuất bản LAN, KHÔNG sửa `version.json`
   triển khai, KHÔNG chạy `BUILD_AND_PUBLISH.bat`.
+
+## PROMPT-030 — Gói Portable chết khi khởi động: `Failed to resolve Python.Runtime.Loader.Initialize` (v1.3.4 / Build 017, không đổi version)
+
+Bối cảnh: trên Windows thật, pytest xanh hết, `build_portable.bat --no-publish` build xong, nhưng
+`H:\ReportExtractor_v1.3.4_Portable\ReportExtractor.exe` chết ngay khi khởi động với
+`RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize from H:\...\_internal\pythonnet\runtime\Python.Runtime.dll`
+trước khi UI hiện ra.
+
+- **Thông báo lỗi đó KHÔNG chứa nguyên nhân.** `clr_loader/ffi/netfx.py` chỉ khai báo đúng năm hàm native
+  (`pyclr_initialize`, `pyclr_create_appdomain`, `pyclr_get_function`, `pyclr_close_appdomain`,
+  `pyclr_finalize`) và **không có hàm lấy lỗi** (khác coreclr/hostfxr có `util/coreclr_errors.py`), nên
+  `clr_loader/netfx.py::_get_callable` gộp MỌI thất bại của `pyclr_get_function` — file thiếu, file bị
+  Windows chặn, .NET Framework quá cũ, sai kiến trúc, payload bị đổi tên, chữ ký không bind được delegate —
+  vào đúng một chuỗi đó. Nó in ra đường dẫn pythonnet **đã hỏi**, không phải đường dẫn tồn tại.
+  `NetFx.__init__` cũng không kiểm tra `pyclr_create_appdomain` có trả về NULL hay không, còn
+  `NetFx.info()` hardcode `initialized=True` và `version="<undefined>"`, nên `pythonnet.get_runtime_info()`
+  không thể phân biệt "đã tạo AppDomain" với "AppDomain NULL". Câu hint của PROMPT-028R khẳng định
+  "clr_loader created a .NET Framework app domain" — điều không thể chứng minh được từ chuỗi lỗi đó, và chính
+  nó đã hướng việc điều tra sang lỗi đóng gói mà cổng build đã loại trừ rồi.
+- **Nhóm nguyên nhân đóng gói (A) bị LOẠI BẰNG BẰNG CHỨNG, không phải bằng suy đoán.** Cổng build
+  PROMPT-028R (`validate_pythonnet_runtime`, bước 10) có `fail()` và build này ĐÃ HOÀN TẤT, nghĩa là gói đã
+  được chứng minh: đúng MỘT bản `Python.Runtime.dll`, nằm đúng `_internal/pythonnet/runtime/`, SHA256
+  **byte-identical** với bản trong `.venv-build`, và có `ClrLoader.dll` đúng kiến trúc. Bước 3
+  (`verify_runtime_imports`) cũng đã `import clr` **thành công trên chính máy đó** trước khi freeze — tức là
+  cùng bytes DLL, cùng máy, cùng runtime netfx thì phân giải được. Vậy assembly và máy đều tốt; phần sai
+  nằm ở môi trường tiến trình đã freeze.
+- **`tools/dotnet_pe.py` (MỚI)** — bộ đọc PE/ECMA-335 thuần stdlib, chạy trên mọi nền tảng, đọc thẳng
+  metadata quản lý ra để chứng minh thay vì giả định. Kết quả ĐO trên đúng hai DLL mà bản build này đóng gói:
+  `Python.Runtime.dll` = `Python.Runtime, Version=3.0.5.0, Culture=neutral, PublicKeyToken=5000fea6cba702dd`,
+  size 450048, SHA256 `d204ad74dc18cd07320c8e665bd32ec6549b555ce97e61e4d3cf88437a64988e`, **IL-only /
+  any-cpu** (nên không thể là xung đột kiến trúc), targets `.NETStandard,Version=v2.0`, tham chiếu
+  `netstandard 2.0.0.0` + `System.Reflection.Emit(.ILGeneration) 4.0.0.0`, 241 type, và
+  **`Python.Runtime.Loader.Initialize` là `static int32 (native int, int32)`** — đúng typedef `entry_point`
+  mà clr_loader bind, nên lệch phiên bản pythonnet↔clr_loader cũng bị loại.
+  `clr_loader/ffi/dlls/{amd64,x86}/ClrLoader.dll` = `ClrLoader 1.0.0.0`, **mixed-mode C++/CLI**
+  (không IL-only), targets `.NETFramework,Version=v4.7.2`, export đúng năm symbol `pyclr_*`.
+- **Cổng build nay chứng minh LOADABILITY chứ không chỉ presence/hash** (`tools/build_portable.py`):
+  `prove_runtime_identity` (danh tính assembly, IL-only/any-cpu, target framework → suy ra .NET Framework
+  `Release` tối thiểu và so với registry máy build, type + method + **chữ ký** entry point),
+  `prove_clr_loader` (đúng kiến trúc, mixed-mode, đủ năm export), `mark_of_the_web` (stream
+  `Zone.Identifier`), và `probe_packaged_runtime` — chạy **thật** chuỗi đã hỏng
+  (`ffi.dlopen` ClrLoader.dll **trong gói** → `pyclr_initialize` → `pyclr_create_appdomain` → kiểm tra NULL →
+  `pyclr_get_function` trên `Python.Runtime.dll` **trong gói**) trong một tiến trình con, có timeout, và fail
+  build nếu không phân giải được. Thêm `--validate-only <FOLDER>` để chạy đúng cổng đó trên một thư mục
+  Portable **đã build xong** (ví dụ `H:\ReportExtractor_v1.3.4_Portable`) mà không phải build lại.
+- **Điều kiện duy nhất khớp MỌY dữ kiện và xuất hiện SAU build**: assembly bị Windows chặn.
+  `Zone.Identifier` được gắn khi giải nén `release\ReportExtractor_1.3.4.zip` hoặc chép từ máy/USB khác;
+  `LoadLibrary` **bỏ qua** cờ đó nên `ClrLoader.dll` native vẫn nạp và AppDomain vẫn được tạo, còn
+  `Assembly.LoadFrom` của .NET Framework thì **từ chối** (`COR_E_FILELOAD`, HRESULT 0x80131515 "Operation is
+  not supported") — đúng nghĩa một file tồn tại, đúng đường dẫn, đúng SHA256 mà vẫn không initialize được,
+  và đúng lý do cùng bytes đó chạy được từ `.venv-build` (pip không bao giờ gắn stream). Đây là **giả thuyết
+  có cơ chế khớp bằng chứng**, CHƯA được chứng minh trên Windows thật; cổng `--validate-only` và log khởi động
+  mới là thứ xác nhận nó.
+- **`app/desktop.py`**: thêm `mark_of_the_web`/`_read_zone_identifier`/`_remove_zone_identifier`/
+  `unblock_packaged_runtime` (chỉ chạy khi `sys.platform == "win32"` VÀ `is_packaged()`, chỉ đụng hai file
+  runtime dưới `sys._MEIPASS`, gỡ stream đúng như tick "Unblock" của Windows, mọi lỗi đều suy giảm thành
+  báo cáo chứ không làm app không khởi động được), `packaged_runtime_files`, `appdomain_report` (đọc thẳng
+  handle thay vì tin `info()`), các field log `blocked_runtime` / `unblocked_runtime` / `unblock_failed` /
+  `runtime_files_checked` / `dotnet_appdomain`, cảnh báo `WEBVIEW_DOTNET_BLOCKED`, và viết lại hint
+  `_CLR_HINTS` để chỉ vào đúng các field phân biệt được nguyên nhân. KHÔNG đổi `pythonnet.load()`, KHÔNG ép
+  runtime khác: `clr_loader.get_coreclr()` cần `find_dotnet_root()` + một runtime `Microsoft.NETCore.App` đã
+  cài, mà máy đích Portable thì không được phép cần .NET — nên nhánh `except → PYTHONNET_RUNTIME='coreclr'`
+  trong `webview/platforms/winforms.py` không bao giờ cứu được app (và vì `pythonnet.load()` để lại
+  `_RUNTIME` đã set sau lần thất bại, nhánh đó còn dùng lại đúng runtime netfx cũ và ném lại đúng lỗi cũ).
+- **Test**: `tests/dotnet_image_fixtures.py` (MỚI) **tự sinh ảnh PE managed thật** theo ECMA-335 — không cần
+  Windows, không cần .NET, không cần PyInstaller, không phụ thuộc gói đã cài — để mutate đúng MỘT thuộc tính
+  mỗi lần. `tests/test_prompt030_runtime.py` (MỚI, 58 test). Fixture PROMPT-028R cũ dùng chuỗi 16 byte
+  `b"MANAGED-ASSEMBLY"` nên bị cổng mới từ chối đúng: **sửa fixture, KHÔNG nới cổng** (nay ghi ảnh managed
+  thật; ca "build cũ" dùng `version=(3,0,4,0)` để cô lập đúng việc so SHA256). Python
+  **1104 → 1162 passed**, 0 skip, 0 xfail, không xoá test nào; `tests/test_prompt028_portable.py` +
+  `tests/test_prompt027r_renderer.py` **110 passed, 0 skip**. `compileall` sạch, `pyflakes app tools run.py`
+  sạch, `git diff --check` sạch. Frontend KHÔNG đụng tới và xanh: `test:bridge` 14/14, `test:frontend`
+  29/29, `tsc --noEmit` sạch, bundle vẫn `index-B5WzBAyA.js` / `index-BTW1TSfn.css`.
+- **GIỚI HẠN (phải nói rõ)**: sandbox là Linux x86_64, KHÔNG build được artifact PyInstaller nào, KHÔNG
+  chạy được `ReportExtractor.exe`. Tiêu chí nghiệm thu cuối — exe mở lên và vào được UI React/pywebview,
+  log không còn `Failed to resolve Python.Runtime.Loader.Initialize`, cầu nối Python hoạt động — **CHƯA THỰC
+  HIỆN** và không được báo là đã đạt.
+- KHÔNG đổi: version/build (vẫn 1.3.4 / Build 017), logic trích xuất, `ImprovementItem` / `AfterVisualRegion`,
+  renderer, React UI, `ReportExtractor.spec`, `backup/…STABLE/`. KHÔNG merge PR #7, KHÔNG xuất bản LAN,
+  KHÔNG tạo ZIP phát hành, KHÔNG chạy `BUILD_AND_PUBLISH.bat`, KHÔNG force push.

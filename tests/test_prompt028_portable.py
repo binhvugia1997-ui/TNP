@@ -26,6 +26,7 @@ import pytest
 
 import app.desktop as desktop
 import app.main as app_main
+import dotnet_image_fixtures as dotnet_fx
 import app.runtime_paths as rp
 import build_portable as bp
 from build_portable import (_same_tree, build_number, copy_frontend_into_portable, package_name,
@@ -874,9 +875,18 @@ def test_explain_clr_failure_covers_the_real_windows_signature():
     real = ("RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize from "
             "_internal\\pythonnet\\runtime\\Python.Runtime.dll")
     hint = desktop.explain_clr_failure(real)
-    assert hint and "hook-clr" in hint, "must name the hook that owns the DLL"
-    assert "python_runtime_dll" in hint, "must tell the reader which log field settles it"
+    # PROMPT-030: clr_loader/netfx.py collapses EVERY failure of pyclr_get_function() into this one
+    # string and its cdef has no error accessor, so the hint must instead name the log fields that
+    # discriminate between the causes that are left.
+    assert hint, "must explain the exact signature Windows reported"
+    for field in ("blocked_runtime", "dotnet_appdomain", "dotnet_framework", "python_runtime_dll_exists"):
+        assert field in hint, f"must point at the {field} field that settles it"
     assert "461808" in hint or "4.7.2" in hint, "must name the .NET Framework prerequisite"
+    assert "--validate-only" in hint, "must name the command that re-proves an already shipped folder"
+    # It must NOT assert a fact it cannot know: NetFx.info() hardcodes initialized=True, so "Failed to
+    # resolve" never proves an app domain was created — that was the PROMPT-028R wording, and it is what
+    # sent the investigation looking for a packaging defect the build gate had already excluded.
+    assert "clr_loader created a .NET Framework app domain but" not in hint
     assert desktop.explain_clr_failure("Python.Runtime.dll not found")
     assert desktop.explain_clr_failure("Could not find a suitable hostfxr library in X")
     assert desktop.explain_clr_failure("ValueError: something unrelated") == ""
@@ -908,12 +918,38 @@ def test_desktop_main_logs_runtime_diagnostics_before_starting_the_window(fake_w
 
 
 # ---------------------------------------------------------------- builder verification of the package
+def _runtime_bytes(rel: str) -> bytes:
+    """A REAL managed image for ``rel``, synthesized from ECMA-335 instead of copied from site-packages.
+
+    PROMPT-030: these fixtures used to be the 16-byte string ``b"MANAGED-ASSEMBLY"``, which was enough
+    while ``validate_pythonnet_runtime()`` only compared presence and SHA256.  That gate now proves the
+    payload IS pythonnet's assembly declaring ``Python.Runtime.Loader.Initialize`` with the signature
+    clr_loader binds, and proves ``ClrLoader.dll``'s architecture and ``pyclr_*`` exports — so a
+    placeholder is correctly rejected.  The fixture was the wrong part, not the gate: each file is now a
+    genuine PE with controlled properties, built identically on Windows and on Linux and independent of
+    whatever happens to be installed.
+    """
+    logical = PurePath(rel.replace("\\", "/"))               # PurePath is host-dependent: fold first
+    if logical.name == "Python.Runtime.dll":
+        return dotnet_fx.python_runtime_image()
+    if logical.name == "ClrLoader.dll":
+        parts = logical.parts
+        arch = parts[parts.index("dlls") + 1] if "dlls" in parts else _build_arch()
+        return dotnet_fx.clr_loader_image(arch)
+    return b"NOT-A-RUNTIME-FILE"
+
+
 def _package_with_dll(tmp_path, rel_paths, content=None):
+    """``content`` is either bytes applied to every file, or a {relative path or file name: bytes} map."""
     folder = tmp_path / "pkg"
     for rel in rel_paths:
         target = folder / PurePath(rel)                      # accepts "/" OR "\" spelling
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content if content is not None else b"MANAGED-ASSEMBLY")
+        if isinstance(content, dict):
+            payload = content.get(rel, content.get(PurePath(rel.replace("\\", "/")).name))
+        else:
+            payload = content
+        target.write_bytes(payload if payload is not None else _runtime_bytes(rel))
     return folder
 
 
@@ -983,11 +1019,16 @@ def test_validate_pythonnet_runtime_rejects_a_second_conflicting_copy(tmp_path, 
 
 def test_validate_pythonnet_runtime_rejects_a_stale_or_modified_dll(tmp_path, monkeypatch):
     _force_windows(monkeypatch)
-    folder = _hook_layout_package(tmp_path, content=b"STALE BUILD")
+    # A STALE build is still a genuine managed assembly — an older pythonnet — so this isolates the hash
+    # check.  A placeholder byte string would also trip the PROMPT-030 identity proof and hide the point.
+    stale = dotnet_fx.python_runtime_image(version=(3, 0, 4, 0))
+    folder = _hook_layout_package(tmp_path, content={PACKAGED_DLL_REL: stale})
     problems = validate_pythonnet_runtime(folder, {"found": True, "sha256": "0" * 64})
     assert any("SHA256 KHÁC" in p for p in problems)
     assert any(".venv-build" in p for p in problems)
     assert not any("ClrLoader" in p for p in problems), "only the defect under test may be reported"
+    assert not any("không phải là một .NET assembly" in p for p in problems), (
+        "an older-but-genuine runtime must be reported as a hash mismatch, not as a corrupt payload")
 
 
 def test_validate_pythonnet_runtime_rejects_a_missing_dll(tmp_path, monkeypatch):
@@ -1005,9 +1046,10 @@ def test_validate_pythonnet_runtime_rejects_a_missing_clrloader(tmp_path, monkey
     assert len(problems) == 1, problems
     assert "ClrLoader.dll" in problems[0] and _build_arch() in problems[0]
     assert "thiếu Python.Runtime.dll" not in problems[0], "the managed assembly IS present"
-    # putting it back clears the problem
+    # putting it back clears the problem — and it has to be a REAL mixed-mode host image, because the
+    # gate now proves architecture and pyclr_* exports, not merely that a file with that name exists.
     (folder / PurePath(_clrloader_rel())).parent.mkdir(parents=True, exist_ok=True)
-    (folder / PurePath(_clrloader_rel())).write_bytes(b"NATIVE-HOST")
+    (folder / PurePath(_clrloader_rel())).write_bytes(dotnet_fx.clr_loader_image(_build_arch()))
     assert validate_pythonnet_runtime(folder, {"found": False}) == []
 
 
