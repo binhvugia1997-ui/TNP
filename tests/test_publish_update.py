@@ -210,15 +210,21 @@ def test_missing_release_inputs_fail_cleanly(tmp_path):
 # ------------------------------------------------------------------ build integration: only after a successful build
 def test_publish_is_the_last_build_step_and_never_runs_after_failures():
     main_src = BUILD_SRC[BUILD_SRC.index("def main("):BUILD_SRC.index("def publish_step(")]
-    order = [m.group(1) for m in re.finditer(r"step\((\d+),", main_src)]
-    assert order == [str(i) for i in range(1, 13)] and 'step(12, "Xuất bản' in main_src
+    order = [int(m.group(1)) for m in re.finditer(r"step\((\d+),", main_src)]
+    # contiguous from 1, whatever the current step count is (PROMPT-028 inserted the frontend build step)
+    assert order == list(range(1, len(order) + 1)) and len(order) >= 12
+    # publishing is the FINAL step and is named as such
+    publish_number = order[-1]
+    assert f'step({publish_number}, "Xuất bản' in main_src
     publish_pos = main_src.index("publish_step(")
-    for gate in ("pyflakes", 'run([py, "-m", "pytest", "-q"])', "PyInstaller", "validate_artifact(folder)",
-                 "write_version_manifest(", "zipfile.ZipFile(zip_path"):
+    for gate in ("pyflakes", 'run([py, "-m", "pytest", "-q"])', "build_frontend(", "PyInstaller",
+                 "copy_frontend_into_portable(folder)", "validate_artifact(folder)",
+                 "validate_frontend(folder)", "write_version_manifest(", "zipfile.ZipFile(zip_path"):
         assert main_src.index(gate) < publish_pos                         # every gate precedes publishing
     # fail() exits the process (code 1) -> publishing is unreachable after any failed gate
     assert "sys.exit(code)" in BUILD_SRC[BUILD_SRC.index("def fail("):BUILD_SRC.index("def run(")]
     assert "--no-publish" in main_src and "--publish-dir" in main_src
+    assert "--skip-frontend" in main_src                                  # the bundle is rebuilt by default
 
 
 def test_publish_step_reports_failure_without_masking_build_success(tmp_path, capsys):
@@ -239,7 +245,15 @@ def test_no_publish_after_failed_test_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(pu, "publish_release", lambda *a, **k: calls.append(1))
     monkeypatch.setattr(bp, "run", lambda cmd, cwd=None: (_ for _ in ()).throw(SystemExit(1))
                         if "pytest" in " ".join(map(str, cmd)) else None)
-    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": "", "stderr": ""})())
+    # PROMPT-028R: step 3 now queries the build venv's versions through subprocess.run([py, "-c", ...]),
+    # so the stub must answer those queries with the JSON shape the builder parses.
+    def fake_subprocess_run(*a, **k):
+        cmd = list(a[0]) if a and isinstance(a[0], (list, tuple)) else []
+        out = ('{"pywebview": "6.2.1", "pythonnet": "3.0.5", "clr-loader": "0.2.10",'
+               ' "pyinstaller": "6.22.3", "pyinstaller-hooks-contrib": "2026.8",'
+               ' "_python": "3.12.10"}' if "-c" in cmd else "")
+        return type("R", (), {"stdout": out, "stderr": "", "returncode": 0})()
+    monkeypatch.setattr(bp.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(bp, "check_python", lambda py: None)
     monkeypatch.setattr(sys, "argv", ["build_portable.py", "--no-venv", "--allow-non-windows"])
     with pytest.raises(SystemExit) as ex:
@@ -261,4 +275,4 @@ def test_destination_is_centralised_and_configurable(monkeypatch):
 
 
 def test_build_010_identity():
-    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_LABEL == "Build 015"
+    assert app.__version__ == "1.3.4" and app.BUILD_NUMBER == 17 and app.BUILD_LABEL == "Build 017"

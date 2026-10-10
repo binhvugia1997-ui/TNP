@@ -190,6 +190,37 @@ function targetRect(c: ImageCandidate): { x: number; y: number; w: number; h: nu
   return { x: c.bounds.x, y: c.bounds.y, w: c.bounds.w, h: c.bounds.h }
 }
 
+/**
+ * PROMPT-027 §13/§15/§16: the FINAL Excel evidence region is a DIFFERENT geometry from the picture
+ * candidate being labelled.  One ImprovementItem can own several After pictures plus caption/arrows, so
+ * the region exported to Excel is generally LARGER than one picture.  Its geometry comes from Python's
+ * authoritative ``ImprovementVisualRegion.bbox`` (the exact region production crops) already expressed as
+ * slide percentages — React never derives it from ``candidate.bounds`` and never guesses from pixels.
+ * Returns null when this picture does not belong to any region that would reach Excel.
+ */
+function evidenceRect(c: ImageCandidate): { x: number; y: number; w: number; h: number } | null {
+  const pct = c.evidenceRegionBboxPct
+  if (!pct || !(pct.w > 0) || !(pct.h > 0)) return null
+  return { x: pct.x, y: pct.y, w: pct.w, h: pct.h }
+}
+
+/** Which overlay geometry the reviewer wants to see; "both" is the default so the Excel region is obvious. */
+type OverlayMode = 'both' | 'evidence' | 'picture'
+
+const OVERLAY_MODES: { key: OverlayMode; label: string }[] = [
+  { key: 'evidence', label: 'Vùng xuất Excel' },
+  { key: 'picture', label: 'Ảnh đang đánh giá' },
+  { key: 'both', label: 'Cả hai' },
+]
+
+/** Human-readable renderer backend name for the preview (§4/§42) — never a filesystem path. */
+function backendLabel(backend: string): string {
+  if (backend === 'powerpoint') return 'PowerPoint'
+  if (backend === 'libreoffice') return 'LibreOffice'
+  if (backend === 'builtin') return 'Trình vẽ tích hợp'
+  return backend || 'không rõ'
+}
+
 const MIN_LIST_W = 200
 const MAX_LIST_W = 420
 
@@ -217,6 +248,9 @@ function ImageReview() {
   const viewportRef = useRef<HTMLDivElement>(null)
   const [viewport, setViewport] = useState({ w: 0, h: 0 })
   const [zoom, setZoom] = useState(1)
+  /* PROMPT-027 §17: compact overlay toggle.  Declared with the other hooks and BEFORE the
+     candidate-dependent early return below, so hook order stays stable (React #310 / §44). */
+  const [overlayMode, setOverlayMode] = useState<OverlayMode>('both')
   useEffect(() => {
     const el = viewportRef.current
     if (!el) return
@@ -264,10 +298,25 @@ function ImageReview() {
 
   const chosen = cand.userLabel !== 'UNLABELED'
   const rect = targetRect(cand)
-  const clipTop = Math.max(0, rect.y)
-  const clipRight = Math.max(0, 100 - (rect.x + rect.w))
-  const clipBottom = Math.max(0, 100 - (rect.y + rect.h))
-  const clipLeft = Math.max(0, rect.x)
+  /* PROMPT-027 §13: TWO different review geometries.  ``rect`` is the picture currently being labelled;
+     ``evidence`` is the item-scoped region production would export to Excel.  They are never conflated. */
+  const evidence = evidenceRect(cand)
+  /* PROMPT-027R §18/§19: the slide bitmap is shown EXACTLY as rendered.  No blur, no brightness/saturation, no dimming
+     and no second clipped copy — those changed the perceived colour of gray authored text.  Both overlays are outlines
+     positioned from Python's DTO percentages; nothing here recomputes geometry or touches the evidence bytes. */
+  const showEvidence = overlayMode !== 'picture' && evidence !== null
+  const showPicture = overlayMode !== 'evidence'
+  const evidenceItemIndex = typeof cand.evidenceRegionItemIndex === 'number' && cand.evidenceRegionItemIndex >= 0
+    ? cand.evidenceRegionItemIndex
+    : cand.itemIndex
+  const evidenceLabel = typeof evidenceItemIndex === 'number' && evidenceItemIndex >= 0
+    ? `Mục #${evidenceItemIndex + 1} · Vùng xuất Excel`
+    : 'Vùng xuất Excel'
+  /* §4/§6/§41: honest backend reporting.  Only PowerPoint is pixel-faithful; any fallback backend gets a
+     small NON-BLOCKING fidelity notice instead of silently pretending to match PowerPoint. */
+  const previewBackend = cand.slidePreviewBackend || ''
+  const previewFaithful = Boolean(cand.slidePreviewFaithful)
+  const showFidelityNotice = Boolean(previewBackend) && !previewFaithful
 
   /* §25/§28: true authored position — the slide's own aspect ratio drives the display box, so the
      percentage highlight stays aligned at any panel size, DPI scale or zoom level. */
@@ -366,6 +415,33 @@ function ImageReview() {
           {cand.itemHeading || ''}
         </span>
         <div className="ml-auto flex items-center gap-1">
+          {/* PROMPT-027 §17: compact overlay toggle — deliberately NOT a large toolbar. */}
+          <div className="mr-1 flex items-center gap-[2px] rounded-sm2 border border-line bg-white/70 p-[2px]"
+            role="group" aria-label="Chọn khung hiển thị trên slide">
+            {OVERLAY_MODES.map(({ key, label }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setOverlayMode(key)}
+                aria-pressed={overlayMode === key}
+                className={cn(
+                  'whitespace-nowrap rounded-[2px] px-1.5 py-[2px] text-xxs',
+                  overlayMode === key ? 'bg-brand-500 font-semibold text-white' : 'text-muted hover:bg-[#f4f7fb]',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* §4/§42: which renderer actually produced this preview (safe name only, never a path). */}
+          {previewBackend && (
+            <span
+              className="hidden shrink-0 rounded-[2px] border border-line bg-white/70 px-1.5 py-[1px] text-xxs text-muted lg:inline"
+              title={`Backend đã render ảnh xem trước: ${previewBackend}`}
+            >
+              Render: {backendLabel(previewBackend)}
+            </span>
+          )}
           <Button variant="ghost" className="h-[24px] px-1.5" disabled={zoom <= 0.5}
             onClick={() => setZoom((z) => Math.max(0.5, z / 1.25))} aria-label="Thu nhỏ">
             <Minus className="h-3.5 w-3.5" />
@@ -381,32 +457,65 @@ function ImageReview() {
           </Button>
         </div>
       </header>
+      {/* PROMPT-027 §6/§41: honest fallback notice — small and NON-BLOCKING.  Reduced preview fidelity must
+          never fail the report, and a genuine PowerPoint render must not show this warning at all. */}
+      {showFidelityNotice && (
+        <p
+          className="flex items-center gap-1.5 border-b border-warn-500/30 bg-warn-50 px-3 py-1 text-xxs text-warn-600"
+          role="status"
+        >
+          <AlertTriangle className="h-3 w-3 shrink-0" />
+          <span>
+            Bản xem trước đơn giản — bố cục có thể khác PowerPoint (backend: {backendLabel(previewBackend)}).
+            Kết quả Excel vẫn dùng đúng toạ độ PPTX.
+          </span>
+        </p>
+      )}
       <div ref={viewportRef} className={cn('relative min-h-0 flex-1 overflow-auto bg-[#dbe3ec]', !cand.slidePreview && 'flex items-center justify-center')}>
         {cand.slidePreview ? (
           <div className="flex min-h-full min-w-full items-center justify-center p-3">
-            {/* §23/§24: the FULL authored slide stays visible; non-target content is dimmed/blurred,
-                the target keeps its TRUE authored position and stays sharp (§25). Review display only —
-                evidence bytes are never modified (§30). */}
+            {/* PROMPT-027R §18/§19: the FULL authored slide is shown unchanged (the bitmap is the render, not a
+                restyled copy). Overlays sit on top at their true authored positions. Evidence bytes are never
+                modified here (§30). */}
             <div className="relative shrink-0 overflow-hidden rounded-[2px] border border-line bg-white shadow-card"
               style={{ width: dispW, height: dispH }}>
               <img
+                data-testid="slide-preview-bitmap"
                 src={cand.slidePreview} alt="" draggable={false}
                 className="absolute inset-0 h-full w-full select-none"
-                style={{ filter: 'blur(2px) brightness(0.82) saturate(0.85)' }}
               />
-              <img
-                src={cand.slidePreview} alt="" draggable={false}
-                className="absolute inset-0 h-full w-full select-none"
-                style={{ clipPath: `inset(${clipTop}% ${clipRight}% ${clipBottom}% ${clipLeft}%)` }}
-              />
-              <div
-                className="absolute rounded-[2px] border-2 border-brand-500"
-                style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.w}%`, height: `${rect.h}%` }}
-              >
-                <span className="absolute -top-[18px] left-0 whitespace-nowrap rounded-[2px] bg-brand-500 px-1 py-[1px] text-xxs font-medium text-white">
-                  Ảnh #{cand.pictureId} · {itemLabel}
-                </span>
-              </div>
+              {/* PROMPT-027 §16: SECONDARY — the picture currently being classified/labelled.  Thin dashed
+                  box, drawn first so the Excel region stays visually dominant.  Purely a highlight. */}
+              {showPicture && (
+                <div
+                  data-testid="overlay-picture-candidate"
+                  className="absolute rounded-[2px] border border-dashed border-amber-500"
+                  style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.w}%`, height: `${rect.h}%` }}
+                >
+                  <span className="absolute bottom-0 left-0 whitespace-nowrap rounded-t-[2px] bg-amber-500 px-1 py-[1px] text-xxs font-medium text-white">
+                    Ảnh #{cand.pictureId}
+                  </span>
+                </div>
+              )}
+              {/* PROMPT-027 §16: PRIMARY — the FINAL Excel evidence region of this candidate's improvement
+                  item.  Solid, heavier border and the more prominent label, because this is the exact
+                  geometry production crops into Excel (possibly several After pictures + annotation). */}
+              {showEvidence && evidence && (
+                <div
+                  data-testid="overlay-evidence-region"
+                  className="absolute rounded-[2px] border-2 border-brand-600 shadow-[0_0_0_1px_rgba(255,255,255,0.75)]"
+                  style={{ left: `${evidence.x}%`, top: `${evidence.y}%`, width: `${evidence.w}%`, height: `${evidence.h}%` }}
+                >
+                  <span
+                    className={cn(
+                      'absolute left-0 whitespace-nowrap rounded-[2px] bg-brand-600 px-1 py-[1px] text-xxs font-semibold text-white',
+                      evidence.y > 3 ? '-top-[18px]' : 'top-0',
+                    )}
+                  >
+                    {evidenceLabel}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         ) : cand.src ? (
@@ -420,10 +529,25 @@ function ImageReview() {
           <p className="text-base2 text-muted">Preview không khả dụng.</p>
         )}
       </div>
-      <p className="border-t border-lineSoft px-3 py-1.5 text-xxs text-muted">
-        Vùng làm nét là vị trí thật của ảnh trên slide gốc; phần còn lại chỉ được làm mờ để dễ quan sát.
-        Kết quả Excel vẫn tuân theo quy tắc eligibility và bằng chứng ngữ nghĩa phía Python.
-      </p>
+      <div className="border-t border-lineSoft px-3 py-1.5 text-xxs leading-[15px] text-muted">
+        <p className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="inline-flex items-center gap-1">
+            <span className="inline-block h-[9px] w-[14px] rounded-[1px] border-2 border-brand-600" aria-hidden />
+            <strong className="font-semibold text-body">Vùng xuất Excel</strong>
+            {evidence ? `— ${evidenceLabel}` : '— ảnh này không thuộc vùng Sau cải tiến nào sẽ xuất Excel'}
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <span className="inline-block h-[9px] w-[14px] rounded-[1px] border border-dashed border-amber-500" aria-hidden />
+            <strong className="font-semibold text-body">Ảnh đang đánh giá</strong> — Ảnh #{cand.pictureId}
+          </span>
+        </p>
+        <p className="mt-0.5">
+          Hai khung là HAI khái niệm khác nhau: khung nét đứt là một ảnh ứng viên, khung liền nét là vùng bằng
+          chứng Sau cải tiến của cả Mục (có thể gồm nhiều ảnh + chú thích) mà Excel sẽ nhận. Ảnh slide được hiển thị
+          nguyên bản như bản render (không làm mờ, không đổi độ sáng hay màu); khung chỉ là viền đánh dấu và không
+          thay đổi ảnh hay dữ liệu xuất Excel.
+        </p>
+      </div>
     </section>
   )
 
@@ -451,6 +575,59 @@ function ImageReview() {
           {cand.excelEligible ? 'Đủ điều kiện'
             : <span className="text-warn-600">Chưa đủ điều kiện — {cand.eligibilityReason}</span>}
         </KeyValue>
+
+        {/* PROMPT-027 §13/§42: the two review geometries and the renderer that produced the preview, shown
+            as plain numbers so Windows acceptance can compare UI, logs and the exported crop. */}
+        <div className="mt-2.5 border-t border-lineSoft pt-2">
+          <p className="mb-1 text-base2 font-medium text-header">Vùng xuất Excel (bằng chứng Sau)</p>
+          {evidence && cand.evidenceRegionBbox ? (
+            <>
+              <KeyValue label="Thuộc Mục">
+                {evidenceLabel}
+                {typeof cand.evidenceRegionPictureCount === 'number' && cand.evidenceRegionPictureCount > 0 &&
+                  ` · ${cand.evidenceRegionPictureCount} ảnh`}
+              </KeyValue>
+              {Array.isArray(cand.evidenceRegionPictureIds) && cand.evidenceRegionPictureIds.length > 0 && (
+                <KeyValue label="Ảnh trong vùng">
+                  <span className="font-mono text-xxs" data-testid="evidence-picture-ids">
+                    {/* PROMPT-027R §24: display/debug only — the region itself is the Python DTO bbox */}
+                    {cand.evidenceRegionPictureIds.map((id) => `#${id}`).join(', ')}
+                  </span>
+                </KeyValue>
+              )}
+              <KeyValue label="Toạ độ EMU">
+                <span className="font-mono text-xxs">
+                  {cand.evidenceRegionBbox.x}, {cand.evidenceRegionBbox.y} ·
+                  {' '}{cand.evidenceRegionBbox.width}×{cand.evidenceRegionBbox.height}
+                </span>
+              </KeyValue>
+              <KeyValue label="% slide">
+                <span className="font-mono text-xxs">
+                  {evidence.x.toFixed(2)}, {evidence.y.toFixed(2)} · {evidence.w.toFixed(2)}×{evidence.h.toFixed(2)}
+                </span>
+              </KeyValue>
+            </>
+          ) : (
+            <p className="text-xs2 text-warn-600">
+              Ảnh này hiện KHÔNG nằm trong vùng Sau cải tiến nào sẽ được xuất Excel (khung nét liền không hiển thị).
+            </p>
+          )}
+          <KeyValue label="Ảnh đang đánh giá">
+            <span className="font-mono text-xxs">
+              Ảnh #{cand.pictureId} · {rect.x.toFixed(2)}, {rect.y.toFixed(2)} · {rect.w.toFixed(2)}×{rect.h.toFixed(2)}%
+            </span>
+          </KeyValue>
+          <KeyValue label="Render xem trước">
+            {previewBackend ? (
+              <span>
+                {backendLabel(previewBackend)}
+                {previewFaithful
+                  ? <span className="text-ok-600"> · trung thực PowerPoint</span>
+                  : <span className="text-warn-600"> · bản đơn giản, bố cục có thể khác</span>}
+              </span>
+            ) : '—'}
+          </KeyValue>
+        </div>
 
         <p className="mb-1 mt-2.5 text-base2 font-medium text-header">Lý do</p>
         <ul className="max-h-[110px] list-disc overflow-y-auto pl-5 text-xs2 leading-[17px] text-body">

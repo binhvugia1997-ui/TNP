@@ -127,7 +127,7 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
       update: { path: '', autoCheck: true },
     }
     const dashboard = {
-      app: { name: 'Report Extractor', title: 'Report Extractor v1.3.2', version: '1.3.2', build: '015', buildNumber: 15 },
+      app: { name: 'Report Extractor', title: 'Report Extractor v1.3.4', version: '1.3.4', build: '017', buildNumber: 17 },
       config,
       scan: { scanned: false, message: 'No reports selected.' },
       reports: [],
@@ -185,7 +185,7 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
       api: {
         ping: async () => bridgeEnvelope('Python bridge OK'),
         get_app_version: async () => bridgeEnvelope({
-          name: 'Report Extractor', title: 'Report Extractor v1.3.2', version: '1.3.2', build: '015',
+          name: 'Report Extractor', title: 'Report Extractor v1.3.4', version: '1.3.4', build: '017',
         }),
         get_current_config: async () => bridgeEnvelope(config),
         get_dashboard_state: async () => bridgeEnvelope(dashboard),
@@ -234,10 +234,11 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
     'the populated candidate and first slide preview')
 
     let previewPanel = container.querySelector('section[aria-label="Slide ngữ cảnh"]')
-    assert.equal(previewPanel.querySelectorAll('img').length, 2, 'full-slide and focused preview layers should render')
+    // PROMPT-027R §18/§19: ONE unmodified slide bitmap (no blurred duplicate, no clipped copy)
+    assert.equal(previewPanel.querySelectorAll('img').length, 1, 'the unmodified slide bitmap should render once')
     assert.deepEqual(
       [...previewPanel.querySelectorAll('img')].map((image) => image.getAttribute('src')),
-      [previewOne, previewOne],
+      [previewOne],
     )
 
     const secondCandidate = [...container.querySelectorAll('section[aria-label="Đối tượng ảnh"] button')]
@@ -253,7 +254,7 @@ test('ImageReview keeps hook order through StrictMode disconnect, readiness, can
     previewPanel = container.querySelector('section[aria-label="Slide ngữ cảnh"]')
     assert.deepEqual(
       [...previewPanel.querySelectorAll('img')].map((image) => image.getAttribute('src')),
-      [previewTwo, previewTwo],
+      [previewTwo],
       'switching candidates should update the rendered slide preview',
     )
 
