@@ -32,6 +32,17 @@ These tests pin what PROMPT-030 adds (as corrected by PROMPT-030R and PROMPT-030
   app-domain handle that ``clr_loader`` itself never inspects, and treats its NULL root-domain sentinel as
   the NORMAL case while demanding positive evidence (``resolved True`` + ``initialize_rc == 0``) and
   failing CLOSED on missing, malformed, erroring, nonzero-exit or timed-out probe output;
+* PROMPT-030T — that probe must run pythonnet's **whole** lifecycle, not just its start.  pythonnet 3.0.5's
+  ``load()`` registers ``atexit(unload)`` the moment ``Loader.Initialize`` returns 0, ``unload()`` calls
+  ``Loader.Shutdown(b"full_shutdown")`` before ``_RUNTIME.shutdown()``, and clr-loader's own ``atexit``
+  ``_release()`` then calls ``pyclr_finalize()``.  Stopping after ``Initialize`` leaves
+  ``AppDomain.CurrentDomain.ProcessExit`` subscribed and pythonnet's managed Finalizer queue full, so the
+  CLR tears the runtime down out of order and ``Py.cs:41``'s ``~GILState()`` throws
+  ``GIL must always be released…`` off the finalizer thread — unhandled on .NET Framework, i.e. a nonzero
+  subprocess exit AFTER healthy-looking JSON was printed.  The probe therefore reports
+  ``shutdown_resolved`` / ``shutdown_rc`` / ``finalized`` / ``stage`` and the gate demands all of them;
+  the probe source is also EXECUTED here against a stub ``cffi`` so its stage/cleanup control flow is
+  proven on any host instead of merely grepped;
 * startup diagnostics that report the discriminating facts — root/current vs named AppDomain, blocked
   runtime, .NET Framework release — instead of asserting an unprovable one.
 
@@ -44,6 +55,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import struct
+import subprocess
 import sys
 import types
 from pathlib import Path, PurePath
@@ -703,7 +715,24 @@ def test_probe_turns_a_null_resolution_into_a_build_failure(tmp_path, monkeypatc
 #: resolution, Initialize 0) must be accepted — the old gate failed it, and the old test below encoded
 #: that wrong expectation.  A NULL appdomain on the probe's unnamed/default request is clr-loader's
 #: ROOT/CURRENT-domain sentinel (ClrLoader.cs answers index 0 = AppDomain.CurrentDomain), not a failure.
-HEALTHY_ROOT_DOMAIN_EVIDENCE = {"arch": "amd64", "appdomain": "NULL", "resolved": True, "initialize_rc": 0}
+#:
+#: PROMPT-030T — a successful INITIALIZE is only half of the lifecycle pythonnet 3.0.5 actually runs.
+#: ``pythonnet/__init__.py::load()`` registers ``atexit(unload)`` the moment ``Initialize`` returns 0, and
+#: ``unload()`` is ``Loader.Shutdown(b"full_shutdown")`` (``src/runtime/Loader.cs:40-60`` →
+#: ``PythonEngine.Shutdown()``) BEFORE ``_RUNTIME.shutdown()``; clr-loader's own ``atexit(_release)`` then
+#: calls ``pyclr_finalize()`` (``clr_loader/netfx.py:68,74``).  Skipping that half leaves
+#: ``AppDomain.CurrentDomain.ProcessExit += OnProcessExit`` subscribed and the managed Finalizer queue
+#: full, so the CLR tears the runtime down out of order and ``Py.cs:41``'s ``~GILState()`` throws
+#: ``GIL must always be released…`` from the finalizer thread — an unhandled exception on .NET Framework,
+#: i.e. a nonzero subprocess exit AFTER healthy-looking JSON was already printed.  A PASS therefore has to
+#: prove shutdown and finalization too.
+HEALTHY_ROOT_DOMAIN_EVIDENCE = {"arch": "amd64", "appdomain": "NULL", "resolved": True,
+                                "initialize_rc": 0, "shutdown_resolved": True, "shutdown_rc": 0,
+                                "finalized": True, "stage": "pythonnet-shutdown"}
+
+#: What the probe emitted BEFORE PROMPT-030T: initialization proven, shutdown/finalization never performed.
+#: On Windows that is the payload of a subprocess which then dies, so it must now FAIL CLOSED.
+INITIALIZE_ONLY_EVIDENCE = {"arch": "amd64", "appdomain": "NULL", "resolved": True, "initialize_rc": 0}
 
 
 def _feed_probe(monkeypatch, payload_text, returncode=0, stderr=""):
@@ -774,17 +803,25 @@ def test_probe_fails_closed_on_unparseable_output(tmp_path, monkeypatch, stdout)
 
 def test_gate_accepts_the_healthy_root_domain_probe_end_to_end(tmp_path, monkeypatch):
     """The Windows acceptance shape, decision-tested on any host: every structural proof plus the real
-    root-domain probe evidence (NULL sentinel, resolved True, initialize_rc 0) yields NO problems —
-    while each structural check below the probe stays independently enforced by the tests above."""
+    root-domain probe evidence (NULL sentinel, resolved True, initialize_rc 0, shutdown resolved,
+    shutdown_rc 0, finalized) yields NO problems — while each structural check below the probe stays
+    independently enforced by the tests above."""
     _feed_probe(monkeypatch, json.dumps(HEALTHY_ROOT_DOMAIN_EVIDENCE))
     problems = validate_pythonnet_runtime(_package(tmp_path), {"found": False}, Path(sys.executable))
     assert problems == [], problems
 
 
+def test_gate_rejects_an_initialize_only_probe_end_to_end(tmp_path, monkeypatch):
+    """The same package, same exit code, but a probe that stopped after Initialize: the gate must stop
+    the build even though every structural proof and every initialization field looks healthy."""
+    _feed_probe(monkeypatch, json.dumps(INITIALIZE_ONLY_EVIDENCE))
+    problems = validate_pythonnet_runtime(_package(tmp_path), {"found": False}, Path(sys.executable))
+    assert problems and any("Shutdown" in p for p in problems), problems
+
+
 def test_probe_accepts_a_runtime_that_resolves(tmp_path, monkeypatch):
     """The named-domain shape of success (a NON-NULL handle stays valid evidence where it applies)."""
-    _feed_probe(monkeypatch, json.dumps({"arch": "amd64", "appdomain": "created",
-                                         "resolved": True, "initialize_rc": 0}))
+    _feed_probe(monkeypatch, json.dumps({**HEALTHY_ROOT_DOMAIN_EVIDENCE, "appdomain": "created"}))
     assert bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64") == []
 
 
@@ -793,6 +830,16 @@ def test_probe_rejects_a_nonzero_initialize_result(tmp_path, monkeypatch):
                                          "resolved": True, "initialize_rc": 3}))
     problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
     assert any("Initialize trả về 3" in p for p in problems), problems
+
+
+def test_probe_does_not_demand_shutdown_evidence_from_a_runtime_that_never_initialized(tmp_path, monkeypatch):
+    """H — a failed Initialize must stay the single visible finding.  Shutting down (or demanding shutdown
+    evidence for) a runtime that never started would bury the real cause under invented complaints."""
+    _feed_probe(monkeypatch, json.dumps({"arch": "amd64", "appdomain": "NULL",
+                                         "resolved": True, "initialize_rc": 1}))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert problems == ["Python.Runtime.Loader.Initialize trả về 1 (khác 0): pythonnet không khởi động "
+                        "được trong gói đã build"], problems
 
 
 def test_probe_reports_a_crash_instead_of_a_silent_pass(tmp_path, monkeypatch):
@@ -809,6 +856,350 @@ def test_probe_reports_its_own_exception(tmp_path, monkeypatch):
     problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
     assert any("probe nạp runtime đã đóng gói thất bại" in p for p in problems), problems
     assert len(problems) == 1, "the exception is the finding; no invented secondary complaints"
+
+
+# ================================================= the pythonnet lifecycle (PROMPT-030T)
+def test_probe_fails_closed_when_the_shutdown_half_of_the_lifecycle_is_absent(tmp_path, monkeypatch):
+    """D — THE reproduced Windows failure boundary, at decision level.
+
+    This exact payload is what the pre-PROMPT-030T probe printed on Windows immediately before the
+    subprocess died with ``GIL must always be released, and it must be released from the same thread that
+    acquired it``.  Initialization evidence alone must NOT be a pass any more: the probe has to prove it
+    ran ``Loader.Shutdown(b"full_shutdown")`` and finalized the CLR.
+    """
+    _feed_probe(monkeypatch, json.dumps(INITIALIZE_ONLY_EVIDENCE))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any("Shutdown" in p for p in problems), problems
+    assert problems, "initialization-only evidence must fail closed"
+
+
+def test_probe_accepts_the_complete_root_domain_lifecycle(tmp_path, monkeypatch, capsys):
+    """A — NULL root domain + Initialize 0 + Shutdown resolved, rc 0 + finalized, process rc 0 → PASS."""
+    _feed_probe(monkeypatch, json.dumps(HEALTHY_ROOT_DOMAIN_EVIDENCE))
+    assert bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64") == []
+    printed = capsys.readouterr().out
+    for key in ("appdomain", "resolved", "initialize_rc", "shutdown_resolved", "shutdown_rc", "finalized"):
+        assert f"probe {key}" in printed, f"{key} must stay visible in the Windows build log"
+    assert "root/current AppDomain" in printed, "030S-R semantics must survive"
+
+
+def test_probe_fails_when_shutdown_cannot_be_resolved_after_successful_initialize(tmp_path, monkeypatch):
+    """B — Initialize returned 0, so Shutdown was obligatory; an unresolvable Shutdown is a real defect."""
+    _feed_probe(monkeypatch, json.dumps({**HEALTHY_ROOT_DOMAIN_EVIDENCE, "shutdown_resolved": False}))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any("Shutdown" in p and "NULL" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("mutate, expected", [
+    pytest.param(lambda p: p.pop("shutdown_resolved"), "bằng chứng",
+                 id="shutdown_resolved-missing-fails-closed"),
+    pytest.param(lambda p: p.update(shutdown_resolved="yes"), "bằng chứng",
+                 id="shutdown_resolved-non-boolean-fails-closed"),
+    pytest.param(lambda p: p.pop("shutdown_rc"), "chưa có kết quả hợp lệ",
+                 id="shutdown_rc-missing-fails-closed"),
+    pytest.param(lambda p: p.update(shutdown_rc=False), "chưa có kết quả hợp lệ",
+                 id="shutdown_rc-JSON-false-is-not-zero"),
+    pytest.param(lambda p: p.update(shutdown_rc=True), "chưa có kết quả hợp lệ",
+                 id="shutdown_rc-JSON-true-is-not-zero"),
+])
+def test_probe_fails_closed_on_malformed_shutdown_evidence(tmp_path, monkeypatch, mutate, expected):
+    """E — missing or malformed shutdown evidence is ignorance, and ignorance fails closed."""
+    payload = dict(HEALTHY_ROOT_DOMAIN_EVIDENCE)
+    mutate(payload)
+    _feed_probe(monkeypatch, json.dumps(payload))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any(expected in p for p in problems), problems
+
+
+def test_probe_rejects_a_nonzero_shutdown_result(tmp_path, monkeypatch):
+    """C — Loader.Shutdown returning 1 means PythonEngine.Shutdown() threw; the runtime is not clean."""
+    _feed_probe(monkeypatch, json.dumps({**HEALTHY_ROOT_DOMAIN_EVIDENCE, "shutdown_rc": 1}))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any("Shutdown trả về 1" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("payload, expected", [
+    pytest.param({**HEALTHY_ROOT_DOMAIN_EVIDENCE, "finalized": False,
+                  "finalize_error": "OSError: pyclr_finalize crashed"},
+                 "pyclr_finalize", id="finalization-raised"),
+    pytest.param({**HEALTHY_ROOT_DOMAIN_EVIDENCE, "finalized": False},
+                 "pyclr_finalize", id="finalization-reported-false"),
+    pytest.param({k: v for k, v in HEALTHY_ROOT_DOMAIN_EVIDENCE.items() if k != "finalized"},
+                 "pyclr_finalize", id="finalization-evidence-missing"),
+    pytest.param({**HEALTHY_ROOT_DOMAIN_EVIDENCE, "finalized": 1},
+                 "pyclr_finalize", id="finalized-JSON-1-is-not-true"),
+])
+def test_probe_fails_when_clr_loader_finalization_did_not_succeed(tmp_path, monkeypatch, payload, expected):
+    """F — clr-loader registers atexit(_release) → pyclr_finalize(); skipping or failing it fails the gate."""
+    _feed_probe(monkeypatch, json.dumps(payload))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any(expected in p for p in problems), problems
+    assert not any("Shutdown" in p for p in problems), \
+        "shutdown succeeded here; the finding must stay on the finalization stage"
+
+
+def test_probe_fails_closed_on_nonzero_exit_even_with_a_complete_healthy_lifecycle(tmp_path, monkeypatch):
+    """G — the exit-code gate is NOT weakened by the new positive evidence.
+
+    This is the exact PROMPT-030T regression: a probe that printed a perfect lifecycle report and then
+    died must still fail.  Nothing in the shutdown/finalization evidence may rescue a nonzero exit.
+    """
+    _feed_probe(monkeypatch, json.dumps(HEALTHY_ROOT_DOMAIN_EVIDENCE), returncode=1,
+                stderr="System.InvalidOperationException: GIL must always be released, "
+                       "and it must be released from the same thread that acquired it.")
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert any("mã lỗi 1" in p for p in problems), problems
+    assert any("GIL must always be released" in p for p in problems), "the .NET cause must stay visible"
+
+
+def test_probe_invents_no_lifecycle_evidence_after_an_exception_before_initialize(tmp_path, monkeypatch):
+    """I — a dlopen failure happens before any CLR/Python.Runtime state exists: the report must not claim
+    shutdown or finalization success for state the probe never created."""
+    _feed_probe(monkeypatch, json.dumps({"error": "OSError: cannot load library 'ClrLoader.dll'",
+                                         "stage": "start"}))
+    problems = bp.probe_packaged_runtime(tmp_path, Path(sys.executable), "amd64")
+    assert len(problems) == 1, problems
+    assert all("Shutdown" not in p and "pyclr_finalize" not in p for p in problems), problems
+
+
+def test_probe_source_models_the_verified_shutdown_and_finalize_lifecycle():
+    """L — the probe body must contain the shutdown half, in the upstream order, with structured cleanup.
+
+    Pinned evidence: ``pythonnet/__init__.py:160-167`` (``Loader.Shutdown(b"full_shutdown")`` then
+    ``_RUNTIME.shutdown()``) and ``clr_loader/netfx.py:74`` (``pyclr_finalize()`` in ``atexit``).
+    """
+    source = bp.PROBE_PACKAGED_RUNTIME
+    compile(source, "<probe>", "exec")
+    assert 'b"Python.Runtime.Loader", b"Shutdown"' in source, "the probe must resolve Loader.Shutdown"
+    assert 'b"full_shutdown"' in source, "…and call it with pythonnet's own full_shutdown command"
+    assert "fw.pyclr_finalize()" in source, "…and finish with clr-loader's pyclr_finalize()"
+    assert source.index('b"Python.Runtime.Loader", b"Initialize"') < source.index(
+        'b"Python.Runtime.Loader", b"Shutdown"') < source.index("fw.pyclr_finalize()"), \
+        "lifecycle order must be Initialize → Shutdown → finalize (atexit is LIFO upstream)"
+    assert "finally:" in source, "cleanup must be structured, not skipped when the native chain throws"
+    assert '"shutdown_resolved"' in source and '"shutdown_rc"' in source and '"finalized"' in source, \
+        "the validator must receive positive evidence for every stage it relies on"
+
+
+def test_probe_source_only_shuts_down_a_runtime_that_initialized():
+    """L/H — ``PythonEngine.Shutdown()`` on a runtime that never initialized is not the upstream contract,
+    and the finalize call must be gated on ``pyclr_initialize()`` having actually run."""
+    source = bp.PROBE_PACKAGED_RUNTIME
+    assert 'if out["initialize_rc"] == 0:' in source, \
+        "Shutdown must be nested inside the successful-initialize branch"
+    assert source.index('if out["initialize_rc"] == 0:') < source.index(
+        'b"Python.Runtime.Loader", b"Shutdown"'), "…so no shutdown is attempted after a failed Initialize"
+    assert 'if stage != "start":' in source, \
+        "pyclr_finalize must only run once pyclr_initialize succeeded, and exactly once"
+    assert source.index('if stage != "start":') < source.index("fw.pyclr_finalize()")
+    assert "pyclr_create_appdomain(ffi.NULL, ffi.NULL)" in source, \
+        "030S-R: the probe still requests the unnamed root domain — never a named one to dodge the sentinel"
+    assert 'out["appdomain"] = "NULL" if domain == ffi.NULL else "created"' in source
+
+
+def test_probe_source_never_lets_a_cleanup_error_hide_the_original_failure():
+    """6 — the first exception is written to ``error`` once, in the except block; cleanup records its own
+    failure under a different key instead of overwriting the finding."""
+    source = bp.PROBE_PACKAGED_RUNTIME
+    assert 'out["error"] = f"{type(exc).__name__}: {exc}"[:400]' in source
+    assert source.count('out["error"] =') == 1, "only the original failure may claim the error key"
+    assert '"finalize_error"' in source, "a finalize failure is reported separately, not swallowed"
+    assert 'out["finalized"] = False' in source, "…and failed cleanup is never reported as successful"
+
+
+# ---------------------------------------------------------------- executing the real probe source
+#: A minimal stand-in for the ``cffi`` module so ``PROBE_PACKAGED_RUNTIME`` itself — the production
+#: string, unmodified — can be executed on any host and its control flow observed.  This does NOT replace
+#: the real Windows probe (which still dlopens the packaged ClrLoader.dll); it only lets Linux prove the
+#: probe's stage/cleanup logic instead of merely grepping it.  Behaviour is selected by TNP_PROBE_FAKE.
+#: The fake entry points return 99 when the probe passes the wrong buffer/size, so a drifted argument
+#: shows up as a nonzero rc rather than silently passing.
+_CFFI_STUB = r"""
+import json, os, sys, types as _types
+
+_cfg = json.loads(os.environ.get("TNP_PROBE_FAKE", "{}"))
+_calls = []
+
+
+def _boom(what):
+    raise OSError(_cfg.get(what, "injected failure"))
+
+
+class _FakeFFI:
+    NULL = None
+
+    def cdef(self, text):
+        _calls.append(("cdef", text.count("pyclr_")))
+
+    def dlopen(self, path):
+        if _cfg.get("dlopen_raises"):
+            _boom("dlopen_raises")
+        return _FakeLib(path)
+
+    def from_buffer(self, kind, data):
+        return data
+
+    def cast(self, kind, value):
+        return value
+
+
+class _FakeLib:
+    def __init__(self, path):
+        self.path = path
+        self.finalized = 0
+
+    def pyclr_initialize(self):
+        _calls.append(("pyclr_initialize",))
+        if _cfg.get("initialize_raises_native"):
+            _boom("initialize_raises_native")
+
+    def pyclr_create_appdomain(self, name, config):
+        _calls.append(("pyclr_create_appdomain", name, config))
+        return None if _cfg.get("root_domain", True) else object()
+
+    def pyclr_get_function(self, domain, assembly, class_name, function):
+        _calls.append(("pyclr_get_function", assembly, class_name, function))
+        if function == b"Shutdown" and not _cfg.get("shutdown_resolvable", True):
+            return None
+        return _EntryPoint(function)
+
+    def pyclr_close_appdomain(self, domain):
+        _calls.append(("pyclr_close_appdomain", domain))
+
+    def pyclr_finalize(self):
+        self.finalized += 1
+        _calls.append(("pyclr_finalize", self.finalized))
+        if self.finalized > 1:
+            raise OSError("pyclr_finalize called twice")
+        if _cfg.get("finalize_raises"):
+            _boom("finalize_raises")
+
+
+class _EntryPoint:
+    def __init__(self, function):
+        self.function = function
+
+    def __call__(self, buffer, size):
+        _calls.append(("call", self.function, bytes(buffer), size))
+        if self.function == b"Initialize" and _cfg.get("initialize_call_raises"):
+            _boom("initialize_call_raises")
+        if self.function == b"Initialize":
+            return 99 if (bytes(buffer) != b"" or size != 0) else int(_cfg.get("initialize_rc", 0))
+        if self.function == b"Shutdown":
+            return 99 if (bytes(buffer) != b"full_shutdown" or size != 13) \
+                else int(_cfg.get("shutdown_rc", 0))
+        return 99
+
+
+_mod = _types.ModuleType("cffi")
+_mod.FFI = _FakeFFI
+sys.modules["cffi"] = _mod
+"""
+
+
+def _run_probe_source(monkeypatch, tmp_path, fake_cfg):
+    """Execute bp.PROBE_PACKAGED_RUNTIME for real and return (returncode, parsed-json-or-None, calls)."""
+    monkeypatch.setenv("TNP_PROBE_FAKE", json.dumps(fake_cfg))
+    proc = subprocess.run(
+        [sys.executable, "-c", _CFFI_STUB + bp.PROBE_PACKAGED_RUNTIME, str(tmp_path), _build_arch()],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        out = None
+    return proc.returncode, out, proc.stderr
+
+
+def test_probe_source_runs_the_complete_lifecycle_and_exits_zero(tmp_path, monkeypatch):
+    """A — executed, not grepped: the production probe string emits evidence for every stage and exits 0."""
+    rc, out, err = _run_probe_source(monkeypatch, tmp_path, {})
+    assert rc == 0, err
+    assert out == {**out, "arch": _build_arch(), "appdomain": "NULL", "resolved": True,
+                   "initialize_rc": 0, "shutdown_resolved": True, "shutdown_rc": 0,
+                   "finalized": True, "stage": "pythonnet-shutdown"}, out
+    assert out["host"].replace("\\", "/").endswith(
+        f"_internal/clr_loader/ffi/dlls/{_build_arch()}/ClrLoader.dll"), out["host"]
+    assert out["assembly"].replace("\\", "/").endswith(
+        "_internal/pythonnet/runtime/Python.Runtime.dll"), out["assembly"]
+
+
+def test_probe_source_never_shuts_down_a_runtime_whose_initialize_failed(tmp_path, monkeypatch):
+    """H — executed: Initialize rc != 0 means no Loader.Shutdown call at all, the original rc survives,
+    and pyclr_finalize still runs because the CLR itself WAS started."""
+    rc, out, err = _run_probe_source(monkeypatch, tmp_path, {"initialize_rc": 1})
+    assert rc == 0, err
+    assert out["initialize_rc"] == 1 and "error" not in out
+    assert "shutdown_resolved" not in out and "shutdown_rc" not in out, \
+        "no shutdown may be attempted after a failed Initialize"
+    assert out["finalized"] is True and out["stage"] == "appdomain", out
+
+
+def test_probe_source_reports_a_failed_shutdown_and_still_finalizes(tmp_path, monkeypatch):
+    """C — executed: Loader.Shutdown returning 1 is reported, the stage stops before shutdown, and the
+    CLR is still finalized so the probe does not abandon native state it created."""
+    rc, out, err = _run_probe_source(monkeypatch, tmp_path, {"shutdown_rc": 1})
+    assert rc == 0, err
+    assert out["shutdown_resolved"] is True and out["shutdown_rc"] == 1
+    assert out["finalized"] is True and out["stage"] == "pythonnet-initialized", out
+
+
+def test_probe_source_reports_an_unresolvable_shutdown(tmp_path, monkeypatch):
+    """B — executed: a NULL functor for Loader.Shutdown is recorded as shutdown_resolved False."""
+    rc, out, err = _run_probe_source(monkeypatch, tmp_path, {"shutdown_resolvable": False})
+    assert rc == 0, err
+    assert out["shutdown_resolved"] is False and "shutdown_rc" not in out
+    assert out["finalized"] is True and out["stage"] == "pythonnet-initialized", out
+
+
+def test_probe_source_invents_no_lifecycle_evidence_when_dlopen_fails(tmp_path, monkeypatch):
+    """I — executed: a dlopen failure happens before any CLR state exists, so the probe reports the
+    exception, the stage it died at, and NO shutdown/finalization success."""
+    rc, out, err = _run_probe_source(monkeypatch, tmp_path, {"dlopen_raises": "cannot load ClrLoader.dll"})
+    assert rc == 0, err
+    assert out["error"].startswith("OSError: cannot load ClrLoader.dll"), out
+    assert out["stage"] == "start" and out["error_stage"] == "start", out
+    assert "finalized" not in out and "shutdown_resolved" not in out, out
+
+
+def test_probe_source_keeps_the_original_failure_when_finalize_also_fails(tmp_path, monkeypatch):
+    """6 — executed: a cleanup exception must be reported under its own key and must not replace the
+    original finding, and failed cleanup is reported as False, never as success."""
+    rc, out, err = _run_probe_source(monkeypatch, tmp_path,
+                                     {"initialize_call_raises": "Loader.Initialize exploded",
+                                      "finalize_raises": "pyclr_finalize exploded"})
+    assert rc == 0, err
+    assert out["error"] == "OSError: Loader.Initialize exploded", out
+    assert out["error_stage"] == "appdomain", out
+    assert out["finalized"] is False, out
+    assert out["finalize_error"] == "OSError: pyclr_finalize exploded", out
+
+
+def test_probe_source_does_not_finalize_a_clr_it_never_started(tmp_path, monkeypatch):
+    """6 — executed: ``pyclr_initialize`` itself failing means there is nothing to finalize, so the probe
+    must not claim cleanup it never attempted (and must not call it either)."""
+    rc, out, err = _run_probe_source(monkeypatch, tmp_path,
+                                     {"initialize_raises_native": "pyclr_initialize exploded"})
+    assert rc == 0, err
+    assert out["error"] == "OSError: pyclr_initialize exploded", out
+    assert out["stage"] == "start" and "finalized" not in out, out
+
+
+def test_probe_source_finalizes_exactly_once(tmp_path, monkeypatch):
+    """6 — executed: no double-finalize.  The stub raises on a second ``pyclr_finalize()``, so a healthy
+    ``finalized is True`` can only mean the finally block ran the call exactly once."""
+    _, out, err = _run_probe_source(monkeypatch, tmp_path, {})
+    assert out["finalized"] is True and "finalize_error" not in out, (out, err)
+    _, out2, err = _run_probe_source(monkeypatch, tmp_path, {"shutdown_rc": 1})
+    assert out2["finalized"] is True and out2["stage"] == "pythonnet-initialized", (out2, err)
+
+
+def test_probe_source_sends_pythonnets_own_entry_point_arguments(tmp_path, monkeypatch):
+    """The buffers must match clr_loader.types.ClrFunction.__call__ exactly (``ffi.from_buffer`` +
+    ``len(buf)``): ``b""``/0 for Initialize and ``b"full_shutdown"``/13 for Shutdown.  A wrong argument
+    makes the fake entry point return 99, which fails the healthy-path assertions."""
+    _, out, err = _run_probe_source(monkeypatch, tmp_path, {})
+    assert out["initialize_rc"] == 0 and out["shutdown_rc"] == 0, (out, err)
+    assert 99 not in (out["initialize_rc"], out["shutdown_rc"])
 
 
 def test_probe_reports_a_timeout_as_a_failure(tmp_path, monkeypatch):
@@ -848,13 +1239,23 @@ def test_validate_only_reuses_the_same_gate_and_reports_a_real_cause(tmp_path, m
 @pytest.mark.skipif(sys.platform != "win32",
                     reason="Windows-only: exercises real CFFI/CLR DLL loading; Linux cannot claim native loadability")
 def test_validate_only_passes_a_healthy_folder(tmp_path, capsys):
-    """The Windows live-probe case uses installed, genuinely loadable runtime payloads."""
+    """The Windows live-probe case uses installed, genuinely loadable runtime payloads.
+
+    PROMPT-030T — the probe must now prove the WHOLE lifecycle (Initialize → Shutdown → pyclr_finalize)
+    and the subprocess must exit 0, with no ``GIL must always be released`` finalizer exception.
+    """
     py = _validate_only_interpreter()
     folder = _package_from_installed_runtime(tmp_path, py)
     assert bp.validate_existing_package(folder, py) == 0
     output = capsys.readouterr().out
     assert "OK: Python.Runtime.Loader.Initialize phân giải được" in output
     assert "probe appdomain" in output and "probe resolved" in output and "probe initialize_rc" in output
+    assert "probe shutdown_resolved" in output and "probe shutdown_rc" in output, \
+        "the Windows log must carry the pythonnet unload() evidence"
+    assert "probe finalized" in output, "…and the clr-loader pyclr_finalize() evidence"
+    assert "root/current AppDomain" in output, "030S-R root-domain semantics must stay visible"
+    assert "GIL must always be released" not in output, \
+        "an unhandled Py.cs ~GILState() finalizer exception means the lifecycle is still incomplete"
 
 
 @pytest.mark.parametrize(
