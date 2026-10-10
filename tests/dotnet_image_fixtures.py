@@ -1,16 +1,14 @@
-"""Synthetic ECMA-335 managed images for the PROMPT-030 packaging/runtime tests.
+"""Synthetic ECMA-335/PE images for PROMPT-030 STRUCTURAL tests.
 
-``tests/test_prompt028_portable.py`` proved layout, uniqueness and SHA256 with 16-byte placeholder files,
-which was enough while ``validate_pythonnet_runtime`` only checked presence and hash.  PROMPT-030 makes
-that gate prove LOADABILITY — assembly identity, IL-only/any-cpu, the ``Python.Runtime.Loader.Initialize``
-signature clr_loader binds, and for the netfx host its architecture, mixed-mode-ness and ``pyclr_*``
-exports — and a placeholder byte string cannot satisfy any of it.
+These fixtures model assembly identity, metadata, target framework, architecture and export-name tables so
+``tools/dotnet_pe.py`` and the cross-platform validator checks can be tested without .NET or installed DLLs.
+They are not substitutes for executing a real runtime: in particular, ``clr_loader_image()`` writes the
+``pyclr_*`` export names and placeholder function RVAs, but contains no callable native/mixed-mode
+``ClrLoader`` implementation. Never use it in a test that claims Windows DLL loadability or symbol resolution.
 
-Rather than weaken the gate back, or skip the tests on machines without ``pythonnet`` installed, this module
-*writes* a real managed PE.  Everything is derived from ECMA-335 II.22–II.25, so the fixture is a genuine
-image that ``tools/dotnet_pe.py`` parses the same way it parses the shipped ``Python.Runtime.dll`` — and
-each property the gate checks can be mutated ONE at a time, which is what makes the negative cases mean
-something.  No platform, no .NET installation and no repository file is required.
+PROMPT-030 deliberately makes the production gate stronger than presence/hash checks. Keep these synthetic
+images for structural and malformed-image cases; Windows live-probe tests must stage the real installed
+runtime payloads. No platform, .NET installation or repository file is required for the structural tests.
 """
 from __future__ import annotations
 
@@ -37,8 +35,8 @@ _ELEMENT = {
     "string": 0x0E, "native int": 0x18, "native uint": 0x19, "object": 0x1C,
 }
 
-#: What the real pythonnet 3.0.5 runtime looks like, measured with tools/dotnet_pe.py — the fixture's
-#: defaults reproduce it so a "valid" package fixture is a faithful stand-in.
+#: Reader-visible metadata measured from the real pythonnet 3.0.5 runtime with tools/dotnet_pe.py. The
+#: generated image models these fields only; it does not contain the runtime's executable IL method bodies.
 REAL_PYTHON_RUNTIME = dict(
     assembly_name="Python.Runtime",
     version=(3, 0, 5, 0),
@@ -53,7 +51,8 @@ REAL_PYTHON_RUNTIME = dict(
     machine="x86",
     strong_name=True,
 )
-#: What the real clr_loader 0.2.10 netfx host looks like (mixed-mode C++/CLI, five native exports).
+#: Structural values measured from the real clr_loader 0.2.10 netfx host. These flags and names model its PE
+#: metadata only; build_managed_pe() does NOT synthesize the native C++/CLI implementation.
 REAL_CLR_LOADER = dict(
     assembly_name="ClrLoader",
     version=(1, 0, 0, 0),
@@ -145,11 +144,11 @@ def build_managed_pe(assembly_name: str = "Python.Runtime",
                      include_method: bool = True,
                      include_type: bool = True,
                      metadata_version: str = "v4.0.30319") -> bytes:
-    """Emit a complete, parseable managed PE whose properties are all arguments.
+    """Emit a parseable PE/CLI metadata image whose reader-visible properties are controlled by arguments.
 
-    ``include_type=False`` / ``include_method=False`` produce an image that is perfectly valid but does not
-    declare the entry point — the "exists and hashes correctly yet cannot initialize" case the PROMPT-030
-    gate has to reject.
+    The image is suitable for structural parser/validator tests, not for loading into the CLR. In particular,
+    it does not emit executable IL method bodies. ``include_type=False`` / ``include_method=False`` produce an
+    image that parses but does not declare the entry point the PROMPT-030 gate has to reject.
     """
     strings = _Heap()
     blobs = _Heap()
@@ -338,14 +337,14 @@ def build_managed_pe(assembly_name: str = "Python.Runtime",
 
 
 def python_runtime_image(**overrides) -> bytes:
-    """A faithful stand-in for pythonnet's ``Python.Runtime.dll`` (defaults = the measured real image)."""
+    """Build a structural PE/CLI fixture for Python.Runtime metadata, not a loadable runtime DLL."""
     params = dict(REAL_PYTHON_RUNTIME)
     params.update(overrides)
     return build_managed_pe(**params)
 
 
 def clr_loader_image(machine: str = "amd64", **overrides) -> bytes:
-    """A faithful stand-in for ``clr_loader/ffi/dlls/<machine>/ClrLoader.dll``."""
+    """Build a structural export-table fixture, not a callable ``ClrLoader.dll``."""
     params = dict(REAL_CLR_LOADER)
     params.update(overrides)
     params["machine"] = machine
