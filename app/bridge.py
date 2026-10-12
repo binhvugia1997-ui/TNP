@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -134,6 +135,25 @@ class BridgeService:
 
     def install_update(self) -> dict:
         return self._respond(self.service.install_update)
+
+    def close_for_update(self) -> dict:
+        def call():
+            if self.window is None:
+                raise ServiceError("Không thể đóng cửa sổ ứng dụng để chuyển sang trình cập nhật.",
+                                   "UPDATE_CLOSE_UNAVAILABLE")
+            result = self.service.close_for_update()
+
+            def destroy_after_response():
+                try:
+                    self.window.destroy()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("UPDATE_WINDOW_CLOSE_FAILED")
+
+            timer = threading.Timer(0.2, destroy_after_response)
+            timer.daemon = True
+            timer.start()
+            return result
+        return self._respond(call)
 
     def run_diagnostics(self) -> dict:
         return self._respond(self.service.run_diagnostics)

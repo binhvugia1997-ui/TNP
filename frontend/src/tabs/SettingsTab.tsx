@@ -250,86 +250,111 @@ function OptionsSection() {
 function UpdateSection() {
   const s = useStore()
   const u = s.update
-  const installing = u.status === 'installing'
+  const preparing = ['staging', 'verifying', 'installing'].includes(u.status)
+  const handoff = u.status === 'ready_to_restart'
+  const portable = s.appInfo.runtime === 'pyinstaller-portable'
+  const editable = !preparing && !handoff && !s.locked
+  const canInstall = u.status === 'available' && u.installEnabled && s.connected && !s.locked
 
   return (
-    <>
-      <Card title="Cập nhật">
-        <div className="max-w-[820px]">
-          <Field label="Phiên bản hiện tại">
-            <div className="flex items-center gap-2">
-              <span className="font-semibold text-header">
-                {s.appInfo.version || '—'} — Build {s.appInfo.build || '—'}
-              </span>
-              <ToneChip tone="info">development</ToneChip>
-            </div>
-          </Field>
-          <Field label="Đường dẫn cập nhật" hint="Thư mục local hoặc LAN chứa version.json và gói ZIP. Dùng quyền truy cập Windows hiện có; chương trình không lưu mật khẩu.">
-            <div className="flex items-center gap-2">
-              <TextInput
-                className="flex-1"
-                value={u.path}
-                disabled={installing || s.locked}
-                onChange={(e) => s.setUpdate({ ...u, path: e.target.value })}
-              />
-              <Button disabled={installing || s.locked} onClick={s.chooseUpdateFolder}>
-                Chọn…
-              </Button>
-            </div>
-          </Field>
-          <Field label=" ">
-            <Checkbox
-              checked={u.autoCheck}
-              disabled={installing || s.locked}
-              onChange={(v) => s.setUpdate({ ...u, autoCheck: v })}
-              label="Tự động kiểm tra cập nhật khi khởi động"
-            />
-          </Field>
-
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <Button
-              icon={u.status === 'checking' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-              disabled={u.status === 'checking' || installing || s.locked}
-              onClick={() => s.checkUpdate(false)}
-            >
-              Kiểm tra cập nhật
-            </Button>
-            <Button
-              variant="primary"
-              icon={<Download className="h-3.5 w-3.5" />}
-              disabled={true}
-              onClick={s.installUpdate}
-            >
-              Cập nhật ngay
-            </Button>
-            <span className="text-xs2 text-muted">
-              {u.autoCheck ? 'Có kiểm tra tự động khi khởi động (nhắc một lần cho mỗi bản).' : 'Đã tắt kiểm tra tự động.'}
-              {' '}Việc áp dụng/cài gói cập nhật đang bị khóa trong bản tích hợp phát triển.
+    <Card title="Cập nhật">
+      <div className="max-w-[820px]">
+        <Field label="Phiên bản hiện tại">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-header">
+              {s.appInfo.version || '—'} — Build {s.appInfo.build || '—'}
             </span>
+            <ToneChip tone={portable ? (s.appInfo.updateInstallCapable ? 'ok' : 'warn') : 'muted'}>
+              {portable ? 'Portable đã đóng gói' : 'development'}
+            </ToneChip>
           </div>
+        </Field>
+        <Field label="Đường dẫn cập nhật" hint="Thư mục local hoặc LAN chứa version.json và gói ZIP. Dùng quyền truy cập Windows hiện có; chương trình không lưu mật khẩu.">
+          <div className="flex items-center gap-2">
+            <TextInput
+              className="flex-1"
+              value={u.path}
+              disabled={!editable}
+              onChange={(e) => s.setUpdate({ ...u, path: e.target.value })}
+            />
+            <Button disabled={!editable} onClick={s.chooseUpdateFolder}>Chọn…</Button>
+          </div>
+        </Field>
+        <Field label=" ">
+          <Checkbox
+            checked={u.autoCheck}
+            disabled={!editable}
+            onChange={(v) => s.setUpdate({ ...u, autoCheck: v })}
+            label="Tự động kiểm tra cập nhật khi khởi động"
+          />
+        </Field>
 
-          <div className="mt-2.5 flex flex-col items-start gap-1.5 border-t border-lineSoft pt-2">
-            {u.status === 'available' && <ToneChip tone="info" icon={<Download className="h-3.5 w-3.5" />}>Có bản cập nhật</ToneChip>}
-            {u.status === 'installed' && <ToneChip tone="ok" icon={<CheckCircle2 className="h-3.5 w-3.5" />}>Gói đã sẵn sàng</ToneChip>}
-            {u.status === 'idle' && <ToneChip tone="muted">Chưa kiểm tra</ToneChip>}
-            {u.status === 'latest' && <ToneChip tone="ok" icon={<CheckCircle2 className="h-3.5 w-3.5" />}>Đang dùng bản mới nhất</ToneChip>}
-            {u.status === 'error' && <ToneChip tone="error" icon={<AlertTriangle className="h-3.5 w-3.5" />}>Không thể kiểm tra cập nhật</ToneChip>}
-            <p className="text-base2 text-body">{u.message}</p>
-            {installing && (
-              <div className="mt-1">
-                <div className="flex items-center gap-2 text-xs2">
-                  <span className="text-body">Trạng thái tiến trình: {u.progressStage}</span>
-                  <span className="ml-auto font-semibold text-brand-600">{u.progress}%</span>
-                </div>
-                <ProgressBar className="mt-1" value={u.progress} />
-                <p className="mt-1 text-xs2 text-muted">{u.message}</p>
-              </div>
-            )}
-          </div>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <Button
+            icon={u.status === 'checking' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            disabled={u.status === 'checking' || preparing || handoff || s.locked || !s.connected}
+            onClick={() => s.checkUpdate(false)}
+          >
+            Kiểm tra cập nhật
+          </Button>
+          <Button
+            variant="primary"
+            icon={preparing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+            disabled={!canInstall}
+            onClick={s.installUpdate}
+          >
+            {preparing ? 'Đang chuẩn bị…' : 'Cập nhật ngay'}
+          </Button>
+          {handoff && (
+            <Button variant="outline" onClick={s.retryUpdateClose}>
+              Đóng ứng dụng để tiếp tục
+            </Button>
+          )}
+          <span className="text-xs2 text-muted">
+            {u.autoCheck ? 'Tự động kiểm tra khi khởi động đang bật.' : 'Tự động kiểm tra khi khởi động đang tắt.'}
+            {' '}{portable
+              ? 'Chỉ Build mới hơn mới có thể cài; gói sẽ được kiểm tra cục bộ trước khi thay thế.'
+              : 'Môi trường development chỉ được kiểm tra và xem thông tin cập nhật; không thể cài đặt.'}
+          </span>
         </div>
-      </Card>
 
-    </>
+        <div className="mt-2.5 flex flex-col items-start gap-1.5 border-t border-lineSoft pt-2">
+          {u.status === 'available' && (
+            <ToneChip tone="info" icon={<Download className="h-3.5 w-3.5" />}>
+              Có bản cập nhật{u.available ? ` — ${u.available.version} / Build ${u.available.build}` : ''}
+            </ToneChip>
+          )}
+          {u.status === 'installed' && <ToneChip tone="ok" icon={<CheckCircle2 className="h-3.5 w-3.5" />}>Đã cài bản cập nhật</ToneChip>}
+          {u.status === 'idle' && <ToneChip tone="muted">Chưa kiểm tra</ToneChip>}
+          {u.status === 'checking' && <ToneChip tone="info" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" />}>Đang kiểm tra</ToneChip>}
+          {u.status === 'latest' && <ToneChip tone="ok" icon={<CheckCircle2 className="h-3.5 w-3.5" />}>Đang dùng bản mới nhất</ToneChip>}
+          {u.status === 'older' && <ToneChip tone="warn" icon={<AlertTriangle className="h-3.5 w-3.5" />}>Bản trên nguồn cập nhật cũ hơn</ToneChip>}
+          {u.status === 'error' && <ToneChip tone="error" icon={<AlertTriangle className="h-3.5 w-3.5" />}>Không thể kiểm tra cập nhật</ToneChip>}
+          {u.status === 'failed' && <ToneChip tone="error" icon={<XCircle className="h-3.5 w-3.5" />}>Cài đặt thất bại</ToneChip>}
+          {u.status === 'development_disabled' && <ToneChip tone="muted">Chỉ kiểm tra trong development</ToneChip>}
+          {u.status === 'staging' && <ToneChip tone="info" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" />}>Đang sao chép và kiểm tra gói</ToneChip>}
+          {u.status === 'verifying' && <ToneChip tone="info" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" />}>Đang xác minh</ToneChip>}
+          {u.status === 'installing' && <ToneChip tone="info" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" />}>Đang thay thế ứng dụng</ToneChip>}
+          {handoff && <ToneChip tone="warn" icon={<Download className="h-3.5 w-3.5" />}>Trình cập nhật đã khởi chạy</ToneChip>}
+          <p className="text-base2 text-body">{u.message}</p>
+          {u.status === 'available' && !u.installEnabled && u.installDisabledReason && (
+            <p className="text-xs2 text-muted">{u.installDisabledReason}</p>
+          )}
+          {u.error && (u.status === 'failed' || u.status === 'error' || handoff) && (
+            <p role="alert" className="text-xs2 text-danger-600">{u.error}</p>
+          )}
+          {(preparing || handoff) && (
+            <div className="mt-1 w-full max-w-[560px]">
+              <div className="flex items-center gap-2 text-xs2">
+                <span className="text-body">Trạng thái tiến trình: {u.progressStage || 'PREPARING'}</span>
+                <span className="ml-auto font-semibold text-brand-600">{Math.round(u.progress)}%</span>
+              </div>
+              <ProgressBar className="mt-1" value={u.progress} />
+            </div>
+          )}
+        </div>
+      </div>
+    </Card>
   )
 }
 

@@ -23,14 +23,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from . import APP_NAME, APP_TITLE, BUILD_ID, BUILD_NUMBER, __version__
+from . import APP_NAME, APP_TITLE, BUILD_ID, BUILD_NUMBER, __version__, updater
 from .excel_writer import ExcelLockedError, ExcelWriter, TemplateError
 from .gui_controller import GuiController
 from .extractor import management_number_from_filename
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD,
                       ACTION_PROCESS, ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, normalize_source_path)
 from .preview_geometry import slide_fraction_box
-from .runtime_paths import config_dir, logs_dir
+from .runtime_paths import config_dir, is_packaged, logs_dir, portable_root
 from .scan_diagnostics import ScanMetrics
 
 LOG = logging.getLogger("report_extractor.webview")
@@ -119,13 +119,23 @@ class ApplicationService:
         self._scan_snapshot: Optional[dict] = None
         self._scan_pending_reports: List[dict] = []
         self._scan_redactor: Optional[_SourcePathRedactor] = None
+        self._update_result: Optional[dict] = None
+        self._update_close_requested = False
         self._load_manual_fields()
+        if is_packaged() and updater.production_install_capability(portable_root())[0]:
+            self._refresh_update_result()
+        # The React/pywebview default runtime uses the same persisted startup-check policy as the legacy GUI.
+        # This is a single asynchronous read-only check, not a new polling loop.
+        if self.controller.auto_update_check:
+            self.controller.check_update_async(startup=True)
 
     # ------------------------------------------------------------------ static app/config DTOs
-    @staticmethod
-    def app_version() -> dict:
+    def app_version(self) -> dict:
+        capable, _reason = updater.production_install_capability(portable_root())
         return {"name": APP_NAME, "title": APP_TITLE, "version": __version__,
-                "build": BUILD_ID, "buildNumber": BUILD_NUMBER, "runtime": "pywebview-development"}
+                "build": BUILD_ID, "buildNumber": BUILD_NUMBER,
+                "runtime": "pyinstaller-portable" if is_packaged() else "pywebview-development",
+                "updateInstallCapable": bool(capable)}
 
     def current_config(self) -> dict:
         with self._lock:
@@ -866,13 +876,37 @@ class ApplicationService:
 
     def check_update(self) -> dict:
         with self._lock:
+            self._update_result = None
             self.controller.check_update_async(startup=False)
             return self.dashboard_state()
 
     def install_update(self) -> dict:
-        return {"status": "unavailable", "message":
-                "Cài đặt bản cập nhật bị tắt trong tích hợp phát triển; không thay thế hay khởi động lại ứng dụng.",
-                "state": self.dashboard_state()}
+        with self._lock:
+            capable, reason = updater.production_install_capability(portable_root())
+            if not capable:
+                raise ServiceError(reason, "UPDATE_INSTALL_DISABLED")
+            try:
+                self._assert_idle(updater.MSG["busy"])
+            except ServiceError as exc:
+                raise ServiceError(str(exc), "UPDATE_BUSY") from exc
+            if not self.controller.update_available():
+                raise ServiceError("Không có bản cập nhật mới hợp lệ để cài.", "UPDATE_NOT_AVAILABLE")
+            if self.controller.update_installing:
+                raise ServiceError(updater.MSG["already_installing"], "UPDATE_ALREADY_RUNNING")
+            if not self.controller.install_update_async():
+                reason = (self.controller.update_install_disabled_reason()
+                          or updater.MSG["already_installing"])
+                raise ServiceError(reason, "UPDATE_INSTALL_REJECTED")
+            state = self._update_dto()
+            return {"status": state["status"], "message": state["message"], "state": state}
+
+    def close_for_update(self) -> dict:
+        with self._lock:
+            if not self.controller.update_handoff_started:
+                raise ServiceError("Trình cập nhật chưa được khởi chạy; ứng dụng chưa thể thoát.",
+                                   "UPDATE_HANDOFF_NOT_READY")
+            self._update_close_requested = True
+            return {"status": "closing", "message": "Ứng dụng sẽ khởi động lại sau khi cài đặt."}
 
     # ------------------------------------------------------------------ learning: real candidates, labels, Excel reapply, model training
     def learning_state(self) -> dict:
@@ -1154,6 +1188,10 @@ class ApplicationService:
     # ------------------------------------------------------------------ close/log helpers
     def close_requested(self) -> tuple[bool, str]:
         with self._lock:
+            if self.controller.update_handoff_started and self._update_close_requested:
+                return True, ""
+            if self.controller.update_installing:
+                return False, "Đang chuẩn bị cập nhật. Hãy đợi thông báo chuyển sang khởi động lại."
             if self.controller.is_running():
                 self.controller.request_stop()
                 return False, "Đã yêu cầu dừng sau báo cáo hiện tại. Hãy đợi xử lý kết thúc rồi đóng cửa sổ."
@@ -1531,19 +1569,98 @@ class ApplicationService:
             return f"Mô hình {kind} không khả dụng ({state}); backend tiếp tục dùng quy tắc hiện tại."
         return f"Chưa huấn luyện mô hình {kind}; backend tiếp tục dùng quy tắc hiện tại."
 
+    def _refresh_update_result(self) -> None:
+        """Observe a helper result until its process exits, then consume it and safely clean its stage."""
+        data = updater.read_update_result(portable_root())
+        if not data:
+            return
+        status = data.get("status")
+        if status in ("installing", "restarting"):
+            return
+        self._update_result = data
+        helper_pid = int(data.get("helper_pid") or 0)
+        if not helper_pid or not updater.process_alive(helper_pid):
+            consumed = updater.consume_result(portable_root())
+            if consumed:
+                self._update_result = consumed
+            updater.cleanup_staging(portable_root())
+
     def _update_dto(self) -> dict:
         c = self.controller
         check = c.update_check
         info = check.info if check else None
-        status = "checking" if c.update_busy else (
-            "available" if check and check.available else "latest" if check and check.status == "latest" else
-            "error" if check and check.status not in ("no_path", "older") else "idle")
+        capable, install_reason = updater.production_install_capability(portable_root())
+        if capable:
+            self._refresh_update_result()
+
+        lock_problem = updater.update_lock_problem(portable_root()) if capable else ""
+        lock_available = capable and not lock_problem
+        busy = (c.is_running() or self._scan_active or self._training or self._diagnostics_running
+                or self._server_apply_running or (capable and not lock_available))
+        progress_stage = c.update_progress.stage
+        error = ""
+        if c.update_installing:
+            if c.update_handoff_started:
+                status = "ready_to_restart"
+                message = "Ứng dụng sẽ khởi động lại sau khi trình cài đặt đã được khởi chạy."
+            elif progress_stage == "VERIFYING":
+                status, message = "verifying", c.update_progress.label
+            else:
+                status, message = "staging", c.update_progress.label or "Đang chuẩn bị cập nhật..."
+        elif self._update_result:
+            result = self._update_result
+            result_status = result.get("status")
+            if result_status == "ok":
+                status = "installed"
+                message = f"Cập nhật thành công lên {result.get('version', '')} — Build {int(result.get('build') or 0):03d}."
+            elif result_status == "rolled_back":
+                status = "failed"
+                message = ("Cập nhật không thành công; đã khôi phục phiên bản trước. "
+                           + str(result.get("detail") or "")).strip()
+                error = message
+            else:
+                status = "failed"
+                message = str(result.get("detail") or "Cập nhật thất bại.")
+                error = message
+        elif c.update_install_error:
+            status, message = "failed", c.update_install_error
+            error = c.update_install_error
+        elif c.update_busy:
+            status, message = "checking", "Đang kiểm tra cập nhật..."
+        elif check and check.available:
+            status, message = "available", check.message
+        elif check and check.status == "latest":
+            status, message = "latest", check.message
+        elif check and check.status == "older":
+            status, message = "older", check.message
+        elif check and check.status not in ("no_path",):
+            status, message = "error", check.message
+            error = check.message
+        else:
+            status, message = "idle", c.update_status_text()
+
+        available = None
+        if info is not None:
+            available = {"version": info.version, "build": f"{info.build:03d}",
+                         "package": info.package, "size": info.size}
+        can_install = bool(capable)
+        install_enabled = bool(status == "available" and check and check.available and capable and not busy
+                               and not c.update_busy and not c.update_installing and not c.update_handoff_started)
+        if not capable:
+            install_reason = install_reason or updater.MSG["development_only"]
+        elif not lock_available:
+            install_reason = lock_problem
+        elif busy:
+            install_reason = updater.MSG["busy"]
+        elif not (check and check.available):
+            install_reason = "Không có bản cập nhật mới hợp lệ để cài."
+        elif c.update_installing:
+            install_reason = updater.MSG["already_installing"]
         return {"path": c.update_path, "autoCheck": bool(c.auto_update_check), "status": status,
-                "message": c.update_status_text(),
-                "available": ({"version": info.version, "build": f"{info.build:03d}",
-                               "package": info.package, "size": ""} if info else None),
-                "progress": float(c.update_progress.percent), "progressStage": c.update_progress.label,
-                "installEnabled": False}
+                "message": message, "available": available,
+                "progress": float(c.update_progress.percent), "progressStage": progress_stage,
+                "installEnabled": install_enabled, "canInstall": can_install,
+                "installDisabledReason": install_reason, "error": error}
 
     @staticmethod
     def _discovery_dto(result) -> dict:

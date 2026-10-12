@@ -320,15 +320,18 @@ class UiEvent:
     payload: Any = None
 
 
-UPDATE_STAGES_VI = {                      # PROMPT-011 progress window texts (stage -> label)
+UPDATE_STAGES_VI = {                      # shared update progress labels (worker -> UI DTO)
     "PREPARING": "Đang chuẩn bị cập nhật...",
-    "COPYING": "Đang sao chép bản cập nhật...",
-    "VERIFYING": "Đang kiểm tra tính toàn vẹn...",
+    "COPYING": "Đang sao chép gói cập nhật...",
+    "VERIFYING": "Đang xác minh SHA256 và ZIP...",
+    "EXTRACTING": "Đang giải nén an toàn...",
+    "VALIDATING": "Đang kiểm tra gói Portable...",
     "READY": "Gói cập nhật đã được kiểm tra và sẵn sàng.",
+    "HELPER_START": "Đang chuẩn bị cài đặt...",
     "APPLYING": "Đang chuẩn bị cài đặt...",
-    "BACKUP": "Đang sao lưu phiên bản hiện tại...",      # performed by the external updater (after this GUI exits)
-    "INSTALLING": "Đang cài đặt...",                       # idem – never shown with an invented percentage here
-    "HANDOFF": "Gói cập nhật đã sẵn sàng.\nĐang khởi động trình cài đặt...",
+    "BACKUP": "Đang sao lưu phiên bản hiện tại...",
+    "INSTALLING": "Đang cài đặt...",
+    "HANDOFF": "Ứng dụng sẽ khởi động lại...",
     "COMPLETE": "Cập nhật hoàn tất — đang khởi động lại...",
     "ERROR": "Cập nhật thất bại",
 }
@@ -411,10 +414,15 @@ class GuiController:
         self._update_thread: Optional[threading.Thread] = None
         self.update_check_done = threading.Event()   # set when a check has COMPLETED (result published); cleared at start
         self.update_check_done.set()
-        self.update_installing: bool = False         # PROMPT-011: one install at a time (buttons disabled meanwhile)
+        self.update_installing: bool = False         # one install at a time (buttons disabled meanwhile)
+        self.update_handoff_started: bool = False    # true only after the helper process was launched
+        self.update_install_error: str = ""
         self.update_progress = UpdateProgress()
         self._install_thread: Optional[threading.Thread] = None
         self._install_lock = threading.Lock()
+        self._update_file_lock: Optional[updater.UpdateInstallLock] = None
+        self._activity_file_lock: Optional[updater.UpdateInstallLock] = None
+        self._activity_lock_depth = 0
         self.prescan: Optional[PreScanResult] = None
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # reviewed scan list (before Start): real pre-scan result + manual exclusions
@@ -895,6 +903,19 @@ class GuiController:
     def scan(self, metrics: Optional[ScanMetrics] = None,
              on_leaf_complete: Optional[Callable[[PreScanResult, int, int, Path], None]] = None
              ) -> Optional[PreScanResult]:
+        if self.is_running():
+            return self.scan_result
+        if not self._acquire_activity_file_lock():
+            self.scan_message = updater.MSG["already_installing"]
+            return None
+        try:
+            return self._scan_unlocked(metrics=metrics, on_leaf_complete=on_leaf_complete)
+        finally:
+            self._release_activity_file_lock()
+
+    def _scan_unlocked(self, metrics: Optional[ScanMetrics] = None,
+                       on_leaf_complete: Optional[Callable[[PreScanResult, int, int, Path], None]] = None
+                       ) -> Optional[PreScanResult]:
         """Run the REAL pre-scan (same function the batch uses) on the discovered files with the current folder /
         Excel / period / cache / force settings.  Resets manual exclusions.  Nothing is opened or written.
         Never runs while a batch is active: ``discover()`` would replace the live rows/progress from another thread."""
@@ -1506,6 +1527,9 @@ class GuiController:
                 return False
         if self.scan_stale:
             return False
+        if not self._acquire_activity_file_lock():
+            self.scan_message = updater.MSG["already_installing"]
+            return False
         # the processing queue = the FINAL reviewed list (manual exclusions never reach the pipeline; a new
         # Excel row is created only when its candidate is actually processed)
         self._set_files([it.path for it in self.final_queue()])
@@ -1522,20 +1546,25 @@ class GuiController:
         self.log_lines.append(self.period_label())
         if self.period_warning():
             self.log_lines.append(self.period_warning())
-        self.processor = self._processor_factory(
-            self.build_options(use_ollama),
-            on_prescan=lambda r: self._queue.put(UiEvent("prescan", r)),
-            on_file=lambda i, s, d: self._queue.put(UiEvent("row", (i, s, d))),
-            on_batch=lambda d, t: self._queue.put(UiEvent("progress", (d, t))),
-            on_done=lambda s: self._queue.put(UiEvent("done", s)),
-            on_log=lambda m: self._queue.put(UiEvent("log", m)),
-        )
-        self.state = "running"
-        if in_thread:
-            self.processor.start()
-        else:
-            self.processor.run()
-        return True
+        try:
+            self.processor = self._processor_factory(
+                self.build_options(use_ollama),
+                on_prescan=lambda r: self._queue.put(UiEvent("prescan", r)),
+                on_file=lambda i, s, d: self._queue.put(UiEvent("row", (i, s, d))),
+                on_batch=lambda d, t: self._queue.put(UiEvent("progress", (d, t))),
+                on_done=lambda s: self._queue.put(UiEvent("done", s)),
+                on_log=lambda m: self._queue.put(UiEvent("log", m)),
+            )
+            self.state = "running"
+            if in_thread:
+                self.processor.start()
+            else:
+                self.processor.run()
+            return True
+        except Exception:
+            self.state = "idle"
+            self._release_activity_file_lock()
+            raise
 
     def request_stop(self) -> bool:
         """Stop AFTER the current report (never in the middle of an Excel write)."""
@@ -1691,6 +1720,7 @@ class GuiController:
             self.progress.current_index, self.progress.current_stage, self.progress.current_fraction = None, "", 0.0
             self.progress.done = self._count_done()
             self.progress.finished = True
+            self._release_activity_file_lock()
         elif ev.kind == "ollama":
             self.ollama_ok, self.ollama_status = ev.payload
         elif ev.kind == "models":
@@ -1906,6 +1936,7 @@ class GuiController:
 
     def check_update(self, startup: bool = False) -> UpdateCheck:
         """Synchronous read-only check – reads version.json only, never copies the ZIP (worker thread / tests)."""
+        self.update_install_error = ""
         self.update_busy = True
         self.update_check_startup = bool(startup)
         try:
@@ -1947,44 +1978,121 @@ class GuiController:
             self.update_notice = f"Cập nhật thất bại ({data.get('status')}). {data.get('detail', '')}".strip()
         return self.update_notice
 
-    def install_update(self, spawn=None) -> Tuple[bool, str]:
-        """Synchronous stage + verify + launch of the external updater (tests / CLI).  The GUI uses
-        install_update_async(); both share _install_work.  On success the caller must close the application."""
+    def update_install_disabled_reason(self) -> str:
+        root = portable_root()
+        allowed, reason = updater.production_install_capability(root)
+        if not allowed:
+            return reason
+        return updater.update_lock_problem(root)
+
+    def _acquire_activity_file_lock(self) -> bool:
+        """Serialize packaged scans/batches against a helper replacing this Portable root."""
+        if not updater.is_packaged():
+            return True
+        if self._activity_file_lock is not None and self._activity_file_lock.acquired:
+            self._activity_lock_depth += 1
+            return True
+        try:
+            lock = updater.acquire_update_lock(portable_root(), timeout=0)
+        except OSError:
+            # If this runtime cannot create/open its lock, the helper cannot safely acquire it either.
+            return True
+        if lock is None:
+            return False
+        self._activity_file_lock = lock
+        self._activity_lock_depth = 1
+        return True
+
+    def _release_activity_file_lock(self) -> None:
+        if self._activity_file_lock is None:
+            self._activity_lock_depth = 0
+            return
+        self._activity_lock_depth = max(0, self._activity_lock_depth - 1)
+        if self._activity_lock_depth:
+            return
+        lock, self._activity_file_lock = self._activity_file_lock, None
+        lock.release()
+
+    def _begin_update_install(self) -> Tuple[bool, str]:
         if self.is_running():
             return False, "Đang xử lý báo cáo – hãy đợi xong rồi cập nhật."
         if not self.update_available():
-            return False, "Không có bản cập nhật để cài."
-        with self._install_lock:
-            if self.update_installing:
-                return False, "Đang cập nhật – vui lòng đợi."
-            self.update_installing = True
-        try:
-            return self._install_work(spawn, emit=False)
-        finally:
-            if not (self.update_progress.stage == "HANDOFF"):
-                self.update_installing = False
-
-    def install_update_async(self, spawn=None) -> bool:
-        """Start the install worker (LAN copy / verify / extract off the Tk thread); False when one is already
-        running, nothing is available or a batch is processing.  Progress -> UiEvent('update_progress'),
-        result -> UiEvent('update_done', (ok, msg))."""
-        if self.is_running() or not self.update_available():
-            return False
+            return False, "Không có bản cập nhật mới hợp lệ để cài."
+        allowed, reason = updater.production_install_capability(portable_root())
+        if not allowed:
+            return False, reason
+        if self.update_check is None or not self.update_check.info or self.update_check.info.build <= updater.BUILD_NUMBER:
+            return False, "Bản cập nhật không mới hơn phiên bản đang chạy; không cho phép cài lại hoặc hạ cấp."
         with self._install_lock:
             if self.update_installing or (self._install_thread and self._install_thread.is_alive()):
-                return False
+                return False, updater.MSG["already_installing"]
+            try:
+                file_lock = updater.acquire_update_lock(portable_root(), timeout=0)
+            except OSError:
+                return False, updater.MSG["lock_failed"]
+            if file_lock is None:
+                return False, updater.MSG["already_installing"]
+            self._update_file_lock = file_lock
             self.update_installing = True
-        self.update_progress = UpdateProgress(stage="PREPARING")
-        self.update_dirty = True
+            self.update_handoff_started = False
+            self.update_install_error = ""
+            self.update_progress = UpdateProgress(stage="PREPARING")
+            self.update_dirty = True
+        return True, ""
+
+    def _release_update_file_lock(self) -> None:
+        lock, self._update_file_lock = self._update_file_lock, None
+        if lock is not None:
+            lock.release()
+
+    def install_update(self, spawn=None) -> Tuple[bool, str]:
+        """Synchronous safe install adapter; production closes only after the helper starts successfully."""
+        started, reason = self._begin_update_install()
+        if not started:
+            return False, reason
+        try:
+            result = self._install_work(spawn, emit=False)
+            if not result[0]:
+                self.update_install_error = result[1]
+            return result
+        finally:
+            if not self.update_handoff_started:
+                self.update_installing = False
+                self._release_update_file_lock()
+
+    def install_update_async(self, spawn=None) -> bool:
+        """Run copy/verify/extract/validation off the UI thread with one process-wide install lock."""
+        started, _reason = self._begin_update_install()
+        if not started:
+            return False
 
         def work():
-            ok, msg = self._install_work(spawn, emit=True)
-            if not ok:
-                self.update_installing = False
-                self.update_dirty = True
-            self._queue.put(UiEvent("update_done", (ok, msg)))
-        self._install_thread = threading.Thread(target=work, name="update-install", daemon=True)
-        self._install_thread.start()
+            ok, msg = False, "Cập nhật thất bại; phiên bản hiện tại chưa bị thay đổi."
+            try:
+                ok, msg = self._install_work(spawn, emit=True)
+            except Exception as exc:  # noqa: BLE001 - worker failure must release locks and reach the DTO
+                msg = f"Cập nhật thất bại ({type(exc).__name__}); phiên bản hiện tại chưa bị thay đổi."
+                self.update_progress = UpdateProgress(stage="ERROR", error=msg)
+                LOG.exception("UPDATE_INSTALL_WORKER_FAILED")
+            finally:
+                if not ok:
+                    self.update_install_error = msg
+                    self.update_installing = False
+                    self._release_update_file_lock()
+                    self.update_dirty = True
+                self._queue.put(UiEvent("update_done", (ok, msg)))
+
+        worker = threading.Thread(target=work, name="update-install", daemon=True)
+        self._install_thread = worker
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001
+            self.update_install_error = f"Cập nhật không thể khởi chạy ({type(exc).__name__})."
+            self.update_installing = False
+            self.update_progress = UpdateProgress(stage="ERROR", error=self.update_install_error)
+            self._release_update_file_lock()
+            self.update_dirty = True
+            return False
         return True
 
     def _publish_update_progress(self, stage: str, done: int, total: int, pct: float, emit: bool,
@@ -1995,34 +2103,49 @@ class GuiController:
             t0[0] = now
         elapsed = now - t0[0] if t0[0] is not None else 0.0
         speed = (done / elapsed) if (stage == "COPYING" and elapsed > 0 and done) else 0.0
+        determinate = stage in ("COPYING", "VERIFYING", "READY", "HANDOFF", "COMPLETE")
         snap = UpdateProgress(stage=stage, bytes_copied=int(done), total_bytes=int(total), percent=float(pct),
-                              speed_bps=speed, determinate=(stage in ("COPYING", "VERIFYING", "READY", "HANDOFF",
-                                                                      "COMPLETE")))
+                              speed_bps=speed, determinate=determinate)
         self.update_progress = snap
+        self.update_dirty = True
         if emit:
             self._queue.put(UiEvent("update_progress", snap))
 
     def _install_work(self, spawn, emit: bool) -> Tuple[bool, str]:
         t0: List[Optional[float]] = [None]
+        staged = None
         try:
-            staged = updater.stage_update(self.update_check, portable_root(),
-                                          progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p,
-                                                                                                     emit, t0))
+            staged = updater.stage_update(
+                self.update_check, portable_root(),
+                progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p, emit, t0),
+                lock=self._update_file_lock,
+            )
             size = Path(staged.zip_path).stat().st_size
-            self._publish_update_progress("HANDOFF", size, size, 100.0, emit, t0)   # verified: 100%, then hand off
-            cmd = updater.launch_updater(staged, spawn) if spawn else updater.launch_updater(staged)
-        except Exception as e:  # noqa: BLE001
-            msg = str(e) or type(e).__name__
-            LOG.error("UPDATE_INSTALL failed: %s", msg)
-            updater.cleanup_staging(portable_root())
+            self._publish_update_progress("HELPER_START", size, size, 100.0, emit, t0)
+            if spawn:
+                updater.launch_updater(staged, spawn)
+            else:
+                updater.launch_updater(staged)
+            # This is the handoff boundary: Popen returned successfully. Only now may the main app exit.
+            self.update_handoff_started = True
+            self._publish_update_progress("HANDOFF", size, size, 100.0, emit, t0)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc) if isinstance(exc, RuntimeError) else f"Cập nhật thất bại ({type(exc).__name__})."
+            LOG.error("UPDATE_INSTALL_FAILED stage=UPDATE_HELPER_START error=%s", type(exc).__name__)
+            if staged is not None:
+                try:
+                    updater.cleanup_staged_update(staged)
+                except OSError:
+                    LOG.warning("UPDATE_STAGE_CLEANUP_FAILED")
             prev = self.update_progress
             self.update_progress = UpdateProgress(stage="ERROR", bytes_copied=prev.bytes_copied,
                                                   total_bytes=prev.total_bytes, percent=prev.percent, error=msg)
+            self.update_dirty = True
             if emit:
                 self._queue.put(UiEvent("update_progress", self.update_progress))
             return False, msg
-        LOG.info("UPDATE_INSTALL updater launched: %s", cmd)
-        return True, f"Đang cài đặt {self.update_check.info.label()} – ứng dụng sẽ tự khởi động lại."
+        LOG.info("UPDATE_HELPER_STARTED build=%s", self.update_check.info.build)
+        return True, f"Đang cài đặt {self.update_check.info.label()} – ứng dụng sẽ khởi động lại."
 
     def save_settings(self) -> None:
         c = self.cfg

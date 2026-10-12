@@ -1627,8 +1627,12 @@ class ReportExtractorApp:
             style = "Warning.TLabel"
         else:
             style = "Warning.TLabel"
+        install_reason = c.update_install_disabled_reason()
+        if install_reason and c.update_available():
+            text = f"{text}\n{install_reason}"
         self.lbl_update.configure(text=text, style=style)
-        self.btn_install_update.configure(state="normal" if (c.update_available() and not c.is_running()) else "disabled")
+        self.btn_install_update.configure(state="normal" if (c.update_available() and not c.is_running()
+                                                              and not install_reason) else "disabled")
         self.btn_check_update.configure(state="disabled" if (c.update_busy or c.is_running() or c.update_installing)
                                         else "normal")
         offer = c.pending_update_offer()

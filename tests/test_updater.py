@@ -6,8 +6,10 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,16 +32,30 @@ def _version_txt(version, build):
 
 def make_release_zip(path: Path, version=V_NEW, build=B_NEW, top=True, with_exe=True, with_version=True,
                      extra=None) -> Path:
-    """A release ZIP shaped like build_portable.py's output (top folder optional)."""
+    """A small but structurally complete Portable ZIP matching the checked-in publisher contract."""
     prefix = f"ReportExtractor_v{version}_Portable/" if top else ""
     path.parent.mkdir(parents=True, exist_ok=True)
+    directories = (
+        "_internal/", "_internal/app/", "_internal/pptx/", "_internal/pptx/templates/",
+        "_internal/webview/", "_internal/webview/js/", "_internal/webview/lib/",
+        "_internal/frontend/", "_internal/frontend/dist/", "_internal/frontend/dist/assets/",
+        "frontend/", "frontend/dist/", "frontend/dist/assets/",
+    )
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for directory in directories:
+            zf.writestr(prefix + directory, b"")
         if with_exe:
             zf.writestr(prefix + up.APP_EXE, b"MZ-new-" + version.encode())
         zf.writestr(prefix + "_internal/app/core.py", f"# core {version}".encode())
         zf.writestr(prefix + "_internal/pptx/templates/default.pptx", b"PK-template")
+        for name in ("api.js", "lib/dom_json.js", "state.js"):
+            zf.writestr(prefix + "_internal/webview/js/" + name, b"// pywebview runtime")
         if with_version:
             zf.writestr(prefix + "VERSION.txt", _version_txt(version, build))
+        for base in ("frontend/dist", "_internal/frontend/dist"):
+            zf.writestr(prefix + base + "/index.html", b"<!doctype html><script src='./assets/app.js'></script>")
+            zf.writestr(prefix + base + "/assets/app.js", b"// React bundle")
+            zf.writestr(prefix + base + "/assets/app.css", b"/* styles */")
         zf.writestr(prefix + "README.txt", f"readme {version}")
         zf.writestr(prefix + "Output/.keep", b"")
         zf.writestr(prefix + "logs/.keep", b"")
@@ -54,20 +70,37 @@ def make_update_folder(folder: Path, version=V_NEW, build=B_NEW, sha=True, manif
     pkg = f"ReportExtractor_{version}.zip"
     if package:
         make_release_zip(folder / pkg, version, build, **zip_kw)
-    data = {"version": version, "build": build, "package": pkg}
-    if sha and package:
-        data["sha256"] = up.sha256_file(folder / pkg)
+        digest = up.sha256_file(folder / pkg)
+        size = (folder / pkg).stat().st_size
+    else:
+        digest, size = "0" * 64, 1
+    # SHA-256 is a mandatory manifest field; sha=False is retained for older test call-sites but now
+    # means the archive itself will be modified later to create a digest mismatch.
+    data = {"version": version, "build": build, "package": pkg, "sha256": digest, "size": size}
     if manifest:
         (folder / "version.json").write_text(json.dumps(data), encoding="utf-8")
     return folder
 
 
-def make_portable(root: Path, version="1.0.4", build=4) -> Path:
+def make_portable(root: Path, version=app.__version__, build=app.BUILD_NUMBER) -> Path:
     """Current installation with user data that must survive an update."""
     (root / "_internal" / "app").mkdir(parents=True)
+    (root / "_internal" / "webview" / "js").mkdir(parents=True)
+    (root / "_internal" / "frontend" / "dist").mkdir(parents=True)
+    (root / "frontend" / "dist").mkdir(parents=True)
+    (root / "frontend" / "dist" / "assets").mkdir()
+    (root / "_internal" / "frontend" / "dist" / "assets").mkdir()
     (root / up.APP_EXE).write_bytes(b"MZ-old")
     (root / "_internal" / "app" / "core.py").write_text("# core old", encoding="utf-8")
     (root / "_internal" / "old_only.dll").write_bytes(b"old")
+    (root / "_internal" / "webview" / "js" / "api.js").write_text("// bridge", encoding="utf-8")
+    (root / "_internal" / "webview" / "js" / "lib").mkdir()
+    (root / "_internal" / "webview" / "js" / "lib" / "dom_json.js").write_text("// bridge", encoding="utf-8")
+    (root / "_internal" / "webview" / "js" / "state.js").write_text("// bridge", encoding="utf-8")
+    for base in (root / "frontend" / "dist", root / "_internal" / "frontend" / "dist"):
+        (base / "index.html").write_text("<!doctype html>", encoding="utf-8")
+        (base / "assets" / "app.js").write_text("// bundle", encoding="utf-8")
+        (base / "assets" / "app.css").write_text("/* styles */", encoding="utf-8")
     (root / "VERSION.txt").write_text(_version_txt(version, build), encoding="utf-8")
     (root / "README.txt").write_text("readme old", encoding="utf-8")
     (root / "config").mkdir()
@@ -80,6 +113,16 @@ def make_portable(root: Path, version="1.0.4", build=4) -> Path:
     (root / "Output" / "backup" / "k_backup.xlsx").write_bytes(b"bak")
     (root / "Kiem_chung.xlsx").write_bytes(b"master")
     return root
+
+
+def set_packaged_runtime(monkeypatch, root: Path) -> None:
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    monkeypatch.setattr(up.sys, "executable", str(root / up.APP_EXE))
+
+
+def set_helper_runtime(monkeypatch, staged: up.StagedUpdate) -> None:
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    monkeypatch.setattr(up.sys, "executable", str(Path(staged.source_root) / up.APP_EXE))
 
 
 def _ctl(tmp_path, update_path=""):
@@ -152,6 +195,15 @@ def test_invalid_json(tmp_path):
     assert r.status == "invalid_manifest" and r.message.startswith("version.json không hợp lệ")
 
 
+def test_oversized_manifest_is_rejected_before_unbounded_read(tmp_path):
+    folder = tmp_path / "Update"
+    folder.mkdir()
+    (folder / "version.json").write_bytes(b" " * (up.MAX_MANIFEST_BYTES + 1))
+    result = up.check_for_update(str(folder))
+    assert result.status == "invalid_manifest"
+    assert "kích thước vượt giới hạn" in result.message
+
+
 @pytest.mark.parametrize("data", [
     {"version": "1.0.5", "package": "x.zip"},                       # no build
     {"build": 5, "package": "x.zip"},                               # no version
@@ -168,7 +220,8 @@ def test_missing_or_invalid_required_metadata(data):
 
 
 def test_build_as_numeric_string_is_accepted():
-    info = up.parse_manifest('{"version": "1.0.5", "build": "005", "package": "p.zip"}')
+    info = up.parse_manifest('{"version": "1.0.5", "build": "005", '
+                             '"package": "ReportExtractor_1.0.5.zip", "sha256": "' + "0" * 64 + '"}')
     assert info.build == 5 and info.label() == "1.0.5 — Build 005"
 
 
@@ -251,14 +304,17 @@ def test_corrupt_zip_rejected(tmp_path):
 def test_required_exe_missing_from_zip_rejected(tmp_path):
     folder = make_update_folder(tmp_path / "U", with_exe=False)
     ok, msg = up.verify_package(folder / "ReportExtractor_1.0.5.zip", _info(folder))
-    assert not ok and up.APP_EXE in msg
+    assert not ok and msg.startswith("Gói cập nhật không hợp lệ")
 
 
 def test_version_metadata_must_match_requested_update(tmp_path):
     folder = make_update_folder(tmp_path / "U")                                  # zip says 1.0.5 / 005
     z = folder / "ReportExtractor_1.0.5.zip"
-    assert not up.verify_package(z, _info(folder, version="1.0.6"))[0]          # manifest says 1.0.6
-    assert not up.verify_package(z, _info(folder, build=6))[0]                  # manifest says build 006
+    version_mismatch = _info(folder, version="1.0.6", package="ReportExtractor_1.0.6.zip")
+    renamed = tmp_path / version_mismatch.package
+    renamed.write_bytes(z.read_bytes())
+    assert not up.verify_package(renamed, version_mismatch)[0]                 # ZIP marker remains 1.0.5
+    assert not up.verify_package(z, _info(folder, build=6))[0]                 # manifest says build 006
     folder2 = make_update_folder(tmp_path / "U2", with_version=False)
     ok, msg = up.verify_package(folder2 / "ReportExtractor_1.0.5.zip", _info(folder2))
     assert not ok and "VERSION.txt" in msg
@@ -271,63 +327,190 @@ def test_sha256_valid(tmp_path):
     assert up.verify_package(folder / info.package, info)[0]
 
 
-def test_sha256_mismatch_aborts(tmp_path):
-    folder = make_update_folder(tmp_path / "U", sha=True)
+def test_sha256_mismatch_aborts(tmp_path, monkeypatch):
+    folder = make_update_folder(tmp_path / "U", version=V_NEWER, build=B_NEWER, sha=True)
     info = _info(folder, sha256="0" * 64)
+    (folder / "version.json").write_text(json.dumps({**json.loads((folder / "version.json").read_text()),
+                                                       "sha256": info.sha256}), encoding="utf-8")
     ok, msg = up.verify_package(folder / info.package, info)
     assert not ok and msg == "Gói cập nhật không hợp lệ hoặc bị thay đổi."
     portable = make_portable(tmp_path / "app")
-    check = up.check_for_update(str(folder), current_build=4)
-    check.info = info
-    with pytest.raises(RuntimeError, match="Gói cập nhật không hợp lệ hoặc bị thay đổi."):
-        up.stage_update(check, portable)
-    assert not (portable / up.STAGING_DIR).exists() and (portable / up.APP_EXE).read_bytes() == b"MZ-old"
+    set_packaged_runtime(monkeypatch, portable)
+    check = up.check_for_update(str(folder))
+    lock = up.acquire_update_lock(portable, timeout=0)
+    assert lock is not None
+    try:
+        with pytest.raises(RuntimeError, match="Gói cập nhật không hợp lệ hoặc bị thay đổi."):
+            up.stage_update(check, portable, lock=lock)
+    finally:
+        lock.release()
+    assert not list((portable / up.STAGING_DIR).glob("stage-*"))
+    assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"
+
+
+def test_production_install_gate_and_shared_activity_lock(tmp_path, monkeypatch):
+    portable = make_portable(tmp_path / "app")
+    assert not up.production_install_capability(portable)[0]  # source/dev can discover only
+    set_packaged_runtime(monkeypatch, portable)
+    assert up.production_install_capability(portable) == (True, "")
+
+    import app.gui_controller as gc
+    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    controller, another = _ctl(tmp_path / "one"), _ctl(tmp_path / "two")
+    held = up.acquire_update_lock(portable, timeout=0)
+    assert held is not None and not up.update_lock_available(portable)
+    assert controller.scan() is None and controller.scan_message == up.MSG["already_installing"]
+    held.release()
+    lockfile = portable / up.LOCK_NAME
+    old_owner = lockfile.read_bytes()
+    assert up.update_lock_available(portable) and lockfile.read_bytes() == old_owner  # read-only probe
+
+    assert controller._acquire_activity_file_lock()
+    assert controller._acquire_activity_file_lock()  # scan nested under start retains the same lock
+    assert not another._acquire_activity_file_lock() and not up.update_lock_available(portable)
+    controller._release_activity_file_lock()
+    assert not up.update_lock_available(portable)   # nested activity still owns it
+    controller._release_activity_file_lock()
+    assert up.update_lock_available(portable)
+
+
+def test_update_lock_probe_distinguishes_access_failure_from_contention(tmp_path, monkeypatch):
+    def denied(*_args, **_kwargs):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(up, "acquire_update_lock", denied)
+    assert up.update_lock_problem(tmp_path) == up.MSG["lock_failed"]
+    assert not up.update_lock_available(tmp_path)
+
+
+def test_another_process_lock_blocks_packaged_scan_and_batch_until_done(tmp_path, monkeypatch):
+    """Use a real child process to prove the shared lock excludes scan/batch work across app instances."""
+    real_python = sys.executable
+    portable = make_portable(tmp_path / "app")
+    set_packaged_runtime(monkeypatch, portable)
+    import app.gui_controller as gc
+    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    ready = tmp_path / "child-lock-ready"
+    script = (
+        "import sys, time; from pathlib import Path; from app.updater import acquire_update_lock; "
+        "lock = acquire_update_lock(Path(sys.argv[1]), timeout=0); "
+        "assert lock is not None; Path(sys.argv[2]).write_text('ready'); time.sleep(60)"
+    )
+    process = subprocess.Popen([real_python, "-c", script, str(portable), str(ready)],
+                               cwd=Path(__file__).resolve().parents[1],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 8
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), f"child lock holder exited unexpectedly: {process.poll()}"
+        assert not up.update_lock_available(portable)
+
+        class FakeProcessor:
+            def __init__(self, *args, **kwargs):
+                self.running = False
+
+            def start(self):
+                self.running = True
+
+            def is_running(self):
+                return self.running
+
+        controller = GuiController(AppConfig(period_mode="all"), processor_factory=FakeProcessor,
+                                   config_path=tmp_path / "cfg" / "config.json")
+        controller.report_folder = str(tmp_path)
+        controller.template, controller.output = str(tmp_path / "template.xlsx"), str(tmp_path / "output.xlsx")
+        controller.validate = lambda: []
+        controller.scan_result = SimpleNamespace(candidates=[])
+        controller.final_queue = lambda: [SimpleNamespace(path=tmp_path / "report.pptx")]
+        controller.save_settings = lambda: None
+        assert controller.scan() is None and controller.scan_message == up.MSG["already_installing"]
+        assert not controller.start(use_ollama=False) and not controller.is_running()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=8)
+
+    from app.batch_processor import BatchSummary
+    from app.gui_controller import UiEvent
+    assert up.update_lock_available(portable)
+    assert controller.start(use_ollama=False)
+    assert controller.is_running() and not up.update_lock_available(portable)
+    controller.apply_event(UiEvent("done", BatchSummary(total=1)))
+    assert not controller.is_running() and up.update_lock_available(portable)
 
 
 # ---------------------------------------------------------------------------- staging + updater launch (§9, §10)
-def test_package_copied_to_local_staging_before_installation(tmp_path):
-    folder = make_update_folder(tmp_path / "Update")
+def test_package_copied_to_local_staging_before_installation(tmp_path, monkeypatch):
+    folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     portable = make_portable(tmp_path / "app")
-    check = up.check_for_update(str(folder), current_build=4)
-    staged = up.stage_update(check, portable)
+    set_packaged_runtime(monkeypatch, portable)
+    check = up.check_for_update(str(folder))
+    lock = up.acquire_update_lock(portable, timeout=0)
+    assert lock is not None
+    try:
+        staged = up.stage_update(check, portable, lock=lock)
+    finally:
+        lock.release()
     staging = portable / up.STAGING_DIR
-    assert Path(staged.zip_path) == staging / "ReportExtractor_1.0.5.zip" and Path(staged.zip_path).exists()
+    assert Path(staged.zip_path) == Path(staged.staging_dir) / "ReportExtractor_1.3.6.zip" and Path(staged.zip_path).exists()
     assert Path(staged.source_root).is_relative_to(staging) and (Path(staged.source_root) / up.APP_EXE).exists()
     m = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
-    assert m["old_pid"] == os.getpid() and m["target_root"] == str(portable) and m["build"] == 5
-    # nothing installed yet
+    assert m["old_pid"] == os.getpid() and m["target_root"] == str(portable) and m["build"] == B_NEWER
+    assert m["from_build"] == app.BUILD_NUMBER and m["sha256"] == up.sha256_file(Path(staged.zip_path))
+    # nothing installed yet; both staging and the helper are local to this Portable root
     assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"
-    # updater runs from the STAGED copy, never from the share and never the running exe
     cmd = up.updater_command(staged, packaged=True)
-    assert cmd[0] == str(Path(staged.source_root) / up.APP_EXE) and cmd[1:] == ["--apply-update", staged.manifest_path]
-    dev = up.updater_command(staged, packaged=False)
-    assert dev[0] == sys.executable and dev[1].endswith("run.py") and dev[2] == "--apply-update"
+    assert cmd[0] == str(Path(staged.source_root) / up.APP_EXE)
+    assert cmd[1:] == ["--apply-update", staged.manifest_path]
+    with pytest.raises(RuntimeError, match="Chỉ có thể cài đặt cập nhật"):
+        up.updater_command(staged, packaged=False)
     spawned = []
     up.launch_updater(staged, spawn=lambda cmd, **kw: spawned.append((cmd, kw)))
     assert spawned and spawned[0][1]["cwd"] == staged.source_root
     log = (portable / "logs" / up.UPDATE_LOG).read_text(encoding="utf-8")
-    assert "UPDATE_STAGE start" in log and "verify=ok" in log and "UPDATE_LAUNCH" in log
+    assert "UPDATE_STAGE_START" in log and "UPDATE_VERIFY_OK" in log and "UPDATE_HELPER_STARTED" in log
 
 
-def test_zip_slip_rejected(tmp_path):
-    folder = make_update_folder(tmp_path / "U", sha=False, extra={"../../evil.txt": b"x"})
+def test_zip_slip_rejected(tmp_path, monkeypatch):
+    folder = make_update_folder(tmp_path / "U", version=V_NEWER, build=B_NEWER,
+                                extra={"../../evil.txt": b"x"})
     portable = make_portable(tmp_path / "app")
-    check = up.check_for_update(str(folder), current_build=4)
-    with pytest.raises(RuntimeError):
-        up.stage_update(check, portable)
+    set_packaged_runtime(monkeypatch, portable)
+    check = up.check_for_update(str(folder))
+    lock = up.acquire_update_lock(portable, timeout=0)
+    assert lock is not None
+    try:
+        with pytest.raises(RuntimeError):
+            up.stage_update(check, portable, lock=lock)
+    finally:
+        lock.release()
     assert not (tmp_path / "evil.txt").exists()
 
 
 # ---------------------------------------------------------------------------- apply (§9, §12, §13, §14)
-def _staged(tmp_path, **folder_kw):
+def _staged(tmp_path, monkeypatch, **folder_kw):
+    folder_kw.setdefault("version", V_NEWER)
+    folder_kw.setdefault("build", B_NEWER)
     folder = make_update_folder(tmp_path / "Update", **folder_kw)
     portable = make_portable(tmp_path / "app")
-    check = up.check_for_update(str(folder), current_build=4)
-    return portable, up.stage_update(check, portable)
+    set_packaged_runtime(monkeypatch, portable)
+    check = up.check_for_update(str(folder))
+    lock = up.acquire_update_lock(portable, timeout=0)
+    assert lock is not None
+    try:
+        staged = up.stage_update(check, portable, lock=lock)
+    finally:
+        lock.release()
+    data = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
+    data["old_pid"] = os.getpid() + 12345   # helper's PID must not be the old GUI PID in this in-process test
+    Path(staged.manifest_path).write_text(json.dumps(data), encoding="utf-8")
+    return portable, staged
 
 
-def test_updater_waits_for_main_process_exit(tmp_path):
-    portable, staged = _staged(tmp_path)
+def test_updater_waits_for_main_process_exit(tmp_path, monkeypatch):
+    portable, staged = _staged(tmp_path, monkeypatch)
+    set_helper_runtime(monkeypatch, staged)
     alive_calls = {"n": 0}
 
     def alive(pid):
@@ -336,27 +519,63 @@ def test_updater_waits_for_main_process_exit(tmp_path):
     slept = []
     rc = up.apply_update(Path(staged.manifest_path), alive=alive, sleep=slept.append, spawn=lambda *a, **k: None)
     assert rc == 0 and alive_calls["n"] >= 4 and len(slept) == 3
-    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.0.5"
-    # process never exits -> nothing replaced
-    portable2, staged2 = _staged(tmp_path / "second")
+    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.3.6"
+    # process never exits -> nothing replaced and no backup is created
+    portable2, staged2 = _staged(tmp_path / "second", monkeypatch)
+    set_helper_runtime(monkeypatch, staged2)
     rc2 = up.apply_update(Path(staged2.manifest_path), alive=lambda pid: True, sleep=lambda s: None,
                           spawn=lambda *a, **k: None, wait_timeout=0.0)
     assert rc2 == 1 and (portable2 / up.APP_EXE).read_bytes() == b"MZ-old"
-    assert not (portable2 / up.BACKUP_DIR / up.APP_EXE).exists()
+    assert not (portable2 / up.BACKUP_DIR).exists()
 
 
-def test_application_files_replaced_and_user_data_preserved(tmp_path):
-    portable, staged = _staged(tmp_path)
+def test_helper_rejects_oversized_stage_manifest_before_parsing(tmp_path, monkeypatch):
+    manifest = tmp_path / "update.json"
+    manifest.write_bytes(b" " * (up.MAX_MANIFEST_BYTES + 1))
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    assert up.apply_update(manifest, restart=False) == 2
+
+
+def test_helper_rechecks_target_identity_after_acquiring_shared_lock(tmp_path, monkeypatch):
+    portable, staged = _staged(tmp_path, monkeypatch)
+    set_helper_runtime(monkeypatch, staged)
+    original_acquire = up.UpdateInstallLock.acquire
+
+    def change_target_while_waiting(lock, *args, **kwargs):
+        if lock.path == portable / up.LOCK_NAME:
+            (portable / "VERSION.txt").write_text(_version_txt("1.3.6", B_NEWER), encoding="utf-8")
+        return original_acquire(lock, *args, **kwargs)
+
+    monkeypatch.setattr(up.UpdateInstallLock, "acquire", change_target_while_waiting)
+    rc = up.apply_update(Path(staged.manifest_path), alive=lambda pid: False, sleep=lambda s: None,
+                         spawn=lambda cmd, **kw: None)
+    assert rc == 1 and (portable / up.APP_EXE).read_bytes() == b"MZ-old"
+    assert not (portable / up.BACKUP_DIR).exists()
+    result = json.loads((portable / "logs" / up.RESULT_FILE).read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+
+
+def test_oversized_backup_manifest_is_rejected_before_parsing(tmp_path):
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    (backup / "backup.json").write_bytes(b" " * (up.MAX_BACKUP_MANIFEST_BYTES + 1))
+    with pytest.raises(OSError, match="oversized"):
+        up._read_backup_entries(backup)
+
+
+def test_application_files_replaced_and_user_data_preserved(tmp_path, monkeypatch):
+    portable, staged = _staged(tmp_path, monkeypatch)
+    set_helper_runtime(monkeypatch, staged)
     spawned = []
     rc = up.apply_update(Path(staged.manifest_path), alive=lambda pid: False, sleep=lambda s: None,
                          spawn=lambda cmd, **kw: spawned.append((cmd, kw)))
     assert rc == 0
     # application files replaced
-    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.0.5"
-    assert (portable / "_internal" / "app" / "core.py").read_text(encoding="utf-8") == "# core 1.0.5"
+    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.3.6"
+    assert (portable / "_internal" / "app" / "core.py").read_text(encoding="utf-8") == "# core 1.3.6"
     assert not (portable / "_internal" / "old_only.dll").exists()                 # stale runtime file gone
-    assert "build=005" in (portable / "VERSION.txt").read_text(encoding="utf-8")
-    assert (portable / "README.txt").read_text(encoding="utf-8") == "readme 1.0.5"
+    assert "build=019" in (portable / "VERSION.txt").read_text(encoding="utf-8")
+    assert (portable / "README.txt").read_text(encoding="utf-8") == "readme 1.3.6"
     # config.json preserved
     assert (portable / "config" / "config.json").read_text(encoding="utf-8") == '{"update_path": "X:\\\\Update"}'
     # Output preserved (incl. result workbook + Excel backups)
@@ -367,45 +586,49 @@ def test_application_files_replaced_and_user_data_preserved(tmp_path):
     assert (portable / "logs" / "app.log").read_text(encoding="utf-8") == "log line"
     assert (portable / "Kiem_chung.xlsx").read_bytes() == b"master"                # root-level user Excel untouched
     # previous runtime kept for recovery
-    assert (portable / up.BACKUP_DIR / up.APP_EXE).read_bytes() == b"MZ-old"
+    backups = list((portable / up.BACKUP_DIR).glob("backup-018-*"))
+    assert len(backups) == 1 and (backups[0] / up.APP_EXE).read_bytes() == b"MZ-old"
+    metadata = json.loads((backups[0] / "backup.json").read_text(encoding="utf-8"))
+    assert metadata["version"] == "1.3.5" and metadata["build"] == 18
     # restart of the NEW application
     assert spawned and spawned[0][0][0] == str(portable / up.APP_EXE) and spawned[0][1]["cwd"] == str(portable)
     res = json.loads((portable / "logs" / up.RESULT_FILE).read_text(encoding="utf-8"))
-    assert res["status"] == "ok" and res["version"] == "1.0.5" and res["build"] == 5
+    assert res["status"] == "ok" and res["version"] == "1.3.6" and res["build"] == 19
     log = (portable / "logs" / up.UPDATE_LOG).read_text(encoding="utf-8")
-    for key in ("UPDATE_APPLY start", "old process exited", "UPDATE_REPLACE ok", "UPDATE_RESTART ok"):
+    for key in ("UPDATE_WAIT_EXIT_OK", "UPDATE_BACKUP_OK", "UPDATE_INSTALL_OK", "UPDATE_RESTART"):
         assert key in log
 
 
 def test_failed_install_triggers_rollback(tmp_path, monkeypatch):
-    portable, staged = _staged(tmp_path)
-    orig = up._copy
-    calls = {"n": 0}
+    portable, staged = _staged(tmp_path, monkeypatch)
+    set_helper_runtime(monkeypatch, staged)
+    original_replace = up.os.replace
 
-    def flaky_copy(src, dst):
-        calls["n"] += 1
-        if calls["n"] == 3:                                  # fail in the middle of the replacement
-            raise OSError(5, "disk I/O error")
-        orig(src, dst)
-    monkeypatch.setattr(up, "_copy", flaky_copy)
+    def fail_internal_replace(src, dst):
+        if Path(dst) == portable / "_internal":
+            raise OSError(5, "simulated locked runtime file")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(up.os, "replace", fail_internal_replace)
     spawned = []
     rc = up.apply_update(Path(staged.manifest_path), alive=lambda pid: False, sleep=lambda s: None,
                          spawn=lambda cmd, **kw: spawned.append(cmd))
-    assert rc == 1 and not spawned                           # no restart of a half-updated app
+    assert rc == 1 and spawned == [[str(portable / up.APP_EXE)]]  # rollback restarts the restored app
     assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"
     assert (portable / "_internal" / "app" / "core.py").read_text(encoding="utf-8") == "# core old"
     assert (portable / "_internal" / "old_only.dll").exists()
     assert (portable / "README.txt").read_text(encoding="utf-8") == "readme old"
-    assert "build=004" in (portable / "VERSION.txt").read_text(encoding="utf-8")
+    assert "build=018" in (portable / "VERSION.txt").read_text(encoding="utf-8")
     assert (portable / "config" / "config.json").exists() and (portable / "Output" / "Kiem_chung_09_2026.xlsx").exists()
     res = json.loads((portable / "logs" / up.RESULT_FILE).read_text(encoding="utf-8"))
     assert res["status"] == "rolled_back"
     log = (portable / "logs" / up.UPDATE_LOG).read_text(encoding="utf-8")
-    assert "UPDATE_REPLACE failed" in log and "UPDATE_ROLLBACK result=ok" in log
+    assert "UPDATE_INSTALL_FAILED" in log and "UPDATE_ROLLBACK_OK" in log and "UPDATE_ROLLBACK_RESTART" in log
 
 
 def test_successful_install_restarts_application_and_notice_shown_once(tmp_path, monkeypatch):
-    portable, staged = _staged(tmp_path)
+    portable, staged = _staged(tmp_path, monkeypatch)
+    set_helper_runtime(monkeypatch, staged)
     spawned = []
     assert up.apply_update(Path(staged.manifest_path), alive=lambda pid: False, sleep=lambda s: None,
                            spawn=lambda cmd, **kw: spawned.append(cmd)) == 0
@@ -413,19 +636,23 @@ def test_successful_install_restarts_application_and_notice_shown_once(tmp_path,
     # the restarted GUI shows the one-shot notice, then it is gone
     import app.gui_controller as gc
     monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    monkeypatch.setattr(up, "process_alive", lambda pid: False)  # helper has exited before the restarted GUI consumes
     c = _ctl(tmp_path)
-    assert c.consume_update_notice() == "Cập nhật thành công lên phiên bản 1.0.5."
+    assert c.consume_update_notice() == "Cập nhật thành công lên phiên bản 1.3.6."
     assert c.consume_update_notice() == "" and not (portable / "logs" / up.RESULT_FILE).exists()
-    assert not (portable / up.STAGING_DIR).exists()          # staging cleaned after a successful restart
+    assert not list((portable / up.STAGING_DIR).glob("stage-*"))  # updater-owned stage cleaned after success
 
 
 def test_apply_update_cli_entry_point(tmp_path, monkeypatch):
-    portable, staged = _staged(tmp_path)
+    portable, staged = _staged(tmp_path, monkeypatch)
+    set_helper_runtime(monkeypatch, staged)
     monkeypatch.setattr(up, "process_alive", lambda pid: False)
-    monkeypatch.setattr(up.subprocess, "Popen", lambda *a, **k: None)
+    original_apply = up.apply_update
+    monkeypatch.setattr(up, "apply_update", lambda manifest: original_apply(
+        Path(manifest), spawn=lambda *a, **k: None))
     from app.main import main
     assert main(["--apply-update", staged.manifest_path]) == 0
-    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.0.5"
+    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.3.6"
     assert main(["--apply-update", str(tmp_path / "nope.json")]) == 2
 
 
@@ -490,16 +717,19 @@ def test_startup_check_is_non_blocking(tmp_path, monkeypatch):
 def test_install_update_requires_confirmation_and_idle_state(tmp_path, monkeypatch):
     folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     portable = make_portable(tmp_path / "app")
+    set_packaged_runtime(monkeypatch, portable)
     import app.gui_controller as gc
     monkeypatch.setattr(gc, "portable_root", lambda: portable)
     c = _ctl(tmp_path, str(folder))
-    assert c.install_update() == (False, "Không có bản cập nhật để cài.")      # never without a positive check
+    assert c.install_update() == (False, "Không có bản cập nhật mới hợp lệ để cài.")  # never without a positive check
     c.check_update()
     spawned = []
     ok, msg = c.install_update(spawn=lambda cmd, **kw: spawned.append(cmd))
     assert ok and msg.startswith("Đang cài đặt 1.3.6 — Build 019")
     assert spawned and "--apply-update" in spawned[0] and spawned[0][-1].endswith("update.json")
     assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"                    # files untouched until the updater runs
+    c._release_update_file_lock()
+    c.update_installing = False
     # downgrade / latest never install
     c2 = _ctl(tmp_path / "x", str(folder))
     c2.update_check = up.check_for_update(str(folder), current_build=B_NEWER + 1)
@@ -523,17 +753,18 @@ def test_gui_update_card_controls(monkeypatch, tmp_path):
     a.check_update()
     a.ctl._update_thread.join(10)
     a._poll()
-    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.3.6 — Build 019"
-    assert a.btn_install_update.cfg["state"] == "normal"
+    assert a.lbl_update.cfg["text"].startswith("Có phiên bản mới: 1.3.6 — Build 019")
+    assert "Chỉ có thể cài đặt cập nhật" in a.lbl_update.cfg["text"]
+    assert a.btn_install_update.cfg["state"] == "disabled"  # source/development runtime is check-only
     assert a.ctl.update_path == str(folder) and a.ctl.cfg.update_path == str(folder)     # persisted via save_settings
     from app.runtime_paths import config_file, portable_root
     test_root = Path(os.environ["TNP_TEST_RUNTIME_ROOT"]).resolve()
     assert portable_root() == test_root and config_file() == test_root / "config" / "config.json"
     assert config_file().is_file() and config_file().is_relative_to(tmp_path)
     assert AppConfig.load().update_path == str(folder)                              # saved under disposable pytest state
-    # "Để sau" (dialog closed without confirming) -> nothing happens
+    # A source/development install remains disabled even if the view method is invoked directly.
     a.install_update()
-    assert a.btn_install_update.cfg["state"] == "normal" and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
+    assert a.btn_install_update.cfg["state"] == "disabled" and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
     # latest / older render as status text only
     a.ctl.update_check = up.check_for_update(str(folder), current_build=B_NEWER)
     a._render_update()

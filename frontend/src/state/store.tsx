@@ -45,15 +45,22 @@ export const FILTERS = [
 export type FilterKey = (typeof FILTERS)[number]
 export type PeriodMode = 'auto' | 'all' | 'month' | 'range'
 
+export type UpdateStatus = 'idle' | 'checking' | 'available' | 'latest' | 'older' | 'error'
+  | 'development_disabled' | 'staging' | 'verifying' | 'installing' | 'ready_to_restart'
+  | 'failed' | 'installed'
+
 export type UpdateState = {
   path: string
   autoCheck: boolean
-  status: 'idle' | 'checking' | 'available' | 'latest' | 'error' | 'installing' | 'installed'
+  status: UpdateStatus
   message: string
-  available?: { version: string; build: string; package: string; size: string }
+  available: { version: string; build: string; package: string; size: number | null } | null
   progress: number
   progressStage: string
-  installEnabled?: boolean
+  installEnabled: boolean
+  canInstall: boolean
+  installDisabledReason: string
+  error: string
 }
 
 export type LearningCandidateAvailability = {
@@ -84,11 +91,15 @@ type NativeConfig = {
   ollama: { host: string; port: string; model: string; checked?: OllamaConnection['checked'];
     message?: string; models?: string[] }
   update: { path: string; autoCheck: boolean }
-  app?: { name: string; title: string; version: string; build: string; buildNumber: number }
+  app?: { name: string; title: string; version: string; build: string; buildNumber: number;
+    runtime?: string; updateInstallCapable?: boolean }
 }
 
+type AppInfo = { name: string; title: string; version: string; build: string; buildNumber: number;
+  runtime?: string; updateInstallCapable?: boolean }
+
 type DashboardDTO = {
-  app: { name: string; title: string; version: string; build: string; buildNumber: number }
+  app: AppInfo
   config: NativeConfig
   scan: {
     scanned: boolean
@@ -120,9 +131,11 @@ type DashboardDTO = {
     serverApplyRunning: boolean
     serverApplyMessage: string
   }
-  update: UpdateState
+  update: unknown
   diagnostics: { running: boolean; rows: DiagnosticRow[]; error: string }
 }
+
+type NormalizedDashboardDTO = Omit<DashboardDTO, 'update'> & { update: UpdateState }
 
 export type ScanSnapshotVersion = { generation: number; revision: number }
 
@@ -164,6 +177,16 @@ const EMPTY_RUN: ProcessingRun = {
   status: 'idle', queue: [], index: 0, doneCount: 0, stage: 'waiting', percent: 0, currentFile: '',
   elapsedSec: 0, remainSec: null, startedAt: null, finishedAt: null, hasSamples: false,
 }
+const EMPTY_UPDATE: UpdateState = {
+  path: '', autoCheck: true, status: 'idle', message: 'Chưa kiểm tra cập nhật.', available: null,
+  progress: 0, progressStage: '', installEnabled: false, canInstall: false,
+  installDisabledReason: '', error: '',
+}
+const UPDATE_STATUSES = new Set<UpdateStatus>([
+  'idle', 'checking', 'available', 'latest', 'older', 'error', 'development_disabled',
+  'staging', 'verifying', 'installing', 'ready_to_restart', 'failed', 'installed',
+])
+
 const EMPTY_LEARNING: LearningState = {
   images: [], contents: [],
   candidateStatus: {
@@ -229,10 +252,56 @@ function reportFromDto(value: Report): Report {
   }
 }
 
-function normalizeDashboard(raw: DashboardDTO): DashboardDTO {
+const INVALID_UPDATE_MESSAGE = 'Phản hồi trạng thái cập nhật từ Python bị thiếu hoặc không hợp lệ.'
+
+function invalidUpdateState(message = INVALID_UPDATE_MESSAGE): UpdateState {
+  return { ...EMPTY_UPDATE, status: 'failed', message, error: message,
+    installDisabledReason: 'Không thể cài đặt khi trạng thái cập nhật không hợp lệ.' }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Keep an incomplete or malformed native update DTO visible as a failure, never as install authorization. */
+export function normalizeUpdate(raw: unknown): UpdateState {
+  if (!isRecord(raw) || typeof raw.path !== 'string' || typeof raw.autoCheck !== 'boolean'
+    || typeof raw.status !== 'string' || !UPDATE_STATUSES.has(raw.status as UpdateStatus)
+    || typeof raw.message !== 'string' || typeof raw.progress !== 'number'
+    || !Number.isFinite(raw.progress) || raw.progress < 0 || raw.progress > 100
+    || typeof raw.progressStage !== 'string' || typeof raw.installEnabled !== 'boolean'
+    || typeof raw.canInstall !== 'boolean' || typeof raw.installDisabledReason !== 'string'
+    || typeof raw.error !== 'string') return invalidUpdateState()
+
+  let available: UpdateState['available'] = null
+  if (raw.available !== null) {
+    if (!isRecord(raw.available) || typeof raw.available.version !== 'string'
+      || typeof raw.available.build !== 'string' || !/^\d{1,12}$/.test(raw.available.build)
+      || typeof raw.available.package !== 'string' || raw.available.package.length === 0
+      || !(raw.available.size === null || (typeof raw.available.size === 'number'
+        && Number.isSafeInteger(raw.available.size) && raw.available.size >= 0))) return invalidUpdateState()
+    available = { version: raw.available.version, build: raw.available.build,
+      package: raw.available.package, size: raw.available.size as number | null }
+  }
+
+  const normalized: UpdateState = {
+    path: raw.path, autoCheck: raw.autoCheck, status: raw.status as UpdateStatus,
+    message: raw.message, available, progress: raw.progress, progressStage: raw.progressStage,
+    installEnabled: raw.installEnabled, canInstall: raw.canInstall,
+    installDisabledReason: raw.installDisabledReason, error: raw.error,
+  }
+  if ((normalized.status === 'available' && !available)
+    || (normalized.installEnabled && (normalized.status !== 'available' || !normalized.canInstall))) {
+    return invalidUpdateState()
+  }
+  return normalized
+}
+
+function normalizeDashboard(raw: DashboardDTO): NormalizedDashboardDTO {
   const reports = (raw.reports || []).map(reportFromDto)
   return {
     ...raw,
+    update: normalizeUpdate(raw.update),
     scan: { ...raw.scan, generation: raw.scan?.generation ?? 0, revision: raw.scan?.revision ?? 0,
       inProgress: raw.scan?.inProgress ?? false, incremental: raw.scan?.incremental ?? false,
       completedLeaves: raw.scan?.completedLeaves ?? 0,
@@ -259,7 +328,8 @@ function useStoreValue() {
   const [connected, setConnected] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
   const [errorCode, setErrorCode] = useState('')
-  const [appInfo, setAppInfo] = useState({ name: 'Report Extractor', title: 'Report Extractor', version: '', build: '' })
+  const [appInfo, setAppInfo] = useState<AppInfo>({ name: 'Report Extractor', title: 'Report Extractor',
+    version: '', build: '', buildNumber: 0, runtime: 'pywebview-development', updateInstallCapable: false })
   const [reports, setReports] = useState<Report[]>([])
   const [scanned, setScanned] = useState(false)
   const [scanDirty, setScanDirty] = useState(false)
@@ -292,9 +362,7 @@ function useStoreValue() {
   const [appliedServer, setAppliedServer] = useState<string | null>(null)
   const [serverApplyRunning, setServerApplyRunning] = useState(false)
   const [serverApplyMessage, setServerApplyMessage] = useState('')
-  const [update, setUpdateState] = useState<UpdateState>({
-    path: '', autoCheck: true, status: 'idle', message: 'Chưa kiểm tra cập nhật.', progress: 0, progressStage: '',
-  })
+  const [update, setUpdateState] = useState<UpdateState>(EMPTY_UPDATE)
   const [diagRows, setDiagRows] = useState<DiagnosticRow[]>([])
   const [diagRunning, setDiagRunning] = useState(false)
   const [learningState, setLearningState] = useState<LearningState>(EMPTY_LEARNING)
@@ -318,6 +386,9 @@ function useStoreValue() {
   const detailStatus = useRef<Record<string, string>>({})
   const ollamaDirty = useRef(false)
   const updateDirty = useRef(false)
+  const autoUpdateCloseRequested = useRef(false)
+  const updateInstallInFlight = useRef(false)
+  const updateCloseInFlight = useRef(false)
   const alive = useRef(true)
   useEffect(() => { reportsRef.current = reports }, [reports])
   const publishError = useCallback((error: unknown) => {
@@ -363,7 +434,9 @@ function useStoreValue() {
       models: config.ollama?.models || [], message: config.ollama?.message || 'Chưa kiểm tra kết nối.',
     })
     setUpdateState((prev) => ({ ...prev, ...(config.update || {}) }))
-    if (config.app) setAppInfo({ name: config.app.name, title: config.app.title, version: config.app.version, build: config.app.build })
+    if (config.app) setAppInfo({ ...config.app,
+      runtime: config.app.runtime || 'pywebview-development',
+      updateInstallCapable: Boolean(config.app.updateInstallCapable) })
   }, [])
 
   const acceptDashboard = useCallback((raw: DashboardDTO) => {
@@ -377,7 +450,8 @@ function useStoreValue() {
       ? mergeIncrementalReports(reportsRef.current, data.reports)
       : data.reports
     reportsRef.current = nextReports
-    setAppInfo({ name: data.app.name, title: data.app.title, version: data.app.version, build: data.app.build })
+    setAppInfo({ ...data.app, runtime: data.app.runtime || 'pywebview-development',
+      updateInstallCapable: Boolean(data.app.updateInstallCapable) })
     setReports(nextReports)
     setScanned(Boolean(data.scan.scanned))
     setScanMessage(data.scan.message || '')
@@ -483,7 +557,8 @@ function useStoreValue() {
       },
       onConnected: ({ version, config, dashboard }) => {
         bridgeReadyRef.current = true
-        setAppInfo({ name: version.name, title: version.title, version: version.version, build: version.build })
+        setAppInfo({ ...version, runtime: version.runtime || 'pywebview-development',
+          updateInstallCapable: Boolean(version.updateInstallCapable) })
         applyConfig(config)
         acceptDashboard(dashboard)
         setConnected(true)
@@ -749,15 +824,90 @@ function useStoreValue() {
     setAppliedServer(`${host}:${port}`)
   }), [runOperation])
 
-  const checkUpdate = useCallback((_startup = false) => runOperation(async () => {
-    await callNative('check_update', configDto())
-    updateDirty.current = false
-    ollamaDirty.current = false
-  }), [configDto, runOperation])
-  const installUpdate = useCallback(() => runOperation(async () => {
-    const result = await callNative<{ status: string; message: string }>('install_update')
-    setUpdateState((current) => ({ ...current, status: 'error', message: result.message }))
-  }), [runOperation])
+  const checkUpdate = useCallback((_startup = false) => {
+    setUpdateState((current) => ({ ...current, status: 'checking', message: 'Đang kiểm tra cập nhật...',
+      installEnabled: false, error: '' }))
+    return runOperation(async () => {
+      await callNative('check_update', configDto())
+      updateDirty.current = false
+      ollamaDirty.current = false
+    })
+  }, [callNative, configDto, runOperation])
+
+  const requestUpdateClose = useCallback(async () => {
+    if (updateCloseInFlight.current) return
+    updateCloseInFlight.current = true
+    try {
+      const result = await callNative<unknown>('close_for_update')
+      if (!isRecord(result) || result.status !== 'closing' || typeof result.message !== 'string') {
+        throw new BridgeProtocolError()
+      }
+    } catch (error) {
+      const message = safeErrorDetails(error).message
+      setUpdateState((current) => ({ ...current, status: 'ready_to_restart',
+        message: `Trình cập nhật đã khởi chạy nhưng cửa sổ chưa đóng. Hãy thử đóng ứng dụng để tiếp tục. ${message}`,
+        error: message, installEnabled: false }))
+      recordError(error)
+    } finally {
+      updateCloseInFlight.current = false
+    }
+  }, [callNative, recordError])
+
+  useEffect(() => {
+    if (update.status !== 'ready_to_restart') {
+      autoUpdateCloseRequested.current = false
+      return
+    }
+    if (autoUpdateCloseRequested.current) return
+    autoUpdateCloseRequested.current = true
+    void requestUpdateClose()
+  }, [requestUpdateClose, update.status])
+
+  const retryUpdateClose = useCallback(() => {
+    autoUpdateCloseRequested.current = true
+    void requestUpdateClose()
+  }, [requestUpdateClose])
+
+  const installUpdate = useCallback(async () => {
+    if (!update.installEnabled || update.status !== 'available' || updateInstallInFlight.current) return
+    updateInstallInFlight.current = true
+    clearError()
+    setUpdateState((current) => ({ ...current, status: 'staging', progressStage: 'PREPARING',
+      message: 'Đang chuẩn bị gói cập nhật...', error: '', installEnabled: false,
+      installDisabledReason: 'Đang chuẩn bị cập nhật.' }))
+    try {
+      const result = await callNative<unknown>('install_update')
+      if (!isRecord(result) || typeof result.status !== 'string' || typeof result.message !== 'string'
+        || !Object.prototype.hasOwnProperty.call(result, 'state')) {
+        const message = 'Python không trả về trạng thái hợp lệ sau khi bắt đầu cập nhật.'
+        setUpdateState((current) => ({ ...current, status: 'failed', message, error: message,
+          installEnabled: false, installDisabledReason: message }))
+        return
+      }
+      const next = normalizeUpdate(result.state)
+      const activeStatuses: UpdateStatus[] = ['staging', 'verifying', 'installing', 'ready_to_restart']
+      if (next.message === INVALID_UPDATE_MESSAGE
+        || !(activeStatuses.includes(next.status) || next.status === 'failed')
+        || !['staging', 'verifying', 'installing', 'ready_to_restart', 'failed'].includes(result.status)) {
+        const message = 'Python không trả về trạng thái cập nhật hợp lệ sau khi bắt đầu.'
+        setUpdateState((current) => ({ ...current, status: 'failed', message, error: message,
+          installEnabled: false, installDisabledReason: message }))
+        return
+      }
+      setUpdateState(next)
+      if (next.status === 'failed') {
+        setErrorCode('UPDATE_INSTALL_FAILED')
+        setErrorMessage(next.error || next.message || result.message)
+      }
+    } catch (error) {
+      const message = safeErrorDetails(error).message
+      setUpdateState((current) => ({ ...current, status: 'failed', message, error: message,
+        installEnabled: false, installDisabledReason: message }))
+      recordError(error)
+    } finally {
+      updateInstallInFlight.current = false
+    }
+  }, [callNative, clearError, recordError, update.installEnabled, update.status])
 
   const runDiagnostics = useCallback(() => runOperation(() => callNative('run_diagnostics')), [runOperation])
   const clearLogView = useCallback(() => {
@@ -888,7 +1038,7 @@ function useStoreValue() {
     ollama, setOllama, ollamaIndicator, aiStatusText, aiMode, discovering, discoveryMessage, discoveryResults,
     startDiscovery, stopDiscovery, useServer, appliedServer, serverApplyRunning, serverApplyMessage,
     checkConnection, refreshModels, saveOllamaConfig,
-    update, setUpdate, checkUpdate, installUpdate, chooseUpdateFolder,
+    update, setUpdate, checkUpdate, installUpdate, retryUpdateClose, chooseUpdateFolder,
     diagRows, diagRunning, runDiagnostics,
     learning: learningState, learningLoad, refreshLearning,
     imageReviewIndex, setImageReviewIndex, contentReviewIndex, setContentReviewIndex,

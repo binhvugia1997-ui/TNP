@@ -12,7 +12,7 @@ import app.updater as up
 from app.config import AppConfig
 from app.gui_controller import AUTO_CHECK_FAILED_VI, AUTO_UPDATE_CHECK_KEY, GuiController
 from tests.test_gui_redesign import _make_app
-from tests.test_updater import make_update_folder
+from tests.test_updater import make_portable, make_update_folder
 
 SRC = Path(app.__file__).with_name("gui.py").read_text(encoding="utf-8")
 CUR = app.BUILD_NUMBER                      # 11
@@ -36,6 +36,15 @@ def _startup(a):
     fn()
     _join(a.ctl)
     a._poll()
+
+
+def _make_production_runtime(monkeypatch, tmp_path):
+    import app.gui_controller as gc
+    portable = make_portable(tmp_path / "app")
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    monkeypatch.setattr(up.sys, "executable", str(portable / up.APP_EXE))
+    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    return portable
 
 
 # ------------------------------------------------------------------ 1-3 setting
@@ -176,8 +185,10 @@ def test_manual_check_still_reports_explicit_errors(monkeypatch, tmp_path):
 
 
 # ------------------------------------------------------------------ 12-14 notification once / Để sau / Cập nhật ngay
-def _gui_with_update(monkeypatch, tmp_path, build=CUR + 1):
+def _gui_with_update(monkeypatch, tmp_path, build=CUR + 1, packaged=False):
     folder = make_update_folder(tmp_path / "Update", version="1.2.2", build=build)
+    if packaged:
+        _make_production_runtime(monkeypatch, tmp_path)
     cfg = AppConfig(update_path=str(folder))
     monkeypatch.setattr("tests.test_gui_redesign.AppConfig", lambda **k: cfg)
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
@@ -190,8 +201,9 @@ def test_startup_detects_newer_build_and_offers_once(monkeypatch, tmp_path):
     monkeypatch.setattr(a, "_confirm_update", lambda label: offers.append(label) or False)   # user: Để sau
     _startup(a)
     assert offers == ["1.2.2 — Build 019"]
-    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.2.2 — Build 019"
-    assert a.btn_install_update.cfg["state"] == "normal"
+    assert a.lbl_update.cfg["text"].startswith("Có phiên bản mới: 1.2.2 — Build 019")
+    assert "Chỉ có thể cài đặt cập nhật" in a.lbl_update.cfg["text"]
+    assert a.btn_install_update.cfg["state"] == "disabled"  # update checks remain available in development
     for _ in range(3):                                                  # polls / re-renders: no repeated popup
         a._poll()
         a._render_update()
@@ -217,7 +229,7 @@ def test_same_or_older_build_is_not_offered(monkeypatch, tmp_path):
 
 
 def test_update_now_routes_into_existing_installer(monkeypatch, tmp_path):
-    gui, a, reg, folder = _gui_with_update(monkeypatch, tmp_path)
+    gui, a, reg, folder = _gui_with_update(monkeypatch, tmp_path, packaged=True)
     monkeypatch.setattr(a, "_confirm_update", lambda label: True)       # user: Cập nhật ngay
     calls = []
     monkeypatch.setattr(a.ctl, "install_update_async", lambda *x, **k: calls.append(1) or True)

@@ -23,7 +23,7 @@ from tests.test_after_evidence import (AFTER_RGB, BEFORE_RGB, NAME, _arrow, _dec
                                        _prod_head, _rgb, _select, _tb, _tb_colored)
 from tests.test_content_region import COL, IMP_ITEM_1, INSPECTION_TEXT, SHEET, _images_at, _prefill, _shape
 from tests.test_prompt004 import MGMT
-from tests.test_updater import make_portable, make_update_folder
+from tests.test_updater import _staged, set_helper_runtime
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import make_stable_backup as msb  # noqa: E402
@@ -530,36 +530,39 @@ def test_28_learning_dir_is_beside_portable_root_and_preserved_by_updater(tmp_pa
 
 
 def test_28_apply_update_keeps_learning_data_and_rollback_restores_it(tmp_path, monkeypatch):
-    portable = make_portable(tmp_path / "app")
+    portable, staged = _staged(tmp_path, monkeypatch)
     ld = portable / "learning_data"
     (ld / "model").mkdir(parents=True)
     (ld / "thumbnails").mkdir()
     (ld / "image_labels.jsonl").write_text('{"candidate_id": "a|S3|#1|1", "label": "AFTER"}\n', encoding="utf-8")
     (ld / "model" / "image_model.json").write_text('{"schema_version": 1}', encoding="utf-8")
-    folder = make_update_folder(tmp_path / "Update")
-    check = up.check_for_update(str(folder), current_build=4)
-    staged = up.stage_update(check, portable)
+    set_helper_runtime(monkeypatch, staged)
     rc = up.apply_update(Path(staged.manifest_path), alive=lambda pid: False, sleep=lambda s: None,
                          spawn=lambda cmd, **kw: None)
-    assert rc == 0 and (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.0.5"
+    assert rc == 0 and (portable / up.APP_EXE).read_bytes().startswith(b"MZ-new-")
     assert (ld / "image_labels.jsonl").read_text(encoding="utf-8").startswith('{"candidate_id"')
     assert (ld / "model" / "image_model.json").exists() and (ld / "thumbnails").is_dir()
-    # rollback after a failed apply keeps the user data as well
-    (ld / "image_labels.jsonl").write_text("second\n", encoding="utf-8")
-    staged2 = up.stage_update(check, portable)
-    orig = up._copy
-    calls = {"n": 0}
 
-    def flaky_copy(src, dst):
-        calls["n"] += 1
-        if calls["n"] == 3:
-            raise OSError(5, "disk I/O error")
-        orig(src, dst)
-    monkeypatch.setattr(up, "_copy", flaky_copy)
+    # An interrupted replacement on a separate Build 018 root rolls back the app but leaves learning data alone.
+    portable2, staged2 = _staged(tmp_path / "rollback", monkeypatch)
+    ld2 = portable2 / "learning_data"
+    (ld2 / "model").mkdir(parents=True)
+    (ld2 / "image_labels.jsonl").write_text("second\n", encoding="utf-8")
+    (ld2 / "model" / "image_model.json").write_text("{}", encoding="utf-8")
+    set_helper_runtime(monkeypatch, staged2)
+    original_replace = up.os.replace
+
+    def fail_internal_replace(src, dst):
+        if Path(dst) == portable2 / "_internal":
+            raise OSError(5, "simulated locked runtime file")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(up.os, "replace", fail_internal_replace)
     rc2 = up.apply_update(Path(staged2.manifest_path), alive=lambda pid: False, sleep=lambda s: None,
                           spawn=lambda cmd, **kw: None)
-    assert rc2 == 1 and (ld / "image_labels.jsonl").read_text(encoding="utf-8") == "second\n"
-    assert (ld / "model" / "image_model.json").exists()
+    assert rc2 == 1 and (portable2 / up.APP_EXE).read_bytes() == b"MZ-old"
+    assert (ld2 / "image_labels.jsonl").read_text(encoding="utf-8") == "second\n"
+    assert (ld2 / "model" / "image_model.json").exists()
 
 
 def test_28_release_artifact_never_contains_learning_data(tmp_path):
