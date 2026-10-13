@@ -416,6 +416,22 @@ test('a “Bỏ qua” report that later becomes actionable again reappears: no 
   }
 })
 
+test('PROMPT-037R: the summary shows no “Bỏ qua” card or text; the three remaining stat cards stay in one row', async () => {
+  const m = await mount([rep(0, 'waiting'), rep(1, 'skipped'), rep(2, 'outside_period'), rep(3, 'completed'),
+    rep(4, 'needs_review'), rep(5, 'error')])
+  try {
+    assert.doesNotMatch(m.text(), /bỏ qua/i)
+    const grid = m.document().querySelector('.grid-cols-3')
+    assert.ok(grid, 'stat grid rendered')
+    assert.equal(grid.children.length, 3)
+    const labels = ['Hoàn thành', 'Cần kiểm tra', 'Lỗi']
+    labels.forEach((label, index) => assert.ok(grid.children[index].textContent.includes(label), `card ${index} is ${label}`))
+    assert.equal(m.store().stats.total, 4) // waiting + completed + needs_review + error
+  } finally {
+    await m.cleanup()
+  }
+})
+
 test('select-all in the rendered table never includes “Bỏ qua” reports', async () => {
   const m = await mount([rep(0, 'waiting'), rep(1, 'skipped'), rep(2, 'completed')])
   try {
