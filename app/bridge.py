@@ -190,6 +190,18 @@ class BridgeService:
             self._string(kind, "kind", 16), self._string(candidate_id, "candidateId", 512),
             self._string(label, "label", 64), self._string(note, "note", 1000)))
 
+    def set_learning_label_fast(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: same pending-label write as ``set_learning_label``, minimal ack (no full state)."""
+        return self._respond(lambda: self.service.set_learning_label_fast(
+            self._string(kind, "kind", 16), self._string(candidate_id, "candidateId", 512),
+            self._string(label, "label", 64), self._string(note, "note", 1000)))
+
+    def save_learning_candidate(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: atomic set+save of one candidate (replaces the set→save two-call sequence)."""
+        return self._respond(lambda: self.service.save_learning_candidate(
+            self._string(kind, "kind", 16), self._string(candidate_id, "candidateId", 512),
+            self._string(label, "label", 64), self._string(note, "note", 1000)))
+
     def save_learning_labels(self, kind: str, notes: Any = None) -> dict:
         if notes is None:
             notes = {}

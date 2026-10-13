@@ -1009,52 +1009,102 @@ class ApplicationService:
             message = f"Lượt xử lý hiện tại không có {noun} cần kiểm tra."
         return {"state": state, "reason": reason, "count": int(count), "message": message}
 
+    def _set_pending_label_unlocked(self, kind: str, candidate_id: str, label: str, note: str) -> None:
+        """Validate + record one pending label. Caller holds ``self._lock`` and has asserted idle."""
+        c = self.controller
+        if kind == "image":
+            candidate = next((item for item in c.review_candidates() if item.candidate_id == candidate_id), None)
+            if candidate is None:
+                raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
+            c.set_pending_label(candidate, label, note)
+        else:
+            candidate = next((item for item in c.review_content_candidates()
+                              if item.candidate_id == candidate_id), None)
+            if candidate is None:
+                raise ServiceError("Khối nội dung này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
+            c.set_pending_content_label(candidate, label, note)
+
     def set_learning_label(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
         kind = self._choice(kind, "kind", {"image", "content"})
         candidate_id = self._text(candidate_id, "candidateId", 512)
         note = self._text(note, "note", 1000)
         with self._lock:
             self._assert_idle("Không thể gán nhãn trong khi đang xử lý báo cáo.")
-            c = self.controller
-            if kind == "image":
-                candidate = next((item for item in c.review_candidates() if item.candidate_id == candidate_id), None)
-                if candidate is None:
-                    raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
-                c.set_pending_label(candidate, label, note)
-            else:
-                candidate = next((item for item in c.review_content_candidates()
-                                  if item.candidate_id == candidate_id), None)
-                if candidate is None:
-                    raise ServiceError("Khối nội dung này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
-                c.set_pending_content_label(candidate, label, note)
+            self._set_pending_label_unlocked(kind, candidate_id, label, note)
             return self.learning_state()
+
+    def set_learning_label_fast(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: identical pending-label write to :meth:`set_learning_label`, minimal ack.
+
+        The full-state variant above is kept for its existing contract; this path exists because a
+        single label click must not rebuild/serialize the entire LearningState (measured multi-MB
+        payloads and cold slide-preview renders per click — see
+        ``.specify/bugs/prompt036s-learning-latency/assessment.md``). The pending write itself is the
+        same O(1) controller operation, so the service lock is held only for that write.
+        """
+        kind = self._choice(kind, "kind", {"image", "content"})
+        candidate_id = self._text(candidate_id, "candidateId", 512)
+        note = self._text(note, "note", 1000)
+        with self._lock:
+            self._assert_idle("Không thể gán nhãn trong khi đang xử lý báo cáo.")
+            self._set_pending_label_unlocked(kind, candidate_id, label, note)
+            return {"kind": kind, "candidateId": candidate_id, "label": label, "labelPending": True}
+
+    def _save_learning_labels_unlocked(self, kind: str, notes: dict) -> tuple:
+        """The exact ``save_learning_labels`` persistence flow. Caller holds ``self._lock``.
+
+        Returns ``(message, excel_pending)``; raises ``ServiceError`` on failure exactly as before.
+        """
+        c = self.controller
+        if kind == "image":
+            for candidate_id in c.pending_labels:
+                if candidate_id in notes:
+                    c.pending_label_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
+        else:
+            for candidate_id in c.pending_content_labels:
+                if candidate_id in notes:
+                    c.pending_content_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
+        if kind == "image":
+            ok, message = c.save_confirmations(c.review_candidates())
+            pending = c.image_reapply_pending
+        else:
+            ok, message = c.save_content_confirmations(c.review_content_candidates())
+            pending = c.content_reapply_pending
+        if not ok:
+            raise ServiceError(message, "LABEL_SAVE_FAILED")
+        status = "locked" if pending or "chưa cập nhật được Excel" in message.lower() or "đang được sử dụng" in message.lower() else "ok"
+        self._last_excel_result = {"kind": status, "message": message}
+        LOG.info("WEBVIEW_LABELS_SAVED kind=%s pending_excel=%d", kind, pending)
+        return message, pending
 
     def save_learning_labels(self, kind: str, notes: Optional[dict] = None) -> dict:
         kind = self._choice(kind, "kind", {"image", "content"})
         notes = self._object(notes or {}, "learningNotes")
         with self._lock:
             self._assert_idle("Không thể lưu nhãn trong khi đang xử lý báo cáo.")
-            c = self.controller
-            if kind == "image":
-                for candidate_id in c.pending_labels:
-                    if candidate_id in notes:
-                        c.pending_label_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
-            else:
-                for candidate_id in c.pending_content_labels:
-                    if candidate_id in notes:
-                        c.pending_content_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
-            if kind == "image":
-                ok, message = c.save_confirmations(c.review_candidates())
-                pending = c.image_reapply_pending
-            else:
-                ok, message = c.save_content_confirmations(c.review_content_candidates())
-                pending = c.content_reapply_pending
-            if not ok:
-                raise ServiceError(message, "LABEL_SAVE_FAILED")
-            status = "locked" if pending or "chưa cập nhật được Excel" in message.lower() or "đang được sử dụng" in message.lower() else "ok"
-            self._last_excel_result = {"kind": status, "message": message}
-            LOG.info("WEBVIEW_LABELS_SAVED kind=%s pending_excel=%d", kind, pending)
+            message, _pending = self._save_learning_labels_unlocked(kind, notes)
             return {"message": message, "state": self.learning_state()}
+
+    def save_learning_candidate(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: atomic set-pending + save for one candidate in ONE bridge call.
+
+        Replaces the frontend's former sequential ``set_learning_label`` →
+        ``save_learning_labels`` pair (two full-state round trips) with the identical
+        persistence sequence under a single lock hold: this candidate's pending label is
+        set, then every pending label of the kind is committed exactly as
+        :meth:`save_learning_labels` does (labels JSONL first, Excel reapply second,
+        pending-Excel retry state preserved). Returns a minimal ack, not the full state.
+        """
+        kind = self._choice(kind, "kind", {"image", "content"})
+        candidate_id = self._text(candidate_id, "candidateId", 512)
+        note = self._text(note, "note", 1000)
+        with self._lock:
+            self._assert_idle("Không thể lưu nhãn trong khi đang xử lý báo cáo.")
+            self._set_pending_label_unlocked(kind, candidate_id, label, note)
+            message, pending = self._save_learning_labels_unlocked(kind, {candidate_id: note})
+            return {"message": message, "kind": kind, "candidateId": candidate_id, "label": label,
+                    "labelPending": False, "excelPending": pending,
+                    "excelLastResult": dict(self._last_excel_result)}
 
     def dismiss_learning_excel_notice(self) -> dict:
         """Clear only the transient result message; preserve saved labels and any pending Excel retry."""

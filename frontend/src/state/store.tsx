@@ -201,6 +201,27 @@ const EMPTY_LEARNING: LearningState = {
 
 export type LearningLoadState = { status: 'idle' | 'loading' | 'ready' | 'error'; message: string }
 
+/** PROMPT-036S: minimal bridge acks for the label fast paths (never a full LearningState). */
+export type LearningLabelAck = {
+  kind: 'image' | 'content'
+  candidateId: string
+  label: string
+  labelPending: boolean
+}
+export type LearningSaveAck = LearningLabelAck & {
+  message: string
+  excelPending: number
+  excelLastResult: { kind: 'ok' | 'locked' | 'none'; message: string }
+}
+
+type LocalLabelEntry = {
+  kind: 'image' | 'content'
+  id: string
+  label: string
+  note: string
+  phase: 'pending' | 'acked' | 'saving' | 'error'
+}
+
 function normalizeLearning(raw: unknown): LearningState {
   if (!raw || typeof raw !== 'object') throw new BridgeProtocolError()
   const value = raw as Partial<LearningState>
@@ -379,6 +400,19 @@ function useStoreValue() {
   const scanBaselineGenerationRef = useRef<number | null>(null)
   const learningInFlight = useRef(false)
   const lastLearningRefresh = useRef(0)
+  // PROMPT-036S: local (optimistic) learning labels. The map is the source of truth for a
+  // candidate whose newest user choice has not been confirmed saved by the backend; it is
+  // merged over every incoming full LearningState so a stale poll can never revert a click.
+  // Phases: 'pending' = fast-set not yet acked, 'acked' = backend holds the pending label,
+  // 'saving' = atomic save in flight, 'error' = last persist failed (label stays visible,
+  // marked unsaved via labelPending, and can be retried). Entries drop out when a full
+  // state confirms the same label+note, or when a save ack lands.
+  const localLabelsRef = useRef(new Map<string, LocalLabelEntry>())
+  const labelWorkersRef = useRef(new Set<string>())
+  const labelWritesInFlightRef = useRef(0)
+  const labelWriteEpochRef = useRef(0)
+  const learningRefreshQueuedRef = useRef(false)
+  const learningStateRef = useRef<LearningState>(EMPTY_LEARNING)
   const bridgeReadyRef = useRef(false)
   const bridgeLifetimeRef = useRef<AbortController | null>(null)
   const bridgeSessionRef = useRef<BridgeSessionController | null>(null)
@@ -391,6 +425,7 @@ function useStoreValue() {
   const updateCloseInFlight = useRef(false)
   const alive = useRef(true)
   useEffect(() => { reportsRef.current = reports }, [reports])
+  useEffect(() => { learningStateRef.current = learningState }, [learningState])
   const publishError = useCallback((error: unknown) => {
     if (!alive.current || isAbortError(error)) return
     const details = safeErrorDetails(error)
@@ -409,6 +444,51 @@ function useStoreValue() {
 
   const callNative = useCallback(<T,>(method: string, ...args: unknown[]) =>
     callBridgeWithOptions<T>(method, args, { signal: bridgeLifetimeRef.current?.signal }), [])
+
+  // PROMPT-036S: merge unconfirmed local labels over an incoming full LearningState. A
+  // candidate whose backend row already shows the same label+note is confirmed and its
+  // overlay entry is dropped; any other overlay wins so stale responses cannot revert a
+  // click. Labeled counts mirror the backend rule (saved ∪ pending): a locally labeled
+  // candidate the backend still shows UNLABELED adds one.
+  const mergeLocalLabels = useCallback((next: LearningState): LearningState => {
+    if (localLabelsRef.current.size === 0) return next
+    let imageDelta = 0
+    let contentDelta = 0
+    const apply = <T extends { id: string; userLabel: string; note: string }>(list: readonly T[], kind: 'image' | 'content'): T[] => list.map((candidate) => {
+      const key = `${kind}:${candidate.id}`
+      const entry = localLabelsRef.current.get(key)
+      if (!entry) return candidate
+      if (entry.phase !== 'error' && entry.phase !== 'saving'
+        && candidate.userLabel === entry.label && candidate.note === entry.note) {
+        localLabelsRef.current.delete(key)
+        return candidate
+      }
+      if (candidate.userLabel === 'UNLABELED' && entry.label !== 'UNLABELED') {
+        if (kind === 'image') imageDelta += 1
+        else contentDelta += 1
+      }
+      return { ...candidate, userLabel: entry.label, note: entry.note, labelPending: true }
+    })
+    const merged: LearningState = {
+      ...next,
+      images: apply(next.images, 'image'),
+      contents: apply(next.contents, 'content'),
+    }
+    if (imageDelta || contentDelta) {
+      merged.counts = {
+        image: { ...merged.counts.image, labeled: merged.counts.image.labeled + imageDelta },
+        content: { ...merged.counts.content, labeled: merged.counts.content.labeled + contentDelta },
+      }
+    }
+    return merged
+  }, [])
+
+  const acceptLearningState = useCallback((next: LearningState) => {
+    setLearningState(mergeLocalLabels(next))
+  }, [mergeLocalLabels])
+
+  const labelWritesActive = useCallback(() => labelWritesInFlightRef.current > 0
+    || [...localLabelsRef.current.values()].some((entry) => entry.phase === 'saving'), [])
 
   const configDto = useCallback((): NativeConfig => ({
     paths: { reportFolder: folder, template, output },
@@ -507,16 +587,29 @@ function useStoreValue() {
 
   const refreshLearning = useCallback(async (signal?: AbortSignal) => {
     if (learningInFlight.current || !bridgeReadyRef.current) return
+    // PROMPT-036S: user label writes have priority over background refresh. Defer (and
+    // re-queue) instead of racing a write; the write worker re-runs this when it drains.
+    if (labelWritesActive()) {
+      learningRefreshQueuedRef.current = true
+      return
+    }
     learningInFlight.current = true
     lastLearningRefresh.current = Date.now()
+    const epochAtStart = labelWriteEpochRef.current
     if (alive.current) setLearningLoad({ status: 'loading', message: '' })
     try {
       const raw = await callBridgeWithOptions<unknown>('get_learning_state', [], {
         signal: signal ?? bridgeLifetimeRef.current?.signal,
       })
       if (!alive.current) return
+      // A label changed while this response was in flight: it may predate the click, so
+      // discard it and re-queue a fresh read instead of letting it revert the choice.
+      if (epochAtStart !== labelWriteEpochRef.current) {
+        learningRefreshQueuedRef.current = true
+        return
+      }
       const next = normalizeLearning(raw)
-      setLearningState(next)
+      acceptLearningState(next)
       setTraining(Boolean(next.training))
       setLearningLoad({ status: 'ready', message: '' })
     } catch (error) {
@@ -526,8 +619,62 @@ function useStoreValue() {
       }
     } finally {
       learningInFlight.current = false
+      if (learningRefreshQueuedRef.current && alive.current && !labelWritesActive()) {
+        learningRefreshQueuedRef.current = false
+        void refreshLearning()
+      }
     }
-  }, [recordError])
+  }, [acceptLearningState, labelWritesActive, recordError])
+
+  // Run a deferred Learning refresh once user label writes have drained.
+  const drainLearningRefresh = useCallback(() => {
+    if (!learningRefreshQueuedRef.current || !alive.current || labelWritesActive()) return
+    learningRefreshQueuedRef.current = false
+    void refreshLearning()
+  }, [labelWritesActive, refreshLearning])
+
+  // PROMPT-036S: per-candidate label persist worker. At most one in-flight
+  // set_learning_label_fast per candidate; clicks that arrive during a flight only replace
+  // the desired value, so rapid clicking collapses to at most one extra call and the last
+  // choice always wins. The backlog is therefore bounded per candidate, never unbounded.
+  const persistLabel = useCallback((kind: 'image' | 'content', id: string) => {
+    const key = `${kind}:${id}`
+    if (labelWorkersRef.current.has(key)) return
+    labelWorkersRef.current.add(key)
+    labelWritesInFlightRef.current += 1
+    void (async () => {
+      try {
+        for (;;) {
+          const entry = localLabelsRef.current.get(key)
+          if (!entry || entry.phase === 'saving') return
+          const sentLabel = entry.label
+          const sentNote = entry.note
+          entry.phase = 'pending'
+          try {
+            await callNative<LearningLabelAck>('set_learning_label_fast', kind, id, sentLabel, sentNote)
+          } catch (error) {
+            const current = localLabelsRef.current.get(key)
+            if (current && current.phase !== 'saving'
+              && (current.label !== sentLabel || current.note !== sentNote)) {
+              continue // a newer click landed during the failed flight: persist that instead
+            }
+            if (current && current.phase !== 'saving') current.phase = 'error'
+            if (alive.current) recordError(error)
+            return
+          }
+          const current = localLabelsRef.current.get(key)
+          if (!current || current.phase === 'saving') return
+          current.phase = 'acked'
+          if (current.label === sentLabel && current.note === sentNote) return
+          // A newer click landed during the flight: loop and persist the latest value.
+        }
+      } finally {
+        labelWorkersRef.current.delete(key)
+        labelWritesInFlightRef.current -= 1
+        drainLearningRefresh()
+      }
+    })()
+  }, [callNative, drainLearningRefresh, recordError])
 
   const markBridgeDisconnected = useCallback((error: unknown) => {
     bridgeReadyRef.current = false
@@ -942,48 +1089,110 @@ function useStoreValue() {
     } catch (error) { recordError(error) }
   }, [acceptDashboard, clearError, recordError])
 
-  const labelImage = useCallback(async (id: string, label: string) => {
-    const candidate = learningState.images.find((item) => item.id === id)
-    try {
-      const next = await callNative<LearningState>('set_learning_label', 'image', id, label, candidate?.note || '')
-      setLearningState(normalizeLearning(next))
-    } catch (error) { recordError(error) }
-  }, [learningState.images, recordError])
-  const labelContent = useCallback(async (id: string, label: string) => {
-    const candidate = learningState.contents.find((item) => item.id === id)
-    try {
-      const next = await callNative<LearningState>('set_learning_label', 'content', id, label, candidate?.note || '')
-      setLearningState(normalizeLearning(next))
-    } catch (error) { recordError(error) }
-  }, [learningState.contents, recordError])
+  // PROMPT-036S: a label click updates local state IMMEDIATELY (same React tick, before any
+  // bridge traffic) and persists asynchronously through the coalescing worker. The visual
+  // state therefore never waits for a backend round trip, however slow the bridge is.
+  const applyLocalLabel = useCallback((kind: 'image' | 'content', id: string, label: string) => {
+    labelWriteEpochRef.current += 1
+    const key = `${kind}:${id}`
+    const existing = localLabelsRef.current.get(key)
+    const candidate = (kind === 'image' ? learningStateRef.current.images : learningStateRef.current.contents)
+      .find((item) => item.id === id)
+    localLabelsRef.current.set(key, {
+      kind, id, label,
+      note: existing?.note ?? candidate?.note ?? '',
+      phase: existing?.phase === 'saving' ? 'saving' : 'pending',
+    })
+    setLearningState((current) => {
+      const list = kind === 'image' ? current.images : current.contents
+      const target = list.find((item) => item.id === id)
+      if (!target) return current
+      const labeledDelta = target.userLabel === 'UNLABELED' && label !== 'UNLABELED' ? 1 : 0
+      const counts = labeledDelta
+        ? { ...current.counts, [kind]: { ...current.counts[kind], labeled: current.counts[kind].labeled + 1 } }
+        : current.counts
+      return kind === 'image'
+        ? { ...current, images: current.images.map((item) => item.id === id ? { ...item, userLabel: label, labelPending: true } : item), counts }
+        : { ...current, contents: current.contents.map((item) => item.id === id ? { ...item, userLabel: label, labelPending: true } : item), counts }
+    })
+    if (localLabelsRef.current.get(key)?.phase !== 'saving') persistLabel(kind, id)
+  }, [persistLabel])
+  const labelImage = useCallback((id: string, label: string) => applyLocalLabel('image', id, label), [applyLocalLabel])
+  const labelContent = useCallback((id: string, label: string) => applyLocalLabel('content', id, label), [applyLocalLabel])
   const setNote = useCallback((kind: 'image' | 'content', id: string, note: string) => {
+    const entry = localLabelsRef.current.get(`${kind}:${id}`)
+    if (entry) entry.note = note
     setLearningState((current) => kind === 'image'
       ? { ...current, images: current.images.map((item) => item.id === id ? { ...item, note } : item) }
       : { ...current, contents: current.contents.map((item) => item.id === id ? { ...item, note } : item) })
   }, [])
   const saveLearningLabels = useCallback(async (kind: 'image' | 'content') => {
     const notes = kind === 'image'
-      ? Object.fromEntries(learningState.images.map((candidate) => [candidate.id, candidate.note]))
-      : Object.fromEntries(learningState.contents.map((candidate) => [candidate.id, candidate.note]))
+      ? Object.fromEntries(learningStateRef.current.images.map((candidate) => [candidate.id, candidate.note]))
+      : Object.fromEntries(learningStateRef.current.contents.map((candidate) => [candidate.id, candidate.note]))
     try {
       const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, notes)
-      setLearningState(normalizeLearning(result.state))
+      acceptLearningState(normalizeLearning(result.state))
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
       setTraining(false)
     } catch (error) { recordError(error) }
-  }, [learningState, recordError])
+  }, [acceptLearningState, callNative, recordError])
   const saveImageLabels = useCallback(() => saveLearningLabels('image'), [saveLearningLabels])
   const saveContentLabels = useCallback(() => saveLearningLabels('content'), [saveLearningLabels])
+  // PROMPT-036S: ONE atomic bridge call (save_learning_candidate) instead of the former
+  // sequential set_learning_label + save_learning_labels pair. The click is reflected
+  // locally at once; on failure the choice stays visible and marked unsaved (labelPending)
+  // with the error surfaced, and clicking Save again retries — it is never silently lost.
   const saveLearningCandidate = useCallback(async (kind: 'image' | 'content', id: string, label: string, note: string) => {
+    const key = `${kind}:${id}`
+    labelWriteEpochRef.current += 1
+    localLabelsRef.current.set(key, { kind, id, label, note, phase: 'saving' })
+    setLearningState((current) => kind === 'image'
+      ? { ...current, images: current.images.map((item) => item.id === id ? { ...item, userLabel: label, note, labelPending: true } : item) }
+      : { ...current, contents: current.contents.map((item) => item.id === id ? { ...item, userLabel: label, note, labelPending: true } : item) })
+    labelWritesInFlightRef.current += 1
     try {
-      await callNative<LearningState>('set_learning_label', kind, id, label, note)
-      const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, { [id]: note })
-      setLearningState(normalizeLearning(result.state))
-      setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
+      // Let an in-flight fast-set for this candidate land first (backend order), then save
+      // the LATEST local choice atomically. Bounded: the worker holds at most one flight.
+      // Clicks during the save keep updating the entry/state immediately; the ack handler
+      // below detects a superseded choice and re-persists it instead of dropping it.
+      while (labelWorkersRef.current.has(key)) {
+        await new Promise((resolve) => { window.setTimeout(resolve, 5) })
+      }
+      const latest = localLabelsRef.current.get(key)
+      const sentLabel = latest?.label ?? label
+      const sentNote = latest?.note ?? note
+      const result = await callNative<LearningSaveAck>('save_learning_candidate', kind, id, sentLabel, sentNote)
+      const current = localLabelsRef.current.get(key)
+      const superseded = current && (current.label !== sentLabel || current.note !== sentNote)
+      if (!superseded) {
+        localLabelsRef.current.delete(key)
+        setLearningState((state) => kind === 'image'
+          ? { ...state, images: state.images.map((item) => item.id === id ? { ...item, labelPending: false } : item),
+              excelLastResult: result.excelLastResult, excelPending: result.excelPending }
+          : { ...state, contents: state.contents.map((item) => item.id === id ? { ...item, labelPending: false } : item),
+              excelLastResult: result.excelLastResult, excelPending: result.excelPending })
+      }
+      setErrorCode(result.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
-    } catch (error) { recordError(error) }
-  }, [recordError])
+      if (superseded && current) {
+        current.phase = 'pending'
+        persistLabel(kind, id)
+      }
+    } catch (error) {
+      const current = localLabelsRef.current.get(key)
+      if (current) {
+        const superseded = current.label !== label || current.note !== note
+        current.phase = superseded ? 'pending' : 'error'
+        if (superseded) persistLabel(kind, id)
+      }
+      if (alive.current) recordError(error)
+    } finally {
+      labelWritesInFlightRef.current -= 1
+      if (alive.current) void refreshLearning()
+    }
+  }, [applyLocalLabel, callNative, persistLabel, recordError, refreshLearning])
   const saveImageCandidate = useCallback((id: string, label: string, note: string) =>
     saveLearningCandidate('image', id, label, note), [saveLearningCandidate])
   const saveContentCandidate = useCallback((id: string, label: string, note: string) =>
