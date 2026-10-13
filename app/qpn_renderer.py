@@ -18,10 +18,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -250,15 +252,134 @@ def _com_reason(exc: BaseException, pptx: Optional[Path]) -> str:
     return text or type(exc).__name__
 
 
+# PROMPT-035 — explicit PowerPoint ownership.
+#
+# PowerPoint is a SINGLE-INSTANCE automation server: ``DispatchEx("PowerPoint.Application")`` returns the user's
+# already-running instance when there is one, so "I called DispatchEx" is NOT proof that this process owns the
+# Application.  Cleanup (Close / Quit) is therefore gated on positive proof, and every doubt fails closed:
+#
+#   * app-owned Application  = no PowerPoint process existed before activation, exactly ONE new process exists after
+#                              it, and the returned object is pristine (0 presentations, 0 windows);
+#   * app-owned Presentation = the object returned by OUR ``Presentations.Open`` on a pristine instance;
+#   * anything else (user instance, shared/ambiguous instance, unreadable process table) is never opened into,
+#     closed, quit, saved or killed.
+#
+# There is deliberately NO process-termination primitive in this module: the process table is only ever READ
+# (Toolhelp snapshot — no process handle is opened, so nothing can be signalled).
+_POWERPOINT_LOCK = threading.Lock()          # serialises the whole COM lifecycle: in-process jobs cannot collide
+_POWERPOINT_IMAGE_NAME = "powerpnt.exe"
+_PROCESS_EXIT_TIMEOUT_S = 15.0               # bounded wait for OUR quit instance to disappear (never escalates)
+_PROCESS_POLL_S = 0.1
+
+
+def _powerpoint_process_ids() -> Optional[FrozenSet[int]]:
+    """PIDs of every running PowerPoint process, or ``None`` when the process table cannot be read.
+
+    READ-ONLY: a Toolhelp32 snapshot lists processes without opening a handle to any of them, so this can never
+    affect a user's PowerPoint.  ``None`` (non-Windows, API failure) means "ownership cannot be established" and
+    callers must fail closed."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        k32.Process32FirstW.restype = wintypes.BOOL
+        k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        k32.Process32NextW.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        snapshot = k32.CreateToolhelp32Snapshot(0x00000002, 0)       # TH32CS_SNAPPROCESS
+        if snapshot in (None, 0, ctypes.c_void_p(-1).value):
+            return None
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            pids = set()
+            ok = k32.Process32FirstW(snapshot, ctypes.byref(entry))
+            if not ok:
+                return None if ctypes.get_last_error() != 18 else frozenset()   # 18 = ERROR_NO_MORE_FILES
+            while ok:
+                if entry.szExeFile.lower() == _POWERPOINT_IMAGE_NAME:
+                    pids.add(int(entry.th32ProcessID))
+                ok = k32.Process32NextW(snapshot, ctypes.byref(entry))
+            return frozenset(pids)
+        finally:
+            k32.CloseHandle(snapshot)
+    except Exception:  # noqa: BLE001 – any failure means "unknown", never "none running"
+        return None
+
+
+def _running_powerpoint_registered(client) -> bool:
+    """Second, independent signal: is a PowerPoint instance registered in the Running Object Table?  ``GetActiveObject``
+    only ever *looks up* a running object (it never starts one).  The normal "nothing running" answer is an
+    exception; an object means a session exists, so it is released untouched and the caller refuses."""
+    try:
+        found = client.GetActiveObject(POWERPOINT_PROGID)
+    except Exception:  # noqa: BLE001 – MK_E_UNAVAILABLE: nothing registered
+        return False
+    return found is not None
+
+
+def _is_pristine(app) -> bool:
+    """A freshly created automation instance holds no presentations and no windows.  Any failed read is "not
+    pristine" (fail closed)."""
+    try:
+        return int(app.Presentations.Count) == 0 and int(app.Windows.Count) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _presentation_count(app) -> Optional[int]:
+    try:
+        return int(app.Presentations.Count)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ownership_refusal(reason: str, pptx: Path) -> PowerPointStageError:
+    return PowerPointStageError("ownership", RuntimeError(reason), pptx)
+
+
+def _wait_for_process_exit(pid: int) -> bool:
+    """Bounded wait for the process WE quit to leave the process table.  Observation only: on timeout it reports and
+    returns False — it never terminates anything."""
+    deadline = time.monotonic() + _PROCESS_EXIT_TIMEOUT_S
+    while True:
+        pids = _powerpoint_process_ids()
+        if pids is not None and pid not in pids:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_PROCESS_POLL_S)
+
+
 def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Path,
                            width_px: int = 1920) -> Dict[int, Path]:
-    """Export COMPLETE authored slides through an APP-OWNED PowerPoint instance (PROMPT-027R §16).
+    """Export COMPLETE authored slides through a PowerPoint instance this call can PROVE it owns (PROMPT-035).
 
-    The user's interactive PowerPoint is never attached to, never closed and never quit: the instance is created with
-    ``DispatchEx``, the source is opened read-only without a window, only that presentation is closed and only the
-    instance this function created is quit.  CoInitialize / CoUninitialize are balanced.  Every failure raises
-    :class:`PowerPointStageError` naming the stage that failed, so diagnostics say WHERE COM broke.
-    """
+    A PowerPoint that is already running (the user's session) is never attached to, opened into, closed, quit or
+    killed: activation is refused with ``PowerPointStageError("ownership")`` and the renderer chain falls through to
+    the next backend.  Only the presentation this call opened is closed, and the Application is quit only when it is
+    proven app-created and still exclusively ours.  Cleanup follows the same rules on success, error, timeout and
+    cancellation.  CoInitialize / CoUninitialize are balanced.  Every failure raises :class:`PowerPointStageError`
+    naming the stage that failed (cooperative cancellation propagates unchanged)."""
+    with _POWERPOINT_LOCK:
+        return _render_with_powerpoint_locked(pptx, slide_numbers, out_dir, width_px)
+
+
+def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out_dir: Path,
+                                   width_px: int) -> Dict[int, Path]:
     try:
         import pythoncom  # type: ignore
         import win32com.client  # type: ignore
@@ -271,14 +392,33 @@ def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Pa
         raise PowerPointStageError("com-init", exc, pptx)
     app = None
     pres = None
-    created_app = False
+    owned = False                         # True ONLY after the ownership proof below succeeded
+    owned_pid: Optional[int] = None
     cleanup_failures: List[Tuple[str, BaseException]] = []
+    notes: List[Tuple[str, str]] = []
     try:
+        # ---- ownership proof (read-only checks BEFORE anything is activated) -------------------------------------
+        before = _powerpoint_process_ids()
+        if before is None:
+            raise _ownership_refusal("process table unreadable; ownership cannot be established", pptx)
+        if before:
+            raise _ownership_refusal("a PowerPoint session is already running; not attaching to it", pptx)
+        if _running_powerpoint_registered(win32com.client):
+            raise _ownership_refusal("a running PowerPoint instance is registered; not attaching to it", pptx)
         try:
-            app = win32com.client.DispatchEx(POWERPOINT_PROGID)           # always a NEW, application-owned instance
-            created_app = True
+            app = win32com.client.DispatchEx(POWERPOINT_PROGID)           # may return a USER's instance: unproven
         except Exception as exc:  # noqa: BLE001
             raise PowerPointStageError("dispatch", exc, pptx)
+        after = _powerpoint_process_ids()
+        created = None if after is None else after - before
+        if created is None or len(created) != 1 or not _is_pristine(app):
+            # Could be a session the user started in the meantime: leave it exactly as it is (owned stays False).
+            raise _ownership_refusal("returned PowerPoint instance is not proven app-created; left untouched", pptx)
+        owned, owned_pid = True, next(iter(created))
+        # ---- open only into an instance that is still pristine ---------------------------------------------------
+        if not _is_pristine(app):
+            owned = False                                                 # someone else arrived: no longer exclusive
+            raise _ownership_refusal("PowerPoint instance is no longer exclusively app-owned; left untouched", pptx)
         try:
             # WithWindow=False keeps it invisible; ReadOnly=True never modifies the source
             pres = app.Presentations.Open(str(pptx.resolve()), True, False, False)
@@ -291,19 +431,35 @@ def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Pa
                 target = out_dir / f"slide_{n:03d}.png"
                 pres.Slides(n).Export(str(target.resolve()), "PNG", width_px, h)
                 out[n] = target
+        except CancellationRequested:
+            raise                                                         # cooperative cancel is not a COM failure
         except Exception as exc:  # noqa: BLE001
             raise PowerPointStageError("slide-export", exc, pptx)
     finally:
+        # Cleanup obeys the SAME ownership rules on success / error / timeout / cancellation.
+        pres_closed = pres is None
         if pres is not None:
             try:
                 pres.Close()                                              # only the presentation WE opened
+                pres_closed = True
             except Exception as exc:  # noqa: BLE001
                 cleanup_failures.append(("presentation-close", exc))
-        if created_app and app is not None:
-            try:
-                app.Quit()                                                # only the instance WE created
-            except Exception as exc:  # noqa: BLE001
-                cleanup_failures.append(("app-quit", exc))
+        quit_sent = False
+        if owned and app is not None:
+            remaining = _presentation_count(app)
+            if remaining is not None and remaining == (0 if pres_closed else 1):
+                try:
+                    app.Quit()                                            # only an instance PROVEN created + exclusive
+                    quit_sent = True
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_failures.append(("app-quit", exc))
+            else:
+                notes.append(("app-quit-skipped", "instance holds other presentations or its state is unreadable; "
+                                                  "left running"))
+        app = None                                                        # release our references before waiting
+        pres = None
+        if quit_sent and owned_pid is not None and not _wait_for_process_exit(owned_pid):
+            notes.append(("app-exit-wait-timeout", f"pid={owned_pid} still running; not terminated"))
         try:
             pythoncom.CoUninitialize()
         except Exception:  # noqa: BLE001
@@ -311,6 +467,8 @@ def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Pa
         for step, exc in cleanup_failures:
             LOG.info("SLIDE_RENDER_CLEANUP backend=powerpoint stage=cleanup step=%s exception_type=%s reason=%s",
                      step, type(exc).__name__, _com_reason(exc, pptx))
+        for step, detail in notes:
+            LOG.warning("SLIDE_RENDER_CLEANUP backend=powerpoint stage=cleanup step=%s detail=%s", step, detail)
     return out
 
 
