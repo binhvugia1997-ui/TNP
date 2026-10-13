@@ -96,12 +96,20 @@ export const BUCKET_OF: Record<StatusKey, StatBucket | 'other'> = {
 }
 
 /**
- * PROMPT-037: the ONE authoritative rule for rows shown in “Danh sách báo cáo”.
- * `skipped` (“Bỏ qua — đã cập nhật”) rows are hidden from the list, its totals, selection and
- * the active row. The DTO still carries them: the backend keeps the skip classification for
- * processing, duplicate handling, scan decisions and incremental transitions. Presentation-only.
+ * PROMPT-037 / PROMPT-037R: the ONE authoritative rule for rows shown in “Danh sách báo cáo”.
+ * Every status whose UI meaning is “Bỏ qua” is hidden from the list, its totals, selection and
+ * the active row: `skipped` (“Bỏ qua — đã cập nhật”), `outside_period` (“Bỏ qua ngoài thời gian
+ * xử lý”), `source_duplicate` and `fast_skip` (“Bỏ qua nhanh — đã xử lý gần đây”). The DTO still
+ * carries them: the backend keeps the classification for processing, duplicate handling, scan
+ * decisions and incremental transitions. Presentation-only; nothing is blacklisted by path, so a
+ * later scan that makes a report visible/actionable shows it again.
  */
-export const HIDDEN_REPORT_STATUSES: ReadonlySet<StatusKey> = new Set<StatusKey>(['skipped'])
+export const HIDDEN_REPORT_STATUSES: ReadonlySet<StatusKey> = new Set<StatusKey>([
+  'skipped',
+  'outside_period',
+  'source_duplicate',
+  'fast_skip',
+])
 
 export function isVisibleReport(report: Pick<Report, 'status'>): boolean {
   return !HIDDEN_REPORT_STATUSES.has(report.status)

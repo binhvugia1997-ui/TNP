@@ -88,3 +88,15 @@ setActiveIdValue((current) => resolveActiveReportId(previousReports, nextReports
   `tests/test_application_service.py::test_configuration_ollama_update_state_and_disabled_install`
   (same `1.3.5` expectation) are unrelated to this bug and were not modified (version/build is out of scope).
 - Windows / pywebview acceptance of the hide behaviour with a real scan has not been performed.
+
+## PROMPT-037R addendum — all “Bỏ qua” statuses
+
+- **Scope widened**: `HIDDEN_REPORT_STATUSES` now = `skipped`, `outside_period`, `source_duplicate`, `fast_skip`
+  (the four statuses whose UI meaning is “Bỏ qua”). Still a single rule in `frontend/src/types.ts`.
+- **Filter option removed**: `File bị bỏ qua` is removed from `FILTERS`, because every row it could match is now hidden
+  (keeping it would show a permanently empty filter). Changed in `frontend/src/state/store.tsx`.
+- **Stat card**: the “Bỏ qua” card (`stats.skipped`) now always reads 0 for the visible list. It is kept for layout;
+  removing it is a follow-up UI decision.
+- Backend classification, DTO, diagnostics, and source files: unchanged. No version/build bump. No Portable build, no publish, no merge.
+- Tests: `frontend/tests/prompt037-hide-skipped.test.mjs` is now 19 tests (all four statuses in rows, totals, selection, select-all,
+  active row, polls, incremental deltas, rescan, and reappearance). Red check against the previous commit: 14 of 19 fail.

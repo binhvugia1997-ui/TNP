@@ -40,7 +40,6 @@ export const FILTERS = [
   'File đã xử lý',
   'File cần kiểm tra',
   'File lỗi',
-  'File bị bỏ qua',
   'File đã loại thủ công',
 ] as const
 export type FilterKey = (typeof FILTERS)[number]
@@ -826,8 +825,6 @@ function useStoreValue() {
       case 'File đã xử lý': return report.status === 'completed'
       case 'File cần kiểm tra': return report.status === 'needs_review'
       case 'File lỗi': return report.status === 'error'
-      // PROMPT-037: `skipped` rows are never in `reports`; this filter lists the remaining skip kinds.
-      case 'File bị bỏ qua': return ['outside_period', 'source_duplicate', 'fast_skip'].includes(report.status)
       case 'File đã loại thủ công': return report.status === 'excluded'
       default: return true
     }

@@ -92,3 +92,14 @@ Hold for review — verified in the Linux development environment, partial overa
 acceptance with a real scan is still needed, and (b) the scope question for the other “Bỏ qua…” statuses is open.
 The fix itself is complete for the `skipped` status: the hide rule is single, reconciled at the store ingestion point,
 and covered by red-then-green regression tests. Do not merge without the user's explicit authorization.
+
+## PROMPT-037R addendum — verification
+
+- `npm run test:prompt037` → 19/19 pass (`# tests 19 / # pass 19 / # fail 0`).
+- Red check against the previous commit's `src/` (hides only `skipped`): 14 of 19 fail, including every all-status test.
+- `npm run typecheck` → exit 0.
+- `pytest tests/test_prompt037_skipped_dto.py` → 3/3 pass. `py_compile` → ok.
+- `git diff --check` → clean.
+- Not run (per scope): the full frontend suite, the broader Python suites, Windows/pywebview acceptance, Portable build.
+  The unrelated version-metadata failures seen earlier remain as they were.
+- **Result: partial** (unchanged): Linux evidence only; real Windows scan acceptance still pending.
