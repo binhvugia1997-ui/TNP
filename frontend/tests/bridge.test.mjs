@@ -377,3 +377,58 @@ test('normal ready path pings, loads version/config/dashboard, and adds no start
     assert.equal(fakeWindow.timeouts.size, 0)
   })
 })
+
+// PROMPT-036R regression test #3: a slow-but-healthy backend call must never be misclassified as a dead
+// bridge. Once a method is already registered (the normal post-pywebviveready state), callBridge/startAppBridge
+// await the call itself with no secondary timer layered on top of `timeoutMs` — only an explicit AbortSignal
+// can cut it short. A legitimately slow `get_dashboard_state` (e.g. while building a large report list) must
+// resolve successfully, not be rejected as BRIDGE_UNAVAILABLE just because it took a while.
+test('a slow-but-successful dashboard call during startup resolves instead of being misclassified as BRIDGE_UNAVAILABLE', async () => {
+  await withWindow(async (fakeWindow) => {
+    fakeWindow.pywebview = {
+      api: {
+        ping: async () => ({ ok: true, data: 'Python bridge OK' }),
+        get_app_version: async () => ({ ok: true, data: { version: '1.3.6', build: '019' } }),
+        get_current_config: async () => ({ ok: true, data: { config: true } }),
+        get_dashboard_state: async () => {
+          await delay(150) // simulates a genuinely slow, but healthy, dashboard_state() build
+          return { ok: true, data: { dashboard: true } }
+        },
+      },
+    }
+
+    const started = Date.now()
+    // timeoutMs only bounds the WAIT for a method to appear, not the call itself (see bridge.ts); 50ms is
+    // intentionally shorter than the 150ms the dashboard call takes, to prove that distinction.
+    const initial = await bridgeModules.startAppBridge(undefined, 50)
+    const elapsed = Date.now() - started
+
+    assert.deepEqual(initial.dashboard, { dashboard: true })
+    assert.ok(elapsed >= 150, 'the slow call must actually be awaited, not raced against timeoutMs')
+    assert.equal(fakeWindow.timeouts.size, 0)
+  })
+})
+
+test('a slow poll tick is awaited to completion and never raises BRIDGE_UNAVAILABLE on its own', async () => {
+  await withWindow(async () => {
+    let disconnected = 0
+    const controller = bridgeModules.createBridgeSessionController({
+      connect: async () => ({ ready: true }),
+      poll: async () => {
+        await delay(60) // slower than the poll interval below, simulating an expensive dashboard refresh
+      },
+      onConnected: () => {},
+      onDisconnected: () => { disconnected += 1 },
+      pollIntervalMs: 10,
+      reconnectDelaysMs: [20],
+    })
+
+    controller.start()
+    await waitUntil(() => controller.ready)
+    await delay(140) // multiple poll intervals elapse while a slow poll is still in flight
+    assert.equal(disconnected, 0, 'slow-but-successful polling must never trigger a disconnect/BRIDGE_UNAVAILABLE')
+    assert.equal(controller.ready, true)
+
+    controller.stop()
+  })
+})

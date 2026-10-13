@@ -26,10 +26,33 @@ class BridgeService:
 
     def __init__(self, service: Optional[ApplicationService] = None):
         self.service = service or ApplicationService()
-        self.window = None
+        # PROMPT-036R: kept PRIVATE (leading underscore) on purpose. This ``BridgeService`` instance is the
+        # exact object pywebview hands to ``webview.util.get_functions()`` to build the JS method manifest at
+        # startup (``js_api=bridge`` in ``app/desktop.py``), and that walker only skips names starting with
+        # ``_`` — every OTHER public, non-callable attribute (with a ``__module__``) is recursively reflected
+        # into, with no cycle protection beyond ``id()`` identity.
+        # A bound pywebview ``Window`` is not a plain value: once the native window exists, ``window.gui`` /
+        # ``window.native`` resolve (on Windows) to pythonnet-wrapped WinForms/WebView2 CLR objects whose
+        # struct-typed properties (``Size``, ``Padding``, ``Font`` … ) expose a static ``Empty`` field that
+        # returns a BRAND NEW wrapper object on every access. Two different wrapper objects representing the
+        # same logical value never compare equal by ``id()``, so that reflection walk cannot detect the
+        # cycle and recurses down ``...Empty.Empty.Empty...`` until Python's recursion limit is hit. pywebview
+        # catches that ``RecursionError`` per attribute (it wraps every visit in its own ``try/except``), so
+        # it does not crash outright — but it DOES burn a full stack's worth of recursive Python/CLR calls,
+        # once per struct-typed property reachable from the window (there are dozens on a real WinForms
+        # control), spamming exactly the "Error while processing ...Empty.Empty.Empty...: maximum recursion
+        # depth exceeded" lines captured in the bug report while starving the native message loop long enough
+        # to explain both the "(Not Responding)" window and the frontend timing out into BRIDGE_UNAVAILABLE
+        # even though "before_load"/"_pywebviewready" debug lines already logged (those print before pywebview
+        # attempts this reflection, not after it finishes). See tests/test_prompt036r_bridge_hang.py for a
+        # deterministic, non-Windows reproduction of this exact mechanism. Exposing the live window as
+        # ``self.window`` put it one public attribute away from that walk; keeping it as ``self._window``
+        # removes it from the reflected surface entirely while changing nothing about the explicit,
+        # intentional bridge contract (``get_app_version``, ``ping``, …) the frontend relies on.
+        self._window = None
 
     def bind_window(self, window) -> None:
-        self.window = window
+        self._window = window
 
     # -------------------------------------------------------------- required bridge contract
     def get_app_version(self) -> dict:
@@ -138,14 +161,14 @@ class BridgeService:
 
     def close_for_update(self) -> dict:
         def call():
-            if self.window is None:
+            if self._window is None:
                 raise ServiceError("Không thể đóng cửa sổ ứng dụng để chuyển sang trình cập nhật.",
                                    "UPDATE_CLOSE_UNAVAILABLE")
             result = self.service.close_for_update()
 
             def destroy_after_response():
                 try:
-                    self.window.destroy()
+                    self._window.destroy()
                 except Exception:  # noqa: BLE001
                     LOG.exception("UPDATE_WINDOW_CLOSE_FAILED")
 
@@ -246,9 +269,9 @@ class BridgeService:
         return {"cancelled": False, "path": str(selected)}
 
     def _dialog_path(self, dialog_type: Any, **kwargs) -> str:
-        if self.window is None:
+        if self._window is None:
             raise ServiceError("Cửa sổ native chưa sẵn sàng để mở hộp thoại.", "DIALOG_UNAVAILABLE")
-        result = self.window.create_file_dialog(dialog_type, **kwargs)
+        result = self._window.create_file_dialog(dialog_type, **kwargs)
         if not result:
             return ""
         if isinstance(result, (tuple, list)):
