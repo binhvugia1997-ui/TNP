@@ -201,6 +201,19 @@ const EMPTY_LEARNING: LearningState = {
 
 export type LearningLoadState = { status: 'idle' | 'loading' | 'ready' | 'error'; message: string }
 
+/**
+ * PROMPT-036: a full Learning snapshot carries every candidate plus its slide bitmap, so it is by far the
+ * most expensive poll the UI makes.  These two bounds keep it off the critical path of a click without ever
+ * stopping it: the poll keeps its existing 1400 ms cadence, and it is only held off while a selection is
+ * actually being acknowledged (or for one short quiet window straight afterwards, because that reply already
+ * delivered an authoritative snapshot).
+ */
+const LEARNING_POLL_MIN_INTERVAL_MS = 1_400
+const LEARNING_MUTATION_QUIET_MS = 600
+
+/** Local-only note edits, keyed `image:<id>` / `content:<id>`; notes reach Python only on "Lưu nhãn & ghi chú". */
+type DirtyNoteKey = string
+
 function normalizeLearning(raw: unknown): LearningState {
   if (!raw || typeof raw !== 'object') throw new BridgeProtocolError()
   const value = raw as Partial<LearningState>
@@ -379,6 +392,15 @@ function useStoreValue() {
   const scanBaselineGenerationRef = useRef<number | null>(null)
   const learningInFlight = useRef(false)
   const lastLearningRefresh = useRef(0)
+  /* PROMPT-036: click-path state.  `learningStateRef` is the always-current Learning snapshot the local
+     mutators read and write synchronously (React state is only published afterwards), `learningEpoch` is the
+     monotonic generation of local edits, and the mutation counter/quiet window keep an expensive poll from
+     starting while a selection is still being acknowledged. */
+  const learningStateRef = useRef<LearningState>(EMPTY_LEARNING)
+  const learningEpoch = useRef(0)
+  const learningMutationInFlight = useRef(0)
+  const lastLearningMutation = useRef(0)
+  const dirtyNotes = useRef(new Map<DirtyNoteKey, string>())
   const bridgeReadyRef = useRef(false)
   const bridgeLifetimeRef = useRef<AbortController | null>(null)
   const bridgeSessionRef = useRef<BridgeSessionController | null>(null)
@@ -505,19 +527,147 @@ function useStoreValue() {
   }, [acceptDashboard])
   const refreshDashboard = useCallback(() => loadDashboard(), [loadDashboard])
 
+  /* ------------------------------------------------------------------ PROMPT-036 learning click path
+     A selection must be visible the instant it is made, and an authoritative snapshot that was already in
+     flight when the reviewer clicked must never undo it.  Python stays the single source of truth: every
+     local edit is provisional (`labelPending`) and is reconciled or rolled back by the reply. */
+
+  const publishLearning = useCallback((next: LearningState) => {
+    learningStateRef.current = next
+    setLearningState(next)
+  }, [])
+
+  /** Re-apply notes the reviewer typed but has not saved yet, so a poll never erases them. */
+  const mergeDirtyNotes = useCallback((next: LearningState): LearningState => {
+    const dirty = dirtyNotes.current
+    if (dirty.size === 0) return next
+    const overlay = <T extends { id: string; note: string }>(kind: 'image' | 'content', list: T[]): T[] => {
+      let touched = false
+      const mapped = list.map((item) => {
+        const note = dirty.get(`${kind}:${item.id}`)
+        if (note === undefined || note === item.note) return item
+        touched = true
+        return { ...item, note }
+      })
+      return touched ? mapped : list
+    }
+    const images = overlay('image', next.images)
+    const contents = overlay('content', next.contents)
+    return images === next.images && contents === next.contents ? next : { ...next, images, contents }
+  }, [])
+
+  /**
+   * Install one authoritative Learning snapshot, but only if the reviewer has not edited anything locally
+   * since it was requested.  pywebview serializes each reply after Python returns, so a large in-flight
+   * `get_learning_state` can be delivered *after* the small `set_learning_label` reply; without this guard
+   * that stale snapshot visibly reverts an already-accepted selection (the reported "click swallowed").
+   */
+  const applyLearningSnapshot = useCallback((next: LearningState, requestedEpoch: number) => {
+    if (!alive.current) return false
+    if (requestedEpoch !== learningEpoch.current) return false
+    publishLearning(mergeDirtyNotes(next))
+    setTraining(Boolean(next.training))
+    return true
+  }, [mergeDirtyNotes, publishLearning])
+
+  /**
+   * Drop the local-only note for ONE candidate, and only once Python actually owns it: a note reaches the
+   * backend through `set_learning_label` (as that candidate's pending label note) or through a
+   * `save_learning_labels` commit for that same candidate.  Notes of candidates that were never part of the
+   * call stay overlaid, because Python has not persisted them and a snapshot would otherwise erase them.
+   */
+  const clearDirtyNote = useCallback((kind: 'image' | 'content', id: string) => {
+    dirtyNotes.current.delete(`${kind}:${id}`)
+  }, [])
+
+  type PreviousLabel = { label: string; pending: boolean; note: string }
+
+  /** Write one candidate's label into local state immediately; returns what was there so it can be restored. */
+  const applyLocalLabel = useCallback((
+    kind: 'image' | 'content', id: string, label: string, note: string,
+  ): PreviousLabel | null => {
+    const current = learningStateRef.current
+    if (kind === 'image') {
+      const target = current.images.find((item) => item.id === id)
+      if (!target) return null
+      publishLearning({
+        ...current,
+        images: current.images.map((item) => item.id === id
+          // `labelPending` is exactly Python's own pending semantics: chosen here, not yet committed to disk.
+          ? { ...item, userLabel: label, labelPending: true, note }
+          : item),
+      })
+      return { label: target.userLabel, pending: Boolean(target.labelPending), note: target.note }
+    }
+    const target = current.contents.find((item) => item.id === id)
+    if (!target) return null
+    publishLearning({
+      ...current,
+      contents: current.contents.map((item) => item.id === id
+        ? { ...item, userLabel: label, labelPending: true, note }
+        : item),
+    })
+    return { label: target.userLabel, pending: Boolean(target.labelPending), note: target.note }
+  }, [publishLearning])
+
+  /** A rejected selection must not stay on screen — but never clobber a newer click already made. */
+  const restoreLocalLabel = useCallback((
+    kind: 'image' | 'content', id: string, previous: PreviousLabel, epoch: number,
+  ) => {
+    if (!alive.current || epoch !== learningEpoch.current) return
+    const current = learningStateRef.current
+    if (kind === 'image') {
+      publishLearning({
+        ...current,
+        images: current.images.map((item) => item.id === id
+          ? { ...item, userLabel: previous.label, labelPending: previous.pending, note: previous.note }
+          : item),
+      })
+      return
+    }
+    publishLearning({
+      ...current,
+      contents: current.contents.map((item) => item.id === id
+        ? { ...item, userLabel: previous.label, labelPending: previous.pending, note: previous.note }
+        : item),
+    })
+  }, [publishLearning])
+
+  /** Bump the local-edit generation; every snapshot requested before this point becomes stale. */
+  const nextLearningEpoch = useCallback(() => {
+    learningEpoch.current += 1
+    return learningEpoch.current
+  }, [])
+
+  /** Start a click-driven mutation: a new generation plus the poll hold-off described above. */
+  const beginLearningMutation = useCallback(() => {
+    const epoch = nextLearningEpoch()
+    learningMutationInFlight.current += 1
+    lastLearningMutation.current = Date.now()
+    return epoch
+  }, [nextLearningEpoch])
+
+  const endLearningMutation = useCallback(() => {
+    learningMutationInFlight.current = Math.max(0, learningMutationInFlight.current - 1)
+    // The reply carried a full authoritative snapshot, so the poll does not need to fetch another one now.
+    lastLearningRefresh.current = Date.now()
+    lastLearningMutation.current = Date.now()
+  }, [])
+
   const refreshLearning = useCallback(async (signal?: AbortSignal) => {
     if (learningInFlight.current || !bridgeReadyRef.current) return
     learningInFlight.current = true
     lastLearningRefresh.current = Date.now()
+    const requestedEpoch = learningEpoch.current
     if (alive.current) setLearningLoad({ status: 'loading', message: '' })
     try {
       const raw = await callBridgeWithOptions<unknown>('get_learning_state', [], {
         signal: signal ?? bridgeLifetimeRef.current?.signal,
       })
       if (!alive.current) return
-      const next = normalizeLearning(raw)
-      setLearningState(next)
-      setTraining(Boolean(next.training))
+      // The transport succeeded, so the load state is 'ready' even when the payload itself is dropped as
+      // stale: what stays on screen is the reviewer's newer local edit, not an unfinished load.
+      applyLearningSnapshot(normalizeLearning(raw), requestedEpoch)
       setLearningLoad({ status: 'ready', message: '' })
     } catch (error) {
       if (alive.current && !isAbortError(error)) {
@@ -527,7 +677,7 @@ function useStoreValue() {
     } finally {
       learningInFlight.current = false
     }
-  }, [recordError])
+  }, [applyLearningSnapshot, recordError])
 
   const markBridgeDisconnected = useCallback((error: unknown) => {
     bridgeReadyRef.current = false
@@ -550,7 +700,15 @@ function useStoreValue() {
       connect: (signal) => startAppBridge<typeof appInfo, NativeConfig, DashboardDTO>(signal),
       poll: async (signal) => {
         const tasks: Promise<void>[] = [loadDashboard(signal)]
-        if (tabRef.current === 'learning' && Date.now() - lastLearningRefresh.current > 1400) {
+        /* PROMPT-036: never launch a full Learning snapshot that would contend with a selection the reviewer
+           just made.  The snapshot is the most expensive poll there is (every candidate plus its slide
+           bitmap) and it needs the same Python lock the click needs; the click's own reply already carries
+           an authoritative snapshot, so nothing is lost by waiting one quiet window. */
+        const now = Date.now()
+        const learningQuiet = learningMutationInFlight.current === 0
+          && now - lastLearningMutation.current > LEARNING_MUTATION_QUIET_MS
+        if (tabRef.current === 'learning' && learningQuiet
+          && now - lastLearningRefresh.current > LEARNING_POLL_MIN_INTERVAL_MS) {
           tasks.push(refreshLearning(signal))
         }
         await Promise.all(tasks)
@@ -942,59 +1100,96 @@ function useStoreValue() {
     } catch (error) { recordError(error) }
   }, [acceptDashboard, clearError, recordError])
 
-  const labelImage = useCallback(async (id: string, label: string) => {
-    const candidate = learningState.images.find((item) => item.id === id)
+  /**
+   * PROMPT-036: one Before/After (or content) selection.
+   *
+   * Everything before the first `await` runs inside the click event, so the selection is on screen in the
+   * same frame regardless of how long Python needs.  The bridge call then reconciles: on success the
+   * authoritative snapshot replaces the provisional one, on rejection the previous label is restored and the
+   * real error is surfaced — learning feedback is never lost and the semantics of the label are untouched.
+   */
+  const labelCandidate = useCallback(async (kind: 'image' | 'content', id: string, label: string) => {
+    const current = learningStateRef.current
+    const note = (kind === 'image'
+      ? current.images.find((item) => item.id === id)
+      : current.contents.find((item) => item.id === id))?.note ?? ''
+    const epoch = beginLearningMutation()
+    const previous = applyLocalLabel(kind, id, label, note)
     try {
-      const next = await callNative<LearningState>('set_learning_label', 'image', id, label, candidate?.note || '')
-      setLearningState(normalizeLearning(next))
-    } catch (error) { recordError(error) }
-  }, [learningState.images, recordError])
-  const labelContent = useCallback(async (id: string, label: string) => {
-    const candidate = learningState.contents.find((item) => item.id === id)
-    try {
-      const next = await callNative<LearningState>('set_learning_label', 'content', id, label, candidate?.note || '')
-      setLearningState(normalizeLearning(next))
-    } catch (error) { recordError(error) }
-  }, [learningState.contents, recordError])
+      const next = await callNative<LearningState>('set_learning_label', kind, id, label, note)
+      // Python now owns this note as the candidate's pending label note.
+      clearDirtyNote(kind, id)
+      applyLearningSnapshot(normalizeLearning(next), epoch)
+    } catch (error) {
+      if (previous) restoreLocalLabel(kind, id, previous, epoch)
+      recordError(error)
+    } finally {
+      endLearningMutation()
+    }
+  }, [applyLearningSnapshot, applyLocalLabel, beginLearningMutation, callNative, clearDirtyNote,
+    endLearningMutation, recordError, restoreLocalLabel])
+  const labelImage = useCallback((id: string, label: string) => labelCandidate('image', id, label),
+    [labelCandidate])
+  const labelContent = useCallback((id: string, label: string) => labelCandidate('content', id, label),
+    [labelCandidate])
   const setNote = useCallback((kind: 'image' | 'content', id: string, note: string) => {
-    setLearningState((current) => kind === 'image'
+    /* PROMPT-036: typing is local until "Lưu nhãn & ghi chú".  Bump the generation so a snapshot already in
+       flight cannot erase it, and remember it so later snapshots re-apply it instead of overwriting it. */
+    nextLearningEpoch()
+    lastLearningMutation.current = Date.now()
+    dirtyNotes.current.set(`${kind}:${id}`, note)
+    const current = learningStateRef.current
+    publishLearning(kind === 'image'
       ? { ...current, images: current.images.map((item) => item.id === id ? { ...item, note } : item) }
       : { ...current, contents: current.contents.map((item) => item.id === id ? { ...item, note } : item) })
-  }, [])
+  }, [nextLearningEpoch, publishLearning])
   const saveLearningLabels = useCallback(async (kind: 'image' | 'content') => {
+    const state = learningStateRef.current
     const notes = kind === 'image'
-      ? Object.fromEntries(learningState.images.map((candidate) => [candidate.id, candidate.note]))
-      : Object.fromEntries(learningState.contents.map((candidate) => [candidate.id, candidate.note]))
+      ? Object.fromEntries(state.images.map((candidate) => [candidate.id, candidate.note]))
+      : Object.fromEntries(state.contents.map((candidate) => [candidate.id, candidate.note]))
+    const epoch = beginLearningMutation()
     try {
       const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, notes)
-      setLearningState(normalizeLearning(result.state))
+      applyLearningSnapshot(normalizeLearning(result.state), epoch)
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
       setTraining(false)
     } catch (error) { recordError(error) }
-  }, [learningState, recordError])
+    finally { endLearningMutation() }
+  }, [applyLearningSnapshot, beginLearningMutation, callNative, endLearningMutation, recordError])
   const saveImageLabels = useCallback(() => saveLearningLabels('image'), [saveLearningLabels])
   const saveContentLabels = useCallback(() => saveLearningLabels('content'), [saveLearningLabels])
   const saveLearningCandidate = useCallback(async (kind: 'image' | 'content', id: string, label: string, note: string) => {
+    /* The label is already visible from the selection click; this only commits it.  Both bridge calls stay
+       sequential because Python must hold the pending label before it is persisted. */
+    const epoch = beginLearningMutation()
     try {
       await callNative<LearningState>('set_learning_label', kind, id, label, note)
       const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', kind, { [id]: note })
-      setLearningState(normalizeLearning(result.state))
+      clearDirtyNote(kind, id)
+      applyLearningSnapshot(normalizeLearning(result.state), epoch)
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
     } catch (error) { recordError(error) }
-  }, [recordError])
+    finally { endLearningMutation() }
+  }, [applyLearningSnapshot, beginLearningMutation, callNative, clearDirtyNote, endLearningMutation, recordError])
   const saveImageCandidate = useCallback((id: string, label: string, note: string) =>
     saveLearningCandidate('image', id, label, note), [saveLearningCandidate])
   const saveContentCandidate = useCallback((id: string, label: string, note: string) =>
     saveLearningCandidate('content', id, label, note), [saveLearningCandidate])
+  /* PROMPT-036: the three long-running Learning operations below take a new generation so a snapshot that
+     was already in flight cannot revert their result, and they are guarded the same way on the way back.
+     They deliberately do NOT hold the poll off: the Learning tab must keep polling so "Đang cập nhật mô
+     hình học…" and the pending-Excel counts stay live while they run. */
   const trainModels = useCallback(async () => {
+    const epoch = nextLearningEpoch()
     try {
       const result = await callNative<LearningState & { training?: boolean }>('train_models')
-      setLearningState(normalizeLearning(result))
+      applyLearningSnapshot(normalizeLearning(result), epoch)
       setTraining(Boolean(result.training))
     } catch (error) { recordError(error) }
-  }, [recordError])
+  }, [applyLearningSnapshot, nextLearningEpoch, recordError])
   const exportLearningData = useCallback(async () => {
     clearError()
     try {
@@ -1003,19 +1198,21 @@ function useStoreValue() {
     } catch (error) { recordError(error) }
   }, [clearError, recordError])
   const applyLabelsToExcel = useCallback(async (_retry = false) => {
+    const epoch = nextLearningEpoch()
     try {
       const result = await callNative<{ message: string; state: LearningState }>('retry_learning_excel')
-      setLearningState(normalizeLearning(result.state))
+      applyLearningSnapshot(normalizeLearning(result.state), epoch)
       setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
       setErrorMessage(result.message)
     } catch (error) { recordError(error) }
-  }, [recordError])
+  }, [applyLearningSnapshot, nextLearningEpoch, recordError])
   const dismissExcelResult = useCallback(async () => {
+    const epoch = nextLearningEpoch()
     try {
       const next = await callNative<LearningState>('dismiss_learning_excel_notice')
-      setLearningState(normalizeLearning(next))
+      applyLearningSnapshot(normalizeLearning(next), epoch)
     } catch (error) { recordError(error) }
-  }, [recordError])
+  }, [applyLearningSnapshot, nextLearningEpoch, recordError])
 
   const title = appInfo.title || appInfo.name
   const aiMode: 'model' | 'heuristic' = ollama.checked === 'ok' ? 'model' : 'heuristic'
