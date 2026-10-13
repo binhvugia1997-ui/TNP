@@ -52,7 +52,9 @@ export function ReportTable() {
           </Button>
         </div>
 
-        <div className="min-h-[300px] flex-1 overflow-auto rounded-sm2 border border-line">
+        {/* PROMPT-034R: bounded list viewport — ~6 rows plus the sticky header, then it scrolls
+            inside itself instead of stretching the whole page. Height stays natural below that. */}
+        <div className="report-list-viewport overflow-auto rounded-sm2 border border-line">
           {rows.length === 0 ? (
             s.reports.length === 0 ? (
               <EmptyState
