@@ -316,6 +316,11 @@ def _fake_com(monkeypatch, calls: _Calls, fail: str = "", com_init_fails: bool =
               close_fails: bool = False):
     """Install fake pythoncom + win32com.client.  ``fail`` names the stage that raises."""
 
+    # PROMPT-035: the renderer now PROVES ownership (empty process table before, exactly one new PowerPoint process
+    # after, pristine instance).  This harness models a machine with no user PowerPoint; the user-session cases live
+    # in tests/test_prompt035_powerpoint_isolation.py.
+    state = {"open": 0, "pids": frozenset()}
+
     class Presentation:
         PageSetup = SimpleNamespace(SlideWidth=960, SlideHeight=540)
 
@@ -335,6 +340,7 @@ def _fake_com(monkeypatch, calls: _Calls, fail: str = "", com_init_fails: bool =
 
         def Close(self):
             calls.events.append(("Presentation.Close", None))
+            state["open"] -= 1
             if close_fails:
                 raise RuntimeError("close failed")
 
@@ -343,13 +349,20 @@ def _fake_com(monkeypatch, calls: _Calls, fail: str = "", com_init_fails: bool =
             calls.events.append(("Open", (read_only, untitled, with_window)))
             if fail == "presentation-open":
                 raise RuntimeError("cannot open presentation")
+            state["open"] += 1
             return Presentation(path)
+
+        @property
+        def Count(self):
+            return state["open"]
 
     class App:
         Presentations = PresentationCollection()
+        Windows = SimpleNamespace(Count=0)
 
         def Quit(self):
             calls.events.append(("App.Quit", None))
+            state["pids"] = frozenset()
 
     def dispatch_ex(progid):
         calls.events.append(("DispatchEx", progid))
@@ -357,6 +370,7 @@ def _fake_com(monkeypatch, calls: _Calls, fail: str = "", com_init_fails: bool =
             error = RuntimeError("Class not registered")
             error.hresult = -2147221005
             raise error
+        state["pids"] = frozenset({4242})                     # the one new PowerPoint process this call created
         return App()
 
     def dispatch(progid):
@@ -370,11 +384,16 @@ def _fake_com(monkeypatch, calls: _Calls, fail: str = "", com_init_fails: bool =
         if com_init_fails:
             raise RuntimeError("RPC_E_CHANGED_MODE")
 
+    def get_active_object(progid):
+        raise RuntimeError("Operation unavailable")           # MK_E_UNAVAILABLE: no PowerPoint is running
+
     pythoncom.CoInitialize = co_init
     pythoncom.CoUninitialize = lambda: calls.events.append(("CoUninitialize", None))
     client = ModuleType("win32com.client")
     client.DispatchEx = dispatch_ex
+    client.GetActiveObject = get_active_object
     client.Dispatch = dispatch
+    monkeypatch.setattr(qrn, "_powerpoint_process_ids", lambda: state["pids"])
     win32com = ModuleType("win32com")
     win32com.client = client
     monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
