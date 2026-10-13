@@ -95,6 +95,28 @@ export const BUCKET_OF: Record<StatusKey, StatBucket | 'other'> = {
   excluded: 'other',
 }
 
+/**
+ * PROMPT-037: the ONE authoritative rule for rows shown in “Danh sách báo cáo”.
+ * `skipped` (“Bỏ qua — đã cập nhật”) rows are hidden from the list, its totals, selection and
+ * the active row. The DTO still carries them: the backend keeps the skip classification for
+ * processing, duplicate handling, scan decisions and incremental transitions. Presentation-only.
+ */
+export const HIDDEN_REPORT_STATUSES: ReadonlySet<StatusKey> = new Set<StatusKey>(['skipped'])
+
+export function isVisibleReport(report: Pick<Report, 'status'>): boolean {
+  return !HIDDEN_REPORT_STATUSES.has(report.status)
+}
+
+/** O(N): visible rows in incoming order, STT renumbered over the visible list only. */
+export function presentReports(list: readonly Report[]): Report[] {
+  const out: Report[] = []
+  for (const report of list) {
+    if (!isVisibleReport(report)) continue
+    out.push(report.stt === out.length + 1 ? report : { ...report, stt: out.length + 1 })
+  }
+  return out
+}
+
 export type QpnImage = {
   src: string
   slide: number

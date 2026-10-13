@@ -12,7 +12,8 @@
     "test:learning-labels": "node --test tests/learning-labels.test.mjs",
     "test:prompt027": "node --test tests/prompt027-overlays.test.mjs",
     "test:prompt027r": "node --test tests/prompt027r-regression.test.mjs",
-    "test:frontend": "node --test tests/bridge.test.mjs tests/learning-hooks.test.mjs tests/learning-labels.test.mjs tests/prompt027-overlays.test.mjs tests/prompt027r-regression.test.mjs tests/prompt031r-incremental.test.mjs tests/update-state.test.mjs",
+    "test:prompt037": "node --test tests/prompt037-hide-skipped.test.mjs",
+    "test:frontend": "node --test tests/bridge.test.mjs tests/learning-hooks.test.mjs tests/learning-labels.test.mjs tests/prompt027-overlays.test.mjs tests/prompt027r-regression.test.mjs tests/prompt031r-incremental.test.mjs tests/prompt037-hide-skipped.test.mjs tests/update-state.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
