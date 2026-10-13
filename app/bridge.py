@@ -160,7 +160,12 @@ class BridgeService:
 
     # -------------------------------------------------------------- learning operations
     def get_learning_state(self) -> dict:
-        return self._respond(self.service.learning_state)
+        """PROMPT-036R: never block the pywebview UI thread with PPTX parsing or slide rendering.
+
+        learning_state(render_previews=False) returns cached-or-empty previews immediately and
+        schedules background rendering; the next poll delivers the fully rendered previews.
+        """
+        return self._respond(lambda: self.service.learning_state(render_previews=False))
 
     def set_learning_label(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
         return self._respond(lambda: self.service.set_learning_label(
@@ -274,7 +279,18 @@ class BridgeService:
     # -------------------------------------------------------------- DTO/error contract
     def _respond(self, action: Callable[[], Any]) -> dict:
         try:
-            return {"ok": True, "data": action()}
+            result = {"ok": True, "data": action()}
+            # PROMPT-036R: validate JSON safety before pywebview serializes the response.
+            # Non-JSON-safe objects (e.g., Python objects, CLR objects) can cause deep recursion
+            # or serialization failures in pywebview's native code.
+            try:
+                json.dumps(result, ensure_ascii=False)
+            except (TypeError, ValueError, OverflowError) as exc:
+                LOG.warning("WEBVIEW_BRIDGE_NON_JSON_RESPONSE type=%s error=%s",
+                           type(result.get("data")).__name__, exc)
+                return {"ok": False, "error": {"code": "INTERNAL_ERROR",
+                                                "message": "Đã xảy ra lỗi nội bộ. Hãy kiểm tra nhật ký ứng dụng."}}
+            return result
         except ServiceError as exc:
             return {"ok": False, "error": {"code": exc.code,
                                             "message": self.service._redact_source_paths(str(exc))}}

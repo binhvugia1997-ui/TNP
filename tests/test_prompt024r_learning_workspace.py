@@ -169,7 +169,10 @@ def test_labels_still_persist_and_reload_with_extended_dto(sample_tree, tmp_path
     service.set_learning_label("image", candidate_id, "AFTER", "review note 024R")
     saved = service.save_learning_labels("image", {candidate_id: "review note 024R"})
     assert saved["state"]["images"][0]["userLabel"] == "AFTER"
-    assert saved["state"]["images"][0]["slidePreview"].startswith("data:image/")
+    # PROMPT-036R: save_learning_labels uses render_previews=False for fast response;
+    # preview may be empty if not cached, but will be available on next poll with render_previews=True
+    preview = saved["state"]["images"][0]["slidePreview"]
+    assert preview == "" or preview.startswith("data:image/")
     # reload from the persisted JSONL store: label + note survive, extended geometry stays present
     reloaded = service.learning_state()
     dto = reloaded["images"][0]

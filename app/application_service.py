@@ -98,6 +98,7 @@ class ApplicationService:
         self._training = False
         self._training_message = ""
         self._training_thread: Optional[threading.Thread] = None
+        self._prerender_active = False
         self._server_apply_running = False
         self._server_apply_message = ""
         self._server_apply_thread: Optional[threading.Thread] = None
@@ -909,7 +910,17 @@ class ApplicationService:
             return {"status": "closing", "message": "Ứng dụng sẽ khởi động lại sau khi cài đặt."}
 
     # ------------------------------------------------------------------ learning: real candidates, labels, Excel reapply, model training
-    def learning_state(self) -> dict:
+    def learning_state(self, render_previews: bool = True) -> dict:
+        """Build the full Learning-tab DTO.
+
+        ``render_previews`` controls whether slide previews that are NOT already cached are rendered
+        synchronously inside this call.  Every bridge call that returns learning state
+        (``get_learning_state`` polling, ``set_learning_label`` clicks, ``save_learning_labels``,
+        ``dismiss_learning_excel_notice``, ``retry_learning_excel``, ``train_models``) must pass
+        ``render_previews=False`` so the pywebview UI thread is never blocked by PPTX parsing or
+        slide rendering (PROMPT-036R).  Background rendering fills the cache; the next poll delivers
+        the newly rendered previews.
+        """
         with self._lock:
             c = self.controller
             # PROMPT-032: this read is authoritative on its own.  Worker completion is delivered through the
@@ -943,7 +954,7 @@ class ApplicationService:
                 content_status = self._model_status(lrn.content.model, lrn.content.model_status, "nội dung")
                 image_candidates = c.review_candidates()
                 content_candidates = c.review_content_candidates()
-                images = [self._image_candidate_dto(candidate, lrn) for candidate in image_candidates]
+                images = [self._image_candidate_dto(candidate, lrn, render_previews=render_previews) for candidate in image_candidates]
                 contents = [self._content_candidate_dto(candidate, lrn) for candidate in content_candidates]
                 saved_image_ids = set(lrn.store.latest())
                 saved_content_ids = set(lrn.content.store.latest())
@@ -985,13 +996,20 @@ class ApplicationService:
                 self._last_learning_diag_signature = diagnostic
 
             pending = c.image_reapply_pending + c.content_reapply_pending
-            return {"images": images, "contents": contents, "candidateStatus": candidate_status,
+            result = {"images": images, "contents": contents, "candidateStatus": candidate_status,
                     "counts": {"image": {"total": len(image_total_ids), "labeled": len(image_labeled_ids)},
                                "content": {"total": len(content_total_ids), "labeled": len(content_labeled_ids)}},
                     "modelStatus": {"image": image_status, "content": content_status},
                     "excelPending": pending, "excelLastResult": dict(self._last_excel_result),
                     "training": self._training, "trainingMessage": self._training_message,
                     "reviewSummary": c.review_summary_text(), "contentReviewSummary": c.content_review_summary_text()}
+
+        # PROMPT-036R: when the caller asked for cached-only previews, schedule background rendering
+        # so the NEXT poll delivers the fully rendered slides without blocking the UI thread.
+        if not render_previews and image_candidates and lrn is not None:
+            self._schedule_preview_prerender(list(image_candidates), lrn)
+
+        return result
 
     @staticmethod
     def _learning_candidate_status(state: str, reason: str, count: int, kind: str) -> dict:
@@ -1027,7 +1045,7 @@ class ApplicationService:
                 if candidate is None:
                     raise ServiceError("Khối nội dung này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
                 c.set_pending_content_label(candidate, label, note)
-            return self.learning_state()
+            return self.learning_state(render_previews=False)
 
     def save_learning_labels(self, kind: str, notes: Optional[dict] = None) -> dict:
         kind = self._choice(kind, "kind", {"image", "content"})
@@ -1054,13 +1072,13 @@ class ApplicationService:
             status = "locked" if pending or "chưa cập nhật được Excel" in message.lower() or "đang được sử dụng" in message.lower() else "ok"
             self._last_excel_result = {"kind": status, "message": message}
             LOG.info("WEBVIEW_LABELS_SAVED kind=%s pending_excel=%d", kind, pending)
-            return {"message": message, "state": self.learning_state()}
+            return {"message": message, "state": self.learning_state(render_previews=False)}
 
     def dismiss_learning_excel_notice(self) -> dict:
         """Clear only the transient result message; preserve saved labels and any pending Excel retry."""
         with self._lock:
             self._last_excel_result = {"kind": "none", "message": ""}
-            return self.learning_state()
+            return self.learning_state(render_previews=False)
 
     def retry_learning_excel(self) -> dict:
         with self._lock:
@@ -1079,13 +1097,13 @@ class ApplicationService:
             pending = c.image_reapply_pending + c.content_reapply_pending
             message = "\n".join(x for x in messages if x)
             self._last_excel_result = {"kind": "locked" if pending else "ok", "message": message}
-            return {"message": message, "state": self.learning_state()}
+            return {"message": message, "state": self.learning_state(render_previews=False)}
 
     def train_models(self) -> dict:
         with self._lock:
             self._assert_idle("Không thể huấn luyện khi đang xử lý báo cáo.")
             if self._training:
-                return self.learning_state()
+                return self.learning_state(render_previews=False)
             self._training = True
             self._training_message = "Đang huấn luyện mô hình ảnh và nội dung…"
 
@@ -1104,7 +1122,7 @@ class ApplicationService:
 
         self._training_thread = threading.Thread(target=work, daemon=True, name="webview-model-training")
         self._training_thread.start()
-        return self.learning_state()
+        return self.learning_state(render_previews=False)
 
     def export_learning_data(self, target: str) -> dict:
         path = Path(target).expanduser()
@@ -1299,7 +1317,7 @@ class ApplicationService:
             return ""
 
     # ------------------------------------------------------------------ PROMPT-024R learning workspace
-    def _slide_preview_for(self, candidate, learning=None) -> Dict[str, Any]:
+    def _slide_preview_for(self, candidate, learning=None, render_if_missing: bool = True) -> Dict[str, Any]:
         """FULL authored slide of one candidate + the slide's authoritative After evidence regions.
 
         Rendered ONCE per (report, slide, file identity, renderer identity) and shared by every candidate of that slide;
@@ -1330,6 +1348,11 @@ class ApplicationService:
             cached = self._slide_preview_cache.get(key)
             if cached is not None and not self._preview_expired(cached):
                 return dict(cached)
+            # PROMPT-036R: never block the pywebview UI thread with PPTX parsing / slide rendering.
+            # When the caller asked for cached-only, return the empty placeholder; a background
+            # thread will fill the cache and the next poll delivers the rendered preview.
+            if not render_if_missing:
+                return dict(empty)
             from .pptx_parser import parse_pptx
             report = parse_pptx(source)
             if report.slide(slide_number) is None:
@@ -1393,6 +1416,33 @@ class ApplicationService:
         if len(self._slide_preview_cache) > 48:
             self._slide_preview_cache.pop(next(iter(self._slide_preview_cache)))
 
+
+    def _schedule_preview_prerender(self, candidates: list, learning) -> None:
+        """PROMPT-036R: render missing slide previews on a background thread.
+
+        Called after a ``learning_state(render_previews=False)`` returns, so the NEXT poll delivers
+        the fully rendered previews without ever blocking the pywebview UI thread.  Only one prerender
+        thread runs at a time; overlapping calls are dropped.
+        """
+        if getattr(self, "_prerender_active", False):
+            return
+        self._prerender_active = True
+
+        def work() -> None:
+            try:
+                for candidate in candidates:
+                    try:
+                        # render_if_missing=True here is safe: this is a background thread, not the UI thread.
+                        self._slide_preview_for(candidate, learning, render_if_missing=True)
+                    except Exception:  # noqa: BLE001 – a single preview failure must not stop the batch
+                        LOG.debug("LEARNING_PRERENDER_FAILED candidate=%s",
+                                  getattr(candidate, "candidate_id", "?"), exc_info=True)
+            finally:
+                self._prerender_active = False
+
+        thread = threading.Thread(target=work, daemon=True, name="webview-slide-prerender")
+        thread.start()
+
     @staticmethod
     def _slide_evidence_regions(report, slide_number: int, candidate, learning=None) -> List[Dict[str, Any]]:
         """Every item-scoped After evidence region of one slide, as JSON-safe primitives (§14/§20/§21).
@@ -1454,7 +1504,7 @@ class ApplicationService:
                 matches = scoped
         return min(matches, key=lambda r: int(r.get("afterBlockIndex", 0)))
 
-    def _image_candidate_dto(self, candidate, learning) -> dict:
+    def _image_candidate_dto(self, candidate, learning, render_previews: bool = True) -> dict:
         src = self._preview_cache.get(candidate.candidate_id)
         if src is None:
             blob = self.controller.candidate_blob(candidate) or b""
@@ -1471,7 +1521,7 @@ class ApplicationService:
         # PROMPT-024R: full-slide context + authoritative target geometry for the review workspace.
         fx, fy, fw, fh = slide_fraction_box((x, y, w, h), bw, bh)
         try:
-            preview = self._slide_preview_for(candidate, learning)
+            preview = self._slide_preview_for(candidate, learning, render_if_missing=render_previews)
         except Exception as exc:  # noqa: BLE001 – display-only preview must never erase truthful metadata
             opaque_id = hashlib.sha256(str(candidate.candidate_id).encode("utf-8")).hexdigest()[:12]
             LOG.warning("LEARNING_IMAGE_PREVIEW_FAILED candidate=%s error=%s", opaque_id, type(exc).__name__)
