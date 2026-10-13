@@ -21,6 +21,7 @@ import {
 import { createBridgeSessionController, startAppBridge, type BridgeSessionController } from '../lib/startup'
 import {
   BUCKET_OF,
+  presentReports,
   type ContentCandidate,
   type DiagnosticRow,
   type DiscoveredServer,
@@ -39,7 +40,6 @@ export const FILTERS = [
   'File đã xử lý',
   'File cần kiểm tra',
   'File lỗi',
-  'File bị bỏ qua',
   'File đã loại thủ công',
 ] as const
 export type FilterKey = (typeof FILTERS)[number]
@@ -163,14 +163,36 @@ export function shouldAcceptScanSnapshot(
 
 function mergeIncrementalReports(current: Report[], incoming: Report[]): Report[] {
   const byId = new Map(current.map((item) => [item.id, item]))
+  // PROMPT-037: the delta copy always overwrites the previous one, even when it is now hidden
+  // (skipped). A visible → skipped transition therefore drops the stale visible row below.
   for (const item of incoming) byId.set(item.id, item)
-  return [...byId.values()]
-    .sort((left, right) => {
-      const a = Number(left.id)
-      const b = Number(right.id)
-      return Number.isFinite(a) && Number.isFinite(b) ? a - b : left.id.localeCompare(right.id)
-    })
-    .map((item, index) => ({ ...item, stt: index + 1 }))
+  const merged = [...byId.values()].sort((left, right) => {
+    const a = Number(left.id)
+    const b = Number(right.id)
+    return Number.isFinite(a) && Number.isFinite(b) ? a - b : left.id.localeCompare(right.id)
+  })
+  return presentReports(merged)
+}
+
+/**
+ * PROMPT-037: the active visible row after a reconciliation. Keeps it while visible; when it
+ * became hidden, advances to the next visible row after its previous position, else the previous
+ * visible row, else the first visible row. Empty list → ''. O(N).
+ */
+export function resolveActiveReportId(
+  previous: readonly Report[],
+  next: readonly Report[],
+  activeId: string,
+  nextIds: ReadonlySet<string> = new Set(next.map((report) => report.id)),
+): string {
+  if (next.length === 0) return ''
+  if (nextIds.has(activeId)) return activeId
+  const at = previous.findIndex((report) => report.id === activeId)
+  if (at >= 0) {
+    for (let i = at + 1; i < previous.length; i += 1) if (nextIds.has(previous[i].id)) return previous[i].id
+    for (let i = at - 1; i >= 0; i -= 1) if (nextIds.has(previous[i].id)) return previous[i].id
+  }
+  return next[0].id
 }
 
 const EMPTY_RUN: ProcessingRun = {
@@ -526,9 +548,11 @@ function useStoreValue() {
     if (!shouldAcceptScanSnapshot(scanVersionRef.current, data.scan, pendingBaseline)) return
     scanVersionRef.current = scanSnapshotVersion(data.scan)
     setScanInProgress(Boolean(data.scan.inProgress))
+    const previousReports = reportsRef.current
+    // PROMPT-037: both paths yield visible rows only (single rule: presentReports / isVisibleReport).
     const nextReports = data.scan.incremental
-      ? mergeIncrementalReports(reportsRef.current, data.reports)
-      : data.reports
+      ? mergeIncrementalReports(previousReports, data.reports)
+      : presentReports(data.reports)
     reportsRef.current = nextReports
     setAppInfo({ ...data.app, runtime: data.app.runtime || 'pywebview-development',
       updateInstallCapable: Boolean(data.app.updateInstallCapable) })
@@ -562,12 +586,13 @@ function useStoreValue() {
         || current.startsWith('Hợp đồng bridge Python') || current.startsWith('Python bridge trả về phản hồi') ? '' : current)
       setErrorCode((current) => ['BRIDGE_UNAVAILABLE', 'BRIDGE_METHOD_MISSING', 'BRIDGE_CONTRACT_ERROR'].includes(current) ? '' : current)
     }
-    if (nextReports.length === 0) {
-      setActiveIdValue('')
-      setSelectedIds([])
-    } else {
-      setActiveIdValue((current) => nextReports.some((r) => r.id === current) ? current : nextReports[0].id)
-    }
+    // PROMPT-037: selection and the active row only ever reference visible rows.
+    const visibleIds = new Set(nextReports.map((report) => report.id))
+    setSelectedIds((current) => {
+      const kept = current.filter((id) => visibleIds.has(id))
+      return kept.length === current.length ? current : kept
+    })
+    setActiveIdValue((current) => resolveActiveReportId(previousReports, nextReports, current, visibleIds))
     if (data.job.error) { setErrorCode('WORKER_FAILED'); setErrorMessage(data.job.error) }
   }, [])
 
@@ -784,7 +809,11 @@ function useStoreValue() {
   const running = run.status === 'processing' || run.status === 'stopping' || run.status === 'cancelling'
   const locked = running || scanBusy || training || diagRunning || serverApplyRunning
   const queue = useMemo(() => {
-    if (running) return run.queue.slice(run.doneCount)
+    // PROMPT-037: a queued candidate that became skipped mid-run is no longer an actionable row.
+    if (running) {
+      const visibleIds = new Set(reports.map((report) => report.id))
+      return run.queue.slice(run.doneCount).filter((id) => visibleIds.has(id))
+    }
     if (run.status === 'done' && !run.stopped) return []
     return reports.filter((report) => report.status === 'waiting' || report.status === 'new_row').map((report) => report.id)
   }, [reports, run, running])
@@ -796,7 +825,6 @@ function useStoreValue() {
       case 'File đã xử lý': return report.status === 'completed'
       case 'File cần kiểm tra': return report.status === 'needs_review'
       case 'File lỗi': return report.status === 'error'
-      case 'File bị bỏ qua': return ['skipped', 'outside_period', 'source_duplicate', 'fast_skip'].includes(report.status)
       case 'File đã loại thủ công': return report.status === 'excluded'
       default: return true
     }

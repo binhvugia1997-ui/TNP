@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { AlertTriangle, CheckCircle2, ChevronDown, MinusCircle, XCircle } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, ChevronDown, XCircle } from 'lucide-react'
 import { Card, StatCard } from '../ui'
 import { useStore } from '../../state/store'
 import { LOG_LEVEL_STYLE } from '../../lib/logStyle'
@@ -60,7 +60,8 @@ export function StatsCard() {
       title="Thống kê"
       actions={<span className="text-xs2 text-muted">Tổng số báo cáo: {stats.total}</span>}
     >
-      <div className="grid grid-cols-2 gap-2">
+      {/* PROMPT-037R: “Bỏ qua” statuses are excluded from the visible list, so no skip card is shown. */}
+      <div className="grid grid-cols-3 gap-2">
         <StatCard tone="ok" icon={<CheckCircle2 className="h-4 w-4" />} value={stats.completed} label="Hoàn thành" />
         <StatCard
           tone="warn"
@@ -69,11 +70,10 @@ export function StatsCard() {
           label="Cần kiểm tra"
         />
         <StatCard tone="error" icon={<XCircle className="h-4 w-4" />} value={stats.error} label="Lỗi" />
-        <StatCard tone="muted" icon={<MinusCircle className="h-4 w-4" />} value={stats.skipped} label="Bỏ qua" />
       </div>
       <p className="mt-2 text-xs2 leading-[16px] text-muted">
         Số liệu lấy trực tiếp từ danh sách báo cáo: {stats.completed} hoàn thành · {stats.needs_review} cần kiểm tra ·{' '}
-        {stats.error} lỗi · {stats.skipped} bỏ qua · {s.queue.length} đang chờ xử lý.
+        {stats.error} lỗi · {s.queue.length} đang chờ xử lý.
       </p>
     </Card>
   )
