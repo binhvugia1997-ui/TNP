@@ -95,6 +95,37 @@
   .tbl-head {
     @apply border-b border-line bg-[#f4f7fb] text-left text-xs2 font-semibold uppercase tracking-[0.02em] text-[#4a6280];
   }
+
+  /*
+   * PROMPT-034R — “Danh sách báo cáo” is a bounded viewport, not a page-growing list.
+   *
+   * Measured in a real engine at the normal 1440×940 window (two-column 65/35 workspace):
+   *   • one report row  = 47px (34px result cell + 2×6px cell padding + 1px row separator)
+   *   • column header   = 43px (two-line uppercase caption, e.g. “Management Number”)
+   *   • --report-frame  = the 1px border on each side of this box (border-box sizing)
+   * So six rows plus the header show inside the list and everything else scrolls here, while a
+   * shorter list keeps its natural height (no reserved blank area, no fixed empty box).
+   */
+  .report-list-viewport {
+    --report-rows: 6;
+    --report-row-h: 47px;
+    --report-head-h: 43px;
+    --report-frame: 2px;
+    max-height: calc(
+      var(--report-rows) * var(--report-row-h) + var(--report-head-h) + var(--report-frame)
+    );
+    overflow-y: auto;
+  }
+
+  /*
+   * The sticky header must stay opaque and keep its bottom edge once rows scroll underneath it.
+   * `border-collapse: collapse` paints collapsed cell borders in the table layer, so the header's
+   * own border stays behind while the header sticks; the inset shadow travels with the cell.
+   */
+  .report-list-viewport thead th {
+    background: #f4f7fb;
+    box-shadow: inset 0 -1px 0 #d8e1ec;
+  }
 }
 
 @layer utilities {
