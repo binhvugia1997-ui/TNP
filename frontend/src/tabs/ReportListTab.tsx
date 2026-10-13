@@ -12,7 +12,9 @@ export function ReportListTab() {
 
       {/* Khu vực làm việc: bảng báo cáo 65% — khung chi tiết 35% */}
       <div className="grid grid-cols-1 items-stretch gap-3 xl:grid-cols-[65fr_35fr]">
-        <div className="flex min-h-[430px] flex-col">
+        {/* PROMPT-034R: the column no longer reserves a fixed 430px blank area — the report list
+            sizes to its content and caps itself at ~6 visible rows (see .report-list-viewport). */}
+        <div className="flex flex-col">
           <ReportTable />
         </div>
         <div className="min-h-0">
