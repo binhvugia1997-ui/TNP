@@ -395,28 +395,69 @@ class LabelStore:
         self.feature_names = tuple(feature_names)
         self.schema = schema
         self.positive = positive
+        # PROMPT-036: memoized views of the append-only file, keyed on the file's own identity.
+        self._records_cache: Optional[List[dict]] = None
+        self._latest_cache: Optional[Dict[str, dict]] = None
+        self._cache_identity: Optional[tuple] = None
+
+    def _file_identity(self) -> Optional[tuple]:
+        """`(size, mtime_ns)` of the label file, or None when it does not exist.
+
+        The file is append-only, so every write changes its size; an external replace (update rollback,
+        manual edit, restored backup) changes size and/or mtime.  Either way the identity differs and the
+        memo is dropped — a cached view can never outlive the file it was read from.
+        """
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_size, stat.st_mtime_ns)
+
+    def _invalidate_cache(self) -> None:
+        self._records_cache = None
+        self._latest_cache = None
+        self._cache_identity = None
 
     def records(self) -> List[dict]:
-        if not self.path.exists():
-            return []
-        out = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:  # noqa: BLE001 – one damaged line never hides the others
-                continue
-            if isinstance(rec, dict) and rec.get("candidate_id") and rec.get("label") in self.labels:
-                out.append(rec)
-        return out
+        """Every valid record in file order.
+
+        PROMPT-036: one ``learning_state()`` build asks for this ~5x per candidate (``current_label``,
+        ``latest`` and ``overrides`` via the preview-cache identity), so re-reading and re-parsing the
+        whole JSONL each time made a single Before/After click re-read hundreds of times the file size
+        (measured: 301 reads, 89.3% of the click).  The parsed result is memoized against the file
+        identity; behaviour is unchanged because the memo is dropped whenever the file changes.
+        """
+        identity = self._file_identity()
+        if self._records_cache is not None and self._cache_identity == identity:
+            return list(self._records_cache)
+        out: List[dict] = []
+        if identity is not None:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:  # noqa: BLE001 – one damaged line never hides the others
+                    continue
+                if isinstance(rec, dict) and rec.get("candidate_id") and rec.get("label") in self.labels:
+                    out.append(rec)
+        self._records_cache = out
+        self._latest_cache = None
+        self._cache_identity = identity
+        return list(out)
 
     def latest(self) -> Dict[str, dict]:
+        """Current record per candidate_id (the LAST one wins; the audit trail stays in the file)."""
+        identity = self._file_identity()
+        if self._latest_cache is not None and self._cache_identity == identity:
+            return dict(self._latest_cache)
         cur: Dict[str, dict] = {}
         for rec in self.records():
             cur[rec["candidate_id"]] = rec
-        return cur
+        self._latest_cache = cur
+        self._cache_identity = identity
+        return dict(cur)
 
     def current_label(self, candidate_id: str) -> str:
         rec = self.latest().get(candidate_id)
@@ -447,6 +488,9 @@ class LabelStore:
         self.dir.mkdir(parents=True, exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # PROMPT-036: the append changed the file, so drop the memoized views explicitly rather than
+        # relying only on the next identity comparison.
+        self._invalidate_cache()
         LOG.info("LABEL file=%s candidate=%s label=%s previous=%s", self.path.name, cand.candidate_id, label,
                  rec["previous_label"])
         return rec
