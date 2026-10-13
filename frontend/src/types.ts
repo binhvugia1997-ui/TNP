@@ -111,8 +111,17 @@ export const HIDDEN_REPORT_STATUSES: ReadonlySet<StatusKey> = new Set<StatusKey>
   'fast_skip',
 ])
 
+/**
+ * PROMPT-038: canonical form of a DTO status for the visibility rule. The checked-in backend
+ * already emits exact keys (`outside_period`, …), but the single authoritative predicate must
+ * not silently leak a “Bỏ qua” row if a future DTO pathway emits different casing/whitespace.
+ */
+export function normalizeReportStatus(status: unknown): string {
+  return typeof status === 'string' ? status.trim().toLowerCase() : ''
+}
+
 export function isVisibleReport(report: Pick<Report, 'status'>): boolean {
-  return !HIDDEN_REPORT_STATUSES.has(report.status)
+  return !HIDDEN_REPORT_STATUSES.has(normalizeReportStatus(report.status) as StatusKey)
 }
 
 /** O(N): visible rows in incoming order, STT renumbered over the visible list only. */

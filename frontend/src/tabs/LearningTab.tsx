@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   BarChart3,
@@ -276,20 +276,31 @@ function ImageReview() {
   const endDrag = () => { dragRef.current = null }
 
   /* §31: fit-to-viewport preview with zoom; geometry recomputed on container resize (§28/§37). */
-  const viewportRef = useRef<HTMLDivElement>(null)
   const [viewport, setViewport] = useState({ w: 0, h: 0 })
   const [zoom, setZoom] = useState(1)
   /* PROMPT-027 §17: compact overlay toggle.  Declared with the other hooks and BEFORE the
      candidate-dependent early return below, so hook order stays stable (React #310 / §44). */
   const [overlayMode, setOverlayMode] = useState<OverlayMode>('both')
-  useEffect(() => {
-    const el = viewportRef.current
+  /* PROMPT-038: lifecycle-safe viewport measurement. This component early-returns while no
+     candidate exists, so the viewport <div> is NOT in the DOM on first render: a mount-once
+     effect saw a null ref and never re-ran when the async candidate arrived, leaving the
+     viewport at 0x0 (the ~80px fallback fit; 400% was only ~320px). A callback ref attaches
+     exactly when the node appears, disconnects from the old node, measures immediately and
+     observes subsequent resizes (window/panel/DPI). */
+  const viewportObserverRef = useRef<ResizeObserver | null>(null)
+  const setViewportNode = useCallback((el: HTMLDivElement | null) => {
+    viewportObserverRef.current?.disconnect()
+    viewportObserverRef.current = null
     if (!el) return
     const update = () => setViewport({ w: el.clientWidth, h: el.clientHeight })
     update()
     const observer = new ResizeObserver(update)
     observer.observe(el)
-    return () => observer.disconnect()
+    viewportObserverRef.current = observer
+  }, [])
+  useEffect(() => () => {
+    viewportObserverRef.current?.disconnect()
+    viewportObserverRef.current = null
   }, [])
 
   /* Compact report groups: the file name is shown once per report, never repeated on every item (§21). */
@@ -503,7 +514,7 @@ function ImageReview() {
           </span>
         </p>
       )}
-      <div ref={viewportRef} className={cn('relative min-h-0 flex-1 overflow-auto bg-[#dbe3ec]', !cand.slidePreview && 'flex items-center justify-center')}>
+      <div ref={setViewportNode} className={cn('relative min-h-0 flex-1 overflow-auto bg-[#dbe3ec]', !cand.slidePreview && 'flex items-center justify-center')}>
         {cand.slidePreview ? (
           <div className="flex min-h-full min-w-full items-center justify-center p-3">
             {/* PROMPT-027R §18/§19: the FULL authored slide is shown unchanged (the bitmap is the render, not a
