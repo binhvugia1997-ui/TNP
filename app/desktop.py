@@ -149,6 +149,87 @@ def frontend_index(dist_dir: Optional[Path] = None) -> Optional[Path]:
     return (resolved / FRONTEND_INDEX_NAME) if resolved else None
 
 
+# --------------------------------------------------------------------------- PROMPT-038: stale-dist guard
+#: Source-tree inputs whose modification makes an existing ``frontend/dist`` stale. ``frontend/dist``
+#: is gitignored/untracked, so pulling or merging newer ``frontend/src`` NEVER updates it; before
+#: PROMPT-038 source mode silently served whatever bundle happened to be on disk, which is how a
+#: Windows acceptance run after merging PROMPT-034/037 still showed the pre-merge UI (unbounded
+#: report list, visible “Bỏ qua” rows) even though the source and a fresh build were correct.
+FRONTEND_SOURCE_INPUTS = ("src", "index.html", "vite.config.ts", "tailwind.config.js",
+                          "postcss.config.js", "package.json")
+
+
+def frontend_dist_freshness(dist_dir: Optional[Path] = None) -> dict:
+    """Whether the resolved bundle is at least as new as the frontend source tree beside it.
+
+    Returns ``stale=False`` when freshness cannot be judged (no source tree next to the bundle —
+    e.g. a packaged layout), so this guard can only ever block a genuine source checkout whose
+    ``dist`` predates its ``src``. mtime comparison is sufficient: a Vite build always writes
+    ``dist/index.html`` after every source input it consumed. Never raises.
+    """
+    report: dict = {"stale": False, "reason": "fresh", "dist": "", "newest_source": "",
+                    "dist_mtime": None, "source_mtime": None}
+    try:
+        resolved = Path(dist_dir) if dist_dir else frontend_dist_dir()
+        if resolved is None:
+            report.update(stale=True, reason="dist-missing")
+            return report
+        report["dist"] = str(resolved)
+        index = resolved / FRONTEND_INDEX_NAME
+        if not index.is_file():
+            report.update(stale=True, reason="dist-missing")
+            return report
+        dist_mtime = index.stat().st_mtime
+        report["dist_mtime"] = dist_mtime
+        frontend_dir = resolved.parent
+        candidates: List[Path] = []
+        for name in FRONTEND_SOURCE_INPUTS:
+            path = frontend_dir / name
+            if path.is_dir():
+                candidates.extend(p for p in path.rglob("*") if p.is_file())
+            elif path.is_file():
+                candidates.append(path)
+        if not candidates:
+            report["reason"] = "no-source-tree"
+            return report
+        newest = max(candidates, key=lambda p: p.stat().st_mtime)
+        source_mtime = newest.stat().st_mtime
+        report.update(newest_source=str(newest), source_mtime=source_mtime)
+        if source_mtime > dist_mtime:
+            report.update(stale=True, reason="source-newer-than-dist")
+        return report
+    except OSError:
+        report.update(stale=False, reason="unreadable")
+        return report
+
+
+def frontend_asset_report(dist_dir: Optional[Path] = None) -> dict:
+    """Short, log-safe identity of the bundle that will be served (asset names + sha256 prefixes).
+
+    This is the runtime evidence a Windows tester/log reader can compare against a fresh build's
+    hashed asset names, instead of guessing whether the UI is stale. Never raises.
+    """
+    import hashlib
+
+    report: dict = {"index_sha256": "", "assets": []}
+    try:
+        resolved = Path(dist_dir) if dist_dir else frontend_dist_dir()
+        if resolved is None:
+            return report
+        index = resolved / FRONTEND_INDEX_NAME
+        if index.is_file():
+            report["index_sha256"] = hashlib.sha256(index.read_bytes()).hexdigest()[:12]
+        assets = resolved / "assets"
+        if assets.is_dir():
+            for path in sorted(assets.iterdir()):
+                if path.is_file() and path.suffix in (".js", ".css"):
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+                    report["assets"].append(f"{path.name}#{digest}")
+        return report
+    except OSError:
+        return report
+
+
 # Import-time convenience values for the SOURCE runtime.  They stay module-level constants because other
 # modules/tests reference them, but ``main()`` always re-resolves through the helpers above so a frozen
 # executable is never tied to the repository layout.
@@ -495,6 +576,23 @@ def main(argv=None) -> int:
         except FileNotFoundError as exc:
             parser.error(str(exc))
         parser.error(f"React bundle not found: {index}")
+    # PROMPT-038: in SOURCE mode never silently serve a stale pre-build bundle. `frontend/dist` is
+    # not tracked by git, so merging newer frontend source cannot update it; a stale dist made the
+    # merged PROMPT-034 (bounded report list) and PROMPT-037 (hidden “Bỏ qua” rows) fixes invisible
+    # at Windows runtime. Refuse with the exact rebuild command instead of opening an old UI.
+    # Packaged mode is exempt: its bundle is produced and validated by the portable builder.
+    if not is_packaged():
+        freshness = frontend_dist_freshness(dist_dir)
+        LOG.info("WEBVIEW_FRONTEND_FRESHNESS stale=%s reason=%s dist_mtime=%s source_mtime=%s newest_source=%s",
+                 freshness["stale"], freshness["reason"], freshness["dist_mtime"],
+                 freshness["source_mtime"], freshness["newest_source"] or "-")
+        if freshness["stale"]:
+            parser.error(
+                "frontend/dist is older than frontend/src (a stale pre-build bundle would be served). "
+                "Rebuild first: npm.cmd --prefix frontend run build")
+        assets = frontend_asset_report(dist_dir)
+        LOG.info("WEBVIEW_FRONTEND_ASSETS index_sha256=%s assets=%s",
+                 assets["index_sha256"] or "-", ",".join(assets["assets"]) or "-")
     try:
         import webview
     except ImportError:
