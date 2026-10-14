@@ -101,7 +101,7 @@ def test_24_stable_backup_exists_and_is_clean():
     assert BACKUP_DIR.is_dir() and msb.verify_backup(BACKUP_DIR) == []
     init = (BACKUP_DIR / "app" / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "1.0.4"' in init and "BUILD_NUMBER = 4" in init       # backup frozen at 1.0.4 / 004
-    assert app.__version__ == "1.3.5" and app.BUILD_NUMBER == 18             # dev version moved on
+    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20             # dev version moved on
     assert not any(p.name in ("sample_data", ".venv", "Output", "logs", "config", "learning_data")
                    for p in BACKUP_DIR.rglob("*") if p.is_dir())
 
@@ -543,7 +543,7 @@ def test_28_apply_update_keeps_learning_data_and_rollback_restores_it(tmp_path, 
     assert (ld / "image_labels.jsonl").read_text(encoding="utf-8").startswith('{"candidate_id"')
     assert (ld / "model" / "image_model.json").exists() and (ld / "thumbnails").is_dir()
 
-    # An interrupted replacement on a separate Build 018 root rolls back the app but leaves learning data alone.
+    # An interrupted replacement on a separate Build 020 root rolls back the app but leaves learning data alone.
     portable2, staged2 = _staged(tmp_path / "rollback", monkeypatch)
     ld2 = portable2 / "learning_data"
     (ld2 / "model").mkdir(parents=True)

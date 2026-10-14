@@ -56,9 +56,9 @@ let incrementalRows: ReportRow[] | null = null
 const appDto = () => ({
   name: 'Report Extractor',
   title: 'Report Extractor',
-  version: '1.3.6',
-  build: '019',
-  buildNumber: 19,
+  version: '1.3.7',
+  build: '020',
+  buildNumber: 20,
 })
 
 const configDto = () => ({

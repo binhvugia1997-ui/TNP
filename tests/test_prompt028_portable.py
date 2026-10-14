@@ -1088,13 +1088,13 @@ def test_builder_can_recreate_the_build_venv_and_reports_dependency_versions():
 
 
 def test_canonical_version_after_release018_authorization():
-    """RELEASE-018 supersedes the prior 1.3.4 / Build 017 integration identity everywhere current metadata lives."""
+    """RELEASE-020 supersedes the prior 1.3.6 / Build 019 identity everywhere current metadata lives."""
     import app as app_pkg
-    assert (app_pkg.__version__, app_pkg.BUILD_NUMBER, app_pkg.BUILD_ID) == ("1.3.5", 18, "018")
-    assert app_pkg.BUILD_LABEL == "Build 018"
-    assert app_pkg.VERSION_LABEL == "1.3.5 — Build 018"
+    assert (app_pkg.__version__, app_pkg.BUILD_NUMBER, app_pkg.BUILD_ID) == ("1.3.7", 20, "020")
+    assert app_pkg.BUILD_LABEL == "Build 020"
+    assert app_pkg.VERSION_LABEL == "1.3.7 — Build 020"
     meta = json.loads((ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
-    assert meta["version"] == "1.3.5", "the React bundle must agree with the backend version"
+    assert meta["version"] == "1.3.7", "the React bundle must agree with the backend version"
 
 
 PROMPT027_BASELINE = "b5f8a29"        # PROMPT-027

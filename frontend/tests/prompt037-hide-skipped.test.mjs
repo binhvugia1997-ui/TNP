@@ -76,7 +76,7 @@ function dashboard(scan, reports = []) {
     update: { path: '', autoCheck: false },
   }
   return {
-    app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.3.6', build: '019', buildNumber: 19 },
+    app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.3.7', build: '020', buildNumber: 20 },
     config, scan, reports,
     job: { status: 'idle', queue: [], index: 0, doneCount: 0, stage: 'waiting', percent: 0,
       currentFile: '', elapsedSec: 0, remainSec: null, startedAt: null, finishedAt: null, hasSamples: false },

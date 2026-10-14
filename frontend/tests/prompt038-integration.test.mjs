@@ -130,7 +130,7 @@ async function mountReview() {
     period: { mode: 'auto', month: '', year: '', from: '', to: '' }, forceReprocess: false,
     ollama: { host: '', port: '11434', model: '', checked: 'unchecked', message: '', models: [] },
     update: { path: '', autoCheck: true } }
-  const dashboard = { app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.3.6', build: '019', buildNumber: 19 },
+  const dashboard = { app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.3.7', build: '020', buildNumber: 20 },
     config, scan: { scanned: false, message: '' }, reports: [],
     job: { status: 'idle', queue: [], index: 0, doneCount: 0, stage: 'waiting', percent: 0, currentFile: '', elapsedSec: 0, remainSec: null, startedAt: null, finishedAt: null, hasSamples: false },
     logs: [], ollama: { host: '', port: '11434', model: '', checked: 'unchecked', message: '', models: [], aiStatus: '', discovering: false, discoveryMessage: '', discoveryResults: [], discoveryChecked: 0, discoveryTotal: 0, serverApplyRunning: false, serverApplyMessage: '' },

@@ -23,8 +23,8 @@ after(async () => {
 
 const available = (overrides = {}) => ({
   path: 'configured-update', autoCheck: true, status: 'available',
-  message: 'Có phiên bản mới: 1.3.6 — Build 019',
-  available: { version: '1.3.6', build: '019', package: 'ReportExtractor_1.3.6.zip', size: 1_234_567 },
+  message: 'Có phiên bản mới: 1.3.7 — Build 020',
+  available: { version: '1.3.7', build: '020', package: 'ReportExtractor_1.3.7.zip', size: 1_234_567 },
   progress: 0, progressStage: '', installEnabled: true, canInstall: true,
   installDisabledReason: '', error: '', ...overrides,
 })
@@ -34,8 +34,8 @@ test('a valid production update DTO preserves backend install permission and pac
   assert.equal(result.status, 'available')
   assert.equal(result.installEnabled, true)
   assert.equal(result.canInstall, true)
-  assert.equal(result.available.build, '019')
-  assert.equal(result.available.package, 'ReportExtractor_1.3.6.zip')
+  assert.equal(result.available.build, '020')
+  assert.equal(result.available.package, 'ReportExtractor_1.3.7.zip')
 })
 
 test('a development runtime can discover an update but stays explicitly non-installable', () => {
@@ -52,7 +52,7 @@ test('incomplete or contradictory update DTOs fail closed and never authorize in
     (() => { const { canInstall, ...legacy } = available(); return legacy })(),
     available({ installEnabled: true, canInstall: false }),
     available({ status: 'available', available: null }),
-    available({ available: { version: '1.3.6', build: '../019', package: 'x.zip', size: 1 } }),
+    available({ available: { version: '1.3.7', build: '../020', package: 'x.zip', size: 1 } }),
   ]) {
     const result = normalizeUpdate(raw)
     assert.equal(result.status, 'failed')

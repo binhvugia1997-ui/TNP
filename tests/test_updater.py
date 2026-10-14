@@ -22,7 +22,12 @@ sys.path.insert(0, str(Path(app.__file__).resolve().parent.parent / "tools"))
 import build_portable as bp  # noqa: E402
 
 V_NEW, B_NEW = "1.0.5", 5
-V_NEWER, B_NEWER = "1.3.6", 19           # newer than the 1.3.5 / Build 018 release app
+# The "next production release" fixture is derived from the single canonical identity (app/__init__.py) so it is
+# ALWAYS newer than the app under test: version and numeric build both move on, exactly like Build019 -> Build020.
+# Numeric build ordering stays authoritative (PROMPT-005); the version string is release metadata.
+_CUR_MAJOR, _CUR_MINOR, _CUR_PATCH = (int(part) for part in app.__version__.split("."))
+V_NEWER = f"{_CUR_MAJOR}.{_CUR_MINOR}.{_CUR_PATCH + 1}"
+B_NEWER = app.BUILD_NUMBER + 1
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -131,16 +136,16 @@ def _ctl(tmp_path, update_path=""):
 
 # ---------------------------------------------------------------------------- version identity (§21/§23)
 def test_numeric_build_display_and_constants():
-    assert app.__version__ == "1.3.5" and app.BUILD_NUMBER == 18
-    assert app.BUILD_ID == "018" and app.BUILD_LABEL == "Build 018" and app.APP_TITLE == "Report Extractor v1.3.5"
+    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20
+    assert app.BUILD_ID == "020" and app.BUILD_LABEL == "Build 020" and app.APP_TITLE == "Report Extractor v1.3.7"
     assert app.format_build(4) == "004" and app.format_build(5) == "005" and app.format_build(15) == "015"
     assert app.format_build(1234) == "1234"
-    assert up.version_label() == "1.3.5 — Build 018" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
+    assert up.version_label() == "1.3.7 — Build 020" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
     assert "git" not in app.BUILD_ID.lower() and app.BUILD_ID.isdigit()
 
 
 def test_build_script_uses_the_same_constants():
-    assert bp._version() == ("1.3.5", "018") and bp.build_number() == 18
+    assert bp._version() == ("1.3.7", "020") and bp.build_number() == 20
     assert bp.package_name("1.0.5") == "ReportExtractor_1.0.5.zip"
 
 
@@ -453,7 +458,8 @@ def test_package_copied_to_local_staging_before_installation(tmp_path, monkeypat
     finally:
         lock.release()
     staging = portable / up.STAGING_DIR
-    assert Path(staged.zip_path) == Path(staged.staging_dir) / "ReportExtractor_1.3.6.zip" and Path(staged.zip_path).exists()
+    assert Path(staged.zip_path) == Path(staged.staging_dir) / f"ReportExtractor_{V_NEWER}.zip" \
+        and Path(staged.zip_path).exists()
     assert Path(staged.source_root).is_relative_to(staging) and (Path(staged.source_root) / up.APP_EXE).exists()
     m = json.loads(Path(staged.manifest_path).read_text(encoding="utf-8"))
     assert m["old_pid"] == os.getpid() and m["target_root"] == str(portable) and m["build"] == B_NEWER
@@ -519,7 +525,7 @@ def test_updater_waits_for_main_process_exit(tmp_path, monkeypatch):
     slept = []
     rc = up.apply_update(Path(staged.manifest_path), alive=alive, sleep=slept.append, spawn=lambda *a, **k: None)
     assert rc == 0 and alive_calls["n"] >= 4 and len(slept) == 3
-    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.3.6"
+    assert (portable / up.APP_EXE).read_bytes() == f"MZ-new-{V_NEWER}".encode()
     # process never exits -> nothing replaced and no backup is created
     portable2, staged2 = _staged(tmp_path / "second", monkeypatch)
     set_helper_runtime(monkeypatch, staged2)
@@ -543,7 +549,7 @@ def test_helper_rechecks_target_identity_after_acquiring_shared_lock(tmp_path, m
 
     def change_target_while_waiting(lock, *args, **kwargs):
         if lock.path == portable / up.LOCK_NAME:
-            (portable / "VERSION.txt").write_text(_version_txt("1.3.6", B_NEWER), encoding="utf-8")
+            (portable / "VERSION.txt").write_text(_version_txt(V_NEWER, B_NEWER), encoding="utf-8")
         return original_acquire(lock, *args, **kwargs)
 
     monkeypatch.setattr(up.UpdateInstallLock, "acquire", change_target_while_waiting)
@@ -571,11 +577,11 @@ def test_application_files_replaced_and_user_data_preserved(tmp_path, monkeypatc
                          spawn=lambda cmd, **kw: spawned.append((cmd, kw)))
     assert rc == 0
     # application files replaced
-    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.3.6"
-    assert (portable / "_internal" / "app" / "core.py").read_text(encoding="utf-8") == "# core 1.3.6"
+    assert (portable / up.APP_EXE).read_bytes() == f"MZ-new-{V_NEWER}".encode()
+    assert (portable / "_internal" / "app" / "core.py").read_text(encoding="utf-8") == f"# core {V_NEWER}"
     assert not (portable / "_internal" / "old_only.dll").exists()                 # stale runtime file gone
-    assert "build=019" in (portable / "VERSION.txt").read_text(encoding="utf-8")
-    assert (portable / "README.txt").read_text(encoding="utf-8") == "readme 1.3.6"
+    assert f"build={up.format_build(B_NEWER)}" in (portable / "VERSION.txt").read_text(encoding="utf-8")
+    assert (portable / "README.txt").read_text(encoding="utf-8") == f"readme {V_NEWER}"
     # config.json preserved
     assert (portable / "config" / "config.json").read_text(encoding="utf-8") == '{"update_path": "X:\\\\Update"}'
     # Output preserved (incl. result workbook + Excel backups)
@@ -586,14 +592,14 @@ def test_application_files_replaced_and_user_data_preserved(tmp_path, monkeypatc
     assert (portable / "logs" / "app.log").read_text(encoding="utf-8") == "log line"
     assert (portable / "Kiem_chung.xlsx").read_bytes() == b"master"                # root-level user Excel untouched
     # previous runtime kept for recovery
-    backups = list((portable / up.BACKUP_DIR).glob("backup-018-*"))
+    backups = list((portable / up.BACKUP_DIR).glob(f"backup-{app.BUILD_ID}-*"))
     assert len(backups) == 1 and (backups[0] / up.APP_EXE).read_bytes() == b"MZ-old"
     metadata = json.loads((backups[0] / "backup.json").read_text(encoding="utf-8"))
-    assert metadata["version"] == "1.3.5" and metadata["build"] == 18
+    assert metadata["version"] == app.__version__ and metadata["build"] == app.BUILD_NUMBER
     # restart of the NEW application
     assert spawned and spawned[0][0][0] == str(portable / up.APP_EXE) and spawned[0][1]["cwd"] == str(portable)
     res = json.loads((portable / "logs" / up.RESULT_FILE).read_text(encoding="utf-8"))
-    assert res["status"] == "ok" and res["version"] == "1.3.6" and res["build"] == 19
+    assert res["status"] == "ok" and res["version"] == V_NEWER and res["build"] == B_NEWER
     log = (portable / "logs" / up.UPDATE_LOG).read_text(encoding="utf-8")
     for key in ("UPDATE_WAIT_EXIT_OK", "UPDATE_BACKUP_OK", "UPDATE_INSTALL_OK", "UPDATE_RESTART"):
         assert key in log
@@ -618,7 +624,7 @@ def test_failed_install_triggers_rollback(tmp_path, monkeypatch):
     assert (portable / "_internal" / "app" / "core.py").read_text(encoding="utf-8") == "# core old"
     assert (portable / "_internal" / "old_only.dll").exists()
     assert (portable / "README.txt").read_text(encoding="utf-8") == "readme old"
-    assert "build=018" in (portable / "VERSION.txt").read_text(encoding="utf-8")
+    assert f"build={app.BUILD_ID}" in (portable / "VERSION.txt").read_text(encoding="utf-8")
     assert (portable / "config" / "config.json").exists() and (portable / "Output" / "Kiem_chung_09_2026.xlsx").exists()
     res = json.loads((portable / "logs" / up.RESULT_FILE).read_text(encoding="utf-8"))
     assert res["status"] == "rolled_back"
@@ -638,7 +644,7 @@ def test_successful_install_restarts_application_and_notice_shown_once(tmp_path,
     monkeypatch.setattr(gc, "portable_root", lambda: portable)
     monkeypatch.setattr(up, "process_alive", lambda pid: False)  # helper has exited before the restarted GUI consumes
     c = _ctl(tmp_path)
-    assert c.consume_update_notice() == "Cập nhật thành công lên phiên bản 1.3.6."
+    assert c.consume_update_notice() == f"Cập nhật thành công lên phiên bản {V_NEWER}."
     assert c.consume_update_notice() == "" and not (portable / "logs" / up.RESULT_FILE).exists()
     assert not list((portable / up.STAGING_DIR).glob("stage-*"))  # updater-owned stage cleaned after success
 
@@ -652,7 +658,7 @@ def test_apply_update_cli_entry_point(tmp_path, monkeypatch):
         Path(manifest), spawn=lambda *a, **k: None))
     from app.main import main
     assert main(["--apply-update", staged.manifest_path]) == 0
-    assert (portable / up.APP_EXE).read_bytes() == b"MZ-new-1.3.6"
+    assert (portable / up.APP_EXE).read_bytes() == f"MZ-new-{V_NEWER}".encode()
     assert main(["--apply-update", str(tmp_path / "nope.json")]) == 2
 
 
@@ -680,11 +686,11 @@ def test_update_path_persisted_in_config(tmp_path):
 def test_controller_check_async_and_status_texts(tmp_path):
     folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     c = _ctl(tmp_path, str(folder))
-    assert c.current_version_text() == "Phiên bản hiện tại: 1.3.5 — Build 018"
+    assert c.current_version_text() == "Phiên bản hiện tại: 1.3.7 — Build 020" == f"Phiên bản hiện tại: {app.VERSION_LABEL}"
     assert c.update_status_text() == "Chưa kiểm tra cập nhật."
     assert c.check_update_async(startup=True)
     c._update_thread.join(10)
-    assert c.update_status_text() == "Có phiên bản mới: 1.3.6 — Build 019" and c.update_available()
+    assert c.update_status_text() == f"Có phiên bản mới: {up.version_label(V_NEWER, B_NEWER)}" and c.update_available()
     # offline share: a status line, never an exception, processing stays available
     c.set_update_path(str(tmp_path / "offline_share"))
     assert c.update_check is None and c.check_update_async()
@@ -725,7 +731,7 @@ def test_install_update_requires_confirmation_and_idle_state(tmp_path, monkeypat
     c.check_update()
     spawned = []
     ok, msg = c.install_update(spawn=lambda cmd, **kw: spawned.append(cmd))
-    assert ok and msg.startswith("Đang cài đặt 1.3.6 — Build 019")
+    assert ok and msg.startswith(f"Đang cài đặt {up.version_label(V_NEWER, B_NEWER)}")
     assert spawned and "--apply-update" in spawned[0] and spawned[0][-1].endswith("update.json")
     assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"                    # files untouched until the updater runs
     c._release_update_file_lock()
@@ -743,8 +749,8 @@ def test_gui_update_card_controls(monkeypatch, tmp_path):
     btn_texts = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Button"}
     assert {"Chọn...", "Kiểm tra cập nhật", "Cập nhật ngay"} <= btn_texts
     labels = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Label"}
-    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.3.5 — Build 018" in labels
-    assert a.lbl_build.cfg["text"] == "Build 018"
+    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.3.7 — Build 020" in labels
+    assert a.lbl_build.cfg["text"] == "Build 020"
     assert a.btn_install_update.cfg["state"] == "disabled"
     # startup check scheduled asynchronously (after), not inline
     assert any(ms == gui.STARTUP_UPDATE_DELAY_MS for ms, _ in a.root.scheduled) and 2000 <= gui.STARTUP_UPDATE_DELAY_MS <= 5000
@@ -753,7 +759,7 @@ def test_gui_update_card_controls(monkeypatch, tmp_path):
     a.check_update()
     a.ctl._update_thread.join(10)
     a._poll()
-    assert a.lbl_update.cfg["text"].startswith("Có phiên bản mới: 1.3.6 — Build 019")
+    assert a.lbl_update.cfg["text"].startswith(f"Có phiên bản mới: {up.version_label(V_NEWER, B_NEWER)}")
     assert "Chỉ có thể cài đặt cập nhật" in a.lbl_update.cfg["text"]
     assert a.btn_install_update.cfg["state"] == "disabled"  # source/development runtime is check-only
     assert a.ctl.update_path == str(folder) and a.ctl.cfg.update_path == str(folder)     # persisted via save_settings

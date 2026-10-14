@@ -14,7 +14,7 @@ manifest (os.replace is atomic) and the new ZIP is removed again so nothing dang
 
 The destination is centralised here (env overrides for other build PCs):
     RE_UPDATE_FOLDER   local folder shared to the LAN     (default D:\\ReportExtractor_Update)
-    RE_UPDATE_LAN_PATH UNC path the work PCs configure    (default \\\\192.168.103.11\\ReportExtractor_Update)
+    RE_UPDATE_LAN_PATH UNC path the work PCs configure    (default \\\\192.168.103.12\\ReportExtractor_Update)
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from typing import Callable, List, Optional
 from console_safe import configure_console, safe_text
 
 DEFAULT_UPDATE_FOLDER = r"D:\ReportExtractor_Update"
-DEFAULT_LAN_PATH = r"\\192.168.103.11\ReportExtractor_Update"
+DEFAULT_LAN_PATH = r"\\192.168.103.12\ReportExtractor_Update"
 MANIFEST_NAME = "version.json"
 PACKAGE_GLOB = "ReportExtractor_*.zip"
 TAG = "[PUBLISH]"

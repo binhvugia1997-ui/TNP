@@ -49,14 +49,14 @@ def test_successful_publish_and_console_output(tmp_path):
     rel, zip_src = _release(tmp_path)
     dest = tmp_path / "ReportExtractor_Update"
     rec = Recorder(dest)
-    res = pu.publish_release(rel, str(dest), say=rec, lan=r"\\192.168.103.11\ReportExtractor_Update")
+    res = pu.publish_release(rel, str(dest), say=rec, lan=r"\\192.168.103.12\ReportExtractor_Update")
     assert res.ok and res.package == zip_src.name and res.error == ""
     assert (dest / zip_src.name).read_bytes() == zip_src.read_bytes()
     assert _manifest(dest) == json.loads((rel / "version.json").read_text(encoding="utf-8"))
     text = "\n".join(rec.lines)
     for expected in (f"[PUBLISH] Update folder: {dest}", "[PUBLISH] Copying package...", "[PUBLISH] Verifying SHA256...",
                      "[PUBLISH] Package OK", "[PUBLISH] Publishing version.json LAST...", "[PUBLISH] SUCCESS",
-                     f"Local update folder:\n    {dest}", r"LAN update path:" + "\n    " + r"\\192.168.103.11\ReportExtractor_Update"):
+                     f"Local update folder:\n    {dest}", r"LAN update path:" + "\n    " + r"\\192.168.103.12\ReportExtractor_Update"):
         assert expected in text
     assert not list(dest.glob("*.tmp"))                                  # temp files cleaned
 
@@ -263,9 +263,9 @@ def test_no_publish_after_failed_test_gate(tmp_path, monkeypatch):
 
 def test_destination_is_centralised_and_configurable(monkeypatch):
     assert pu.DEFAULT_UPDATE_FOLDER == r"D:\ReportExtractor_Update"
-    assert pu.DEFAULT_LAN_PATH == r"\\192.168.103.11\ReportExtractor_Update"
+    assert pu.DEFAULT_LAN_PATH == r"\\192.168.103.12\ReportExtractor_Update"
     assert "ReportExtractor_Update" not in BUILD_SRC                       # only publish_update.py knows the path
-    assert "192.168.103.11" not in BUILD_SRC and "192.168.103.11" not in (ROOT / "app" / "updater.py").read_text(encoding="utf-8")
+    assert "192.168.103.12" not in BUILD_SRC and "192.168.103.12" not in (ROOT / "app" / "updater.py").read_text(encoding="utf-8")
     monkeypatch.setenv("RE_UPDATE_FOLDER", r"E:\Share\Update")
     monkeypatch.setenv("RE_UPDATE_LAN_PATH", r"\\BUILD-PC\Update")
     assert pu.update_folder() == r"E:\Share\Update" and pu.lan_path() == r"\\BUILD-PC\Update"
@@ -275,4 +275,4 @@ def test_destination_is_centralised_and_configurable(monkeypatch):
 
 
 def test_build_010_identity():
-    assert app.__version__ == "1.3.5" and app.BUILD_NUMBER == 18 and app.BUILD_LABEL == "Build 018"
+    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20 and app.BUILD_LABEL == "Build 020"

@@ -325,7 +325,7 @@ def test_configuration_ollama_update_state_and_disabled_install(sample_tree, tmp
 
     install = bridge.install_update()
     assert install["ok"] is False and install["error"]["code"] == "UPDATE_INSTALL_DISABLED"
-    assert service.current_config()["app"]["version"] == "1.3.5"
+    assert service.current_config()["app"]["version"] == "1.3.7"
 
 
 def test_update_install_response_snapshots_actual_progress_state(sample_tree, tmp_path, monkeypatch):
@@ -334,8 +334,8 @@ def test_update_install_response_snapshots_actual_progress_state(sample_tree, tm
 
     service, _ = _make_service(sample_tree, tmp_path)
     controller = service.controller
-    info = updater.UpdateInfo("1.3.6", 19, "ReportExtractor_1.3.6.zip", "0" * 64, 1234)
-    controller.update_check = updater.UpdateCheck("available", "Có phiên bản mới: 1.3.6 — Build 019",
+    info = updater.UpdateInfo("1.3.7", 20, "ReportExtractor_1.3.7.zip", "0" * 64, 1234)
+    controller.update_check = updater.UpdateCheck("available", "Có phiên bản mới: 1.3.7 — Build 020",
                                                   str(tmp_path / "Update"), info, "package.zip")
     monkeypatch.setattr(updater, "production_install_capability", lambda root: (True, ""))
     monkeypatch.setattr(updater, "update_lock_available", lambda root: True)
@@ -351,17 +351,17 @@ def test_update_install_response_snapshots_actual_progress_state(sample_tree, tm
     result = service.install_update()
     assert result["status"] == "staging" and result["state"]["status"] == "staging"
     assert result["state"]["progress"] == 50 and result["state"]["installEnabled"] is False
-    assert result["state"]["available"] == {"version": "1.3.6", "build": "019",
-                                             "package": "ReportExtractor_1.3.6.zip", "size": 1234}
+    assert result["state"]["available"] == {"version": "1.3.7", "build": "020",
+                                             "package": "ReportExtractor_1.3.7.zip", "size": 1234}
 
 
 def test_failed_update_state_never_advertises_install_enabled(sample_tree, tmp_path, monkeypatch):
     import app.updater as updater
 
     service, _ = _make_service(sample_tree, tmp_path)
-    info = updater.UpdateInfo("1.3.6", 19, "ReportExtractor_1.3.6.zip", "0" * 64, 1234)
+    info = updater.UpdateInfo("1.3.7", 20, "ReportExtractor_1.3.7.zip", "0" * 64, 1234)
     service.controller.update_check = updater.UpdateCheck(
-        "available", "Có phiên bản mới: 1.3.6 — Build 019", str(tmp_path / "Update"), info, "package.zip")
+        "available", "Có phiên bản mới: 1.3.7 — Build 020", str(tmp_path / "Update"), info, "package.zip")
     monkeypatch.setattr(updater, "production_install_capability", lambda root: (True, ""))
     monkeypatch.setattr(service, "_refresh_update_result", lambda: None)
 
