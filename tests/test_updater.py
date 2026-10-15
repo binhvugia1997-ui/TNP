@@ -17,6 +17,9 @@ import app
 import app.updater as up
 from app.config import AppConfig
 from app.gui_controller import GuiController
+from tests.portable_fixtures import (CLRLOADER_PATHS, PYTHON_RUNTIME_PATH, WEBVIEW_CORE_PATH,
+                                     WEBVIEW_FORMS_PATH, WEBVIEW_LOADER_PATH,
+                                     add_windows_runtime_to_directory, add_windows_runtime_to_zip)
 
 sys.path.insert(0, str(Path(app.__file__).resolve().parent.parent / "tools"))
 import build_portable as bp  # noqa: E402
@@ -55,6 +58,7 @@ def make_release_zip(path: Path, version=V_NEW, build=B_NEW, top=True, with_exe=
         zf.writestr(prefix + "_internal/pptx/templates/default.pptx", b"PK-template")
         for name in ("api.js", "lib/dom_json.js", "state.js"):
             zf.writestr(prefix + "_internal/webview/js/" + name, b"// pywebview runtime")
+        add_windows_runtime_to_zip(zf, prefix)
         if with_version:
             zf.writestr(prefix + "VERSION.txt", _version_txt(version, build))
         for base in ("frontend/dist", "_internal/frontend/dist"):
@@ -117,6 +121,7 @@ def make_portable(root: Path, version=app.__version__, build=app.BUILD_NUMBER) -
     (root / "Output" / "backup").mkdir()
     (root / "Output" / "backup" / "k_backup.xlsx").write_bytes(b"bak")
     (root / "Kiem_chung.xlsx").write_bytes(b"master")
+    add_windows_runtime_to_directory(root)
     return root
 
 
@@ -276,6 +281,112 @@ def _info(folder, **kw):
     d = json.loads((folder / "version.json").read_text(encoding="utf-8"))
     d.update(kw)
     return up.parse_manifest(json.dumps(d))
+
+
+def _rewrite_zip_without_members(package: Path, relative_paths) -> None:
+    """Repack a synthetic update ZIP without selected paths, preserving its wrapper directory."""
+    omitted = tuple(relative_paths)
+    rewritten = package.with_name(package.stem + ".rewrite.zip")
+    with zipfile.ZipFile(package, "r") as source, zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as target:
+        for member in source.infolist():
+            name = member.filename.rstrip("/")
+            if any(name == relative or name.endswith("/" + relative) for relative in omitted):
+                continue
+            target.writestr(member, source.read(member.filename))
+    rewritten.replace(package)
+
+
+def test_shared_portable_fixtures_match_the_windows_runtime_contract(tmp_path):
+    """Both shared fixtures must carry every runtime path validate_staged_portable checks on Windows."""
+    installed_info = up.UpdateInfo(app.__version__, app.BUILD_NUMBER, "installed.zip", "0" * 64)
+    installed = make_portable(tmp_path / "installed")
+    assert up.validate_staged_portable(installed, installed_info, windows_runtime=True) == (True, "OK")
+
+    archive = make_release_zip(tmp_path / "release.zip", version=V_NEWER, build=B_NEWER)
+    archive_info = up.UpdateInfo(V_NEWER, B_NEWER, archive.name, up.sha256_file(archive), archive.stat().st_size)
+    staged, _count = up._extract_archive(archive, tmp_path / "extract", archive_info)
+    assert up.validate_staged_portable(staged, archive_info, windows_runtime=True) == (True, "OK")
+
+
+def test_stage_update_passes_the_windows_runtime_gate_with_shared_fixture(tmp_path, monkeypatch):
+    folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
+    portable = make_portable(tmp_path / "app")
+    set_packaged_runtime(monkeypatch, portable)
+    validate = up.validate_staged_portable
+
+    def validate_as_windows(root, info, **_kwargs):
+        return validate(root, info, windows_runtime=True)
+
+    monkeypatch.setattr(up, "validate_staged_portable", validate_as_windows)
+    check = up.check_for_update(str(folder))
+    lock = up.acquire_update_lock(portable, timeout=0)
+    assert lock is not None
+    try:
+        staged = up.stage_update(check, portable, lock=lock)
+    finally:
+        lock.release()
+    assert Path(staged.source_root).is_dir()
+    assert Path(staged.manifest_path).is_file()
+
+
+@pytest.mark.parametrize(
+    ("missing_paths", "expected_reason"),
+    [
+        ((PYTHON_RUNTIME_PATH,), "thiếu .NET/pythonnet runtime bắt buộc"),
+        (CLRLOADER_PATHS, "thiếu .NET/pythonnet runtime bắt buộc"),
+    ],
+)
+def test_stage_update_rejects_windows_packages_missing_runtime_dlls(
+    tmp_path, monkeypatch, missing_paths, expected_reason
+):
+    folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
+    package = folder / f"ReportExtractor_{V_NEWER}.zip"
+    _rewrite_zip_without_members(package, missing_paths)
+    manifest_path = folder / "version.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sha256"] = up.sha256_file(package)
+    manifest["size"] = package.stat().st_size
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    portable = make_portable(tmp_path / "app")
+    set_packaged_runtime(monkeypatch, portable)
+    validate = up.validate_staged_portable
+
+    def validate_as_windows(root, info, **_kwargs):
+        return validate(root, info, windows_runtime=True)
+
+    monkeypatch.setattr(up, "validate_staged_portable", validate_as_windows)
+    check = up.check_for_update(str(folder))
+    lock = up.acquire_update_lock(portable, timeout=0)
+    assert lock is not None
+    try:
+        with pytest.raises(RuntimeError) as error:
+            up.stage_update(check, portable, lock=lock)
+    finally:
+        lock.release()
+    assert str(error.value) == f"Gói cập nhật không đạt kiểm tra Portable: {expected_reason}."
+    assert not list((portable / up.STAGING_DIR).glob("stage-*"))
+
+
+@pytest.mark.parametrize(
+    ("missing_paths", "expected_reason"),
+    [
+        ((PYTHON_RUNTIME_PATH,), "thiếu .NET/pythonnet runtime bắt buộc"),
+        (CLRLOADER_PATHS, "thiếu .NET/pythonnet runtime bắt buộc"),
+        ((WEBVIEW_CORE_PATH,), "thiếu WebView2 runtime bắt buộc"),
+        ((WEBVIEW_FORMS_PATH,), "thiếu WebView2 runtime bắt buộc"),
+        ((WEBVIEW_LOADER_PATH,), "thiếu WebView2 runtime bắt buộc"),
+    ],
+)
+def test_staged_portable_rejects_missing_required_windows_runtime_files(tmp_path, missing_paths, expected_reason):
+    """Portable validation remains fail-closed when any required Windows runtime component is absent."""
+    portable = make_portable(tmp_path / "app")
+    info = up.UpdateInfo(app.__version__, app.BUILD_NUMBER, "installed.zip", "0" * 64)
+    for relative_path in missing_paths:
+        (portable / relative_path).unlink()
+
+    valid, reason = up.validate_staged_portable(portable, info, windows_runtime=True)
+    assert not valid and reason == expected_reason
 
 
 def test_valid_zip_passes(tmp_path):

@@ -24,7 +24,7 @@ import os
 import platform
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import APP_TITLE
 from .application_service import ApplicationService
@@ -164,8 +164,9 @@ def frontend_dist_freshness(dist_dir: Optional[Path] = None) -> dict:
 
     Returns ``stale=False`` when freshness cannot be judged (no source tree next to the bundle —
     e.g. a packaged layout), so this guard can only ever block a genuine source checkout whose
-    ``dist`` predates its ``src``. mtime comparison is sufficient: a Vite build always writes
-    ``dist/index.html`` after every source input it consumed. Never raises.
+    ``dist`` predates its source inputs. A Vite build always writes ``dist/index.html`` after every
+    source input it consumed. Staleness requires a strictly newer source mtime; when source mtimes tie,
+    the canonical lexical-first relative path is reported deterministically. Never raises.
     """
     report: dict = {"stale": False, "reason": "fresh", "dist": "", "newest_source": "",
                     "dist_mtime": None, "source_mtime": None}
@@ -192,8 +193,18 @@ def frontend_dist_freshness(dist_dir: Optional[Path] = None) -> dict:
         if not candidates:
             report["reason"] = "no-source-tree"
             return report
-        newest = max(candidates, key=lambda p: p.stat().st_mtime)
+
+        def relative_source_key(path: Path) -> Tuple[str, str]:
+            relative = path.relative_to(frontend_dir).as_posix()
+            return relative.casefold(), relative
+
+        candidates.sort(key=relative_source_key)
+        newest = candidates[0]
         source_mtime = newest.stat().st_mtime
+        for candidate in candidates[1:]:
+            candidate_mtime = candidate.stat().st_mtime
+            if candidate_mtime > source_mtime:
+                newest, source_mtime = candidate, candidate_mtime
         report.update(newest_source=str(newest), source_mtime=source_mtime)
         if source_mtime > dist_mtime:
             report.update(stale=True, reason="source-newer-than-dist")

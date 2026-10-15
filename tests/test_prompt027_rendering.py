@@ -656,19 +656,26 @@ def test_slide_render_logs_purpose_backend_and_dimensions(tmp_path, caplog):
         assert f"schema=v{RENDER_SCHEMA_VERSION}" in line
 
 
-def test_backend_failure_is_logged_not_silently_swallowed(tmp_path, caplog):
+def test_backend_failure_is_logged_not_silently_swallowed(tmp_path, caplog, monkeypatch):
     deck = _simple_slide(tmp_path / "fail.pptx", lambda s: _pics(s, ["#c8e6c9"], 4, 3, w=2, h=1.4))
     report = parse_pptx(str(deck))
+    monkeypatch.setattr(qrn, "powerpoint_available", lambda: True)
+
+    def fail_powerpoint(pptx, slide_numbers, out_dir, width_px=1920):
+        raise qrn.PowerPointStageError("slide-export", RuntimeError("synthetic export failure"), pptx)
+
+    monkeypatch.setattr(qrn, "render_with_powerpoint", fail_powerpoint)
     renderer = SlideRenderer(prefer=("powerpoint", "builtin"), width_px=1200)
     with caplog.at_level(logging.WARNING, logger="report_extractor.renderer"):
         out = renderer.render(report, [1], tmp_path / "o", purpose="learning_preview")
 
-    assert out and renderer.last_backend == "builtin"
+    assert out and out[1].is_file() and renderer.last_backend == "builtin"
+    assert renderer.backend_tried == ["powerpoint", "builtin"]
     failures = [r.getMessage() for r in caplog.records
                 if r.getMessage().startswith("SLIDE_RENDER_BACKEND_FAILED")]
     assert len(failures) == 1
-    assert "purpose=learning_preview backend=powerpoint" in failures[0]
-    assert "reason=unavailable" in failures[0]
+    assert "purpose=learning_preview backend=powerpoint stage=slide-export" in failures[0]
+    assert "reason=synthetic export failure" in failures[0]
 
 
 def test_backend_exception_reason_is_safe_and_path_free(tmp_path):
