@@ -637,8 +637,9 @@ def test_updater_waits_for_main_process_exit(tmp_path, monkeypatch):
     rc = up.apply_update(Path(staged.manifest_path), alive=alive, sleep=slept.append, spawn=lambda *a, **k: None)
     assert rc == 0 and alive_calls["n"] >= 4 and len(slept) == 3
     assert (portable / up.APP_EXE).read_bytes() == f"MZ-new-{V_NEWER}".encode()
-    # process never exits -> nothing replaced and no backup is created
-    portable2, staged2 = _staged(tmp_path / "second", monkeypatch)
+    # Keep the second staged extraction under Windows MAX_PATH: tmp_path + updater staging is deeply nested.
+    # The supported root-level ZIP form removes the extra wrapper component; wrapper ZIPs are tested separately.
+    portable2, staged2 = _staged(tmp_path / "s", monkeypatch, top=False)
     set_helper_runtime(monkeypatch, staged2)
     rc2 = up.apply_update(Path(staged2.manifest_path), alive=lambda pid: True, sleep=lambda s: None,
                           spawn=lambda *a, **k: None, wait_timeout=0.0)

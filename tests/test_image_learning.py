@@ -543,8 +543,9 @@ def test_28_apply_update_keeps_learning_data_and_rollback_restores_it(tmp_path, 
     assert (ld / "image_labels.jsonl").read_text(encoding="utf-8").startswith('{"candidate_id"')
     assert (ld / "model" / "image_model.json").exists() and (ld / "thumbnails").is_dir()
 
-    # An interrupted replacement on a separate Build 020 root rolls back the app but leaves learning data alone.
-    portable2, staged2 = _staged(tmp_path / "rollback", monkeypatch)
+    # Keep this second staged extraction below Windows MAX_PATH: it is nested beneath pytest's long temp root.
+    # Root-level ZIPs are a supported package layout; wrapper-folder ZIPs are covered by updater package tests.
+    portable2, staged2 = _staged(tmp_path / "r", monkeypatch, top=False)
     ld2 = portable2 / "learning_data"
     (ld2 / "model").mkdir(parents=True)
     (ld2 / "image_labels.jsonl").write_text("second\n", encoding="utf-8")
