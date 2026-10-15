@@ -253,6 +253,168 @@ function ImageReview() {
     return () => mq.removeEventListener('change', onChange)
   }, [])
 
+  // PROMPT-030: multi-select + bulk label + double-click (must be before any panel that captures them)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [activeLabel, setActiveLabel] = useState<string | null>(null)
+  const [hint, setHint] = useState('')
+  const [bulkCount, setBulkCount] = useState(0)
+  const doubleSaving = useRef(false)
+  const lastSelectedIndex = useRef<number>(-1)
+  useEffect(() => {
+    if (cand && cand.userLabel !== 'UNLABELED') setActiveLabel(cand.userLabel)
+  }, [cand?.id, cand?.userLabel])
+  useEffect(() => {
+    if (cand) {
+      const firstSlide = cand.slide
+      setSelectedIds((prev) => {
+        if (prev.size <= 1) return prev
+        const filtered = [...prev].filter((id) => {
+          const c = list.find((x) => x.id === id)
+          return c && c.slide === firstSlide
+        })
+        const slides = new Set(filtered.map((id) => list.find((x) => x.id === id)?.slide))
+        if (slides.size > 1) return new Set()
+        return new Set(filtered)
+      })
+    }
+  }, [cand?.slide])
+  useEffect(() => { setSelectedIds(new Set()); lastSelectedIndex.current = -1 }, [list.length])
+  const getSameSlideIds = (ids: Set<string> | string[]): string[] => {
+    const arr = [...ids]
+    if (arr.length === 0) return []
+    const first = list.find((c) => c.id === arr[0])
+    if (!first) return []
+    return arr.filter((id) => {
+      const c = list.find((x) => x.id === id)
+      return c && c.slide === first.slide
+    })
+  }
+
+  const handleCandidateClick = (clickedIdx: number, e: React.MouseEvent) => {
+    const clicked = list[clickedIdx]
+    if (!clicked) return
+    setHint('')
+    if ((e.ctrlKey || e.metaKey)) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev)
+        const clickedSlide = clicked.slide
+        if (prev.size === 0) {
+          const focusedSlide = cand?.slide
+          if (focusedSlide !== undefined && focusedSlide !== clickedSlide) {
+            lastSelectedIndex.current = clickedIdx
+            return new Set([clicked.id])
+          }
+        } else {
+          const firstId = [...prev][0]
+          const firstCand = list.find((x) => x.id === firstId)
+          if (firstCand && firstCand.slide !== clickedSlide) {
+            setHint(`Không chọn chéo slide — đã đổi sang slide ${clicked.slide}.`)
+            lastSelectedIndex.current = clickedIdx
+            return new Set([clicked.id])
+          }
+        }
+        if (next.has(clicked.id)) next.delete(clicked.id)
+        else next.add(clicked.id)
+        lastSelectedIndex.current = clickedIdx
+        return next
+      })
+      if (selectedIds.size === 0 && !selectedIds.has(clicked.id)) {
+        s.setImageReviewIndex(clickedIdx)
+      }
+    } else if (e.shiftKey && lastSelectedIndex.current >= 0) {
+      const start = Math.min(lastSelectedIndex.current, clickedIdx)
+      const end = Math.max(lastSelectedIndex.current, clickedIdx)
+      const rangeIds = list.slice(start, end + 1).map((c) => c.id)
+      const sameSlide = getSameSlideIds(rangeIds)
+      if (sameSlide.length !== rangeIds.length) {
+        const targetSlide = clicked.slide
+        const filtered = list.slice(start, end + 1).filter((c) => c.slide === targetSlide).map((c) => c.id)
+        setHint(`Chỉ chọn được các ảnh cùng slide ${targetSlide}.`)
+        setSelectedIds(new Set(filtered))
+      } else {
+        setSelectedIds(new Set(sameSlide))
+      }
+      s.setImageReviewIndex(clickedIdx)
+    } else {
+      setSelectedIds(new Set())
+      setHint('')
+      lastSelectedIndex.current = clickedIdx
+      s.setImageReviewIndex(clickedIdx)
+    }
+  }
+
+  const handleDoubleClick = (dblIdx: number) => {
+    if (doubleSaving.current || s.locked) return
+    const c = list[dblIdx]
+    if (!c) return
+    s.setImageReviewIndex(dblIdx)
+    setSelectedIds((prev) => {
+      const labelToUse = activeLabel || (c.userLabel !== 'UNLABELED' ? c.userLabel : null)
+      if (!labelToUse) {
+        setHint('Vui lòng chọn nhãn trước khi xác nhận nhanh (double-click).')
+        return prev
+      }
+      doubleSaving.current = true
+      setHint('')
+      const idsToConfirm = prev.size > 1 && prev.has(c.id) ? getSameSlideIds(prev) : [c.id]
+      const slides = new Set(idsToConfirm.map((id) => list.find((x) => x.id === id)?.slide))
+      if (slides.size > 1) {
+        setHint('Không xác nhận chéo slide — chỉ xác nhận các ảnh cùng slide.')
+        doubleSaving.current = false
+        return prev
+      }
+      void (async () => {
+        try {
+          if (idsToConfirm.length === 1) {
+            const single = list.find((x) => x.id === idsToConfirm[0])
+            if (single) await s.saveImageCandidate(single.id, labelToUse, single.note)
+          } else {
+            const storeBulk = (s as unknown as { labelImagesBulk?: (ids: string[], label: string) => Promise<void> }).labelImagesBulk
+            if (storeBulk) await storeBulk(idsToConfirm, labelToUse)
+            else {
+              for (const cid of idsToConfirm) {
+                const it = list.find((x) => x.id === cid)
+                if (it) await s.labelImage(it.id, labelToUse)
+              }
+              await s.saveImageLabels()
+            }
+          }
+          setBulkCount(idsToConfirm.length)
+          setSelectedIds(new Set())
+          setTimeout(() => {
+            const cur = list.findIndex((x) => x.id === c.id)
+            const nextIdx = list.findIndex((x, i) => i > cur && x.userLabel === 'UNLABELED')
+            if (nextIdx >= 0) s.setImageReviewIndex(nextIdx)
+          }, 300)
+        } finally { doubleSaving.current = false }
+      })()
+      return prev
+    })
+  }
+
+  const handleLabelButtonClick = (labelKey: string) => {
+    setActiveLabel(labelKey)
+    setHint('')
+    const idsToLabel = selectedIds.size > 0 ? getSameSlideIds(selectedIds) : [cand.id]
+    const slides = new Set(idsToLabel.map((id) => list.find((x) => x.id === id)?.slide))
+    if (slides.size > 1) {
+      setHint('Không gán nhãn chéo slide — chọn các ảnh cùng slide rồi thử lại.')
+      return
+    }
+    if (idsToLabel.length > 1) {
+      void (async () => {
+        const bulk = (s as unknown as { labelImagesBulk?: (ids: string[], label: string) => Promise<void> }).labelImagesBulk
+        if (bulk) await bulk(idsToLabel, labelKey)
+        else for (const cid of idsToLabel) await s.labelImage(cid, labelKey)
+        setBulkCount(idsToLabel.length)
+        setSelectedIds(new Set())
+      })()
+    } else {
+      void s.labelImage(cand.id, labelKey)
+    }
+  }
+
+
   if (!cand) return (
     <Card title="Kiểm tra ảnh cải tiến">
       <div className="flex flex-col items-start gap-2 text-base2 text-muted">
@@ -311,17 +473,25 @@ function ImageReview() {
             </div>
             <ul className="divide-y divide-lineSoft">
               {group.items.map(({ cand: c, idx }) => {
-                const selected = idx === index
+                const isFocused = idx === index
+                const isMulti = selectedIds.has(c.id)
+                const selected = isFocused || isMulti
                 return (
                   <li key={c.id}>
                     <button
                       type="button"
-                      ref={selected ? selectedRef : undefined}
-                      onClick={() => s.setImageReviewIndex(idx)}
-                      title={`${c.sourceFile} — Slide ${c.slide} — ${itemLabel}`}
+                      ref={isFocused ? selectedRef : undefined}
+                      onClick={(e) => handleCandidateClick(idx, e)}
+                      onDoubleClick={() => handleDoubleClick(idx)}
+                      title={`${c.sourceFile} — Slide ${c.slide} — ${itemLabel} (click chọn, Ctrl+click đa chọn, double-click xác nhận nhanh)`}
+                      aria-selected={selected}
+                      data-testid={`candidate-${idx}`}
+                      data-selected={selected ? 'true' : undefined}
                       className={cn(
                         'flex w-full items-center gap-2 px-2 py-1.5 text-left',
-                        selected ? 'bg-brand-50' : 'bg-white hover:bg-[#f6f9fd]',
+                        isMulti && isFocused ? 'bg-brand-100 ring-2 ring-inset ring-brand-300' :
+                        isMulti ? 'bg-brand-50 ring-1 ring-inset ring-brand-200' :
+                        isFocused ? 'bg-brand-50' : 'bg-white hover:bg-[#f6f9fd]',
                       )}
                     >
                       {c.src
@@ -347,6 +517,9 @@ function ImageReview() {
                 )
               })}
             </ul>
+            {selectedIds.size > 1 && (
+              <p className="px-2 py-1 text-xs2 font-medium text-brand-700" role="status">Đã chọn {selectedIds.size} ảnh — nhấn nhãn ở bên phải để áp cho tất cả.</p>
+            )}
           </div>
         ))}
       </div>
@@ -434,77 +607,88 @@ function ImageReview() {
         <span className="text-xs2 text-muted">Mục {index + 1}/{list.length}</span>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        <KeyValue label="Report nguồn"><span title={cand.sourceFile}>{cand.sourceFile}</span></KeyValue>
-        <KeyValue label="Management Number">{cand.managementNumber}</KeyValue>
-        <KeyValue label="Slide / Mục">
-          Slide {cand.slide}
-          {typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 && ` · Mục #${cand.itemIndex + 1}`}
-        </KeyValue>
-        {cand.itemHeading && (
-          <KeyValue label="Tiêu đề mục"><span title={cand.itemHeading}>{cand.itemHeading}</span></KeyValue>
-        )}
-        <KeyValue label="Dự đoán">{cand.decision}</KeyValue>
-        <KeyValue label="Độ tin cậy">
-          {CONFIDENCE_LABEL[cand.confidenceBand]} <span className="text-muted">({cand.confidence.toFixed(2)})</span>
-        </KeyValue>
-        <KeyValue label="Vào Excel">
-          {cand.excelEligible ? 'Đủ điều kiện'
-            : <span className="text-warn-600">Chưa đủ điều kiện — {cand.eligibilityReason}</span>}
-        </KeyValue>
+        {/* PROMPT-030 §4: label controls at the TOP for immediate reach without scrolling */}
+        <div className="rounded-sm2 border border-brand-100 bg-brand-50/40 p-2.5">
+          <p className="mb-1.5 text-base2 font-semibold text-header">Chọn nhãn xác nhận</p>
+          {selectedIds.size > 1 && (
+            <p className="mb-1.5 text-xs2 font-medium text-brand-700">Đã chọn {selectedIds.size} ảnh (cùng slide) — áp nhãn cho tất cả.</p>
+          )}
+          <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="Chọn nhãn xác nhận">
+            {IMAGE_LABELS.map((l) => (
+              <Button key={l.key} active={cand.userLabel === l.key || activeLabel === l.key} disabled={s.locked}
+                className="justify-center"
+                onClick={() => handleLabelButtonClick(l.key)}>
+                {l.label}
+              </Button>
+            ))}
+          </div>
+          {hint && <p className="mt-1.5 text-xs2 font-medium text-warn-600" role="status">{hint}</p>}
+          {bulkCount > 1 && <p className="mt-1 text-xs2 text-body">Đã áp nhãn cho {bulkCount} ảnh.</p>}
+        </div>
 
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          <Button icon={<ChevronLeft className="h-3.5 w-3.5" />} disabled={index === 0}
+            onClick={() => s.setImageReviewIndex(index - 1)}>
+            Mục trước
+          </Button>
+          <Button disabled={index >= list.length - 1} onClick={() => s.setImageReviewIndex(index + 1)}>
+            Mục tiếp
+            <ChevronRight className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+
+        <p className="mb-1 mt-3 text-base2 font-medium text-header">Ghi chú</p>
+        <TextInput
+          value={cand.note}
+          disabled={s.locked}
+          maxLength={1000}
+          placeholder="Ghi chú cho đối tượng này (không bắt buộc)"
+          onChange={(e) => s.setNote('image', cand.id, e.target.value)}
+        />
+
+        <Button
+          variant="primary"
+          className="mt-3 w-full justify-center"
+          icon={<Save className="h-3.5 w-3.5" />}
+          disabled={!chosen || s.locked}
+          onClick={() => void s.saveImageCandidate(cand.id, cand.userLabel, cand.note)}
+        >
+          Lưu nhãn & ghi chú
+        </Button>
+        {chosen && (
+          <span className={cn('mt-2 inline-flex items-center gap-1.5 text-xs2', cand.labelPending ? 'text-warn-600' : 'text-ok-600')}>
+            {cand.labelPending ? <AlertTriangle className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+            {cand.labelPending ? `Nhãn “${labelName(cand.userLabel)}” chưa lưu.` : `Nhãn “${labelName(cand.userLabel)}” đã lưu cục bộ.`}
+          </span>
+        )}
+
+        {/* Concise identity / status (PROMPT-030 §4: after the primary action) */}
+        <div className="mt-3 border-t border-lineSoft pt-2.5">
+          <KeyValue label="Report nguồn"><span title={cand.sourceFile}>{cand.sourceFile}</span></KeyValue>
+          <KeyValue label="Management Number">{cand.managementNumber}</KeyValue>
+          <KeyValue label="Slide / Mục">
+            Slide {cand.slide}
+            {typeof cand.itemIndex === 'number' && cand.itemIndex >= 0 && ` · Mục #${cand.itemIndex + 1}`}
+          </KeyValue>
+          {cand.itemHeading && (
+            <KeyValue label="Tiêu đề mục"><span title={cand.itemHeading}>{cand.itemHeading}</span></KeyValue>
+          )}
+          <KeyValue label="Dự đoán">{cand.decision}</KeyValue>
+          <KeyValue label="Độ tin cậy">
+            {CONFIDENCE_LABEL[cand.confidenceBand]} <span className="text-muted">({cand.confidence.toFixed(2)})</span>
+          </KeyValue>
+          <KeyValue label="Vào Excel">
+            {cand.excelEligible ? 'Đủ điều kiện'
+              : <span className="text-warn-600">Chưa đủ điều kiện — {cand.eligibilityReason}</span>}
+          </KeyValue>
+        </div>
+
+        {/* Diagnostic / longer content stays below (scrollable) */}
         <p className="mb-1 mt-2.5 text-base2 font-medium text-header">Lý do</p>
         <ul className="max-h-[110px] list-disc overflow-y-auto pl-5 text-xs2 leading-[17px] text-body">
           {cand.evidence.map((e) => <li key={e}>{e}</li>)}
         </ul>
         {cand.nearbyText && <p className="mt-1.5 text-xs2 text-muted">Chữ gần ảnh: “{cand.nearbyText}”</p>}
-
-        <div className="mt-3 border-t border-lineSoft pt-2.5">
-          <p className="mb-1.5 text-base2 font-medium text-header">Chọn nhãn xác nhận</p>
-          <div className="grid grid-cols-2 gap-1.5">
-            {IMAGE_LABELS.map((l) => (
-              <Button key={l.key} active={cand.userLabel === l.key} disabled={s.locked}
-                className="justify-center"
-                onClick={() => s.labelImage(cand.id, l.key)}>
-                {l.label}
-              </Button>
-            ))}
-          </div>
-
-          <p className="mb-1 mt-3 text-base2 font-medium text-header">Ghi chú</p>
-          <TextInput
-            value={cand.note}
-            disabled={s.locked}
-            maxLength={1000}
-            placeholder="Ghi chú cho đối tượng này (không bắt buộc)"
-            onChange={(e) => s.setNote('image', cand.id, e.target.value)}
-          />
-
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Button icon={<ChevronLeft className="h-3.5 w-3.5" />} disabled={index === 0}
-              onClick={() => s.setImageReviewIndex(index - 1)}>
-              Mục trước
-            </Button>
-            <Button disabled={index >= list.length - 1} onClick={() => s.setImageReviewIndex(index + 1)}>
-              Mục tiếp
-              <ChevronRight className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-          <Button
-            variant="primary"
-            className="mt-2 w-full justify-center"
-            icon={<Save className="h-3.5 w-3.5" />}
-            disabled={!chosen || s.locked}
-            onClick={() => void s.saveImageCandidate(cand.id, cand.userLabel, cand.note)}
-          >
-            Lưu nhãn & ghi chú
-          </Button>
-          {chosen && (
-            <span className={cn('mt-2 inline-flex items-center gap-1.5 text-xs2', cand.labelPending ? 'text-warn-600' : 'text-ok-600')}>
-              {cand.labelPending ? <AlertTriangle className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-              {cand.labelPending ? `Nhãn “${labelName(cand.userLabel)}” chưa lưu.` : `Nhãn “${labelName(cand.userLabel)}” đã lưu cục bộ.`}
-            </span>
-          )}
-        </div>
       </div>
     </section>
   )

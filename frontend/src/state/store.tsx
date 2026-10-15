@@ -677,6 +677,27 @@ function useStoreValue() {
       setLearningState(next)
     } catch (error) { recordError(error) }
   }, [learningState.images, recordError])
+  // PROMPT-030 §6: bulk label convenience — each candidate retains its own identity, the loop is only a UI helper
+  const labelImagesBulk = useCallback(async (ids: string[], label: string) => {
+    if (!ids.length) return
+    try {
+      for (const id of ids) {
+        const c = learningState.images.find((item) => item.id === id)
+        // set_learning_label is the per-candidate bridge; handle each but report the batch result once
+        await callNative<LearningState>('set_learning_label', 'image', id, label, c?.note || '')
+      }
+      const notes = Object.fromEntries(
+        ids.map((id) => {
+          const c = learningState.images.find((item) => item.id === id)
+          return [id, c?.note || '']
+        }),
+      )
+      const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', 'image', notes)
+      setLearningState({ ...EMPTY_LEARNING, ...result.state })
+      setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
+      setErrorMessage(result.message)
+    } catch (error) { recordError(error) }
+  }, [learningState.images, recordError])
   const labelContent = useCallback(async (id: string, label: string) => {
     const candidate = learningState.contents.find((item) => item.id === id)
     try {
@@ -769,7 +790,7 @@ function useStoreValue() {
     update, setUpdate, checkUpdate, installUpdate, chooseUpdateFolder,
     diagRows, diagRunning, runDiagnostics,
     learning: learningState, refreshLearning, imageReviewIndex, setImageReviewIndex, contentReviewIndex, setContentReviewIndex,
-    labelImage, labelContent, setNote, saveImageLabels, saveContentLabels, saveImageCandidate, saveContentCandidate,
+    labelImage, labelImagesBulk, labelContent, setNote, saveImageLabels, saveContentLabels, saveImageCandidate, saveContentCandidate,
     trainModels, exportLearningData,
     openLearningFolder, applyLabelsToExcel, dismissExcelResult, training,
     inputFileName, chooseReportFolder, choosePptxFile, chooseTemplateFile, chooseOutputFile,
