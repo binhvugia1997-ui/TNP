@@ -1147,6 +1147,31 @@ function useStoreValue() {
   }, [persistLabel])
   const labelImage = useCallback((id: string, label: string) => applyLocalLabel('image', id, label), [applyLocalLabel])
   const labelContent = useCallback((id: string, label: string) => applyLocalLabel('content', id, label), [applyLocalLabel])
+  // PROMPT-030 §6: bulk label convenience — each candidate retains its own identity, the loop is only a UI
+  // helper.  The bulk path keeps the explicit set + save pair (set_learning_label / save_learning_labels) so a
+  // whole same-slide selection is confirmed in ONE visible batch; single-candidate clicks stay on the
+  // PROMPT-036S optimistic fast path above.
+  const labelImagesBulk = useCallback(async (ids: string[], label: string) => {
+    if (!ids.length) return
+    try {
+      for (const id of ids) {
+        const c = learningStateRef.current.images.find((item) => item.id === id)
+        // set_learning_label is the per-candidate bridge; handle each but report the batch result once
+        await callNative<unknown>('set_learning_label', 'image', id, label, c?.note || '')
+      }
+      const notes = Object.fromEntries(
+        ids.map((id) => {
+          const c = learningStateRef.current.images.find((item) => item.id === id)
+          return [id, c?.note || '']
+        }),
+      )
+      const result = await callNative<{ message: string; state: LearningState }>('save_learning_labels', 'image', notes)
+      acceptLearningState(normalizeLearning(result.state))
+      setErrorCode(result.state.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
+      setErrorMessage(result.message)
+      setTraining(false)
+    } catch (error) { recordError(error) }
+  }, [acceptLearningState, recordError])
   const setNote = useCallback((kind: 'image' | 'content', id: string, note: string) => {
     const entry = localLabelsRef.current.get(`${kind}:${id}`)
     if (entry) entry.note = note
@@ -1279,7 +1304,7 @@ function useStoreValue() {
     diagRows, diagRunning, runDiagnostics,
     learning: learningState, learningLoad, refreshLearning,
     imageReviewIndex, setImageReviewIndex, contentReviewIndex, setContentReviewIndex,
-    labelImage, labelContent, setNote, saveImageLabels, saveContentLabels, saveImageCandidate, saveContentCandidate,
+    labelImage, labelImagesBulk, labelContent, setNote, saveImageLabels, saveContentLabels, saveImageCandidate, saveContentCandidate,
     trainModels, exportLearningData,
     openLearningFolder, applyLabelsToExcel, dismissExcelResult, training,
     inputFileName, chooseReportFolder, choosePptxFile, chooseTemplateFile, chooseOutputFile,

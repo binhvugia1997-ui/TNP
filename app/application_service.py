@@ -908,6 +908,205 @@ class ApplicationService:
             self._update_close_requested = True
             return {"status": "closing", "message": "Ứng dụng sẽ khởi động lại sau khi cài đặt."}
 
+    def _persisted_image_dto(self, rec: dict, learning) -> Optional[dict]:
+        """DTO for a previously labeled candidate that is NOT in the current processor run.
+
+        Survives app/machine restart and update (PROMPT-030 §7–8): the visual asset is
+        loaded from ``learning_data/previews/`` (never %TEMP%), the label/note are
+        from the JSONL, and provenance (bounds/slide/etc.) is from the side-car JSON
+        or the record itself.  Missing/corrupt preview is tolerated — the label is
+        still returned with ``src=""`` and ``slidePreview=""`` so the learning dataset
+        is never discarded.
+        """
+        try:
+            candidate_id = rec.get("candidate_id", "")
+            if not candidate_id:
+                return None
+            # Source/provenance — some older records have only source_name
+            source_name = rec.get("source_name", "") or rec.get("source_file", "") or ""
+            source_file = rec.get("source_file", "") or source_name
+            # Try to enrich from the persisted side-car provenance JSON
+            prov = {}
+            try:
+                from .image_learning import learning_asset_key
+                import json as _json
+                # Side-car is stored alongside the preview JPG under learning_data/previews/<key>.json
+                # Try both source_file-aware and fallback keys
+                for _sf in (source_file, ""):
+                    try:
+                        _key = learning_asset_key(candidate_id, _sf)
+                        _meta_path = learning.dir / "previews" / (_key + ".json")
+                        if _meta_path.is_file():
+                            prov = _json.loads(_meta_path.read_text(encoding="utf-8"))
+                            break
+                    except Exception:
+                        continue
+                # Fallback scan: rec may have only filename while persisted key used absolute path.
+                # Scan side-cars for matching candidate_id to recover absolute source_file/provenance.
+                if not prov:
+                    try:
+                        preview_dir = learning.dir / "previews"
+                        if preview_dir.is_dir():
+                            for _mp in preview_dir.glob("*.json"):
+                                # Skip _slide.json? they have candidate_id too but not candidate preview?
+                                try:
+                                    _data = _json.loads(_mp.read_text(encoding="utf-8"))
+                                    if _data.get("candidate_id") == candidate_id:
+                                        # Prefer the one that has a real JPEG alongside (candidate preview)
+                                        # but any matching candidate_id is better than no provenance.
+                                        prov = _data
+                                        # Use its source_file for subsequent preview load if rec lacked it
+                                        if _data.get("source_file"):
+                                            source_file = _data.get("source_file") or source_file
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+            except Exception:
+                prov = {}
+            mgmt = rec.get("management_number", "") or prov.get("management_number", "") or candidate_id.split("|")[0] if "|" in candidate_id else ""
+            slide = int(rec.get("slide") or prov.get("slide") or 0)
+            shape_id = int(rec.get("shape_id") or rec.get("picture_id") or prov.get("shape_id") or 0)
+            bounds = prov.get("bounds") or (0, 0, 0, 0)
+            if isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+                x, y, w, h = (int(v) for v in bounds)
+            else:
+                x, y, w, h = 0, 0, 0, 0
+            slide_size = prov.get("slide_size") or (0, 0)
+            if isinstance(slide_size, (list, tuple)) and len(slide_size) == 2:
+                bw, bh = int(slide_size[0] or 1), int(slide_size[1] or 1)
+            else:
+                bw, bh = 12192000, 6858000  # 13.33" x 7.5" default
+            if bw <= 0 or bh <= 0:
+                bw, bh = 12192000, 6858000
+            # Load preview (tolerate missing/corrupt — don't crash startup)
+            src = ""
+            try:
+                from .image_learning import load_persisted_preview_data_uri, load_persisted_preview
+                # Try file-path-aware key first for collision safety, then fallback
+                # Also try prov source_file if available (abs path) when rec had only filename.
+                candidates_sf = [source_file]
+                if prov.get("source_file") and prov.get("source_file") not in candidates_sf:
+                    candidates_sf.append(prov.get("source_file"))
+                if source_name and source_name not in candidates_sf:
+                    candidates_sf.append(source_name)
+                candidates_sf.append("")
+                for _sf_try in candidates_sf:
+                    src = load_persisted_preview_data_uri(candidate_id, learning.dir, _sf_try or "")
+                    if src:
+                        break
+                if not src:
+                    for _sf_try in candidates_sf:
+                        raw = load_persisted_preview(candidate_id, learning.dir, _sf_try or "")
+                        if raw:
+                            src = self._bytes_data_uri(raw)
+                            if src:
+                                break
+                # Final scan fallback: look for any preview file whose side-car matches candidate_id
+                if not src:
+                    try:
+                        preview_dir = learning.dir / "previews"
+                        if preview_dir.is_dir():
+                            for _jpg in preview_dir.glob("*.jpg"):
+                                if _jpg.name.endswith("_slide.jpg"):
+                                    continue
+                                _stem = _jpg.stem
+                                _json = preview_dir / (_stem + ".json")
+                                if _json.is_file():
+                                    import json as _js2
+                                    try:
+                                        _d = _js2.loads(_json.read_text(encoding="utf-8"))
+                                        if _d.get("candidate_id") == candidate_id:
+                                            import base64 as _b64
+                                            _raw = _jpg.read_bytes()
+                                            src = "data:image/jpeg;base64," + _b64.b64encode(_raw).decode("ascii")
+                                            break
+                                    except Exception:
+                                        continue
+                    except Exception:
+                        pass
+            except Exception:
+                src = ""
+            # Slide preview fallback: try persisted slide render if live render not possible
+            slide_preview = ""
+            spw = sph = 0
+            try:
+                import hashlib, base64
+                from pathlib import Path as _P
+                for sk in (f"{candidate_id}|slide{slide}|{_P(source_file).name if source_file else ''}",
+                           f"{candidate_id}|slide", candidate_id):
+                    _k = hashlib.sha256(sk.encode("utf-8")).hexdigest()[:24]
+                    _sp = learning.dir / "previews" / (_k + "_slide.jpg")
+                    if _sp.is_file() and _sp.stat().st_size > 0:
+                        _raw = _sp.read_bytes()
+                        slide_preview = "data:image/jpeg;base64," + base64.b64encode(_raw).decode("ascii")
+                        try:
+                            from PIL import Image
+                            import io as _io
+                            with Image.open(_io.BytesIO(_raw)) as _im:
+                                spw, sph = _im.size
+                        except Exception:
+                            spw = sph = 0
+                        break
+            except Exception:
+                pass
+            # Geometry fractions — keep even when persisted so the highlight math is defined
+            try:
+                fx, fy, fw, fh = slide_fraction_box((x, y, w, h), bw, bh)
+            except Exception:
+                fx, fy, fw, fh = 0.0, 0.0, 0.0, 0.0
+            label = rec.get("label", "") or "AFTER"
+            # Confirmation source is authoritative (user label)
+            # Use stored confidence/evidence when available, else defaults
+            confidence = float(rec.get("deterministic_confidence") or prov.get("confidence") or 0.5)
+            kind = rec.get("deterministic_kind", "") or prov.get("decision", "")
+            evidence = [f"Đã xác nhận: {label} (khôi phục sau khởi động)"]
+            if kind:
+                evidence.append(f"quy tắc ban đầu: {kind}")
+            # Item identity from provenance
+            item_id = prov.get("item_id", "") or ""
+            item_idx = prov.get("item_index", -1)
+            try:
+                item_idx = int(item_idx)
+            except Exception:
+                item_idx = -1
+            item_heading = prov.get("item_heading", "") or ""
+            return {
+                "id": candidate_id,
+                "sourceFile": source_name,
+                "managementNumber": mgmt,
+                "slide": slide,
+                "pictureId": str(shape_id),
+                "src": src,
+                "bounds": {"x": round(x / bw * 100, 2) if bw else 0, "y": round(y / bh * 100, 2) if bh else 0,
+                           "w": round(w / bw * 100, 2) if bw else 0, "h": round(h / bh * 100, 2) if bh else 0},
+                "slideWidth": bw, "slideHeight": bh,
+                "targetBbox": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
+                "targetBboxPct": {"x": round(fx * 100, 3), "y": round(fy * 100, 3),
+                                  "w": round(fw * 100, 3), "h": round(fh * 100, 3)},
+                "targetKind": "picture",
+                "slidePreview": slide_preview,
+                "slidePreviewWidth": spw, "slidePreviewHeight": sph,
+                "itemId": item_id, "itemIndex": item_idx, "itemHeading": item_heading,
+                "decision": "include" if label == "AFTER" else "exclude" if label in ("BEFORE", "CONTROL", "IGNORE") else "review",
+                "confidenceBand": "high" if confidence >= 0.75 or confidence <= 0.25 else "medium" if confidence >= 0.6 or confidence <= 0.4 else "low",
+                "confidence": confidence,
+                "evidence": evidence,
+                "excelEligible": label == "AFTER",
+                "eligibilityReason": "" if label == "AFTER" else "Không phải Sau cải tiến (khôi phục từ dữ liệu đã lưu)",
+                "nearbyText": "",
+                "userLabel": label,
+                "labelPending": False,
+                "note": rec.get("note", "") or prov.get("note", "") or "",
+                # PROMPT-030: mark as persisted-restored so the UI can indicate the preview may be from cache
+                "persisted": True,
+                "previewAvailable": bool(src),
+            }
+        except Exception as exc:  # noqa: BLE001 — one corrupt record never hides the others
+            LOG.debug("persisted dto failed for %s: %s", rec.get("candidate_id", "?"), exc)
+            return None
+
     # ------------------------------------------------------------------ learning: real candidates, labels, Excel reapply, model training
     def learning_state(self) -> dict:
         with self._lock:
@@ -951,6 +1150,20 @@ class ApplicationService:
                 content_labeled_ids = saved_content_ids | set(c.pending_content_labels)
                 image_total_ids = saved_image_ids | {x.candidate_id for x in image_candidates}
                 content_total_ids = saved_content_ids | {x.candidate_id for x in content_candidates}
+                # PROMPT-030: after app/machine restart processor.results is empty, but previously
+                # confirmed labels + persisted previews must still be visible in the review workspace.
+                # Append DTOs built from the JSONL + persisted assets for any labeled candidate that is
+                # not already in the live candidate list.  Missing/corrupt preview is tolerated — the
+                # label row still appears (previewAvailable=false) so the learned dataset is never hidden.
+                # (Runs BEFORE the PROMPT-032 status computation so its count stays == len(images).)
+                live_ids = {x.candidate_id for x in image_candidates}
+                for cid, rec in lrn.store.latest().items():
+                    if cid not in live_ids:
+                        dto = self._persisted_image_dto(rec, lrn)
+                        if dto is not None:
+                            images.append(dto)
+                        else:
+                            LOG.debug("persisted dto missing for %s (tolerating)", cid)
                 if c.is_running():
                     state, reason = "processing", "processing"
                 elif processor is None:
@@ -1014,6 +1227,9 @@ class ApplicationService:
         c = self.controller
         if kind == "image":
             candidate = next((item for item in c.review_candidates() if item.candidate_id == candidate_id), None)
+            if candidate is None and c.learning is not None and candidate_id in c.learning.store.latest():
+                # PROMPT-030: allow relabeling persisted candidates after restart (also for the fast/save paths)
+                candidate = self._synthetic_image_candidate(candidate_id, c.learning)
             if candidate is None:
                 raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
             c.set_pending_label(candidate, label, note)
@@ -1023,6 +1239,64 @@ class ApplicationService:
             if candidate is None:
                 raise ServiceError("Khối nội dung này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
             c.set_pending_content_label(candidate, label, note)
+
+    def _synthetic_image_candidate(self, candidate_id: str, learning):
+        """Lightweight candidate for relabeling a persisted record after restart (PROMPT-030 §9).
+
+        The original PPTX is not re-parsed — only enough fields to satisfy
+        ``LabelStore.label()`` are populated; missing geometry falls back to defaults
+        and never hides the learned row (tolerates missing/corrupt side-car).
+        """
+        rec = learning.store.latest().get(candidate_id)
+        if rec is None:
+            return None
+        from types import SimpleNamespace
+        import hashlib as _hl, json as _js
+        from pathlib import Path as _P
+        # Try provenance side-car for richer fields
+        prov = {}
+        try:
+            from .image_learning import learning_asset_key
+            for _sf in (rec.get("source_file", "") or rec.get("source_name", ""), ""):
+                try:
+                    _k = learning_asset_key(candidate_id, _sf)
+                    _mp = learning.dir / "previews" / (_k + ".json")
+                    if _mp.is_file():
+                        prov = _js.loads(_mp.read_text(encoding="utf-8"))
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            prov = {}
+        bounds = prov.get("bounds") or (0, 0, 900000, 700000)
+        slide_size = prov.get("slide_size") or (12192000, 6858000)
+        try:
+            bounds = tuple(int(v) for v in bounds)  # type: ignore
+            slide_size = tuple(int(v) for v in slide_size)  # type: ignore
+        except Exception:
+            bounds = (0, 0, 900000, 700000)
+            slide_size = (12192000, 6858000)
+        return SimpleNamespace(
+            candidate_id=candidate_id,
+            management_number=rec.get("management_number", "") or prov.get("management_number", "") or "",
+            source_name=rec.get("source_name", "") or prov.get("source_name", "") or "",
+            source_file=rec.get("source_file", "") or prov.get("source_file", "") or "",
+            slide=int(rec.get("slide") or prov.get("slide") or 0),
+            picture_id=int(rec.get("picture_id") or rec.get("shape_id") or prov.get("shape_id") or 0),
+            order=0,
+            bounds=bounds, slide_size=slide_size,
+            block_bounds=bounds,
+            features=dict(rec.get("features") or prov.get("features") or {}),
+            deterministic_kind=rec.get("deterministic_kind", "") or prov.get("deterministic_kind", "") or "ambiguous",
+            confidence=float(rec.get("deterministic_confidence") or prov.get("confidence") or 0.5),
+            hard_excluded=False, hard_reason="",
+            nearby_text="", nearest_heading="", nearest_caption="", nearest_text_color="",
+            logical_item_owner=prov.get("item_id", "") or "",
+            owner_heading=prov.get("item_heading", "") or "",
+            item_index=int(prov.get("item_index", -1) or -1),
+            confident_owner=False, decision="review", decision_source="rules",
+            evidence=[], excel_output_eligible=False, eligibility_reason="",
+        )
 
     def set_learning_label(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
         kind = self._choice(kind, "kind", {"image", "content"})
@@ -1348,7 +1622,7 @@ class ApplicationService:
             LOG.debug("WEBVIEW_IMAGE_PREVIEW_UNAVAILABLE file=%s error=%s", path.name, exc)
             return ""
 
-    # ------------------------------------------------------------------ PROMPT-024R learning workspace
+    # ------------------------------------------------------------------ PROMPT-024R learning workspace (PROMPT-030: persistent assets survive restart)
     def _slide_preview_for(self, candidate, learning=None) -> Dict[str, Any]:
         """FULL authored slide of one candidate + the slide's authoritative After evidence regions.
 
@@ -1362,59 +1636,122 @@ class ApplicationService:
         fallback is never reused.  A preview produced while a faithful backend FAILED is marked degraded and expires
         after :data:`DEGRADED_PREVIEW_TTL_S`, so recovery is never hidden.  §15: the evidence regions returned here are
         the SAME :class:`ImprovementVisualRegion` objects the production Excel pipeline crops from.
+
+        PROMPT-030: when the rendered slide bytes are produced they are also persisted under
+        ``learning_data/previews/`` (stable key, atomic write), and a candidate whose PPTX is gone from this run
+        (app/machine restart, file moved) falls back to the persisted render — never a %TEMP% path.
         """
         empty = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "regions": []}
         regions: List[Dict[str, Any]] = []
         try:
-            source = Path(candidate.source_file)
-            if not source or not source.is_file():
-                return empty
-            from .qpn_renderer import RENDER_SCHEMA_VERSION, SlideRenderer, is_faithful_backend
-            from .report_identity import report_scope_key
+            source = Path(candidate.source_file) if getattr(candidate, "source_file", "") else Path("")
             slide_number = int(candidate.slide)
-            renderer = SlideRenderer(width_px=LEARNING_PREVIEW_WIDTH_PX)  # same chain as production
-            stat = source.stat()
-            key = (report_scope_key(source), str(source), slide_number, int(stat.st_mtime_ns), int(stat.st_size),
-                   tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION,
-                   tuple(sorted(renderer.availability().items())), self._learning_identity(learning))
-            cached = self._slide_preview_cache.get(key)
-            if cached is not None and not self._preview_expired(cached):
-                return dict(cached)
-            from .pptx_parser import parse_pptx
-            report = parse_pptx(source)
-            if report.slide(slide_number) is None:
-                self._remember_preview(key, empty)
-                return dict(empty)
-            # §15: the authoritative item-scoped After regions of this slide, from the SAME builder the
-            # Excel pipeline uses.  Resolved BEFORE rendering so a failed/reduced preview still reports
-            # the true evidence geometry instead of implying the picture belongs to no region at all.
-            regions = self._slide_evidence_regions(report, slide_number, candidate, learning)
-            result = {**empty, "regions": regions}
-            import tempfile
-            with tempfile.TemporaryDirectory(prefix="re_learning_slide_") as tmp:
-                paths = renderer.render(report, [slide_number], Path(tmp), purpose="learning_preview")
-                degraded = renderer.degraded
-                rendered = paths.get(slide_number)
-                if rendered is None or not Path(rendered).exists():
-                    self._remember_preview(key, {**result, "degraded": True, "created": time.monotonic()})
-                    return result                            # no bitmap, but the region truth is kept
-                from PIL import Image
-                with Image.open(rendered) as im:
-                    image = im.convert("RGB")
-                    width, height = image.size
-                    buf = io.BytesIO()
-                    image.save(buf, format="JPEG", quality=82, optimize=True)
-            result.update({"src": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii"),
-                           "width": width, "height": height,
-                           "backend": renderer.last_backend or "",
-                           "faithful": is_faithful_backend(renderer.last_backend),
-                           "degraded": degraded, "created": time.monotonic()})
-            self._remember_preview(key, result)
-            return result
+            key = None
+            if source and source.is_file():
+                from .qpn_renderer import RENDER_SCHEMA_VERSION, SlideRenderer, is_faithful_backend
+                from .report_identity import report_scope_key
+                renderer = SlideRenderer(width_px=LEARNING_PREVIEW_WIDTH_PX)  # same chain as production
+                stat = source.stat()
+                key = (report_scope_key(source), str(source), slide_number, int(stat.st_mtime_ns), int(stat.st_size),
+                       tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION,
+                       tuple(sorted(renderer.availability().items())), self._learning_identity(learning))
+                cached = self._slide_preview_cache.get(key)
+                if cached is not None and not self._preview_expired(cached):
+                    return dict(cached)
+                from .pptx_parser import parse_pptx
+                report = parse_pptx(source)
+                if report.slide(slide_number) is None:
+                    self._remember_preview(key, empty)
+                    return dict(empty)
+                # §15: the authoritative item-scoped After regions of this slide, from the SAME builder the
+                # Excel pipeline uses.  Resolved BEFORE rendering so a failed/reduced preview still reports
+                # the true evidence geometry instead of implying the picture belongs to no region at all.
+                regions = self._slide_evidence_regions(report, slide_number, candidate, learning)
+                result = {**empty, "regions": regions}
+                import tempfile
+                with tempfile.TemporaryDirectory(prefix="re_learning_slide_") as tmp:
+                    paths = renderer.render(report, [slide_number], Path(tmp), purpose="learning_preview")
+                    degraded = renderer.degraded
+                    rendered = paths.get(slide_number)
+                    if rendered is None or not Path(rendered).exists():
+                        self._remember_preview(key, {**result, "degraded": True, "created": time.monotonic()})
+                        restored = self._persisted_slide_preview(candidate)
+                        return restored if restored is not None else result   # region truth is kept either way
+                    from PIL import Image
+                    with Image.open(rendered) as im:
+                        image = im.convert("RGB")
+                        width, height = image.size
+                        buf = io.BytesIO()
+                        image.save(buf, format="JPEG", quality=82, optimize=True)
+                        raw_bytes = buf.getvalue()
+                result.update({"src": "data:image/jpeg;base64," + base64.b64encode(raw_bytes).decode("ascii"),
+                               "width": width, "height": height,
+                               "backend": renderer.last_backend or "",
+                               "faithful": is_faithful_backend(renderer.last_backend),
+                               "degraded": degraded, "created": time.monotonic()})
+                # PROMPT-030: persist for restart (best-effort, duplicate-prevention, atomic write)
+                self._persist_slide_preview_asset(candidate, source, raw_bytes)
+                self._remember_preview(key, result)
+                return result
+            # No live PPTX in this run (restart / moved file): fall back to the persisted slide render.
+            restored = self._persisted_slide_preview(candidate)
+            return restored if restored is not None else dict(empty)
         except Exception as exc:  # noqa: BLE001 – preview is display-only; never break the review state
             LOG.debug("WEBVIEW_SLIDE_PREVIEW_UNAVAILABLE candidate=%s error=%s",
                       getattr(candidate, "candidate_id", "?"), exc)
             return {**empty, "regions": regions}             # not cached: the render is retried later
+
+    def _persist_slide_preview_asset(self, candidate, source: Path, raw_bytes: bytes) -> None:
+        """PROMPT-030: best-effort persistence of one rendered slide under ``learning_data/previews/``.
+
+        Keyed by (candidate_id, slide, source basename) so the file survives restart even when the PPTX is
+        no longer re-parsed; duplicate-prevention keeps an already persisted JPEG; the write is atomic."""
+        try:
+            lrn = self.controller.learning
+            if lrn is None or not raw_bytes:
+                return
+            from .image_learning import persist_slide_preview
+            import hashlib as _hl2
+            name = source.name if source else ""
+            for _sk in (f"{candidate.candidate_id}|slide{int(candidate.slide)}|{name}",
+                        f"{candidate.candidate_id}|slide"):
+                _pkey = _hl2.sha256(_sk.encode("utf-8")).hexdigest()[:24]
+                _existing = lrn.dir / "previews" / (_pkey + "_slide.jpg")
+                if _existing.is_file() and _existing.stat().st_size > 0:
+                    continue  # already persisted, keep existing JPEG
+                persist_slide_preview(_sk, raw_bytes, lrn.dir)
+        except Exception as exc:  # noqa: BLE001 — display must never break if persist fails
+            LOG.debug("persist slide preview failed %s: %s", getattr(candidate, "candidate_id", "?"), exc)
+
+    def _persisted_slide_preview(self, candidate) -> Optional[Dict[str, Any]]:
+        """PROMPT-030: the slide render persisted by a previous run, or ``None`` when missing/corrupt.
+
+        Survives app/machine restart and update (the asset lives under ``learning_data/previews/``, never
+        %TEMP%).  The restored record reports no backend (it is a stored bitmap, not a fresh render) and
+        carries no evidence regions — geometry truth needs the live PPTX."""
+        try:
+            lrn = self.controller.learning
+            if lrn is None:
+                return None
+            import hashlib
+            source = getattr(candidate, "source_file", "") or ""
+            name = Path(source).name if source else ""
+            for sk in (f"{candidate.candidate_id}|slide{int(candidate.slide)}|{name}",
+                       f"{candidate.candidate_id}|slide",
+                       f"{candidate.candidate_id}"):
+                pkey = hashlib.sha256(sk.encode("utf-8")).hexdigest()[:24]
+                cand_path = lrn.dir / "previews" / (pkey + "_slide.jpg")
+                if cand_path.is_file() and cand_path.stat().st_size > 0:
+                    raw = cand_path.read_bytes()
+                    from PIL import Image
+                    with Image.open(io.BytesIO(raw)) as im:
+                        w, h = im.size
+                    uri = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+                    return {"src": uri, "width": w, "height": h, "backend": "", "faithful": False,
+                            "regions": [], "persisted": True}
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("persisted slide preview fallback failed %s: %s", getattr(candidate, "candidate_id", "?"), exc)
+        return None
 
     @staticmethod
     def _learning_identity(learning) -> tuple:
@@ -1504,14 +1841,76 @@ class ApplicationService:
                 matches = scoped
         return min(matches, key=lambda r: int(r.get("afterBlockIndex", 0)))
 
+    def _persisted_image_preview_uri(self, candidate) -> str:
+        """Load a persisted preview for *candidate* when the live PPTX blob is gone (restart)."""
+        try:
+            lrn = self.controller.learning
+            if lrn is None:
+                return ""
+            from .image_learning import load_persisted_preview_data_uri
+            return load_persisted_preview_data_uri(candidate.candidate_id, lrn.dir,
+                                                   getattr(candidate, "source_file", ""))
+        except Exception:
+            return ""
+
     def _image_candidate_dto(self, candidate, learning) -> dict:
+        # PROMPT-030 — SOURCE OF TRUTH / FALLBACK ORDER (B)
+        # 1) valid persisted Learning asset under learning_data/previews (survives restart/update)
+        # 2) regenerate from source PPTX (live candidate_blob → data URI → also persisted for future restart)
+        # 3) current-session/transient in-memory _preview_cache
+        # 4) graceful missing-preview state (src="")
+        # Live wiring: when a real candidate enters Learning review (first DTO build), persist its
+        # visual asset immediately so restart does not depend on a transient data URI.  Duplicate
+        # prevention: candidate_has_persisted_preview() is checked so the same JPEG is not rewritten
+        # on every refresh; atomic .tmp→replace keeps the asset safe.  Stable identity via
+        # learning_asset_key(candidate_id + source_file) prevents collisions (same filename in
+        # different folders, multiple candidates on one slide).
         src = self._preview_cache.get(candidate.candidate_id)
-        if src is None:
+        if src is None or src == "":
             blob = self.controller.candidate_blob(candidate) or b""
             src = self._bytes_data_uri(blob)
-            self._preview_cache[candidate.candidate_id] = src
-            if len(self._preview_cache) > 128:
-                self._preview_cache.pop(next(iter(self._preview_cache)))
+            if src and blob:
+                # Live blob succeeded — persist for restart (best-effort, no duplicate every refresh)
+                try:
+                    from .image_learning import candidate_has_persisted_preview, persist_candidate_assets
+                    lrn = self.controller.learning
+                    if lrn is not None:
+                        sf = getattr(candidate, "source_file", "") or ""
+                        if not candidate_has_persisted_preview(candidate.candidate_id, lrn.dir, sf):
+                            provenance = {
+                                "management_number": getattr(candidate, "management_number", ""),
+                                "source_name": getattr(candidate, "source_name", ""),
+                                "slide": int(getattr(candidate, "slide", 0) or 0),
+                                "shape_id": int(getattr(candidate, "picture_id", 0) or 0),
+                                "bounds": list(getattr(candidate, "bounds", (0, 0, 0, 0))),
+                                "slide_size": list(getattr(candidate, "slide_size", (0, 0))),
+                                "item_id": getattr(candidate, "logical_item_owner", ""),
+                                "item_heading": getattr(candidate, "owner_heading", ""),
+                                "item_index": int(getattr(candidate, "item_index", -1) or -1),
+                                "decision": getattr(candidate, "decision", ""),
+                                "confidence": float(getattr(candidate, "confidence", 0.5) or 0.5),
+                            }
+                            persist_candidate_assets(candidate.candidate_id, blob, lrn.dir,
+                                                     source_file=sf, provenance=provenance)
+                except Exception as exc2:  # noqa: BLE001 — display must never break if persist fails
+                    LOG.debug("live persist candidate preview failed %s: %s",
+                              getattr(candidate, "candidate_id", "?"), exc2)
+            if not src:
+                # Persisted fallback — survives app/machine restart, update, and missing PPTX
+                src = self._persisted_image_preview_uri(candidate)
+            if src:
+                self._preview_cache[candidate.candidate_id] = src
+                if len(self._preview_cache) > 128:
+                    self._preview_cache.pop(next(iter(self._preview_cache)))
+            else:
+                # Cache the miss too (avoid re-probing) — but allow fallback to still be found
+                self._preview_cache[candidate.candidate_id] = ""
+        elif src == "":
+            # Cached empty — try persisted before giving up (migration may have just saved it)
+            persisted = self._persisted_image_preview_uri(candidate)
+            if persisted:
+                src = persisted
+                self._preview_cache[candidate.candidate_id] = src
         bw = max(1, int(candidate.slide_size[0] or 1))
         bh = max(1, int(candidate.slide_size[1] or 1))
         x, y, w, h = candidate.bounds

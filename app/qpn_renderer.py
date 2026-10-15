@@ -55,9 +55,55 @@ MIN_TEXT_PX = 10
 
 
 # ----------------------------------------------------------------------------
-# Availability checks
+# Availability checks — probe vs. actual render (PROMPT-030)
 # ----------------------------------------------------------------------------
 POWERPOINT_PROGID = "PowerPoint.Application"
+
+
+class PowerPointProbeResult(tuple):
+    """Dual-view result of the side-effect-free availability probe (never launches PowerPoint).
+
+    Sequence view — the PROMPT-027R contract: exactly ``(available, stage, detail)`` where ``stage``
+    names the first check that failed (``""`` / ``"availability"`` / ``"import"``) and ``detail`` is a
+    safe, path-free explanation.  Legacy call sites may unpack or compare it as a plain 3-tuple.
+
+    Attribute view — the PROMPT-030 contract: ``.available`` (bool), ``.stage`` (semantic stage name:
+    ``ok`` / ``not_windows`` / ``registry_missing`` / ``win32com_missing`` / ``unavailable``),
+    ``.reason`` (human-readable; never contains absolute paths) and ``.details`` (technical detail).
+
+    Both views are produced by ONE probe, so they can never disagree about availability itself.
+    ``available`` in both views is the same ``bool`` singleton.
+    """
+
+    # semantic stage -> (sequence stage, sequence detail) for callers that construct the result
+    # directly (tests, tools) instead of going through :func:`powerpoint_probe`.
+    _SEQ_VIEW = {
+        "ok": ("", "progid-com"),
+        "not_windows": ("availability", "not-windows"),
+        "registry_missing": ("availability", "progid-not-registered"),
+        "win32com_missing": ("import", "win32com.client ImportError"),
+        "unavailable": ("availability", "unavailable"),
+    }
+
+    def __new__(cls, available: bool, stage: str, reason: str = "", details: str = "",
+                *, seq: Optional[Tuple[bool, str, str]] = None):
+        flag = bool(available)
+        if seq is None:
+            seq_stage, seq_detail = cls._SEQ_VIEW.get(stage, ("availability", str(stage)))
+            seq = (flag, seq_stage, seq_detail)
+        obj = tuple.__new__(cls, seq)
+        obj.available = flag
+        obj.stage = stage
+        obj.reason = reason
+        obj.details = details
+        return obj
+
+    @classmethod
+    def _make(cls, available: bool, seq_stage: str, seq_detail: str,
+              stage: str, reason: str, details: str = "") -> "PowerPointProbeResult":
+        """Build both views explicitly (the production probe keeps its exact PROMPT-027R detail strings)."""
+        return cls(available, stage, reason, details,
+                   seq=(bool(available), seq_stage, seq_detail))
 
 
 def _powerpoint_progid_registered(pythoncom_module) -> Tuple[bool, str]:
@@ -82,23 +128,33 @@ def _powerpoint_progid_registered(pythoncom_module) -> Tuple[bool, str]:
     return False, f"progid-not-registered ({com_reason})"
 
 
-def powerpoint_probe() -> Tuple[bool, str, str]:
-    """(available, stage, detail).  Side-effect free: it never starts PowerPoint.  ``stage`` names the first check that
-    failed (``availability`` / ``import``); ``detail`` is a safe, path-free explanation for diagnostics."""
+def powerpoint_probe() -> PowerPointProbeResult:
+    """Side-effect free: it never starts PowerPoint.  See :class:`PowerPointProbeResult` for the two
+    views of the answer — the sequence form ``(available, stage, detail)`` (PROMPT-027R) and the
+    attribute form ``.available/.stage/.reason/.details`` (PROMPT-030)."""
     if sys.platform != "win32":
-        return False, "availability", "not-windows"
+        return PowerPointProbeResult._make(False, "availability", "not-windows",
+                                           "not_windows", "Không phải Windows", "platform != win32")
     try:
         import pythoncom  # type: ignore  # pywin32
     except Exception as exc:  # noqa: BLE001
-        return False, "import", f"pythoncom {type(exc).__name__}"
+        return PowerPointProbeResult._make(False, "import", f"pythoncom {type(exc).__name__}",
+                                           "win32com_missing", "Thiếu pythoncom — không gọi được PowerPoint COM",
+                                           f"ImportError pythoncom: {type(exc).__name__}")
     try:
         import win32com.client  # type: ignore  # noqa: F401
     except Exception as exc:  # noqa: BLE001
-        return False, "import", f"win32com.client {type(exc).__name__}"
+        return PowerPointProbeResult._make(False, "import", f"win32com.client {type(exc).__name__}",
+                                           "win32com_missing", "Thiếu pywin32 (win32com) — không gọi được PowerPoint COM",
+                                           f"ImportError: {type(exc).__name__}")
     registered, how = _powerpoint_progid_registered(pythoncom)
     if not registered:
-        return False, "availability", how
-    return True, "", how
+        return PowerPointProbeResult._make(False, "availability", how,
+                                           "registry_missing",
+                                           "PowerPoint chưa được cài đặt (không có registry PowerPoint.Application)",
+                                           how)
+    return PowerPointProbeResult._make(True, "", how,
+                                       "ok", f"PowerPoint có sẵn ({how})", how)
 
 
 def powerpoint_available() -> bool:
@@ -133,11 +189,48 @@ def pymupdf_available() -> bool:
         return False
 
 
+@dataclass
+class PowerPointRenderDiagnostics:
+    """Stage-by-stage record of a PowerPoint render attempt (for logs and UI)."""
+    availability: str = ""          # probe stage
+    availability_reason: str = ""
+    com_init: str = ""              # ok | already_initialized | failed | not_attempted
+    com_init_detail: str = ""
+    open_result: str = ""           # ok | failed | not_attempted
+    open_detail: str = ""
+    export_result: str = ""         # ok | failed | partial | not_attempted
+    export_detail: str = ""
+    cleanup: str = ""               # ok | failed | not_attempted
+    fallback_reason: str = ""       # final human-readable reason when PowerPoint was not used
+    fallback_stage: str = ""        # probe | com_init | open | export | cleanup | none
+
+
+# module-level last diagnostics (updated by the most recent SlideRenderer.render powerpoint attempt)
+_last_powerpoint_diagnostics: Optional[PowerPointRenderDiagnostics] = None
+
+
+def last_powerpoint_diagnostics() -> Optional[PowerPointRenderDiagnostics]:
+    return _last_powerpoint_diagnostics
+
+
 def renderer_status() -> Dict[str, str]:
+    # PROMPT-027R/028 contract: the summary value stays exactly "OK" / "Unavailable";
+    # the staged probe explanation lives in renderer_status_detailed() (PROMPT-030).
     return {
         "powerpoint": "OK" if powerpoint_available() else "Unavailable",
         "libreoffice": "OK" if (find_soffice() and pymupdf_available()) else "Unavailable",
         "builtin": "OK",
+    }
+
+
+def renderer_status_detailed() -> Dict[str, dict]:
+    """PROMPT-030: per-backend status with the probe's stage/reason/details for diagnostics UI."""
+    probe = powerpoint_probe()
+    return {
+        "powerpoint": {"status": "OK" if probe.available else "Unavailable",
+                       "stage": probe.stage, "reason": probe.reason, "details": probe.details},
+        "libreoffice": {"status": "OK" if (find_soffice() and pymupdf_available()) else "Unavailable"},
+        "builtin": {"status": "OK"},
     }
 
 
@@ -215,7 +308,7 @@ def get_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
 
 
 # ----------------------------------------------------------------------------
-# 1) PowerPoint COM
+# 1) PowerPoint COM  (PROMPT-030: staged diagnostics + robust COM apartment handling)
 # ----------------------------------------------------------------------------
 class PowerPointStageError(RuntimeError):
     """A PowerPoint COM failure tagged with the stage that failed (PROMPT-027R §14).
@@ -365,31 +458,88 @@ def _wait_for_process_exit(pid: int) -> bool:
 
 
 def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Path,
-                           width_px: int = 1920) -> Dict[int, Path]:
-    """Export COMPLETE authored slides through a PowerPoint instance this call can PROVE it owns (PROMPT-035).
+                           width_px: int = 1920,
+                           diagnostics: Optional[PowerPointRenderDiagnostics] = None) -> Dict[int, Path]:
+    """Export COMPLETE authored slides through a PowerPoint instance this call can PROVE it owns (PROMPT-035),
+    recording stage-by-stage diagnostics (PROMPT-030).
 
     A PowerPoint that is already running (the user's session) is never attached to, opened into, closed, quit or
     killed: activation is refused with ``PowerPointStageError("ownership")`` and the renderer chain falls through to
     the next backend.  Only the presentation this call opened is closed, and the Application is quit only when it is
     proven app-created and still exclusively ours.  Cleanup follows the same rules on success, error, timeout and
-    cancellation.  CoInitialize / CoUninitialize are balanced.  Every failure raises :class:`PowerPointStageError`
-    naming the stage that failed (cooperative cancellation propagates unchanged)."""
+    cancellation.  CoInitialize / CoUninitialize are balanced (PROMPT-030: an RPC_E_CHANGED_MODE thread is left
+    exactly as it was found).  Every failure raises :class:`PowerPointStageError` naming the stage that failed
+    (cooperative cancellation propagates unchanged).
+
+    ``diagnostics`` optionally receives the staged record (availability / com_init / open / export / cleanup);
+    the most recent attempt is always published through :func:`last_powerpoint_diagnostics`."""
     with _POWERPOINT_LOCK:
-        return _render_with_powerpoint_locked(pptx, slide_numbers, out_dir, width_px)
+        return _render_with_powerpoint_locked(pptx, slide_numbers, out_dir, width_px, diagnostics)
 
 
 def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out_dir: Path,
-                                   width_px: int) -> Dict[int, Path]:
+                                   width_px: int,
+                                   diagnostics: Optional[PowerPointRenderDiagnostics] = None) -> Dict[int, Path]:
+    global _last_powerpoint_diagnostics
+    diag = diagnostics if diagnostics is not None else PowerPointRenderDiagnostics()
+    # reset the staged record for THIS attempt (a caller-provided object is reused across retries)
+    diag.com_init = "not_attempted"
+    diag.com_init_detail = ""
+    diag.open_result = "not_attempted"
+    diag.open_detail = ""
+    diag.export_result = "not_attempted"
+    diag.export_detail = ""
+    diag.cleanup = "not_attempted"
+    diag.fallback_reason = ""
+    diag.fallback_stage = ""
+    probe = powerpoint_probe()
+    diag.availability = getattr(probe, "stage", "") or ("ok" if probe[0] else "unavailable")
+    diag.availability_reason = getattr(probe, "reason", "") or str(probe[2])
+    LOG.info("POWERPOINT_RENDER availability=%s stage=%s", probe[0], diag.availability)
     try:
         import pythoncom  # type: ignore
         import win32com.client  # type: ignore
     except Exception as exc:  # noqa: BLE001
+        diag.com_init = "failed"
+        diag.com_init_detail = f"import failed: {type(exc).__name__}: {exc}"
+        diag.fallback_stage = "com_init"
+        diag.fallback_reason = f"Thiếu pywin32/pythoncom — không gọi được PowerPoint COM: {exc}"
+        _last_powerpoint_diagnostics = diag
         raise PowerPointStageError("import", exc, pptx)
+
     out: Dict[int, Path] = {}
+    # --- COM init stage (PROMPT-030): per-thread CoInitialize with correct balance semantics.
+    # A normal return (S_OK or S_FALSE, pywin32 returns None) means THIS call owns one initialization
+    # and must CoUninitialize it later.  RPC_E_CHANGED_MODE means the thread already lives in another
+    # apartment: proceed, but never CoUninitialize what we did not start.
+    com_initialized_here = False
     try:
         pythoncom.CoInitialize()
-    except Exception as exc:  # noqa: BLE001 – RPC_E_CHANGED_MODE etc.: never CoUninitialize what we did not start
-        raise PowerPointStageError("com-init", exc, pptx)
+        com_initialized_here = True
+        diag.com_init = "ok"
+        diag.com_init_detail = "CoInitialize ok (balanced by CoUninitialize in cleanup)"
+        LOG.info("POWERPOINT_RENDER com_init=ok")
+    except Exception as exc:  # noqa: BLE001 – pythoncom.com_error with RPC_E_CHANGED_MODE etc.
+        code = getattr(exc, "hresult", None)
+        if not isinstance(code, int):
+            args = getattr(exc, "args", ()) or ()
+            code = args[0] if args and isinstance(args[0], int) else None
+        # ONLY a real COM RPC_E_CHANGED_MODE (0x80010106) is "thread already in another apartment" —
+        # proceed and never CoUninitialize what we did not start.  Any other failure (including a bare
+        # error whose text merely mentions the constant) is a genuine com-init failure (PROMPT-027R).
+        if code == -2147417833:
+            diag.com_init = "already_initialized"
+            diag.com_init_detail = f"CoInitialize RPC_E_CHANGED_MODE hr={code} — thread already in another apartment; proceeding"
+            LOG.info("POWERPOINT_RENDER com_init=already_initialized hr=%s note=STA_thread_proceeding", code)
+        else:
+            diag.com_init = "failed"
+            diag.com_init_detail = f"{type(exc).__name__}: {exc}"
+            diag.fallback_stage = "com_init"
+            diag.fallback_reason = f"Không khởi tạo được COM: {exc}"
+            _last_powerpoint_diagnostics = diag
+            LOG.warning("POWERPOINT_RENDER com_init=failed error=%s", exc)
+            raise PowerPointStageError("com-init", exc, pptx)
+
     app = None
     pres = None
     owned = False                         # True ONLY after the ownership proof below succeeded
@@ -400,48 +550,92 @@ def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out
         # ---- ownership proof (read-only checks BEFORE anything is activated) -------------------------------------
         before = _powerpoint_process_ids()
         if before is None:
+            diag.open_result = "failed"
+            diag.open_detail = "process table unreadable; ownership cannot be established"
+            diag.fallback_stage = "open"
+            diag.fallback_reason = "Không xác minh được quyền sở hữu PowerPoint (không đọc được bảng tiến trình)"
             raise _ownership_refusal("process table unreadable; ownership cannot be established", pptx)
         if before:
+            diag.open_result = "failed"
+            diag.open_detail = "a PowerPoint session is already running; not attaching to it"
+            diag.fallback_stage = "open"
+            diag.fallback_reason = "PowerPoint đang mở của người dùng — không đính kèm vào phiên của họ"
             raise _ownership_refusal("a PowerPoint session is already running; not attaching to it", pptx)
         if _running_powerpoint_registered(win32com.client):
+            diag.open_result = "failed"
+            diag.open_detail = "a running PowerPoint instance is registered; not attaching to it"
+            diag.fallback_stage = "open"
+            diag.fallback_reason = "Một phiên PowerPoint đang chạy được đăng ký — không đính kèm vào phiên của họ"
             raise _ownership_refusal("a running PowerPoint instance is registered; not attaching to it", pptx)
         try:
             app = win32com.client.DispatchEx(POWERPOINT_PROGID)           # may return a USER's instance: unproven
+            LOG.info("POWERPOINT_RENDER dispatch=ok")
         except Exception as exc:  # noqa: BLE001
+            diag.open_result = "failed"
+            diag.open_detail = f"DispatchEx failed: {type(exc).__name__}: {exc}"
+            diag.fallback_stage = "open"
+            diag.fallback_reason = f"Không khởi tạo được PowerPoint.Application: {exc}"
             raise PowerPointStageError("dispatch", exc, pptx)
         after = _powerpoint_process_ids()
         created = None if after is None else after - before
         if created is None or len(created) != 1 or not _is_pristine(app):
             # Could be a session the user started in the meantime: leave it exactly as it is (owned stays False).
+            diag.open_result = "failed"
+            diag.open_detail = "returned PowerPoint instance is not proven app-created; left untouched"
+            diag.fallback_stage = "open"
+            diag.fallback_reason = "Phiên PowerPoint trả về không chứng minh được là do ứng dụng tạo — để nguyên"
             raise _ownership_refusal("returned PowerPoint instance is not proven app-created; left untouched", pptx)
         owned, owned_pid = True, next(iter(created))
         # ---- open only into an instance that is still pristine ---------------------------------------------------
         if not _is_pristine(app):
             owned = False                                                 # someone else arrived: no longer exclusive
+            diag.open_result = "failed"
+            diag.open_detail = "PowerPoint instance is no longer exclusively app-owned; left untouched"
+            diag.fallback_stage = "open"
+            diag.fallback_reason = "Phiên PowerPoint không còn thuộc riêng ứng dụng — để nguyên"
             raise _ownership_refusal("PowerPoint instance is no longer exclusively app-owned; left untouched", pptx)
         try:
             # WithWindow=False keeps it invisible; ReadOnly=True never modifies the source
             pres = app.Presentations.Open(str(pptx.resolve()), True, False, False)
+            diag.open_result = "ok"
+            LOG.info("POWERPOINT_RENDER open=ok file=%s", pptx.name)
         except Exception as exc:  # noqa: BLE001
+            diag.open_result = "failed"
+            diag.open_detail = f"Presentations.Open failed: {type(exc).__name__}: {exc}"
+            diag.fallback_stage = "open"
+            diag.fallback_reason = f"Không mở được file bằng PowerPoint: {exc}"
             raise PowerPointStageError("presentation-open", exc, pptx)
         try:
             ratio = pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth
             h = int(width_px * ratio)
+            LOG.info("POWERPOINT_RENDER export=start slides=%s width=%s height=%s", list(slide_numbers), width_px, h)
             for n in slide_numbers:
                 target = out_dir / f"slide_{n:03d}.png"
                 pres.Slides(n).Export(str(target.resolve()), "PNG", width_px, h)
                 out[n] = target
+                LOG.info("POWERPOINT_RENDER export slide=%s ok", n)
+            diag.export_result = "ok"
+            diag.export_detail = f"exported {len(out)} slides"
         except CancellationRequested:
+            diag.export_result = "failed"
+            diag.export_detail = "cancelled"
             raise                                                         # cooperative cancel is not a COM failure
         except Exception as exc:  # noqa: BLE001
+            diag.export_result = "failed"
+            diag.export_detail = f"Export failed: {type(exc).__name__}: {exc}"
+            diag.fallback_stage = "export"
+            diag.fallback_reason = f"PowerPoint export thất bại: {exc}"
+            LOG.warning("POWERPOINT_RENDER export=failed error=%s", exc)
             raise PowerPointStageError("slide-export", exc, pptx)
     finally:
-        # Cleanup obeys the SAME ownership rules on success / error / timeout / cancellation.
+        # Cleanup obeys the SAME ownership rules on success / error / timeout / cancellation (PROMPT-035);
+        # the staged record reports what cleanup did (PROMPT-030).
         pres_closed = pres is None
         if pres is not None:
             try:
                 pres.Close()                                              # only the presentation WE opened
                 pres_closed = True
+                LOG.info("POWERPOINT_RENDER cleanup close=ok")
             except Exception as exc:  # noqa: BLE001
                 cleanup_failures.append(("presentation-close", exc))
         quit_sent = False
@@ -451,6 +645,7 @@ def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out
                 try:
                     app.Quit()                                            # only an instance PROVEN created + exclusive
                     quit_sent = True
+                    LOG.info("POWERPOINT_RENDER cleanup quit=ok")
                 except Exception as exc:  # noqa: BLE001
                     cleanup_failures.append(("app-quit", exc))
             else:
@@ -460,15 +655,31 @@ def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out
         pres = None
         if quit_sent and owned_pid is not None and not _wait_for_process_exit(owned_pid):
             notes.append(("app-exit-wait-timeout", f"pid={owned_pid} still running; not terminated"))
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:  # noqa: BLE001
-            pass
+        # CoUninitialize only if THIS call initialized the thread; never uninitialize an apartment that was
+        # there before us (PROMPT-030 RPC_E_CHANGED_MODE handling).
+        if com_initialized_here:
+            try:
+                pythoncom.CoUninitialize()
+                LOG.info("POWERPOINT_RENDER cleanup com_uninit=ok")
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failures.append(("com-uninit", exc))
+        else:
+            LOG.debug("POWERPOINT_RENDER cleanup com_uninit=skipped (not initialized here)")
+        diag.cleanup = "failed" if cleanup_failures else "ok"
+        if diag.cleanup == "failed" and not diag.fallback_reason:
+            diag.fallback_stage = diag.fallback_stage or "cleanup"
+            diag.fallback_reason = "; ".join(f"{step}: {type(exc).__name__}" for step, exc in cleanup_failures)
+        _last_powerpoint_diagnostics = diag
         for step, exc in cleanup_failures:
             LOG.info("SLIDE_RENDER_CLEANUP backend=powerpoint stage=cleanup step=%s exception_type=%s reason=%s",
                      step, type(exc).__name__, _com_reason(exc, pptx))
         for step, detail in notes:
             LOG.warning("SLIDE_RENDER_CLEANUP backend=powerpoint stage=cleanup step=%s detail=%s", step, detail)
+        if diag.fallback_reason:
+            LOG.info("POWERPOINT_RENDER fallback_stage=%s reason=%s", diag.fallback_stage, diag.fallback_reason)
+        else:
+            LOG.info("POWERPOINT_RENDER success slides=%s", list(out.keys()))
+
     return out
 
 
@@ -801,6 +1012,22 @@ def _draw_table(draw: ImageDraw.ImageDraw, b: Block, px) -> None:
 # ----------------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------------
+def _render_via_powerpoint(report: ReportData, wanted: Sequence[int], out_dir: Path,
+                           width_px: int, diag: PowerPointRenderDiagnostics) -> Dict[int, Path]:
+    """Invoke :func:`render_with_powerpoint` with the staged diagnostics when the binding accepts them.
+
+    Doubles/older bindings that do not take the ``diagnostics`` keyword are called without it.  The
+    TypeError produced by keyword BINDING is raised before any callee body runs, so the fallback can
+    never execute one render twice."""
+    fn = render_with_powerpoint           # module-global lookup: monkeypatching keeps working
+    try:
+        return fn(report.path, wanted, out_dir, width_px, diagnostics=diag)
+    except TypeError as exc:
+        if "keyword argument" not in str(exc) or "diagnostics" not in str(exc):
+            raise
+        return fn(report.path, wanted, out_dir, width_px)
+
+
 class SlideRenderer:
     """Renders slides with the best available backend; caches per file.
 
@@ -810,6 +1037,12 @@ class SlideRenderer:
     produced the preview and why a higher-fidelity backend was not used.  Only ``powerpoint`` is pixel-faithful to
     PowerPoint (:data:`FAITHFUL_BACKENDS`); LibreOffice and the built-in renderer are honest fallbacks and are reported
     as reduced fidelity rather than pretending to be PowerPoint output (§6).  No failure is silently skipped.
+
+    PROMPT-030: ``last_backend`` reports which backend *actually* rendered the last call;
+    ``last_diagnostics`` / ``last_fallback_reason`` / ``last_fallback_stage`` explain why a preferred
+    backend was not used (probe failure, COM init failure, export failure …) so the UI can show
+    "PowerPoint" vs. "Trình vẽ tích hợp" accurately and the yellow fallback warning is only shown
+    when the fallback is legitimate.
     """
 
     def __init__(self, prefer: Sequence[str] = ("powerpoint", "libreoffice", "builtin"),
@@ -821,6 +1054,9 @@ class SlideRenderer:
         self.last_purpose = ""
         self.backend_tried: List[str] = []
         self.last_failures: List[Dict[str, str]] = []
+        self.last_diagnostics: Optional[PowerPointRenderDiagnostics] = None
+        self.last_fallback_reason: str = ""
+        self.last_fallback_stage: str = ""
 
     def availability(self) -> Dict[str, bool]:
         """Per-backend availability for cache identity (PROMPT-027R §30).  Cheap; never starts a renderer."""
@@ -856,6 +1092,9 @@ class SlideRenderer:
         errors: List[str] = []
         self.backend_tried = []
         self.last_failures = []
+        self.last_fallback_reason = ""
+        self.last_fallback_stage = ""
+        self.last_diagnostics = None
         slide_width = int(report.slide_width or 0)
         slide_height = int(report.slide_height or 0)
         for backend in self.prefer:
@@ -863,14 +1102,40 @@ class SlideRenderer:
             self.backend_tried.append(backend)
             try:
                 if backend == "powerpoint":
+                    probe = powerpoint_probe()
                     if not powerpoint_available():
+                        # PROMPT-030: the probe is side-effect-free; record WHY PowerPoint was not attempted.
+                        # powerpoint_available() delegates to the probe, so monkeypatching either entry point
+                        # moves this branch together.
+                        fallback_reason = getattr(probe, "reason", "") or powerpoint_unavailable_detail()
+                        diag = PowerPointRenderDiagnostics(
+                            availability=getattr(probe, "stage", "") or "unavailable",
+                            availability_reason=getattr(probe, "reason", ""),
+                            com_init="not_attempted", open_result="not_attempted",
+                            export_result="not_attempted", cleanup="not_attempted",
+                            fallback_stage="probe", fallback_reason=fallback_reason)
+                        self.last_diagnostics = diag
+                        self.last_fallback_reason = fallback_reason
+                        self.last_fallback_stage = "probe"
+                        LOG.info("POWERPOINT_RENDER fallback_reason=probe stage=%s reason=%s",
+                                 diag.availability, fallback_reason)
+                        # keep the global diagnostics in sync so the diagnostics panel sees it too
+                        global _last_powerpoint_diagnostics
+                        _last_powerpoint_diagnostics = diag
                         self._fail(purpose, backend, report, stage="availability", reason="unavailable",
                                    detail=powerpoint_unavailable_detail())
+                        errors.append(f"powerpoint: {fallback_reason} (stage={diag.availability})")
                         continue
-                    res = render_with_powerpoint(report.path, wanted, out_dir, self.width_px)
+                    # PowerPoint appears available — attempt the real render with staged diagnostics
+                    diag = PowerPointRenderDiagnostics(
+                        availability=getattr(probe, "stage", "") or "ok",
+                        availability_reason=getattr(probe, "reason", ""))
+                    res = _render_via_powerpoint(report, wanted, out_dir, self.width_px, diag)
+                    self.last_diagnostics = diag
                 elif backend == "libreoffice":
                     if not (find_soffice() and pymupdf_available()):
                         self._fail(purpose, backend, report, stage="availability", reason="unavailable")
+                        errors.append("libreoffice: Unavailable (soffice/pymupdf not found)")
                         continue
                     res = render_with_libreoffice(report.path, wanted, out_dir, self.dpi)
                 elif backend == "builtin":
@@ -889,6 +1154,15 @@ class SlideRenderer:
                     self.last_purpose = purpose
                     self._log_render(purpose, backend, report, res, slide_width, slide_height,
                                      attempted=self.backend_tried)
+                    if backend == "powerpoint":
+                        # Success with PowerPoint => clear any stale fallback reason
+                        self.last_fallback_reason = ""
+                        self.last_fallback_stage = ""
+                    else:
+                        # Fell back to a non-PowerPoint backend — keep the diagnostic of WHY PowerPoint failed
+                        if not self.last_fallback_reason and self.last_diagnostics and self.last_diagnostics.fallback_reason:
+                            self.last_fallback_reason = self.last_diagnostics.fallback_reason
+                            self.last_fallback_stage = self.last_diagnostics.fallback_stage
                     return res
                 self._fail(purpose, backend, report, stage="render", reason="incomplete-result")
                 errors.append(f"{backend}: incomplete result")
@@ -898,16 +1172,31 @@ class SlideRenderer:
                 self._fail(purpose, backend, report, stage=e.stage, reason=e.reason,
                            exception_type=e.exception_type, hresult=e.hresult)
                 errors.append(f"{backend}[{e.stage}]: {e.reason}")
+                if backend == "powerpoint":
+                    self._adopt_staged_diagnostics(str(e), e.stage)
             except Exception as e:  # noqa: BLE001
                 reason = _safe_reason(report, e)
                 LOG.warning("Renderer %s failed for %s: %s", backend, report.filename, reason)
                 self._fail(purpose, backend, report, stage="render", reason=reason,
                            exception_type=type(e).__name__)
                 errors.append(f"{backend}: {reason}")
+                if backend == "powerpoint":
+                    self._adopt_staged_diagnostics(str(e), "export")
         LOG.error("SLIDE_RENDER_FAILED purpose=%s report=%s slides=%s tried=%s errors=%s",
                   purpose or "-", report.filename, wanted, ",".join(self.backend_tried) or "-",
                   "; ".join(errors) or "-")
         raise RuntimeError("Không render được slide: " + "; ".join(errors))
+
+    def _adopt_staged_diagnostics(self, fallback: str, stage: str) -> None:
+        """PROMPT-030: after a PowerPoint failure prefer the staged record of WHY it failed."""
+        staged = _last_powerpoint_diagnostics
+        if staged is not None and staged.fallback_reason:
+            self.last_diagnostics = staged
+            self.last_fallback_reason = staged.fallback_reason
+            self.last_fallback_stage = staged.fallback_stage or stage
+        elif not self.last_fallback_reason:
+            self.last_fallback_reason = fallback
+            self.last_fallback_stage = stage
 
     @property
     def degraded(self) -> bool:

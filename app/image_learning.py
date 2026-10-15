@@ -373,7 +373,7 @@ def learning_dir(root: Optional[Path] = None, create: bool = True) -> Path:
         p = Path(root) / LEARNING_DIR_NAME
     if create:
         try:
-            for sub in ("", THUMBS_DIR, MODEL_DIR):
+            for sub in ("", THUMBS_DIR, MODEL_DIR, PREVIEWS_DIR):
                 (p / sub).mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
@@ -488,6 +488,206 @@ def save_thumbnail(cand: ImageCandidate, blob: Optional[bytes], directory: Path,
     except Exception as e:  # noqa: BLE001
         LOG.debug("thumbnail skipped for %s: %s", cand.candidate_id, e)
         return ""
+
+
+# ============================================================================ PROMPT-030 persistent learning assets
+# Learning previews/candidate images must survive app restart, machine restart and
+# update — so they are stored under learning_data/ (user data, never in %TEMP%) with
+# stable collision-resistant names.  The existing thumbnails/ folder is preserved for
+# backward compat; the new previews/ folder stores higher-fidelity persistent crops
+# that are used to rebuild the review workspace after a restart even when the
+# original PPTX is no longer re-parsed in this run.
+#
+# SOURCE OF TRUTH (PROMPT-030 §B): duy nhất learning_data/previews là authoritative.
+# Thứ tự fallback: 1) persisted asset (previews/<key>.jpg + .json) -> 2) regenerate từ PPTX
+# (candidate_blob / SlideRenderer) -> 3) cache trong phiên -> 4) trạng thái thiếu preview.
+# learning_asset_key(candidate_id + source_file.lower) bảo đảm không va chạm giữa cùng tên file ở thư mục khác,
+# nhiều candidate trên cùng slide, nhiều ImprovementItem trên cùng slide. JSONL lưu candidate_id + label,
+# source_file tuyệt đối chỉ lưu trong side-car .json (không lộ trong export) để giữ tính nhất quán.
+
+PREVIEWS_DIR = "previews"
+# Asset key version — bump when the naming or provenance scheme changes (migration will keep old assets readable)
+ASSET_KEY_VERSION = 1
+
+
+def learning_asset_key(candidate_id: str, source_file: str = "") -> str:
+    """Stable collision-resistant key for one candidate's persisted preview.
+
+    Uses the full source path (when present) in addition to *candidate_id* so two
+    PPTX with the same basename in different locations never collide, matching the
+    PROMPT-030 §8 requirement.  The key is a truncated SHA-256 hex digest (24 chars;
+    first 8 chars visible as the filename stem aids manual inspection).
+    """
+    material = candidate_id
+    # Incorporate the normalized absolute-ish source so collisions due to
+    # ManagementNumber-only candidate_ids across different files are avoided.
+    if source_file:
+        material += "|" + source_file.replace("\\", "/").strip().lower()
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def preview_asset_path(candidate_id: str, directory: Path, source_file: str = "", suffix: str = ".jpg") -> Path:
+    return Path(directory) / PREVIEWS_DIR / (learning_asset_key(candidate_id, source_file) + suffix)
+
+
+def persist_candidate_assets(candidate_id: str, blob: Optional[bytes], directory: Path,
+                             source_file: str = "", provenance: Optional[dict] = None) -> Optional[Path]:
+    """Persist one candidate's image blob under ``learning_data/previews/``.
+
+    Atomic write (``.tmp`` → rename) so a half-written file never survives a
+    crash.  Returns the asset path on success or ``None`` on failure/empty blob.
+
+    *provenance* may carry ``fingerprint`` / ``slide`` / ``shape_id`` etc. and is
+    stored as a sibling ``.json`` alongside the image for staleness checks.
+    ``blob`` is expected to be decodable image bytes (PNG/JPG/etc.); when it is
+    an EMF/WMF placeholder the caller should still write a PNG render of the
+    original instead of the raw vector where possible.
+    """
+    if not blob:
+        return None
+    try:
+        from PIL import Image
+        im = Image.open(BytesIO(blob))
+        im.load()
+        # Normalize: RGB thumbnail-ish crop for the review list (not a learning input)
+        # but keep enough resolution for the detail view; respect max 1200px like the DTO
+        im = im.convert("RGB")
+        im.thumbnail((1200, 1000))
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=82, optimize=True)
+        data = buf.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("persist_candidate_assets skipped %s: %s", candidate_id, exc)
+        return None
+    try:
+        base = Path(directory) / PREVIEWS_DIR
+        base.mkdir(parents=True, exist_ok=True)
+        key = learning_asset_key(candidate_id, source_file)
+        target = base / (key + ".jpg")
+        tmp = base / (key + ".jpg.tmp")
+        tmp.write_bytes(data)
+        # atomic replace
+        tmp.replace(target)
+        # provenance side-car (best-effort)
+        if provenance is not None:
+            try:
+                meta = dict(provenance)
+                meta["candidate_id"] = candidate_id
+                meta["source_file"] = source_file
+                meta["key_version"] = ASSET_KEY_VERSION
+                meta_path = base / (key + ".json")
+                meta_tmp = base / (key + ".json.tmp")
+                meta_tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+                meta_tmp.replace(meta_path)
+            except Exception as exc2:  # noqa: BLE001
+                LOG.debug("persist provenance failed %s: %s", candidate_id, exc2)
+        LOG.debug("persist_candidate_assets ok %s -> %s (%d bytes)", candidate_id, target.name, len(data))
+        return target
+    except OSError as exc:
+        LOG.debug("persist_candidate_assets IO failed %s: %s", candidate_id, exc)
+        return None
+
+
+def persist_slide_preview(slide_key: str, image_bytes: bytes, directory: Path) -> Optional[Path]:
+    """Persist one rendered full-slide image (shared by all candidates of that slide).
+
+    ``slide_key`` should be a stable identifier for the (report fingerprint, slide
+    number) pair — e.g. ``f"{candidate_id}|slide{slide}"`` or a hash thereof.
+    The rendered bytes are already a PNG/JPG; they are normalized and written
+    atomically under ``learning_data/previews/`` with a ``_slide`` suffix.
+    """
+    if not image_bytes:
+        return None
+    try:
+        from PIL import Image
+        # image_bytes is a rendered PNG from SlideRenderer; normalize to JPG like the DTO
+        im = Image.open(BytesIO(image_bytes))
+        im.load()
+        im = im.convert("RGB")
+        # keep the full-slide resolution (up to 1600px wide) — higher quality than candidate thumbnails
+        if im.width > 1600:
+            ratio = 1600 / im.width
+            im = im.resize((1600, int(im.height * ratio)), Image.LANCZOS)
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=82, optimize=True)
+        data = buf.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("persist_slide_preview skipped %s: %s", slide_key, exc)
+        return None
+    try:
+        base = Path(directory) / PREVIEWS_DIR
+        base.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(slide_key.encode("utf-8")).hexdigest()[:24]
+        target = base / (key + "_slide.jpg")
+        tmp = base / (key + "_slide.jpg.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(target)
+        LOG.debug("persist_slide_preview ok %s -> %s (%d bytes)", slide_key, target.name, len(data))
+        return target
+    except OSError as exc:
+        LOG.debug("persist_slide_preview IO failed %s: %s", slide_key, exc)
+        return None
+
+
+def load_persisted_preview(candidate_id: str, directory: Path, source_file: str = "") -> Optional[bytes]:
+    """Load the persisted candidate preview bytes, or ``None`` when missing/corrupt."""
+    # Try the new key first, then the legacy thumbnail fallback
+    for cand in [preview_asset_path(candidate_id, directory, source_file, ".jpg"),
+                 preview_asset_path(candidate_id, directory, source_file, ".png"),
+                 Path(directory) / PREVIEWS_DIR / (learning_asset_key(candidate_id, source_file) + ".png"),
+                 # Legacy thumbnails keyed only by sha1(candidate_id) — check for migration
+                 Path(directory) / THUMBS_DIR / (hashlib.sha1(candidate_id.encode("utf-8")).hexdigest()[:16] + ".png")]:
+        try:
+            if cand.is_file() and cand.stat().st_size > 0:
+                data = cand.read_bytes()
+                if data:
+                    return data
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def load_persisted_preview_data_uri(candidate_id: str, directory: Path, source_file: str = "") -> str:
+    """Persisted preview as a ``data:image/...`` URI, or ``""`` when unavailable."""
+    data = load_persisted_preview(candidate_id, directory, source_file)
+    if data is None:
+        return ""
+    # Persisted previews are already normalized JPGs — wrap as data URI
+    try:
+        import base64
+        if data[:3] == b"\xff\xd8\xff" or data[:4] == b"\xff\xd8\xff\xe0":
+            mime = "image/jpeg"
+        elif data[:8] == b"\x89PNG\r\n\x1a\n":
+            mime = "image/png"
+        else:
+            mime = "image/jpeg"
+        return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+    except Exception:
+        return ""
+
+
+def candidate_has_persisted_preview(candidate_id: str, directory: Path, source_file: str = "") -> bool:
+    return load_persisted_preview(candidate_id, directory, source_file) is not None
+
+
+def migrate_legacy_previews(directory: Path) -> int:
+    """Best-effort: ensure every candidate that has a legacy thumbnail but no
+    new preview asset gets a promoted copy (backward compat).  Returns count migrated.
+    """
+    directory = Path(directory)
+    legacy_dir = directory / THUMBS_DIR
+    previews_dir = directory / PREVIEWS_DIR
+    if not legacy_dir.is_dir():
+        return 0
+    # Without a candidate_id mapping we cannot safely convert legacy sha1 names
+    # to the new sha256 key scheme.  This stub preserves existing thumbnails
+    # in place (they remain usable via the fallback in load_persisted_preview)
+    # and ensures the previews folder exists for new writes.
+    try:
+        previews_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return 0
 
 
 # ============================================================================ tiny local model (logistic regression)

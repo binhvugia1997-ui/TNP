@@ -679,6 +679,42 @@ class GuiController:
         self.pending_labels[cand.candidate_id] = label
         self.pending_label_notes[cand.candidate_id] = note
 
+    def _persist_image_assets(self, cands) -> None:
+        """Best-effort: persist thumbnails + side-car provenance so the review workspace can be
+        rebuilt after a restart even when the original PPTX is no longer re-parsed in this run.
+        Never raises — corrupted blob or missing preview is ignored.
+        """
+        lrn = self.learning
+        if lrn is None:
+            return
+        try:
+            from .image_learning import persist_candidate_assets
+        except ImportError:
+            return
+        for cand in cands:
+            try:
+                blob = self.candidate_blob(cand)
+                if not blob:
+                    continue
+                provenance = {
+                    "management_number": cand.management_number,
+                    "source_name": cand.source_name,
+                    "slide": cand.slide,
+                    "shape_id": getattr(cand, "picture_id", 0),
+                    "bounds": list(getattr(cand, "bounds", (0, 0, 0, 0))),
+                    "slide_size": list(getattr(cand, "slide_size", (0, 0))),
+                    "item_id": getattr(cand, "logical_item_owner", ""),
+                    "item_heading": getattr(cand, "owner_heading", ""),
+                    "item_index": getattr(cand, "item_index", -1),
+                    "decision": getattr(cand, "decision", ""),
+                    "confidence": getattr(cand, "confidence", 0.0),
+                }
+                persist_candidate_assets(cand.candidate_id, blob, lrn.dir,
+                                         source_file=getattr(cand, "source_file", ""),
+                                         provenance=provenance)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("persist asset skipped %s: %s", getattr(cand, "candidate_id", "?"), exc)
+
     def save_confirmations(self, cands) -> Tuple[bool, str]:
         """Persist labels first, then re-apply region crops to the Excel image cells."""
         lrn = self.learning
@@ -687,6 +723,58 @@ class GuiController:
         if not self.pending_labels:
             return False, "Chưa chọn nhãn nào."
         by_id = {c.candidate_id: c for c in cands}
+        # PROMPT-030 §9: allow saving labels for persisted candidates after restart
+        # (review_candidates() is empty after restart but latest() still has them).
+        for cid in list(self.pending_labels):
+            if cid not in by_id and cid in lrn.store.latest():
+                # Synthesize a minimal candidate from the persisted record + side-car
+                try:
+                    rec = lrn.store.latest()[cid]
+                    from types import SimpleNamespace
+                    import json as _js
+                    from pathlib import Path as _P
+                    prov = {}
+                    try:
+                        from .image_learning import learning_asset_key
+                        for _sf in (rec.get("source_file", "") or rec.get("source_name", ""), ""):
+                            try:
+                                _k = learning_asset_key(cid, _sf)
+                                _mp = lrn.dir / "previews" / (_k + ".json")
+                                if _mp.is_file():
+                                    prov = _js.loads(_mp.read_text(encoding="utf-8"))
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    bnd = prov.get("bounds") or (0, 0, 900000, 700000)
+                    ssz = prov.get("slide_size") or (12192000, 6858000)
+                    try:
+                        bnd = tuple(int(v) for v in bnd)
+                        ssz = tuple(int(v) for v in ssz)
+                    except Exception:
+                        bnd, ssz = (0, 0, 900000, 700000), (12192000, 6858000)
+                    syn = SimpleNamespace(
+                        candidate_id=cid,
+                        management_number=rec.get("management_number", "") or prov.get("management_number", ""),
+                        source_name=rec.get("source_name", "") or prov.get("source_name", ""),
+                        source_file=rec.get("source_file", "") or prov.get("source_file", ""),
+                        slide=int(rec.get("slide") or prov.get("slide") or 0),
+                        picture_id=int(rec.get("picture_id") or rec.get("shape_id") or prov.get("shape_id") or 0),
+                        shape_id=int(rec.get("shape_id") or rec.get("picture_id") or prov.get("shape_id") or 0),
+                        order=0, bounds=bnd, slide_size=ssz, block_bounds=bnd,
+                        features=dict(rec.get("features") or {}),
+                        deterministic_kind=rec.get("deterministic_kind", "") or "ambiguous",
+                        confidence=float(rec.get("deterministic_confidence") or 0.5),
+                        hard_excluded=False, hard_reason="", nearby_text="", nearest_heading="",
+                        nearest_caption="", nearest_text_color="", logical_item_owner=prov.get("item_id", ""),
+                        owner_heading=prov.get("item_heading", ""), item_index=int(prov.get("item_index", -1) or -1),
+                        confident_owner=False, decision="review", decision_source="rules",
+                        evidence=[], excel_output_eligible=False, eligibility_reason="",
+                    )
+                    by_id[cid] = syn
+                except Exception as exc:
+                    LOG.debug("synthetic candidate failed for %s: %s", cid, exc)
         written, touched = 0, []
         for cid, label in list(self.pending_labels.items()):
             c = by_id.get(cid)
@@ -698,6 +786,12 @@ class GuiController:
             touched.append(c)
         self.pending_labels.clear()
         self.pending_label_notes.clear()
+        # PROMPT-030: persist candidate preview assets so the workspace survives restart
+        if touched:
+            try:
+                self._persist_image_assets(touched)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("persist image assets failed: %s", exc)
         # Include reports owed from a previous locked attempt; the label JSONL stays the source of truth.
         by_touched_id = {c.candidate_id: c for c in self.pending_image_reapply}
         by_touched_id.update({c.candidate_id: c for c in touched})

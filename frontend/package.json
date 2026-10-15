@@ -15,7 +15,7 @@
     "test:report-list": "node --test tests/prompt034r-report-list-layout.test.mjs",
     "test:prompt037": "node --test tests/prompt037-hide-skipped.test.mjs",
     "test:prompt038": "node --test tests/prompt038-integration.test.mjs",
-    "test:frontend": "node --test tests/bridge.test.mjs tests/learning-hooks.test.mjs tests/learning-labels.test.mjs tests/prompt027-overlays.test.mjs tests/prompt027r-regression.test.mjs tests/prompt031r-incremental.test.mjs tests/prompt034r-report-list-layout.test.mjs tests/prompt037-hide-skipped.test.mjs tests/prompt038-integration.test.mjs tests/update-state.test.mjs",
+    "test:frontend": "node --test tests/bridge.test.mjs tests/learning-030.test.mjs tests/learning-hooks.test.mjs tests/learning-labels.test.mjs tests/prompt027-overlays.test.mjs tests/prompt027r-regression.test.mjs tests/prompt031r-incremental.test.mjs tests/prompt034r-report-list-layout.test.mjs tests/prompt037-hide-skipped.test.mjs tests/prompt038-integration.test.mjs tests/update-state.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
