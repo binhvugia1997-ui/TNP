@@ -188,6 +188,8 @@ const STATUS_STYLE: Record<StatusKey, { cls: string; icon: ReactNode }> = {
   processing: { cls: 'border-brand-400/40 bg-brand-50 text-brand-700', icon: <span className="h-2 w-2 animate-pulse rounded-full bg-brand-500" /> },
   needs_review: { cls: 'border-warn-500/30 bg-warn-50 text-warn-600', icon: <AlertTriangle className="h-3.5 w-3.5" /> },
   error: { cls: 'border-danger-500/30 bg-danger-50 text-danger-600', icon: <XCircle className="h-3.5 w-3.5" /> },
+  // PROMPT-024R: user cancellation — neutral grey, never the red "Lỗi" treatment.
+  cancelled: { cls: 'border-line bg-[#eef1f5] text-[#4a6280]', icon: <MinusCircle className="h-3.5 w-3.5" /> },
   waiting: { cls: 'border-line bg-[#f4f7fb] text-muted', icon: <MinusCircle className="h-3.5 w-3.5" /> },
   new_row: { cls: 'border-brand-200 bg-brand-50 text-brand-700', icon: <MinusCircle className="h-3.5 w-3.5" /> },
   skipped: { cls: 'border-line bg-[#f4f7fb] text-muted', icon: <MinusCircle className="h-3.5 w-3.5" /> },

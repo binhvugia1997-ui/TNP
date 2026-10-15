@@ -53,6 +53,7 @@ export type StatusKey =
   | 'needs_review'
   | 'error'
   | 'skipped'
+  | 'cancelled'
   | 'outside_period'
   | 'source_duplicate'
   | 'fast_skip'
@@ -66,6 +67,8 @@ export const STATUS_LABEL: Record<StatusKey, string> = {
   needs_review: 'Cần kiểm tra',
   error: 'Lỗi',
   skipped: 'Bỏ qua — đã cập nhật',
+  /** PROMPT-024R: người dùng chọn "Dừng tất cả" — không phải lỗi xử lý. */
+  cancelled: 'Đã hủy',
   outside_period: 'Bỏ qua ngoài thời gian xử lý',
   source_duplicate: 'Trùng Management Number trong folder',
   fast_skip: 'Bỏ qua nhanh — đã xử lý gần đây',
@@ -83,6 +86,8 @@ export const BUCKET_OF: Record<StatusKey, StatBucket | 'other'> = {
   waiting: 'other',
   needs_review: 'needs_review',
   error: 'error',
+  // PROMPT-024R: cancellation is a user choice — never counted in the Lỗi (failure) bucket.
+  cancelled: 'other',
   skipped: 'skipped',
   outside_period: 'skipped',
   source_duplicate: 'skipped',
@@ -197,6 +202,16 @@ export type ImageCandidate = {
   src: string
   /** Khung ảnh trên slide, tính theo % kích thước slide. */
   bounds: { x: number; y: number; w: number; h: number }
+  /** PROMPT-024R: kích thước slide gốc (EMU) + khung mục tiêu EMU để map toạ độ chính xác. */
+  slideWidth?: number
+  slideHeight?: number
+  targetBbox?: { x: number; y: number; width: number; height: number }
+  targetBboxPct?: { x: number; y: number; w: number; h: number }
+  targetKind?: string
+  /** PROMPT-024R: ảnh TOÀN slide đã render (data URI) — nền ngữ cảnh cho vị trí thật của mục tiêu. */
+  slidePreview?: string
+  slidePreviewWidth?: number
+  slidePreviewHeight?: number
   /** PROMPT-025: định danh mục cải tiến (một slide có thể có nhiều mục). */
   itemId?: string
   itemIndex?: number
@@ -233,7 +248,8 @@ export type ContentCandidate = {
 }
 
 export type ProcessingRun = {
-  status: 'idle' | 'processing' | 'stopping' | 'done'
+  /** PROMPT-024R: "cancelling" = "Dừng tất cả" đã yêu cầu, chờ worker xác nhận ở điểm an toàn. */
+  status: 'idle' | 'processing' | 'stopping' | 'cancelling' | 'done'
   queue: string[]
   /** Chỉ số báo cáo đang xử lý trong hàng đợi. */
   index: number
@@ -249,4 +265,7 @@ export type ProcessingRun = {
   /** true khi ít nhất một báo cáo đã kết thúc trong phiên này (để hiển thị ETA). */
   hasSamples: boolean
   stopped?: boolean
+  /** PROMPT-024R: lượt chạy này có yêu cầu "Dừng tất cả" hay không + số báo cáo đã hủy. */
+  cancelRequested?: boolean
+  cancelledCount?: number
 }

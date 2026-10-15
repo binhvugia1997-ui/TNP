@@ -14,6 +14,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from .cancellation import CancellationRequested, check_cancelled
 from .classifier import classify
 from .excel_writer import ExcelWriter
 from .extractor import extract_record
@@ -34,7 +35,7 @@ LOG = logging.getLogger("report_extractor.batch")
 
 # Per-file stage identifiers (GUI maps them to Vietnamese labels)
 STAGES = ["waiting", "reading", "analyzing", "extracting_qpn", "extracting_images",
-          "writing_excel", "completed", "needs_review", "error", "skipped"]
+          "writing_excel", "completed", "needs_review", "error", "skipped", "cancelled"]
 
 STAGE_LABELS_VI = {
     "waiting": "Đang chờ",
@@ -50,6 +51,7 @@ STAGE_LABELS_VI = {
     "needs_review": "Cần kiểm tra",
     "error": "Lỗi",
     "skipped": "Bỏ qua — đã cập nhật",
+    "cancelled": "Đã hủy",          # PROMPT-024R: user cancel-all; a user choice, not a processing failure
     "not_written": "Cần kiểm tra — Không xác định được Management Number từ tên file",
     # pre-scan outcomes (decided from file name / cache / master workbook – PPTX never opened)
     "outside_period": "Bỏ qua ngoài thời gian xử lý",
@@ -95,7 +97,9 @@ class BatchSummary:
     failed: int = 0
     skipped: int = 0
     not_written: int = 0
+    cancelled: int = 0               # PROMPT-024R: reports stopped by "Dừng tất cả" (NOT counted as failed)
     stopped: bool = False
+    cancel_requested: bool = False   # PROMPT-024R: cancel-all was acknowledged during this run
     output_file: str = ""
     output_folder: str = ""
     errors: List[Dict[str, str]] = field(default_factory=list)
@@ -143,7 +147,14 @@ class BatchProcessor:
             except Exception as e:  # noqa: BLE001 – learning must never block processing
                 LOG.warning("image learning unavailable (%s) – deterministic rules only", e)
         self.cache: Optional[FastScanCache] = None
+        # PROMPT-024R: two distinct cooperative stop modes, both owned by Python.
+        # stop_event  = "Dừng sau file hiện tại": finish the CURRENT report completely (file-atomic),
+        #               then stop before the next one. Never observed inside a report.
+        # cancel_event = "Dừng tất cả": stop the current report at the nearest SAFE boundary and never
+        #               start the remaining queue. Observed only through check_cancelled() calls; a
+        #               cancelled report is never committed as complete and never counted as failed.
         self.stop_event = threading.Event()
+        self.cancel_event = threading.Event()
         self.summary = BatchSummary(total=len(opts.files))
         self.results: List[FileResult] = []
         self._thread: Optional[threading.Thread] = None
@@ -156,6 +167,14 @@ class BatchProcessor:
 
     def request_stop(self) -> None:
         self.stop_event.set()
+
+    def request_cancel(self) -> None:
+        """Cancel-all (idempotent). Implies stop-after-current: no queued report may start either."""
+        self.stop_event.set()
+        self.cancel_event.set()
+
+    def _should_cancel(self) -> bool:
+        return self.cancel_event.is_set()
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
@@ -204,6 +223,13 @@ class BatchProcessor:
             self.on_batch(0, total)
             for item in queue:
                 idx, path = item.index, item.path
+                # safe boundary before starting a report (§7/§12): a cancel-all already acknowledged
+                # means no queued report starts; a graceful stop likewise stops here.
+                if self.cancel_event.is_set():
+                    self.summary.stopped = True
+                    self.summary.cancel_requested = True
+                    self._log("Đã dừng toàn bộ xử lý. Các báo cáo còn lại không được xử lý.")
+                    break
                 if self.stop_event.is_set():
                     self.summary.stopped = True
                     self._log("Đã dừng theo yêu cầu (trước file tiếp theo).")
@@ -232,7 +258,8 @@ class BatchProcessor:
                 LOG.warning("review_report.txt failed: %s", e)
             self._log(f"Kết thúc. Tổng: {self.summary.total}  Hoàn thành: {self.summary.completed}  "
                       f"Cần kiểm tra: {self.summary.needs_review}  Chưa ghi: {self.summary.not_written}  "
-                      f"Lỗi: {self.summary.failed}  Bỏ qua: {self.summary.skipped}")
+                      f"Lỗi: {self.summary.failed}  Bỏ qua: {self.summary.skipped}  "
+                      f"Đã hủy: {self.summary.cancelled}")
             self.on_done(self.summary)
         return self.summary
 
@@ -395,16 +422,23 @@ class BatchProcessor:
                     return fr
 
             # --- 1. read PPTX ------------------------------------------------
+            # safe boundary: any cancel acknowledged while the previous critical section (e.g. new-row
+            # creation + save) finished is observed here, BEFORE expensive parsing starts.
+            check_cancelled(self._should_cancel)
             self.on_file(idx, "reading", "")
             if path.suffix.lower() == ".ppt":
                 raise RuntimeError("Định dạng .ppt cũ không đọc được – hãy mở bằng PowerPoint và lưu lại thành .pptx")
             report = parse_pptx(path)
+            check_cancelled(self._should_cancel)          # after PPTX load
             if not report.slides:
                 raise RuntimeError("PPTX không có slide nào")
 
             # --- 2. classify (AI decides WHERE) ------------------------------
             self.on_file(idx, "analyzing" if client else "analyzing_heuristic", f"{len(report.slides)} slide")
             cls = classify(report, client, self.opts.model if client else "")
+            # an in-flight Ollama request is never killed (§14): it returns or times out, then cancel is
+            # observed here and no further Ollama request starts.
+            check_cancelled(self._should_cancel)          # after semantic classification
             fr.classifier = cls.source
             fr.qpn_slide = cls.qpn_slide
             fr.cause_slides = list(cls.cause_slides)
@@ -428,7 +462,7 @@ class BatchProcessor:
             # --- 3. extract original content (program copies WHAT) ----------
             self.on_file(idx, "extracting", "")
             rec = extract_record(report, cls, writer.item_mapping, writer.known_models, self.opts.vendors or None,
-                                 learning=self.learning)
+                                 learning=self.learning, should_cancel=self._should_cancel)
             manual_fields = self.opts.manual_fields.get(normalize_source_path(path), {})
             if "vendor" in manual_fields:
                 rec.vendor = manual_fields["vendor"]
@@ -454,6 +488,7 @@ class BatchProcessor:
             fr.item = rec.item
 
             # --- 4. QPN = the Quality Problem Notice PANEL only (object/region based, fail-closed) ---------
+            check_cancelled(self._should_cancel)          # before expensive QPN render work
             qpn_png: Optional[Path] = None
             if rec.qpn_slide:
                 self.on_file(idx, "extracting_qpn", f"slide {rec.qpn_slide}")
@@ -480,18 +515,26 @@ class BatchProcessor:
             fr.excluded_sections = list(rec.excluded_sections)
             fr.improvement_items = [dict(item) for item in rec.improvement_items]
             if rec.after_pictures:
+                check_cancelled(self._should_cancel)      # before expensive rendered-image work
                 self.on_file(idx, "extracting_images", f"{len(rec.after_pictures)} ảnh Sau cải tiến")
                 try:
                     imp_jpg, problems = export_after_pictures(
                         report, rec.after_pictures, assets / f"{prefix}_IMPROVEMENT_regions",
-                        renderer=renderer, management_number=rec.management_number)
+                        renderer=renderer, management_number=rec.management_number,
+                        should_cancel=self._should_cancel)
                     fr.after_assets = [str(path) for path in imp_jpg]
                     rec.review_reasons.extend(problems)
+                except CancellationRequested:
+                    raise                                 # cancel between item crops (§45) is not a render error
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("%s: improvement image failed: %s", path.name, e)
                     rec.review_reasons.append(f"Không tạo được hình ảnh cải tiến: {e}")
 
             # --- 6. write Excel ------------------------------------------------
+            # Case A (§11): cancellation acknowledged BEFORE the report commit -> the incomplete report is
+            # cancelled and its partial results never reach the workbook. Once the commit below starts it is
+            # a critical section (§9): it finishes atomically and cancellation is observed afterwards.
+            check_cancelled(self._should_cancel)
             self.on_file(idx, "writing_excel", "")
             if self.opts.row_mode == "match":
                 assert row is not None and missing is not None
@@ -541,6 +584,16 @@ class BatchProcessor:
                          note or (f"Đã tạo dòng mới: {row} – Management Number mới: {fr.management_number}"
                                   if fr.new_row else f"dòng {row}"))
             LOG.info("%s -> row %s (%s%s) %s", path.name, row, status, " new_row" if fr.new_row else "", note)
+        except CancellationRequested:
+            # PROMPT-024R §11/§45: user cancel-all observed at a safe boundary BEFORE this report's Excel
+            # commit. Cancellation is a user choice, never a processing failure (§50): no error counter,
+            # no traceback, no partial result written.
+            fr.status = "cancelled"
+            self.summary.cancelled += 1
+            self.summary.cancel_requested = True
+            LOG.info("%s: cancelled by user request before Excel commit (no partial result written)", path.name)
+            self._log("Báo cáo hiện tại đã hủy trước khi ghi kết quả.")
+            self.on_file(idx, "cancelled", "Đã hủy theo yêu cầu")
         except Exception as e:  # noqa: BLE001
             fr.status = "error"
             fr.error = f"{type(e).__name__}: {e}"

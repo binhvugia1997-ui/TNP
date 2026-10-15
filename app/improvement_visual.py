@@ -8,8 +8,9 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from .cancellation import check_cancelled
 from .content_region import (ROLE_CAPTION, ROLE_FURNITURE, ROLE_SIDEBAR, ROLE_TITLE, classify_blocks)
 from .improvement_pictures import (CAPTION_GAP_MAX, CAPTION_SIDE_GAP_MAX, COLUMN_HEADER_GAP_MAX,
                                    SEMANTIC_PRODUCTION, PictureRef, group_refs, slide_items)
@@ -294,14 +295,18 @@ def _describe(block: Block) -> str:
 
 def build_improvement_visual_regions(report: ReportData, refs: Sequence[PictureRef], management_number: str = "",
                                      safe_padding_fraction: float = DEFAULT_SAFE_PADDING_FRACTION,
-                                     association_gap_fraction: float = DEFAULT_ASSOCIATION_GAP_FRACTION
+                                     association_gap_fraction: float = DEFAULT_ASSOCIATION_GAP_FRACTION,
+                                     should_cancel: Optional[Callable[[], bool]] = None
                                      ) -> List[ImprovementVisualRegion]:
     """Build one slide-crop region for each eligible (report, logical item, slide) group.
 
     Pictures are the ownership seeds. Only geometrically associated After captions and visual objects are
     added. Before captions, unselected pictures, broad background shapes, and center transition arrows are
     excluded. All geometry is PPTX EMU and all thresholds are normalized to the source slide dimensions.
+    ``should_cancel`` is honoured between improvement-item groups (PROMPT-024R): each item is an
+    independent unit of work, so stopping between them never leaves a half-built region in the result.
     """
+    check_cancelled(should_cancel)
     expected_scope = report_scope_key(report.path)
     for ref in refs:
         scope_matches = not ref.report_scope_id or ref.report_scope_id == expected_scope
@@ -324,6 +329,8 @@ def build_improvement_visual_regions(report: ReportData, refs: Sequence[PictureR
     for (scope_id, owner_id, slide_number), pictures in sorted(
             grouped.items(), key=lambda item: (min((r.source_order, r.block.order) for r in item[1]),
                                                 item[0][2], item[0][1])):
+        # safe boundary: between improvement-item groups (PROMPT-024R §45)
+        check_cancelled(should_cancel)
         slide = report.slide(slide_number)
         if slide is None or not pictures:
             continue

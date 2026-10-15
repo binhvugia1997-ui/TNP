@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "test:bridge": "node --test tests/bridge.test.mjs",
+    "test:learning-hooks": "node --test tests/learning-hooks.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

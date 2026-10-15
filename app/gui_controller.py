@@ -48,12 +48,14 @@ STATUS_VI: Dict[str, str] = {
     "not_written": "Cần kiểm tra — Không xác định được Management Number từ tên file",
     "error": "Lỗi",
     "skipped": "Bỏ qua — đã cập nhật",
+    "cancelled": "Đã hủy",          # PROMPT-024R: user cancel-all – a choice, never a processing failure
     "outside_period": "Bỏ qua ngoài thời gian xử lý",
     "source_duplicate": "Trùng Management Number trong folder",
     "fast_skip": "Bỏ qua nhanh — đã xử lý gần đây",
 }
 PRESCAN_STATUSES = ("outside_period", "source_duplicate", "fast_skip")
-FINAL_STATUSES = ("completed", "completed_new", "needs_review", "not_written", "error", "skipped") + PRESCAN_STATUSES
+FINAL_STATUSES = ("completed", "completed_new", "needs_review", "not_written", "error", "skipped",
+                  "cancelled") + PRESCAN_STATUSES
 PERIOD_MODES = ("auto", "month", "range", "all")
 # scanned-file list: Vietnamese label of each pre-scan decision + the manual exclusion
 AUTO_UPDATE_CHECK_KEY = "auto_update_check"            # cfg.extra key (persisted; default enabled)
@@ -421,7 +423,11 @@ class GuiController:
         self.scan_message: str = ""
         self.excluded_keys: set = set()
         # runtime state
-        self.state: str = "idle"                 # idle | running | stopping
+        # PROMPT-024R job-state model (mirrors BatchProcessor events):
+        #   idle -> running -> stopping          ("Dừng sau file hiện tại": current file finishes atomically)
+        #                  \-> cancelling        ("Dừng tất cả": current file stops at the nearest SAFE boundary)
+        # -> idle. A cancelled report is never a failure; untouched queued reports stay "waiting" (Chưa xử lý).
+        self.state: str = "idle"                 # idle | running | stopping | cancelling
         self.files: List[Path] = []
         self.rows: List[RowState] = []
         self.progress = Progress()
@@ -661,6 +667,42 @@ class GuiController:
         self.pending_labels[cand.candidate_id] = label
         self.pending_label_notes[cand.candidate_id] = note
 
+    def _persist_image_assets(self, cands) -> None:
+        """Best-effort: persist thumbnails + side-car provenance so the review workspace can be
+        rebuilt after a restart even when the original PPTX is no longer re-parsed in this run.
+        Never raises — corrupted blob or missing preview is ignored.
+        """
+        lrn = self.learning
+        if lrn is None:
+            return
+        try:
+            from .image_learning import persist_candidate_assets
+        except ImportError:
+            return
+        for cand in cands:
+            try:
+                blob = self.candidate_blob(cand)
+                if not blob:
+                    continue
+                provenance = {
+                    "management_number": cand.management_number,
+                    "source_name": cand.source_name,
+                    "slide": cand.slide,
+                    "shape_id": getattr(cand, "picture_id", 0),
+                    "bounds": list(getattr(cand, "bounds", (0, 0, 0, 0))),
+                    "slide_size": list(getattr(cand, "slide_size", (0, 0))),
+                    "item_id": getattr(cand, "logical_item_owner", ""),
+                    "item_heading": getattr(cand, "owner_heading", ""),
+                    "item_index": getattr(cand, "item_index", -1),
+                    "decision": getattr(cand, "decision", ""),
+                    "confidence": getattr(cand, "confidence", 0.0),
+                }
+                persist_candidate_assets(cand.candidate_id, blob, lrn.dir,
+                                         source_file=getattr(cand, "source_file", ""),
+                                         provenance=provenance)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("persist asset skipped %s: %s", getattr(cand, "candidate_id", "?"), exc)
+
     def save_confirmations(self, cands) -> Tuple[bool, str]:
         """Persist labels first, then re-apply region crops to the Excel image cells."""
         lrn = self.learning
@@ -669,6 +711,58 @@ class GuiController:
         if not self.pending_labels:
             return False, "Chưa chọn nhãn nào."
         by_id = {c.candidate_id: c for c in cands}
+        # PROMPT-030 §9: allow saving labels for persisted candidates after restart
+        # (review_candidates() is empty after restart but latest() still has them).
+        for cid in list(self.pending_labels):
+            if cid not in by_id and cid in lrn.store.latest():
+                # Synthesize a minimal candidate from the persisted record + side-car
+                try:
+                    rec = lrn.store.latest()[cid]
+                    from types import SimpleNamespace
+                    import json as _js
+                    from pathlib import Path as _P
+                    prov = {}
+                    try:
+                        from .image_learning import learning_asset_key
+                        for _sf in (rec.get("source_file", "") or rec.get("source_name", ""), ""):
+                            try:
+                                _k = learning_asset_key(cid, _sf)
+                                _mp = lrn.dir / "previews" / (_k + ".json")
+                                if _mp.is_file():
+                                    prov = _js.loads(_mp.read_text(encoding="utf-8"))
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    bnd = prov.get("bounds") or (0, 0, 900000, 700000)
+                    ssz = prov.get("slide_size") or (12192000, 6858000)
+                    try:
+                        bnd = tuple(int(v) for v in bnd)
+                        ssz = tuple(int(v) for v in ssz)
+                    except Exception:
+                        bnd, ssz = (0, 0, 900000, 700000), (12192000, 6858000)
+                    syn = SimpleNamespace(
+                        candidate_id=cid,
+                        management_number=rec.get("management_number", "") or prov.get("management_number", ""),
+                        source_name=rec.get("source_name", "") or prov.get("source_name", ""),
+                        source_file=rec.get("source_file", "") or prov.get("source_file", ""),
+                        slide=int(rec.get("slide") or prov.get("slide") or 0),
+                        picture_id=int(rec.get("picture_id") or rec.get("shape_id") or prov.get("shape_id") or 0),
+                        shape_id=int(rec.get("shape_id") or rec.get("picture_id") or prov.get("shape_id") or 0),
+                        order=0, bounds=bnd, slide_size=ssz, block_bounds=bnd,
+                        features=dict(rec.get("features") or {}),
+                        deterministic_kind=rec.get("deterministic_kind", "") or "ambiguous",
+                        confidence=float(rec.get("deterministic_confidence") or 0.5),
+                        hard_excluded=False, hard_reason="", nearby_text="", nearest_heading="",
+                        nearest_caption="", nearest_text_color="", logical_item_owner=prov.get("item_id", ""),
+                        owner_heading=prov.get("item_heading", ""), item_index=int(prov.get("item_index", -1) or -1),
+                        confident_owner=False, decision="review", decision_source="rules",
+                        evidence=[], excel_output_eligible=False, eligibility_reason="",
+                    )
+                    by_id[cid] = syn
+                except Exception as exc:
+                    LOG.debug("synthetic candidate failed for %s: %s", cid, exc)
         written, touched = 0, []
         for cid, label in list(self.pending_labels.items()):
             c = by_id.get(cid)
@@ -680,6 +774,12 @@ class GuiController:
             touched.append(c)
         self.pending_labels.clear()
         self.pending_label_notes.clear()
+        # PROMPT-030: persist candidate preview assets so the workspace survives restart
+        if touched:
+            try:
+                self._persist_image_assets(touched)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("persist image assets failed: %s", exc)
         # Include reports owed from a previous locked attempt; the label JSONL stays the source of truth.
         by_touched_id = {c.candidate_id: c for c in self.pending_image_reapply}
         by_touched_id.update({c.candidate_id: c for c in touched})
@@ -1479,8 +1579,23 @@ class GuiController:
         self.log_lines.append("Sẽ dừng sau khi xử lý xong báo cáo hiện tại…")
         return True
 
+    def request_cancel(self) -> bool:
+        """PROMPT-024R: "Dừng tất cả" – cooperative cancel-all.
+
+        The current report stops at the nearest SAFE cancellation point; no queued report starts; the
+        Excel transaction of an already committed report is never rolled back. Idempotent while already
+        stopping/cancelling (duplicate clicks are harmless). Returns False only when nothing is running.
+        """
+        if self.state not in ("running", "stopping") or not self.processor:
+            return False
+        self.processor.request_cancel()
+        self.state = "cancelling"
+        self.log_lines.append("Người dùng yêu cầu dừng tất cả.")
+        self.log_lines.append("Đang hoàn tất thao tác an toàn trước khi dừng…")
+        return True
+
     def is_running(self) -> bool:
-        return self.state in ("running", "stopping")
+        return self.state in ("running", "stopping", "cancelling")
 
     def worker_alive(self) -> bool:
         return bool(self.processor and self.processor.is_running())
@@ -1603,7 +1718,9 @@ class GuiController:
             self.state = "idle"
             for r in self.rows:                      # rows the batch never reached (stopped early)
                 if not r.is_final and r.stage != "waiting":
-                    r.stage = "error"
+                    # A report left mid-pipeline by cancel-all is CANCELLED, never an error (§5/§50);
+                    # untouched queued rows stay "waiting" (Chưa xử lý, §12).
+                    r.stage = "cancelled" if getattr(ev.payload, "cancel_requested", False) else "error"
             self.progress.current_index, self.progress.current_stage, self.progress.current_fraction = None, "", 0.0
             self.progress.done = self._count_done()
             self.progress.finished = True
@@ -1701,12 +1818,14 @@ class GuiController:
         s = self.summary or BatchSummary(total=len(self.files))
         lines = [f"Tổng: {s.total}", f"Hoàn thành: {s.completed}", f"Cần kiểm tra: {s.needs_review}",
                  f"Management Number mới: {s.new_rows}", f"Chưa ghi: {s.not_written}", f"Lỗi: {s.failed}",
-                 f"Bỏ qua: {s.skipped}"]
+                 f"Bỏ qua: {s.skipped}", f"Đã hủy: {getattr(s, 'cancelled', 0)}"]
         if self.scan_result or self.prescan:
             lines.extend(self.prescan_lines())
         if self.started_at is not None:
             lines.append(f"Tổng thời gian xử lý: {format_elapsed(self.elapsed_seconds())}")
-        if s.stopped:
+        if getattr(s, "cancel_requested", False):
+            lines.insert(0, "Đã dừng toàn bộ xử lý theo yêu cầu (Dừng tất cả).")
+        elif s.stopped:
             lines.insert(0, "Đã dừng theo yêu cầu.")
         return lines
 
@@ -1716,7 +1835,8 @@ class GuiController:
     def counts_text(self) -> str:
         s = self.summary or (self.processor.summary if self.processor else None) or BatchSummary(total=len(self.files))
         return (f"Tổng: {s.total}   Hoàn thành: {s.completed}   Cần kiểm tra: {s.needs_review}   "
-                f"Management Number mới: {s.new_rows}   Chưa ghi: {s.not_written}   Lỗi: {s.failed}   Bỏ qua: {s.skipped}")
+                f"Management Number mới: {s.new_rows}   Chưa ghi: {s.not_written}   Lỗi: {s.failed}   "
+                f"Bỏ qua: {s.skipped}   Đã hủy: {getattr(s, 'cancelled', 0)}")
 
     def output_file(self) -> Optional[Path]:
         p = Path(self.summary.output_file) if self.summary and self.summary.output_file else (Path(self.output) if self.output else None)

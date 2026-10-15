@@ -15,6 +15,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw
 
+from .cancellation import CancellationRequested, check_cancelled
 from .pptx_parser import ReportData
 from .improvement_pictures import PictureRef
 from .improvement_visual import (ImprovementVisualRegion, build_improvement_visual_regions, crop_box_px)
@@ -221,15 +222,18 @@ def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_
     embedded-picture export for that region; if that also fails, no image is returned and a diagnostic is added.
     The returned :class:`GroupedImagePaths` keeps one logical item per Excel visual row.
 
-    PROMPT-025: ``should_cancel`` is an optional cooperative-cancellation hook checked between item-level
-    crops (the slide itself is rendered once and shared by every item region of that slide). The batch
-    keeps its file-atomic stop semantics ("Dừng sau file hiện tại"): the hook only shortens work that
-    would otherwise be redone, never an Excel commit.
+    PROMPT-025/PROMPT-024R: ``should_cancel`` is the cooperative cancel-all hook. It is checked before
+    the slide render, between improvement-item region builds and between item-level crops (the slide
+    itself is rendered once and shared by every item region of that slide). A cancel observed at one of
+    these safe boundaries raises :class:`app.cancellation.CancellationRequested`, so the CURRENT report is
+    never committed as a partially processed success (§45). "Dừng sau file hiện tại" never uses this hook:
+    that stop mode stays file-atomic and is only observed between reports.
     """
     problems: List[str] = []
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    regions = build_improvement_visual_regions(report, refs, management_number=management_number)
+    regions = build_improvement_visual_regions(report, refs, management_number=management_number,
+                                               should_cancel=should_cancel)
     if not regions:
         expected_scope = report_scope_key(report.path)
         for ref in refs:
@@ -254,30 +258,31 @@ def export_after_pictures(report: ReportData, refs: Sequence["PictureRef"], out_
     render_paths = {}
     render_error = ""
     slides = sorted({region.slide_index for region in regions})
+    check_cancelled(should_cancel)
     with tempfile.TemporaryDirectory(prefix="re_visual_region_") as tmp:
         try:
-            render_paths = renderer.render(report, slides, Path(tmp))
+            render_paths = renderer.render(report, slides, Path(tmp), should_cancel=should_cancel)
             LOG.info("REGION_RENDER MN=%s report=%s scope=%s slides=%s backend=%s result=ok",
                      management_number or "-", report.filename, report_scope_key(report.path), slides,
                      renderer.last_backend or "unknown")
+        except CancellationRequested:
+            raise                                    # cancel propagates; temp renders are cleaned up by the context
         except Exception as exc:  # noqa: BLE001 – renderer errors must not stop the batch
             render_error = f"{type(exc).__name__}: {exc}"
             LOG.warning("REGION_RENDER MN=%s report=%s scope=%s slides=%s result=failed error=%s",
                         management_number or "-", report.filename, report_scope_key(report.path), slides, render_error)
+        check_cancelled(should_cancel)               # observed immediately after the (atomic) render finishes
 
         path_groups: List[List[Path]] = []
         owners: List[str] = []
         for index, region in enumerate(regions, start=1):
+            # safe boundary between item-level crops (PROMPT-024R §45): raising here cancels the CURRENT
+            # report before its Excel commit, so a partially cropped report is never saved as complete.
             if should_cancel is not None and should_cancel():
-                # cooperative stop between item-level crops (PROMPT-025 §43): finish nothing half-done,
-                # record the stop, and let the caller decide (the batch keeps file-atomic semantics).
-                problems.append(f"REGION_CANCELLED MN={management_number or '-'} report={report.filename} "
-                                f"scope={region.report_scope_id} slide={region.slide_index} "
-                                f"item={region.improvement_item_id}: đã dừng giữa các mục cải tiến")
                 LOG.info("REGION_CANCELLED MN=%s report=%s scope=%s slide=%s item=%s",
                          management_number or "-", report.filename, region.report_scope_id,
                          region.slide_index, region.improvement_item_id)
-                break
+                check_cancelled(should_cancel)
             stem = _region_stem(region, index)
             rendered = render_paths.get(region.slide_index)
             group: List[Path] = []
