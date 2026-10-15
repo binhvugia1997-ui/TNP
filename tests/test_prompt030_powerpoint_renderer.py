@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -48,28 +47,194 @@ def _fake_report(tmp_path: Path, slides=1):
 
 
 # ================================================================= § probe (side-effect-free)
-def test_probe_side_effect_free_does_not_launch_powerpoint(monkeypatch):
-    # On Linux, probe is deterministically unavailable and never touches Dispatch/Open
-    probe = powerpoint_probe()
-    assert probe.available is False
-    assert probe.stage == "not_windows"
+# PROMPT-030C: probe side-effect-free trên MỌI nền tảng — không bao giờ đụng COM entry point có
+# thể khởi động/attach PowerPoint. Availability trên Windows là chuyện CỦA MÁY (PowerPoint có thể
+# đã cài) nên test không bao giờ ép ``available is False`` trên Windows; ma trận registry/progid
+# giả lập bên dưới bao phủ cả trạng thái có và không có PowerPoint trên mọi host.
 
-    # On simulated Windows with no registry key, also unavailable but with distinct stage — still side-effect-free
-    monkeypatch.setattr(sys, "platform", "win32", raising=False)
-    # winreg missing key -> registry_missing
-    import types
-    fake_winreg = types.ModuleType("winreg")
-    def fake_open(*a, **kw):
-        raise FileNotFoundError("no PowerPoint")
-    fake_winreg.OpenKey = fake_open
-    fake_winreg.HKEY_CLASSES_ROOT = 0
-    monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
-    # also make win32com unavailable path distinct from registry missing
-    # ensure winreg is re-imported probe's branch
-    with patch.dict("sys.modules", {"winreg": fake_winreg}):
-        probe2 = powerpoint_probe()
-        assert probe2.available is False
-        assert probe2.stage in ("registry_missing", "win32com_missing", "not_windows")
+_PROBE_LAUNCH_METHODS = (
+    "Dispatch", "DispatchEx", "GetActiveObject", "GetObject", "EnsureDispatch",
+    "CoInitialize", "CoInitializeEx", "CoUninitialize", "Open", "Quit", "Visible",
+)
+
+
+def _recorded_spy(log, name):
+    """Callable ghi log khi bị gọi rồi nỗng — kể cả khi caller nuốt exception, log vẫn fail test."""
+    def _spy(*args, **kwargs):
+        log.append(name)
+        raise AssertionError(f"probe phải không được gọi {name}")
+    return _spy
+
+
+class _SpyModule(ModuleType):
+    """Module giả cho pythoncom / win32com(.client): mọi tên trong nhóm khởi động PowerPoint được
+    ghi log khi TRUY CẬP và nỗng AssertionError khi GỌI. Dunder bị AttributeError như module thường."""
+
+    def __init__(self, name, log):
+        super().__init__(name)
+        self._launch_log = log
+
+    def __getattr__(self, item):
+        if item.startswith("__"):
+            raise AttributeError(item)
+        if item in _PROBE_LAUNCH_METHODS:
+            log = object.__getattribute__(self, "_launch_log")
+            log.append(item)
+            return _recorded_spy(log, item)
+        raise AttributeError(item)
+
+
+class com_error(Exception):  # noqa: N801 – cố ý trùng tên pythoncom.com_error (type name đi vào detail)
+    """pythoncom.com_error giả (mô phỏng REGDB_E_CLASSNOTREG khi thiếu ProgID)."""
+
+    def __init__(self, hresult=-2147221167, strerror="REGDB_E_CLASSNOTREG"):
+        super().__init__(hresult, strerror)
+        self.hresult = hresult
+
+
+class _FakePythoncom(_SpyModule):
+    def __init__(self, log, clsid_ok: bool):
+        super().__init__("pythoncom", log)
+        self.com_error = com_error
+        if clsid_ok:
+            self.CLSIDFromProgID = lambda progid: "{000209FF-0000-0000-C000-000000000046}"
+        else:
+            def _fail(progid):
+                raise com_error()
+            self.CLSIDFromProgID = _fail
+
+
+class _FakeWinregKey:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeWinreg(ModuleType):
+    HKEY_CLASSES_ROOT = 0
+    KEY_READ = 0x20019
+    KEY_WOW64_64KEY = 0x0100
+    KEY_WOW64_32KEY = 0x0200
+
+    def __init__(self, key_present: bool):
+        super().__init__("winreg")
+        self._key_present = key_present
+
+    def OpenKey(self, *args, **kwargs):
+        if not self._key_present:
+            raise FileNotFoundError("no PowerPoint ProgID")
+        return _FakeWinregKey()
+
+
+def _probe_with_fakes(monkeypatch, *, platform="win32", clsid_ok=False, registry_key=True,
+                      pythoncom_present=True, win32com_present=True):
+    """Cài đủ pythoncom/win32com/winreg giả cho MỘT trạng thái máy; trả về (probe, launch_log).
+
+    ``registry_key``: True = ProgID có trong HKCR, False = không có. Không có đường nào chạm COM thật.
+    """
+    log = []
+    monkeypatch.setattr(qr, "sys", SimpleNamespace(platform=platform, version_info=sys.version_info))
+    if pythoncom_present:
+        monkeypatch.setitem(sys.modules, "pythoncom", _FakePythoncom(log, clsid_ok))
+    else:
+        monkeypatch.setitem(sys.modules, "pythoncom", None)   # ImportError khi import
+    if win32com_present:
+        fake_client = _SpyModule("win32com.client", log)
+        fake_win32 = _SpyModule("win32com", log)
+        fake_win32.client = fake_client
+        monkeypatch.setitem(sys.modules, "win32com", fake_win32)
+        monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
+    else:
+        monkeypatch.setitem(sys.modules, "win32com", None)
+        monkeypatch.setitem(sys.modules, "win32com.client", None)
+    monkeypatch.setitem(sys.modules, "winreg", _FakeWinreg(registry_key))
+    return powerpoint_probe(), log
+
+
+def _install_real_launch_spies(monkeypatch, log):
+    """Gắn spy lên COM entry point THẬT nếu pywin32 thật có mặt (máy Windows) để chứng minh probe
+    thật không sờ tới chúng. Không có module thật (Linux) thì bỏ qua — probe cũng không import."""
+    for name in ("win32com.client", "win32com", "pythoncom"):
+        try:
+            mod = __import__(name, fromlist=["*"])
+        except Exception:  # noqa: BLE001 – host không có pywin32: không có gì để spy
+            continue
+        for attr in _PROBE_LAUNCH_METHODS:
+            if hasattr(mod, attr):
+                monkeypatch.setattr(mod, attr, _recorded_spy(log, attr))
+
+
+def test_probe_side_effect_free_does_not_launch_powerpoint(monkeypatch):
+    """PROMPT-030C: probe side-effect-free trên CẢ HAI nền tảng — không Dispatch/DispatchEx/Open/COM init.
+
+    Trước đây test giả định probe luôn unavailable (môi trường Linux) nên fail trên Windows thật có
+    PowerPoint — ở đó ``powerpoint_probe()`` trả ``(True, '', 'progid-registry')`` đúng hợp đồng
+    (ProgID thấy qua HKCR). Test hiện tại: (1) máy thật — đúng hợp đồng host, KHÔNG ép availability
+    trên Windows; (2) ma trận giả lập đủ trạng thái (COM ProgID, registry-only ProgID, không cài
+    PowerPoint, thiếu pywin32, không-Windows); (3) mọi trạng thái đều chứng minh probe không gọi
+    bất kỳ hàm khởi động PowerPoint nào — kể cả khi available=True."""
+    # ---- 1) máy thật: hợp đồng của host, không suy đoán availability trên Windows
+    real_log = []
+    _install_real_launch_spies(monkeypatch, real_log)
+    real = powerpoint_probe()
+    assert real_log == [], f"probe thật đã gọi hàm khởi động PowerPoint: {real_log}"
+    assert isinstance(real.available, bool) and real.available is tuple(real)[0]
+    if sys.platform != "win32":
+        assert real.available is False
+        assert real.stage == "not_windows"
+        assert tuple(real) == (False, "availability", "not-windows")
+    else:
+        # Windows: PowerPoint có/không là chuyện của máy — chỉ khẳng định hợp đồng, không ép False.
+        assert real.stage in ("ok", "registry_missing", "win32com_missing")
+        assert real.available is (real.stage == "ok")
+        if real.available:
+            assert real.details in ("progid-com", "progid-registry")
+            assert tuple(real) == (True, "", real.details)
+            assert real.reason == f"PowerPoint có sẵn ({real.details})"
+        else:
+            assert tuple(real) != (False, "availability", "not-windows"), "Windows phải không bao giờ trả not-windows"
+
+    # ---- 2) ma trận giả lập registry/progid — deterministic trên mọi host
+    # (a) Windows + ProgID thấy qua COM (progid-com)
+    probe, log = _probe_with_fakes(monkeypatch, clsid_ok=True, registry_key=True)
+    assert probe.available is True and probe.stage == "ok"
+    assert tuple(probe) == (True, "", "progid-com")
+    assert probe.reason == "PowerPoint có sẵn (progid-com)" and probe.details == "progid-com"
+    assert log == [], f"probe đã gọi {log} khi báo available"
+
+    # (b) Windows + ProgID chỉ thấy qua registry (progid-registry — đúng dạng máy Windows đã tái lập)
+    probe, log = _probe_with_fakes(monkeypatch, clsid_ok=False, registry_key=True)
+    assert probe.available is True and probe.stage == "ok"
+    assert tuple(probe) == (True, "", "progid-registry")
+    assert probe.reason == "PowerPoint có sẵn (progid-registry)" and probe.details == "progid-registry"
+    assert log == [], f"probe đã gọi {log} khi báo available"
+
+    # (c) Windows + không cài PowerPoint (CLSID fail, HKCR trống)
+    probe, log = _probe_with_fakes(monkeypatch, clsid_ok=False, registry_key=False)
+    assert probe.available is False and probe.stage == "registry_missing"
+    assert tuple(probe) == (False, "availability", "progid-not-registered (com_error)")
+    assert log == [], f"probe đã gọi {log}"
+
+    # (d) Windows + thiếu pythoncom
+    probe, log = _probe_with_fakes(monkeypatch, pythoncom_present=False)
+    assert probe.available is False and probe.stage == "win32com_missing"
+    assert tuple(probe)[1] == "import" and tuple(probe)[2].startswith("pythoncom ")
+    assert log == [], f"probe đã gọi {log}"
+
+    # (e) Windows + thiếu win32com.client
+    probe, log = _probe_with_fakes(monkeypatch, clsid_ok=True, win32com_present=False)
+    assert probe.available is False and probe.stage == "win32com_missing"
+    assert tuple(probe)[1] == "import" and tuple(probe)[2].startswith("win32com.client ")
+    assert log == [], f"probe đã gọi {log}"
+
+    # (f) ép không-Windows — hợp đồng not-windows giữ nguyên trên mọi host
+    for host in ("linux", "darwin"):
+        probe, log = _probe_with_fakes(monkeypatch, platform=host)
+        assert probe.available is False and probe.stage == "not_windows"
+        assert tuple(probe) == (False, "availability", "not-windows"), host
+        assert log == [], f"probe đã gọi {log} trên {host}"
 
 
 def test_powerpoint_available_delegates_to_probe():
