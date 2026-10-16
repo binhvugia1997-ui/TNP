@@ -959,10 +959,13 @@ class ApplicationService:
                     state, reason = "ready", "available"
                 candidate_status = {
                     "image": self._learning_candidate_status(
-                        state, "empty" if state == "ready" and not images else reason, len(images), "image"),
+                        "ready" if images else state,
+                        "available" if images else ("empty" if state == "ready" else reason), len(images), "image"),
                     "content": self._learning_candidate_status(
                         state, "empty" if state == "ready" and not contents else reason, len(contents), "content"),
                 }
+                if images and processor is None:
+                    candidate_status["image"]["message"] = f"Đã khôi phục {len(images)} ảnh ứng viên từ learning_data."
 
             is_running_method = getattr(processor, "is_running", None) if processor is not None else None
             worker_alive = bool(is_running_method()) if callable(is_running_method) else False
@@ -1009,11 +1012,22 @@ class ApplicationService:
             message = f"Lượt xử lý hiện tại không có {noun} cần kiểm tra."
         return {"state": state, "reason": reason, "count": int(count), "message": message}
 
+    def _review_image(self, candidate_id: str):
+        from .learning_assets import review_id
+        candidates = self.controller.review_candidates()
+        scoped = next((item for item in candidates if review_id(item) == candidate_id), None)
+        if scoped is not None:
+            return scoped
+        legacy = [item for item in candidates if item.candidate_id == candidate_id]
+        if len(legacy) > 1:
+            raise ServiceError("Có nhiều nguồn cho ảnh này; chọn lại ảnh trong Learning.", "AMBIGUOUS_CANDIDATE")
+        return legacy[0] if legacy else None
+
     def _set_pending_label_unlocked(self, kind: str, candidate_id: str, label: str, note: str) -> None:
         """Validate + record one pending label. Caller holds ``self._lock`` and has asserted idle."""
         c = self.controller
         if kind == "image":
-            candidate = next((item for item in c.review_candidates() if item.candidate_id == candidate_id), None)
+            candidate = self._review_image(candidate_id)
             if candidate is None:
                 raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
             c.set_pending_label(candidate, label, note)
@@ -1057,9 +1071,12 @@ class ApplicationService:
         """
         c = self.controller
         if kind == "image":
+            from .learning_assets import review_id
             for candidate_id in c.pending_labels:
-                if candidate_id in notes:
-                    c.pending_label_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
+                candidate = c._pending_image_candidates.get(candidate_id)
+                key = review_id(candidate) if candidate is not None and review_id(candidate) in notes else candidate_id
+                if key in notes:
+                    c.pending_label_notes[candidate_id] = self._text(notes[key], "note", 1000)
         else:
             for candidate_id in c.pending_content_labels:
                 if candidate_id in notes:
@@ -1105,6 +1122,36 @@ class ApplicationService:
             return {"message": message, "kind": kind, "candidateId": candidate_id, "label": label,
                     "labelPending": False, "excelPending": pending,
                     "excelLastResult": dict(self._last_excel_result)}
+
+    def save_learning_images(self, candidate_ids: list, label: str, notes: Optional[dict] = None) -> dict:
+        """One bounded bulk ack, same labels-first/Excel retry contract as the 036S single save.
+
+        Validate the entire request and its report+slide scope before touching pending labels.
+        Disk failures propagate; pending choices remain retryable, never a false success.
+        """
+        from .image_learning import LABELS
+        from .learning_assets import review_id
+        from .report_identity import report_scope_key
+        if not isinstance(candidate_ids, list) or not 1 <= len(candidate_ids) <= 500:
+            raise ServiceError("Chọn từ 1 đến 500 ảnh cùng slide.", "INVALID_ARGUMENT")
+        ids = list(dict.fromkeys(self._text(cid, "candidateId", 512) for cid in candidate_ids))
+        label = self._choice(label, "label", set(LABELS))
+        notes = self._object(notes or {}, "learningNotes")
+        clean_notes = {cid: self._text(notes.get(cid, ""), "note", 1000) for cid in ids}
+        with self._lock:
+            self._assert_idle("Không thể lưu nhãn trong khi đang xử lý báo cáo.")
+            candidates = [self._review_image(cid) for cid in ids]
+            if any(candidate is None for candidate in candidates):
+                raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
+            scopes = {(report_scope_key(c.source_file) or review_id(c), c.source_name, c.slide) for c in candidates}
+            if len(scopes) != 1:
+                raise ServiceError("Chỉ xác nhận nhiều ảnh trong cùng báo cáo và slide.", "CROSS_SLIDE_SELECTION")
+            for cid, candidate in zip(ids, candidates):
+                self.controller.set_pending_label(candidate, label, clean_notes[cid])
+            message, pending = self._save_learning_labels_unlocked(
+                "image", {review_id(c): clean_notes[cid] for cid, c in zip(ids, candidates)})
+            return {"message": message, "candidateIds": ids, "label": label, "labelPending": False,
+                    "excelPending": pending, "excelLastResult": dict(self._last_excel_result)}
 
     def dismiss_learning_excel_notice(self) -> dict:
         """Clear only the transient result message; preserve saved labels and any pending Excel retry."""
@@ -1366,20 +1413,30 @@ class ApplicationService:
         empty = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "regions": []}
         regions: List[Dict[str, Any]] = []
         try:
-            source = Path(candidate.source_file)
-            if not source or not source.is_file():
-                return empty
             from .qpn_renderer import RENDER_SCHEMA_VERSION, SlideRenderer, is_faithful_backend
             from .report_identity import report_scope_key
+            from .learning_assets import LearningAssets, digest
+            owner = learning or getattr(getattr(self, "controller", None), "learning", None)
+            assets = LearningAssets(owner.dir) if owner is not None else None
+            source = Path(candidate.source_file)
             slide_number = int(candidate.slide)
             renderer = SlideRenderer(width_px=LEARNING_PREVIEW_WIDTH_PX)  # same chain as production
+            signature = (tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION,
+                         tuple(sorted(renderer.availability().items())), self._learning_identity(learning))
+            if getattr(candidate, "_snapshot_changed", False):
+                return empty  # retained label/snapshot is not evidence for the changed live source
+            if not candidate.source_file or not source.is_file():
+                return (assets.offline_slide(candidate, signature) if assets is not None else None) or empty
             stat = source.stat()
             key = (report_scope_key(source), str(source), slide_number, int(stat.st_mtime_ns), int(stat.st_size),
-                   tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION,
-                   tuple(sorted(renderer.availability().items())), self._learning_identity(learning))
+                   *signature)
             cached = self._slide_preview_cache.get(key)
             if cached is not None and not self._preview_expired(cached):
                 return dict(cached)
+            persisted = assets.slide(digest(key), signature) if assets is not None and cached is None else None
+            if persisted and not self._preview_expired(persisted):
+                self._remember_preview(key, persisted)
+                return persisted
             from .pptx_parser import parse_pptx
             report = parse_pptx(source)
             if report.slide(slide_number) is None:
@@ -1409,6 +1466,8 @@ class ApplicationService:
                            "backend": renderer.last_backend or "",
                            "faithful": is_faithful_backend(renderer.last_backend),
                            "degraded": degraded, "created": time.monotonic()})
+            if assets is not None:
+                result = assets.remember_slide(key, result)
             self._remember_preview(key, result)
             return result
         except Exception as exc:  # noqa: BLE001 – preview is display-only; never break the review state
@@ -1505,11 +1564,20 @@ class ApplicationService:
         return min(matches, key=lambda r: int(r.get("afterBlockIndex", 0)))
 
     def _image_candidate_dto(self, candidate, learning) -> dict:
-        src = self._preview_cache.get(candidate.candidate_id)
-        if src is None:
-            blob = self.controller.candidate_blob(candidate) or b""
-            src = self._bytes_data_uri(blob)
-            self._preview_cache[candidate.candidate_id] = src
+        from .learning_assets import LearningAssets, asset_key, digest, review_id, source_name, source_version
+        from .report_identity import report_scope_key
+        assets = LearningAssets(learning.dir)
+        current_version = source_version(candidate.source_file)
+        if hasattr(candidate, "_snapshot_version") and current_version is not None:
+            candidate._snapshot_changed = current_version != candidate._snapshot_version
+        cache_key = digest((asset_key(candidate), source_version(candidate.source_file)))
+        src = self._preview_cache.get(cache_key)
+        if not src:
+            src = assets.candidate_src(candidate)
+            if not src and not getattr(candidate, "_snapshot_changed", False):
+                blob = self.controller.candidate_blob(candidate) or b""
+                src = self._bytes_data_uri(blob)
+            self._preview_cache[cache_key] = src
             if len(self._preview_cache) > 128:
                 self._preview_cache.pop(next(iter(self._preview_cache)))
         bw = max(1, int(candidate.slide_size[0] or 1))
@@ -1526,6 +1594,8 @@ class ApplicationService:
             opaque_id = hashlib.sha256(str(candidate.candidate_id).encode("utf-8")).hexdigest()[:12]
             LOG.warning("LEARNING_IMAGE_PREVIEW_FAILED candidate=%s error=%s", opaque_id, type(exc).__name__)
             preview = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "regions": []}
+        if not getattr(candidate, "_snapshot_changed", False):
+            assets.remember_candidate(candidate, src, preview)
         # PROMPT-027 §13/§15: the picture candidate and the FINAL Excel evidence region are two different
         # review geometries.  The region below is the production ImprovementVisualRegion that owns this
         # candidate — never a React-side derivation from candidate.bounds.
@@ -1538,7 +1608,9 @@ class ApplicationService:
             evidence_bbox = {"x": rx, "y": ry, "width": rw, "height": rh}
             evidence_pct = {"x": round(ex * 100, 3), "y": round(ey * 100, 3),
                             "w": round(ew * 100, 3), "h": round(eh * 100, 3)}
-        return {"id": candidate.candidate_id, "sourceFile": candidate.source_name,
+        return {"id": candidate.candidate_id, "reviewId": review_id(candidate),
+                "reportScope": report_scope_key(candidate.source_file) or asset_key(candidate),
+                "persisted": bool(getattr(candidate, "_persisted", False)), "sourceFile": source_name(candidate.source_name),
                 "managementNumber": candidate.management_number, "slide": candidate.slide,
                 "pictureId": str(candidate.picture_id), "src": src,
                 "bounds": {"x": round(x / bw * 100, 2), "y": round(y / bh * 100, 2),
@@ -1576,8 +1648,10 @@ class ApplicationService:
                 "itemHeading": candidate.owner_heading,
                 "decision": candidate.decision, "confidenceBand": candidate.confidence_band,
                 "confidence": float(candidate.confidence), "evidence": list(candidate.evidence),
-                "excelEligible": bool(candidate.excel_output_eligible),
-                "eligibilityReason": candidate.eligibility_reason, "nearbyText": candidate.nearby_text,
+                "excelEligible": bool(candidate.excel_output_eligible) and not getattr(candidate, "_snapshot_changed", False),
+                "eligibilityReason": ("Nguồn đã thay đổi; chạy xử lý lại để cập nhật preview."
+                                      if getattr(candidate, "_snapshot_changed", False) else candidate.eligibility_reason),
+                "nearbyText": candidate.nearby_text,
                 "userLabel": label, "labelPending": candidate.candidate_id in self.controller.pending_labels,
                 "note": str(pending_note if pending_note is not None else latest.get("note", ""))}
 

@@ -233,6 +233,10 @@ export const CONFIDENCE_LABEL: Record<'high' | 'medium' | 'low', string> = {
 }
 
 export type ImageCandidate = {
+  /** Scoped evidence identity; canonical `id` remains backward-compatible in the Python DTO. */
+  reviewId?: string
+  reportScope?: string
+  persisted?: boolean
   id: string
   sourceFile: string
   managementNumber: string
