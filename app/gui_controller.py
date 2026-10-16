@@ -475,6 +475,8 @@ class GuiController:
         self.learning_dir: Optional[Path] = learning_dir_override
         self._learning = None
         self.review_index = 0
+        self._restored_image_candidates = None
+        self._pending_image_candidates: Dict[str, Any] = {}
         self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
         self.pending_label_notes: Dict[str, str] = {}
         self.pending_image_reapply: list = []         # saved image labels whose region-crop Excel reapply is still owed
@@ -645,12 +647,23 @@ class GuiController:
 
     def review_candidates(self) -> list:
         """Reviewable pictures of the LAST finished batch (hard-excluded logos/arrows are never offered)."""
-        if self.is_running() or not self.processor:
+        if self.is_running():
             return []
-        out = []
+        from .learning_assets import LearningAssets, review_id
+        if self.processor is None:
+            if self.learning is None:
+                return []
+            if self._restored_image_candidates is None:
+                assets = LearningAssets(self.learning.dir)
+                self._restored_image_candidates = assets.candidates(self.learning.store.latest())
+            return list(self._restored_image_candidates)
+        # A current (even empty) run is authoritative: never append stale archive rows over it (032).
+        out = {}
         for fr in getattr(self.processor, "results", []):
-            out.extend(c for c in getattr(fr, "image_candidates", []) if not c.hard_excluded)
-        return out
+            for candidate in getattr(fr, "image_candidates", []):
+                if not candidate.hard_excluded:
+                    out[review_id(candidate)] = candidate
+        return list(out.values())
 
     def review_summary_text(self) -> str:
         cands = self.review_candidates()
@@ -678,6 +691,7 @@ class GuiController:
             raise ValueError(label)
         self.pending_labels[cand.candidate_id] = label
         self.pending_label_notes[cand.candidate_id] = note
+        self._pending_image_candidates[cand.candidate_id] = cand
 
     def save_confirmations(self, cands) -> Tuple[bool, str]:
         """Persist labels first, then re-apply region crops to the Excel image cells."""
@@ -687,6 +701,8 @@ class GuiController:
         if not self.pending_labels:
             return False, "Chưa chọn nhãn nào."
         by_id = {c.candidate_id: c for c in cands}
+        # Shared classification IDs can have distinct evidence sources. Use the explicitly selected source.
+        by_id.update(self._pending_image_candidates)
         written, touched = 0, []
         for cid, label in list(self.pending_labels.items()):
             c = by_id.get(cid)
@@ -698,6 +714,7 @@ class GuiController:
             touched.append(c)
         self.pending_labels.clear()
         self.pending_label_notes.clear()
+        self._pending_image_candidates.clear()
         # Include reports owed from a previous locked attempt; the label JSONL stays the source of truth.
         by_touched_id = {c.candidate_id: c for c in self.pending_image_reapply}
         by_touched_id.update({c.candidate_id: c for c in touched})

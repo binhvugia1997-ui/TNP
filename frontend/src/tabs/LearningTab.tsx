@@ -255,6 +255,10 @@ function backendLabel(backend: string): string {
 const MIN_LIST_W = 200
 const MAX_LIST_W = 420
 
+function imageSlideScope(candidate: ImageCandidate): string {
+  return `${candidate.reportScope || `${candidate.managementNumber}|${candidate.sourceFile}`}|${candidate.slide}`
+}
+
 function ImageReview() {
   const s = useStore()
   const list = s.learning.images
@@ -307,7 +311,7 @@ function ImageReview() {
   const groups = useMemo(() => {
     const out: { key: string; managementNumber: string; fileName: string; items: { cand: ImageCandidate; idx: number }[] }[] = []
     list.forEach((c, idx) => {
-      const key = `${c.managementNumber}|${c.sourceFile}`
+      const key = c.reportScope || `${c.managementNumber}|${c.sourceFile}`
       const last = out[out.length - 1]
       if (last && last.key === key) last.items.push({ cand: c, idx })
       else out.push({ key, managementNumber: c.managementNumber, fileName: c.sourceFile, items: [{ cand: c, idx }] })
@@ -328,6 +332,77 @@ function ImageReview() {
     mq.addEventListener('change', onChange)
     return () => mq.removeEventListener('change', onChange)
   }, [])
+
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [activeLabel, setActiveLabel] = useState('')
+  const [hint, setHint] = useState('')
+  const [confirming, setConfirming] = useState(false)
+  const confirmInFlight = useRef(false)
+  const anchorId = useRef('')
+  const scope = cand ? imageSlideScope(cand) : ''
+  // Identity/scope pruning also handles same-length candidate replacement and reordering.
+  useEffect(() => {
+    setSelectedIds((previous) => {
+      const next = new Set(list.filter((c) => previous.has(c.id) && imageSlideScope(c) === scope).map((c) => c.id))
+      return next.size === previous.size && [...next].every((id) => previous.has(id)) ? previous : next
+    })
+    if (!list.some((c) => c.id === anchorId.current)) anchorId.current = ''
+  }, [list, scope])
+
+  const handleCandidateClick = (idx: number, event: React.MouseEvent) => {
+    if (event.detail > 1) return // native double-click's second click must not clear the multi-selection
+    const clicked = list[idx]
+    if (!clicked) return
+    setHint('')
+    const clickedScope = imageSlideScope(clicked)
+    if (event.shiftKey && anchorId.current) {
+      const anchor = list.findIndex((c) => c.id === anchorId.current)
+      const range = list.slice(Math.min(anchor, idx), Math.max(anchor, idx) + 1)
+      const same = range.filter((c) => imageSlideScope(c) === clickedScope)
+      setSelectedIds(new Set(same.map((c) => c.id)))
+      if (same.length !== range.length) setHint('Chỉ chọn ảnh cùng báo cáo và slide.')
+    } else if (event.ctrlKey || event.metaKey) {
+      const previous = selectedIds.size ? selectedIds : new Set(cand ? [cand.id] : [])
+      const next = new Set(list.filter((c) => previous.has(c.id) && imageSlideScope(c) === clickedScope).map((c) => c.id))
+      if (clickedScope !== scope) setHint('Đã chuyển lựa chọn sang báo cáo / slide mới.')
+      if (next.has(clicked.id)) next.delete(clicked.id)
+      else next.add(clicked.id)
+      setSelectedIds(next)
+      anchorId.current = clicked.id
+    } else {
+      // Focusing a member keeps a multi-selection intact for click/click/dblclick quick confirmation.
+      if (!selectedIds.has(clicked.id)) setSelectedIds(new Set([clicked.id]))
+      anchorId.current = clicked.id
+    }
+    s.setImageReviewIndex(idx)
+  }
+  const selectedOnSlide = list.filter((c) => selectedIds.has(c.id) && imageSlideScope(c) === scope)
+  const confirm = async (candidates: ImageCandidate[], label: string) => {
+    if (confirmInFlight.current || s.locked || !candidates.length) return
+    if (!label || label === 'UNLABELED') {
+      setHint('Vui lòng chọn nhãn trước khi xác nhận nhanh (double-click).')
+      return
+    }
+    confirmInFlight.current = true
+    setConfirming(true)
+    setHint('')
+    try {
+      const ok = candidates.length > 1
+        ? await s.saveImageCandidates(candidates.map((c) => c.id), label)
+        : await s.saveImageCandidate(candidates[0].id, label, candidates[0].note)
+      setHint(ok ? `Đã xác nhận ${candidates.length} ảnh.` : 'Chưa lưu hết nhãn. Giữ lựa chọn để thử lại.')
+    } finally {
+      confirmInFlight.current = false
+      setConfirming(false)
+    }
+  }
+  const handleDoubleClick = (idx: number) => {
+    const clicked = list[idx]
+    if (!clicked) return
+    const same = list.filter((c) => selectedIds.has(c.id) && imageSlideScope(c) === imageSlideScope(clicked))
+    void confirm(same.length > 1 && selectedIds.has(clicked.id) ? same : [clicked],
+      activeLabel || (clicked.userLabel !== 'UNLABELED' ? clicked.userLabel : ''))
+  }
 
   const emptyFeedback = candidateFeedback(s.connected, s.learningLoad, s.learning.candidateStatus.image)
   if (!cand) return (
@@ -409,11 +484,15 @@ function ImageReview() {
                     <button
                       type="button"
                       ref={selected ? selectedRef : undefined}
-                      onClick={() => s.setImageReviewIndex(idx)}
+                      onClick={(event) => handleCandidateClick(idx, event)}
+                      onDoubleClick={() => handleDoubleClick(idx)}
+                      data-testid={`candidate-${idx}`}
+                      data-selected={selectedIds.has(c.id) ? 'true' : undefined}
+                      aria-pressed={selectedIds.has(c.id)}
                       title={`${c.sourceFile} — Slide ${c.slide} — ${itemLabel}`}
                       className={cn(
                         'flex w-full items-center gap-2 px-2 py-1.5 text-left',
-                        selected ? 'bg-brand-50' : 'bg-white hover:bg-[#f6f9fd]',
+                        selectedIds.has(c.id) ? 'bg-brand-50 ring-1 ring-inset ring-brand-200' : selected ? 'bg-brand-50' : 'bg-white hover:bg-[#f6f9fd]',
                       )}
                     >
                       {c.src
@@ -601,6 +680,61 @@ function ImageReview() {
         <span className="text-xs2 text-muted">Mục {index + 1}/{list.length}</span>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <div className="mb-3 rounded-sm2 border border-brand-100 bg-brand-50/40 p-2.5" data-testid="learning-label-controls">
+          <p className="mb-1.5 text-base2 font-medium text-header">Chọn nhãn xác nhận</p>
+          {selectedOnSlide.length > 1 && <p role="status" className="mb-2 text-xs2 text-brand-700">Đã chọn {selectedOnSlide.length} ảnh cùng báo cáo / slide — áp nhãn cho tất cả.</p>}
+          <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="Chọn nhãn xác nhận">
+            {IMAGE_LABELS.map((l) => (
+              <Button key={l.key} active={cand.userLabel === l.key} disabled={s.locked || confirming}
+                className="justify-center"
+                onClick={() => {
+                  setActiveLabel(l.key)
+                  setHint('')
+                  if (selectedOnSlide.length > 1) void confirm(selectedOnSlide, l.key)
+                  else s.labelImage(cand.id, l.key)
+                }}>
+                {l.label}
+              </Button>
+            ))}
+          </div>
+
+          <p className="mb-1 mt-3 text-base2 font-medium text-header">Ghi chú</p>
+          <TextInput
+            value={cand.note}
+            disabled={s.locked}
+            maxLength={1000}
+            placeholder="Ghi chú cho đối tượng này (không bắt buộc)"
+            onChange={(e) => s.setNote('image', cand.id, e.target.value)}
+          />
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Button icon={<ChevronLeft className="h-3.5 w-3.5" />} disabled={index === 0}
+              onClick={() => s.setImageReviewIndex(index - 1)}>
+              Mục trước
+            </Button>
+            <Button disabled={index >= list.length - 1} onClick={() => s.setImageReviewIndex(index + 1)}>
+              Mục tiếp
+              <ChevronRight className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          <Button
+            variant="primary"
+            className="mt-2 w-full justify-center"
+            icon={<Save className="h-3.5 w-3.5" />}
+            disabled={(!chosen && !activeLabel) || s.locked || confirming}
+            onClick={() => void confirm(selectedOnSlide.length > 1 ? selectedOnSlide : [cand],
+              chosen ? cand.userLabel : activeLabel)}
+          >
+            Lưu nhãn & ghi chú
+          </Button>
+          {hint && <p role="status" className="mt-2 text-xs2 text-body">{hint}</p>}
+          {chosen && (
+            <span className={cn('mt-2 inline-flex items-center gap-1.5 text-xs2', cand.labelPending ? 'text-warn-600' : 'text-ok-600')}>
+              {cand.labelPending ? <AlertTriangle className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+              {cand.labelPending ? `Nhãn “${labelName(cand.userLabel)}” chưa lưu.` : `Nhãn “${labelName(cand.userLabel)}” đã lưu cục bộ.`}
+            </span>
+          )}
+        </div>
         <KeyValue label="Report nguồn"><span title={cand.sourceFile}>{cand.sourceFile}</span></KeyValue>
         <KeyValue label="Management Number">{cand.managementNumber}</KeyValue>
         <KeyValue label="Slide / Mục">
@@ -678,53 +812,6 @@ function ImageReview() {
         </ul>
         {cand.nearbyText && <p className="mt-1.5 text-xs2 text-muted">Chữ gần ảnh: “{cand.nearbyText}”</p>}
 
-        <div className="mt-3 border-t border-lineSoft pt-2.5">
-          <p className="mb-1.5 text-base2 font-medium text-header">Chọn nhãn xác nhận</p>
-          <div className="grid grid-cols-2 gap-1.5">
-            {IMAGE_LABELS.map((l) => (
-              <Button key={l.key} active={cand.userLabel === l.key} disabled={s.locked}
-                className="justify-center"
-                onClick={() => s.labelImage(cand.id, l.key)}>
-                {l.label}
-              </Button>
-            ))}
-          </div>
-
-          <p className="mb-1 mt-3 text-base2 font-medium text-header">Ghi chú</p>
-          <TextInput
-            value={cand.note}
-            disabled={s.locked}
-            maxLength={1000}
-            placeholder="Ghi chú cho đối tượng này (không bắt buộc)"
-            onChange={(e) => s.setNote('image', cand.id, e.target.value)}
-          />
-
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Button icon={<ChevronLeft className="h-3.5 w-3.5" />} disabled={index === 0}
-              onClick={() => s.setImageReviewIndex(index - 1)}>
-              Mục trước
-            </Button>
-            <Button disabled={index >= list.length - 1} onClick={() => s.setImageReviewIndex(index + 1)}>
-              Mục tiếp
-              <ChevronRight className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-          <Button
-            variant="primary"
-            className="mt-2 w-full justify-center"
-            icon={<Save className="h-3.5 w-3.5" />}
-            disabled={!chosen || s.locked}
-            onClick={() => void s.saveImageCandidate(cand.id, cand.userLabel, cand.note)}
-          >
-            Lưu nhãn & ghi chú
-          </Button>
-          {chosen && (
-            <span className={cn('mt-2 inline-flex items-center gap-1.5 text-xs2', cand.labelPending ? 'text-warn-600' : 'text-ok-600')}>
-              {cand.labelPending ? <AlertTriangle className="h-3.5 w-3.5" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-              {cand.labelPending ? `Nhãn “${labelName(cand.userLabel)}” chưa lưu.` : `Nhãn “${labelName(cand.userLabel)}” đã lưu cục bộ.`}
-            </span>
-          )}
-        </div>
       </div>
     </section>
   )

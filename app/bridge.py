@@ -202,6 +202,11 @@ class BridgeService:
             self._string(kind, "kind", 16), self._string(candidate_id, "candidateId", 512),
             self._string(label, "label", 64), self._string(note, "note", 1000)))
 
+    def save_learning_images(self, candidate_ids: Any, label: str, notes: Any = None) -> dict:
+        return self._respond(lambda: self.service.save_learning_images(
+            candidate_ids, self._string(label, "label", 64),
+            self._bounded_object(notes if notes is not None else {}, "learningNotes")))
+
     def save_learning_labels(self, kind: str, notes: Any = None) -> dict:
         if notes is None:
             notes = {}

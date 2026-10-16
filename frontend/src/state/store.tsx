@@ -263,7 +263,9 @@ function normalizeLearning(raw: unknown): LearningState {
     || typeof value.modelStatus.image !== 'string' || typeof value.modelStatus.content !== 'string') {
     throw new BridgeProtocolError()
   }
-  return { ...EMPTY_LEARNING, ...value, images: value.images, contents: value.contents,
+  return { ...EMPTY_LEARNING, ...value,
+    images: value.images.map((candidate) => ({ ...candidate, id: candidate.reviewId || candidate.id })),
+    contents: value.contents,
     candidateStatus: {
       image: image as LearningCandidateAvailability,
       content: content as LearningCandidateAvailability,
@@ -1208,6 +1210,7 @@ function useStoreValue() {
         current.phase = 'pending'
         persistLabel(kind, id)
       }
+      return !superseded
     } catch (error) {
       const current = localLabelsRef.current.get(key)
       if (current) {
@@ -1216,6 +1219,7 @@ function useStoreValue() {
         if (superseded) persistLabel(kind, id)
       }
       if (alive.current) recordError(error)
+      return false
     } finally {
       labelWritesInFlightRef.current -= 1
       if (alive.current) void refreshLearning()
@@ -1225,6 +1229,67 @@ function useStoreValue() {
     saveLearningCandidate('image', id, label, note), [saveLearningCandidate])
   const saveContentCandidate = useCallback((id: string, label: string, note: string) =>
     saveLearningCandidate('content', id, label, note), [saveLearningCandidate])
+  // PROMPT-030B: one bulk save ack, not N full-state round trips. Reuse the 036S
+  // local overlay/epoch/worker ordering contract, including visible failure and retry.
+  const saveImageCandidates = useCallback(async (rawIds: string[], label: string): Promise<boolean> => {
+    const ids = [...new Set(rawIds)]
+    const candidates = ids.map((id) => learningStateRef.current.images.find((c) => c.id === id))
+    const scope = (c: ImageCandidate) => `${c.reportScope || `${c.managementNumber}|${c.sourceFile}`}|${c.slide}`
+    if (!ids.length || candidates.some((c) => !c)
+      || new Set(candidates.map((c) => scope(c!))).size !== 1) {
+      setErrorMessage('Chỉ xác nhận nhiều ảnh trong cùng báo cáo và slide.')
+      return false
+    }
+    const keys = ids.map((id) => `image:${id}`)
+    const notes = Object.fromEntries(candidates.map((c) => [c!.id, c!.note]))
+    labelWriteEpochRef.current += 1
+    candidates.forEach((c) => localLabelsRef.current.set(`image:${c!.id}`,
+      { kind: 'image', id: c!.id, label, note: c!.note, phase: 'saving' }))
+    setLearningState((state) => ({ ...state,
+      images: state.images.map((c) => ids.includes(c.id) ? { ...c, userLabel: label, labelPending: true } : c),
+      counts: { ...state.counts, image: { ...state.counts.image,
+        labeled: state.counts.image.labeled + candidates.filter((c) => c!.userLabel === 'UNLABELED').length } },
+    }))
+    labelWritesInFlightRef.current += 1
+    try {
+      while (keys.some((key) => labelWorkersRef.current.has(key))) {
+        await new Promise((resolve) => { window.setTimeout(resolve, 5) })
+      }
+      const result = await callNative<Omit<LearningSaveAck, 'candidateId' | 'kind'> & { candidateIds: string[] }>(
+        'save_learning_images', ids, label, notes)
+      const saved = new Set<string>()
+      keys.forEach((key, i) => {
+        const entry = localLabelsRef.current.get(key)
+        if (entry?.label === label && entry.note === notes[ids[i]]) {
+          localLabelsRef.current.delete(key)
+          saved.add(ids[i])
+        } else if (entry) {
+          entry.phase = 'pending'
+          persistLabel('image', ids[i])
+        }
+      })
+      setLearningState((state) => ({ ...state,
+        images: state.images.map((c) => saved.has(c.id) ? { ...c, labelPending: false } : c),
+        excelLastResult: result.excelLastResult, excelPending: result.excelPending,
+      }))
+      setErrorCode(result.excelLastResult?.kind === 'locked' ? 'EXCEL_LOCKED' : '')
+      setErrorMessage(result.message)
+      return saved.size === ids.length
+    } catch (error) {
+      keys.forEach((key, i) => {
+        const entry = localLabelsRef.current.get(key)
+        if (!entry) return
+        const superseded = entry.label !== label || entry.note !== notes[ids[i]]
+        entry.phase = superseded ? 'pending' : 'error'
+        if (superseded) persistLabel('image', ids[i])
+      })
+      if (alive.current) recordError(error)
+      return false
+    } finally {
+      labelWritesInFlightRef.current -= 1
+      if (alive.current) void refreshLearning()
+    }
+  }, [callNative, persistLabel, recordError, refreshLearning])
   const trainModels = useCallback(async () => {
     try {
       const result = await callNative<LearningState & { training?: boolean }>('train_models')
@@ -1280,6 +1345,7 @@ function useStoreValue() {
     learning: learningState, learningLoad, refreshLearning,
     imageReviewIndex, setImageReviewIndex, contentReviewIndex, setContentReviewIndex,
     labelImage, labelContent, setNote, saveImageLabels, saveContentLabels, saveImageCandidate, saveContentCandidate,
+    saveImageCandidates,
     trainModels, exportLearningData,
     openLearningFolder, applyLabelsToExcel, dismissExcelResult, training,
     inputFileName, chooseReportFolder, choosePptxFile, chooseTemplateFile, chooseOutputFile,
