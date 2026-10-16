@@ -209,6 +209,37 @@ export type DiagnosticRow = {
   state: 'ok' | 'warn' | 'error' | 'idle'
 }
 
+/* ---------------------------------------------------------------- Excel mặc định (PROMPT-040) */
+
+export type ExcelKind = 'template' | 'output'
+
+/** `unconfigured` = chưa từng chọn; `checking` = đang kiểm tra hợp lệ; các trạng thái còn lại là lỗi thật. */
+export type ExcelState = 'unconfigured' | 'checking' | 'ok' | 'missing' | 'inaccessible' | 'invalid'
+
+/** Một file Excel đã được chọn một lần và ghi vào config người dùng (không dùng localStorage). */
+export type ExcelKindState = {
+  kind: ExcelKind
+  label: string
+  path: string
+  name: string
+  folder: string
+  state: ExcelState
+  message: string
+  /** false = giá trị trong config.json chưa khớp lựa chọn hiện tại (ví dụ thư mục config chỉ đọc). */
+  persisted: boolean
+}
+
+export type ExcelSelectionState = { template: ExcelKindState; output: ExcelKindState }
+
+export const EXCEL_STATE_LABEL: Record<ExcelState, string> = {
+  unconfigured: 'Chưa chọn',
+  checking: 'Đang kiểm tra',
+  ok: 'Dùng được',
+  missing: 'Không tìm thấy',
+  inaccessible: 'Không truy cập được',
+  invalid: 'Không hợp lệ',
+}
+
 /* ---------------------------------------------------------------- Học cải tiến */
 
 export type LabelValue = 'UNLABELED' | string

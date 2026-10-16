@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from . import APP_NAME, APP_TITLE, BUILD_ID, BUILD_NUMBER, __version__, updater
-from .excel_writer import ExcelLockedError, ExcelWriter, TemplateError
+from .config import AppConfig
+from .excel_writer import ExcelLockedError, ExcelWriter, TemplateError, validate_template
 from .gui_controller import GuiController
 from .extractor import management_number_from_filename
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD,
@@ -42,6 +43,20 @@ LEARNING_PREVIEW_WIDTH_PX = 1600
 # PROMPT-027R §30: a preview rendered while a higher-fidelity backend FAILED (not merely absent) is reused only
 # for this many seconds, so a transient COM failure can never pin the fallback for the whole session.
 DEGRADED_PREVIEW_TTL_S = 15.0
+
+# PROMPT-040: the two Excel files the operator picks once and the app then remembers in the existing user
+# config (``last_template`` / ``last_output_file``).  The DTO below is what the UI uses to show the current
+# default and to explain when it cannot be used any more — it never substitutes another file silently.
+EXCEL_KINDS = ("template", "output")
+EXCEL_STATES = ("unconfigured", "checking", "ok", "missing", "inaccessible", "invalid")
+_EXCEL_LABELS = {"template": "File kiểm chứng Excel", "output": "File kết quả Excel"}
+_EXCEL_UNCONFIGURED = {"template": "Chưa chọn File kiểm chứng Excel.",
+                       "output": "Chưa chọn File kết quả Excel."}
+_TEMPLATE_MISSING = "File kiểm chứng đã lưu không còn tồn tại. Hãy chọn lại file."
+_TEMPLATE_INACCESSIBLE = "Không truy cập được File kiểm chứng đã lưu. Kiểm tra ổ đĩa hoặc quyền truy cập."
+_TEMPLATE_CHECKING = "Đang kiểm tra File kiểm chứng đã lưu…"
+_OUTPUT_OK = "Đang dùng File kết quả đã lưu."
+_OUTPUT_FOLDER_NOTE = "Thư mục kết quả chưa tồn tại — sẽ được tạo khi ghi."
 
 
 class _SourcePathRedactor:
@@ -110,6 +125,12 @@ class ApplicationService:
         # PROMPT-032: Learning is polled while its tab is open.  Emit one diagnostic only when the lifecycle/count
         # signature changes, never one per poll; values are counts/states only and contain no paths or payloads.
         self._last_learning_diag_signature: Optional[tuple] = None
+        # PROMPT-040: cached result of the one-shot workbook contract check for the remembered check file, plus
+        # the last verified on-disk persistence flags for the two remembered Excel paths.
+        self._excel_deep_cache: Dict[str, dict] = {}
+        self._excel_check_thread: Optional[threading.Thread] = None
+        self._excel_persisted_key: Optional[tuple] = None
+        self._excel_persisted_flags: Dict[str, bool] = {"template": False, "output": False}
         self._last_scan_metrics: Optional[ScanMetrics] = None  # bounded diagnostics for the most recent Quét call
         # PROMPT-031R: scan work remains one synchronous bridge operation, while the existing bounded dashboard
         # poll reads immutable snapshots published once per completed containing folder.
@@ -194,6 +215,161 @@ class ApplicationService:
             c.set_auto_update_check(self._boolean(update.get("autoCheck", c.auto_update_check), "update.autoCheck"))
             c.save_settings()
             return self.current_config()
+
+    # ------------------------------------------------------------------ remembered Excel selection (PROMPT-040)
+    def excel_selection(self) -> dict:
+        """Remembered Excel files + whether they are still usable.  Cheap, read-only, never opens a dialog."""
+        with self._lock:
+            return self._excel_selection_unlocked()
+
+    def persist_excel_selection(self, kind: str, path: str) -> dict:
+        """Persist one native-dialog Excel choice through the existing config contract.
+
+        Called only by the bridge, with the path the native dialog itself returned — JavaScript never
+        supplies a path here.  The controller keeps its own scan-invalidation semantics for
+        ``set_template`` / ``set_output``; persistence reuses ``GuiController.save_settings()`` and the
+        existing ``AppConfig.last_template`` / ``last_output_file`` fields (no schema change, no migration).
+        """
+        if kind not in EXCEL_KINDS:
+            raise ServiceError("Loại file Excel không hợp lệ.", "INVALID_SELECTION")
+        text = self._text(path, "path", 32767)
+        selected = Path(text).expanduser()
+        if not text or not self._excel_path_allowed(kind, selected):
+            raise ServiceError(f"Chọn một file {'.xlsx' if kind == 'template' else '.xlsx/.xlsm'} hiện có.",
+                               "INVALID_SELECTION")
+        with self._lock:
+            c = self.controller
+            if kind == "template":
+                c.set_template(str(selected))
+            else:
+                c.set_output(str(selected))
+            self._excel_deep_cache.pop(kind, None)
+            self._persist_excel_settings_unlocked(kind)
+            return self._excel_selection_unlocked()
+
+    def clear_excel_selection(self, kind: str) -> dict:
+        """Forget one remembered Excel file (UI “Xóa lựa chọn”); idempotent and persisted the same way."""
+        if kind not in EXCEL_KINDS:
+            raise ServiceError("Loại file Excel không hợp lệ.", "INVALID_SELECTION")
+        with self._lock:
+            c = self.controller
+            if kind == "template":
+                c.set_template("")
+            else:
+                c.set_output("")
+            self._excel_deep_cache.pop(kind, None)
+            self._persist_excel_settings_unlocked(kind)
+            return self._excel_selection_unlocked()
+
+    @staticmethod
+    def _excel_path_allowed(kind: str, path: Path) -> bool:
+        """Selection-time shape checks — identical to what the native dialog already enforced."""
+        if kind == "template":
+            return path.suffix.lower() == ".xlsx" and path.is_file()
+        return path.suffix.lower() in (".xlsx", ".xlsm") and not path.is_dir()
+
+    def _persist_excel_settings_unlocked(self, kind: str) -> bool:
+        """Write the in-memory selection through the existing config mechanism and verify the result."""
+        if self.controller.is_running():
+            # A processing run owns the config write at its start; changing files mid-run is reported, not hidden.
+            self._excel_persisted_key = None
+            return False
+        self.controller.save_settings()
+        self._excel_persisted_key = None                     # re-read the file, never trust memory
+        return bool(self._excel_persisted_unlocked().get(kind))
+
+    def _persisted_excel_flags(self) -> dict:
+        c = self.controller
+        try:
+            stored = AppConfig.load(c.config_storage_path())
+        except Exception:                                    # unreadable config: report "not persisted"
+            LOG.warning("EXCEL_SELECTION_PERSIST_CHECK_FAILED")
+            return {"template": False, "output": False}
+        return {"template": (stored.last_template or "") == (c.template or ""),
+                "output": (stored.last_output_file or "") == (c.output or "")}
+
+    def _excel_persisted_unlocked(self) -> dict:
+        c = self.controller
+        key = (c.template or "", c.output or "")
+        if self._excel_persisted_key != key:
+            self._excel_persisted_key = key
+            self._excel_persisted_flags = self._persisted_excel_flags()
+        return self._excel_persisted_flags
+
+    def _excel_selection_unlocked(self) -> dict:
+        c = self.controller
+        persisted = self._excel_persisted_unlocked()
+        return {"template": self._excel_kind_dto("template", c.template, persisted["template"]),
+                "output": self._excel_kind_dto("output", c.output, persisted["output"])}
+
+    def _excel_kind_dto(self, kind: str, raw_path: str, persisted: bool) -> dict:
+        text = (raw_path or "").strip()
+        dto = {"kind": kind, "label": _EXCEL_LABELS[kind], "path": "", "name": "", "folder": "",
+               "state": "unconfigured", "message": _EXCEL_UNCONFIGURED[kind], "persisted": bool(persisted)}
+        if not text:
+            return dto
+        path = Path(text)
+        dto.update({"path": text, "name": path.name, "folder": str(path.parent)})
+        if kind == "template":
+            state, message = self._template_excel_state(path)
+        else:
+            state, message = self._output_excel_state(path)
+        dto.update({"state": state, "message": message})
+        return dto
+
+    def _template_excel_state(self, path: Path) -> tuple:
+        """Structural state + the cached workbook-contract check for the picked check file."""
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return "missing", _TEMPLATE_MISSING
+        except OSError:
+            return "inaccessible", _TEMPLATE_INACCESSIBLE
+        if not path.is_file():
+            return "missing", _TEMPLATE_MISSING
+        key = (str(path), info.st_mtime_ns, info.st_size)
+        cached = self._excel_deep_cache.get("template")
+        if cached is None or cached["key"] != key:
+            self._start_excel_deep_check(key, path)
+            return "checking", _TEMPLATE_CHECKING
+        if cached["ok"]:
+            return "ok", f"Hợp lệ: {cached['message']}"
+        return "invalid", f"Không hợp lệ: {cached['message']}"
+
+    def _output_excel_state(self, path: Path) -> tuple:
+        """Result file: it may not exist yet, so only the write contract can be checked cheaply."""
+        if path.suffix.lower() not in (".xlsx", ".xlsm"):
+            return "invalid", "File kết quả phải có đuôi .xlsx hoặc .xlsm."
+        if path.is_dir():
+            return "invalid", "Đường dẫn File kết quả đang là thư mục, không phải tệp .xlsx."
+        template = (self.controller.template or "").strip()
+        if template:
+            try:
+                same = path.expanduser().resolve() == Path(template).expanduser().resolve()
+            except OSError:
+                same = str(path) == template
+            if same:
+                return "invalid", "File kết quả không được trùng với file Kiểm chứng gốc."
+        if not path.parent.is_dir():
+            return "ok", _OUTPUT_FOLDER_NOTE
+        return "ok", _OUTPUT_OK
+
+    def _start_excel_deep_check(self, key: tuple, path: Path) -> None:
+        """One workbook-contract check per selection, off the request thread, cached by (path, mtime, size)."""
+        thread = self._excel_check_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._excel_check_thread = threading.Thread(target=self._run_excel_deep_check, args=(key, path),
+                                                    name="webview-excel-check", daemon=True)
+        self._excel_check_thread.start()
+
+    def _run_excel_deep_check(self, key: tuple, path: Path) -> None:
+        try:
+            ok, message = validate_template(Path(path))
+        except Exception as exc:  # noqa: BLE001 - a broken workbook must never break the dashboard
+            ok, message = False, f"Không kiểm tra được file: {exc}"
+        with self._lock:
+            self._excel_deep_cache["template"] = {"key": key, "ok": bool(ok), "message": message}
 
     # ------------------------------------------------------------------ file-selection capabilities
     def register_pptx_selection(self, selected_path: str) -> dict:
@@ -430,6 +606,9 @@ class ApplicationService:
         return {
             "app": self.app_version(),
             "config": self.current_config(),
+            # PROMPT-040: the remembered Excel files travel with every dashboard response (cheap stat + cache),
+            # so the UI can show the current default and its state without an extra round trip or a picker.
+            "excel": self._excel_selection_unlocked(),
             "scan": scan_state,
             "reports": reports,
             "job": {"status": run_status, "queue": candidate_ids if run_status == "idle" else

@@ -2164,6 +2164,10 @@ class GuiController:
         LOG.info("UPDATE_HELPER_STARTED build=%s", self.update_check.info.build)
         return True, f"Đang cài đặt {self.update_check.info.label()} – ứng dụng sẽ khởi động lại."
 
+    def config_storage_path(self) -> Optional[Path]:
+        """Config file this controller persists to (``None`` = the portable ``config/config.json``)."""
+        return self._config_path
+
     def save_settings(self) -> None:
         c = self.cfg
         c.last_report_folder = self.report_folder

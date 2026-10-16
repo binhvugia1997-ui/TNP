@@ -25,6 +25,9 @@ import {
   type ContentCandidate,
   type DiagnosticRow,
   type DiscoveredServer,
+  type ExcelKind,
+  type ExcelKindState,
+  type ExcelSelectionState,
   type ImageCandidate,
   type LogEntry,
   type OllamaConnection,
@@ -133,9 +136,14 @@ type DashboardDTO = {
   }
   update: unknown
   diagnostics: { running: boolean; rows: DiagnosticRow[]; error: string }
+  /** PROMPT-040: Excel mặc định đã lưu (Python/config là nguồn sự thật; không có localStorage). */
+  excel?: unknown
 }
 
-type NormalizedDashboardDTO = Omit<DashboardDTO, 'update'> & { update: UpdateState }
+type NormalizedDashboardDTO = Omit<DashboardDTO, 'update' | 'excel'> & {
+  update: UpdateState
+  excel: ExcelSelectionState
+}
 
 export type ScanSnapshotVersion = { generation: number; revision: number }
 
@@ -274,6 +282,55 @@ function normalizeLearning(raw: unknown): LearningState {
 const EMPTY_OLLAMA: OllamaConnection = {
   server: '', port: '11434', model: '', checked: 'unchecked', models: [], message: 'Chưa kiểm tra kết nối.',
 }
+
+/**
+ * PROMPT-040: one remembered Excel file. Python/config owns the value; the UI only renders what the
+ * backend reports, so a missing or invalid default is shown honestly and never replaced silently.
+ */
+function emptyExcelKind(kind: ExcelKind, label: string): ExcelKindState {
+  return { kind, label, path: '', name: '', folder: '', state: 'unconfigured',
+    message: kind === 'template' ? 'Chưa chọn File kiểm chứng Excel.' : 'Chưa chọn File kết quả Excel.',
+    persisted: true }
+}
+
+const EXCEL_KIND_LABEL: Record<ExcelKind, string> = {
+  template: 'File kiểm chứng Excel',
+  output: 'File kết quả Excel',
+}
+
+export const EMPTY_EXCEL: ExcelSelectionState = {
+  template: emptyExcelKind('template', EXCEL_KIND_LABEL.template),
+  output: emptyExcelKind('output', EXCEL_KIND_LABEL.output),
+}
+
+const EXCEL_STATES = new Set(['unconfigured', 'checking', 'ok', 'missing', 'inaccessible', 'invalid'])
+
+function excelKindFromDto(kind: ExcelKind, raw: unknown): ExcelKindState {
+  const empty = emptyExcelKind(kind, EXCEL_KIND_LABEL[kind])
+  if (!raw || typeof raw !== 'object') return empty
+  const value = raw as Partial<ExcelKindState>
+  const path = typeof value.path === 'string' ? value.path : ''
+  return {
+    kind,
+    label: typeof value.label === 'string' && value.label ? value.label : empty.label,
+    path,
+    name: typeof value.name === 'string' && value.name ? value.name : (path ? path.split(/[\\/]/).pop() || '' : ''),
+    folder: typeof value.folder === 'string' ? value.folder : '',
+    state: EXCEL_STATES.has(String(value.state)) ? value.state as ExcelKindState['state'] : empty.state,
+    message: typeof value.message === 'string' ? value.message : empty.message,
+    persisted: value.persisted !== false,
+  }
+}
+
+/** Tolerates a dashboard from an older/mocked backend: an absent `excel` block renders as “Chưa chọn”. */
+export function normalizeExcelSelection(raw: unknown): ExcelSelectionState {
+  if (!raw || typeof raw !== 'object') return EMPTY_EXCEL
+  const value = raw as { template?: unknown; output?: unknown }
+  return {
+    template: excelKindFromDto('template', value.template),
+    output: excelKindFromDto('output', value.output),
+  }
+}
 export const REVEAL_DONE = 5
 
 type StoreValue = ReturnType<typeof useStoreValue>
@@ -356,6 +413,7 @@ function normalizeDashboard(raw: DashboardDTO): NormalizedDashboardDTO {
     ollama: { ...EMPTY_OLLAMA, ...(raw.ollama || {}) },
     diagnostics: raw.diagnostics || { running: false, rows: [], error: '' },
     logs: raw.logs || [],
+    excel: normalizeExcelSelection(raw.excel),
   }
 }
 
@@ -388,6 +446,7 @@ function useStoreValue() {
   const [folder, setFolderValue] = useState('')
   const [template, setTemplateValue] = useState('')
   const [output, setOutputValue] = useState('')
+  const [excel, setExcel] = useState<ExcelSelectionState>(EMPTY_EXCEL)
   const [periodMode, setPeriodModeValue] = useState<PeriodMode>('auto')
   const [month, setMonthValue] = useState('')
   const [year, setYearValue] = useState('')
@@ -543,9 +602,18 @@ function useStoreValue() {
       updateInstallCapable: Boolean(config.app.updateInstallCapable) })
   }, [])
 
+  /** Read the current Excel default from Python (no dialog): used after a pick and after "Xóa lựa chọn". */
+  const refreshExcelSelection = useCallback(async () => {
+    const next = await callNative<unknown>('get_excel_selection')
+    if (alive.current) setExcel(normalizeExcelSelection(next))
+  }, [])
+
   const acceptDashboard = useCallback((raw: DashboardDTO) => {
     if (!alive.current) return
     const data = normalizeDashboard(raw)
+    // PROMPT-040: the remembered Excel files (and their state) arrive with every dashboard poll, so the
+    // panel always reflects what Python persisted — including after a restart or a deleted/moved file.
+    setExcel(data.excel)
     const pendingBaseline = scanBusyRef.current ? scanBaselineGenerationRef.current : null
     if (!shouldAcceptScanSnapshot(scanVersionRef.current, data.scan, pendingBaseline)) return
     scanVersionRef.current = scanSnapshotVersion(data.scan)
@@ -922,17 +990,35 @@ function useStoreValue() {
     clearError()
     try {
       const result = await callNative<{ cancelled: boolean; path?: string }>('choose_template_file')
-      if (!result.cancelled && result.path) setTemplate(result.path)
+      if (!result.cancelled && result.path) {
+        setTemplate(result.path)
+        // Python already persisted the pick in the user config; re-read it so the panel shows the truth.
+        await refreshExcelSelection()
+      }
     } catch (error) { recordError(error) }
-  }, [clearError, recordError, setTemplate])
+  }, [clearError, recordError, refreshExcelSelection, setTemplate])
 
   const chooseOutputFile = useCallback(async () => {
     clearError()
     try {
       const result = await callNative<{ cancelled: boolean; path?: string }>('choose_output_file')
-      if (!result.cancelled && result.path) setOutput(result.path)
+      if (!result.cancelled && result.path) {
+        setOutput(result.path)
+        await refreshExcelSelection()
+      }
     } catch (error) { recordError(error) }
-  }, [clearError, recordError, setOutput])
+  }, [clearError, recordError, refreshExcelSelection, setOutput])
+
+  /** “Xóa lựa chọn”: forget the remembered Excel file (Python clears the config value and reports back). */
+  const clearExcel = useCallback(async (kind: ExcelKind) => {
+    clearError()
+    try {
+      const next = await callNative<unknown>('clear_excel_selection', kind)
+      setExcel(normalizeExcelSelection(next))
+      if (kind === 'template') setTemplateValue('')
+      else setOutputValue('')
+    } catch (error) { recordError(error) }
+  }, [clearError, recordError])
 
   const chooseUpdateFolder = useCallback(async () => {
     clearError()
@@ -1349,6 +1435,7 @@ function useStoreValue() {
     trainModels, exportLearningData,
     openLearningFolder, applyLabelsToExcel, dismissExcelResult, training,
     inputFileName, chooseReportFolder, choosePptxFile, chooseTemplateFile, chooseOutputFile,
+    excel, clearExcel,
     saveManualFields: setActiveManualFields, retryManualFields,
   }
   return store
