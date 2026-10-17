@@ -10,7 +10,7 @@ from . import APP_TITLE, VERSION_LINE
 from .config import AppConfig
 from .excel_writer import validate_template
 from .ollama_client import OllamaClient, OllamaError
-from .qpn_renderer import renderer_status
+from .qpn_renderer import POWERPOINT_PRESENT_REASONS, powerpoint_render_capability, renderer_status
 
 
 def ollama_smoke_rows(server: str, model: str, timeout: int = 180) -> List[Tuple[str, str]]:
@@ -47,6 +47,18 @@ def run_diagnostics(cfg: AppConfig, template: Optional[str] = None,
         rows.append(("Thư viện", f"LỖI: {e}"))
     rs = renderer_status()
     rows.append(("PowerPoint renderer", rs["powerpoint"]))
+    # PROMPT-041: "OK" above only means PowerPoint is INSTALLED.  This says whether a faithful render can
+    # actually happen right now, and why not — support must never have to guess between "this PC has no
+    # PowerPoint" and "your own PowerPoint session is in the way", which have opposite remedies.
+    capability = powerpoint_render_capability()
+    if capability.isolated:
+        isolation = "OK – app sẽ tạo và sở hữu một phiên PowerPoint riêng khi render"
+    elif capability.available and capability.reason in POWERPOINT_PRESENT_REASONS:
+        isolation = (f"Không dùng được ({capability.reason}) – PowerPoint CÓ sẵn trên máy; "
+                     f"đóng PowerPoint của bạn để có bản xem trước trung thực cao")
+    else:
+        isolation = f"Không dùng được ({capability.reason})"
+    rows.append(("PowerPoint isolation", isolation))
     rows.append(("LibreOffice renderer", rs["libreoffice"]))
     rows.append(("Built-in renderer", rs["builtin"]))
 

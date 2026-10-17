@@ -252,6 +252,36 @@ function backendLabel(backend: string): string {
   return backend || 'không rõ'
 }
 
+/**
+ * PROMPT-041 — the actionable half of the reduced-fidelity notice.
+ *
+ * `slidePreviewReason` is a stable slug from Python. The distinction that matters to the reviewer:
+ * "this PC has no PowerPoint" and "this PC HAS PowerPoint but your own PowerPoint session is in the way"
+ * have opposite remedies, and reporting the first when the second is true sends them looking for an
+ * install that is already there. Unknown/empty slug → no extra sentence (the generic notice still shows).
+ */
+export function fidelityHint(reason: string): string {
+  switch (reason) {
+    case 'powerpoint-user-session-running':
+      return ' Máy này CÓ PowerPoint, nhưng bạn đang mở PowerPoint nên app không dùng chung phiên đó'
+        + ' (để không đụng tới tài liệu của bạn). Đóng PowerPoint rồi chọn lại ảnh để có bản xem trước trung thực cao.'
+    case 'powerpoint-registered-instance':
+      return ' Một phiên PowerPoint đang chạy trên máy này nên app không tạo được phiên riêng.'
+        + ' Đóng PowerPoint rồi chọn lại ảnh.'
+    case 'powerpoint-process-table-unreadable':
+      return ' Không đọc được danh sách tiến trình nên app không chứng minh được phiên PowerPoint là của mình'
+        + ' và từ chối dùng (an toàn cho tài liệu của bạn).'
+    case 'powerpoint-ownership-unproven':
+    case 'powerpoint-not-exclusive':
+      return ' Không chứng minh được phiên PowerPoint là do app tạo nên app từ chối dùng. Hãy thử render lại.'
+    case 'powerpoint-unavailable':
+    case 'powerpoint-import':
+      return ' Máy này không có PowerPoint (hoặc thiếu thành phần COM của PowerPoint).'
+    default:
+      return ''
+  }
+}
+
 const MIN_LIST_W = 200
 const MAX_LIST_W = 420
 
@@ -434,6 +464,7 @@ function ImageReview() {
      small NON-BLOCKING fidelity notice instead of silently pretending to match PowerPoint. */
   const previewBackend = cand.slidePreviewBackend || ''
   const previewFaithful = Boolean(cand.slidePreviewFaithful)
+  const previewReason = cand.slidePreviewReason || ''
   const showFidelityNotice = Boolean(previewBackend) && !previewFaithful
 
   /* §25/§28: true authored position — the slide's own aspect ratio drives the display box, so the
@@ -589,7 +620,7 @@ function ImageReview() {
           <AlertTriangle className="h-3 w-3 shrink-0" />
           <span>
             Bản xem trước đơn giản — bố cục có thể khác PowerPoint (backend: {backendLabel(previewBackend)}).
-            Kết quả Excel vẫn dùng đúng toạ độ PPTX.
+            Kết quả Excel vẫn dùng đúng toạ độ PPTX.{fidelityHint(previewReason)}
           </span>
         </p>
       )}
