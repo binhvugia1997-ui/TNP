@@ -111,6 +111,95 @@ def powerpoint_unavailable_detail() -> str:
     return powerpoint_probe()[2]
 
 
+# ----------------------------------------------------------------------------
+# PROMPT-041 — stable fidelity reasons
+# ----------------------------------------------------------------------------
+# A "reason" is a short slug (never a path, never a PID) that says WHY a preview is not PowerPoint-faithful.
+# The Learning UI turns it into an actionable message and Windows acceptance greps it in the log.  The point of
+# having them at all: "PowerPoint is not installed on this machine" and "PowerPoint IS installed but your own
+# PowerPoint session is in the way" are different answers with different remedies, and reporting the first when
+# the second is true sends the user looking for an install that is already there.
+REASON_OK = "ok"
+REASON_UNAVAILABLE = "powerpoint-unavailable"           # ProgID not registered / not Windows
+REASON_IMPORT = "powerpoint-import"                     # pywin32 (pythoncom / win32com.client) missing
+REASON_PROCESS_TABLE_UNREADABLE = "powerpoint-process-table-unreadable"
+REASON_USER_SESSION_RUNNING = "powerpoint-user-session-running"
+REASON_REGISTERED_INSTANCE = "powerpoint-registered-instance"
+REASON_OWNERSHIP_UNPROVEN = "powerpoint-ownership-unproven"
+REASON_NOT_EXCLUSIVE = "powerpoint-not-exclusive"
+# PROMPT-041W: a PowerPoint process was seen but our OWN Windows session id could not be determined, so
+# "same session" is not a fact we can assert.  Distinct from REASON_USER_SESSION_RUNNING on purpose — contract D
+# forbids dressing an unprovable session up as "the user's PowerPoint is open".
+REASON_SESSION_UNPROVEN = "powerpoint-session-unproven"
+
+#: Reasons that mean "PowerPoint exists here, this render just could not own an instance of it".  A cached
+#: fallback carrying one of these is re-checked against the live machine state before it is shown again
+#: (PROMPT-041W contract E) — it must never outlive the condition that produced it.
+POWERPOINT_PRESENT_REASONS = frozenset({
+    REASON_PROCESS_TABLE_UNREADABLE, REASON_USER_SESSION_RUNNING, REASON_REGISTERED_INSTANCE,
+    REASON_OWNERSHIP_UNPROVEN, REASON_NOT_EXCLUSIVE, REASON_SESSION_UNPROVEN,
+})
+
+
+@dataclass(frozen=True)
+class PowerPointCapability:
+    """Read-only answer to "could an app-owned PowerPoint render this right now?".
+
+    ``available`` PowerPoint COM is registered on this machine (PowerPoint exists — independent of isolation).
+    ``isolated``  nothing is in the way of creating an instance this app would provably own.
+    ``reason``    stable slug (one of the ``REASON_*`` constants).
+    ``detail``    safe, path-free human detail.
+
+    Advisory only: it is deliberately side-effect free (no COM initialisation, no PowerPoint start, no ROT
+    lookup), so :func:`render_with_powerpoint` remains the authority and still applies its stricter two-signal
+    ownership proof.  ``isolated`` can therefore be optimistic; it is never allowed to be *pessimistic* about
+    availability.
+    """
+
+    available: bool
+    isolated: bool
+    reason: str
+    detail: str = ""
+
+
+_CAPABILITY_MEMO: List[Tuple[float, "PowerPointCapability"]] = []
+
+
+def powerpoint_render_capability(max_age_s: float = 0.0) -> PowerPointCapability:
+    """Cheap, side-effect-free capability probe used for diagnostics and for the Learning UI hint.
+
+    ``max_age_s > 0`` allows a caller that runs per candidate (the Learning preview poll) to reuse one answer
+    instead of taking a process-table snapshot per candidate; the default re-reads every time so tests and
+    one-shot diagnostics always see the live state.
+    """
+    if max_age_s > 0 and _CAPABILITY_MEMO:
+        when, cached = _CAPABILITY_MEMO[0]
+        if (time.monotonic() - when) <= max_age_s:
+            return cached
+    capability = _powerpoint_render_capability_uncached()
+    if max_age_s > 0:
+        _CAPABILITY_MEMO[:] = [(time.monotonic(), capability)]
+    return capability
+
+
+def _powerpoint_render_capability_uncached() -> PowerPointCapability:
+    available, stage, detail = powerpoint_probe()
+    if not available:
+        return PowerPointCapability(False, False,
+                                    REASON_IMPORT if stage == "import" else REASON_UNAVAILABLE, detail)
+    facts = powerpoint_snapshot_facts(include_rot=False)
+    if facts["status"] == "unreadable":
+        return PowerPointCapability(True, False, REASON_PROCESS_TABLE_UNREADABLE,
+                                    "process table unreadable; ownership could not be established")
+    if facts["same_session"]:
+        if not _session_filter_is_provable():
+            return PowerPointCapability(True, False, REASON_SESSION_UNPROVEN,
+                                        "a PowerPoint process was seen but our own session id could not be read")
+        return PowerPointCapability(True, False, REASON_USER_SESSION_RUNNING,
+                                    "a PowerPoint session is already running in this Windows session")
+    return PowerPointCapability(True, True, REASON_OK, detail)
+
+
 def find_soffice() -> Optional[str]:
     for name in ("soffice", "soffice.exe", "libreoffice"):
         p = shutil.which(name)
@@ -220,12 +309,18 @@ def get_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
 class PowerPointStageError(RuntimeError):
     """A PowerPoint COM failure tagged with the stage that failed (PROMPT-027R §14).
 
-    ``stage`` is one of import / com-init / dispatch / presentation-open / slide-export; ``reason`` is path-free and
-    safe for logs; ``hresult`` is the COM error code when the exception carries one.
+    ``stage`` is one of import / com-init / dispatch / ownership / presentation-open / slide-export; ``reason`` is
+    path-free and safe for logs; ``hresult`` is the COM error code when the exception carries one.
+
+    PROMPT-041: ``code`` is a STABLE machine-readable slug (see the ``REASON_*`` constants) so a caller can tell
+    *why* a faithful render did not happen — "PowerPoint is not installed" and "PowerPoint is installed but a user
+    session is in the way" are different answers with different remedies, and neither may be reported as the other.
+    It defaults to ``powerpoint-<stage>`` so every stage has a code.
     """
 
-    def __init__(self, stage: str, exc: BaseException, pptx: Optional[Path] = None):
+    def __init__(self, stage: str, exc: BaseException, pptx: Optional[Path] = None, code: str = ""):
         self.stage = stage
+        self.code = code or f"powerpoint-{stage}"
         self.exception_type = type(exc).__name__
         self.hresult = _hresult_text(exc)
         self.reason = _com_reason(exc, pptx)
@@ -273,11 +368,58 @@ _PROCESS_POLL_S = 0.1
 
 
 def _powerpoint_process_ids() -> Optional[FrozenSet[int]]:
-    """PIDs of every running PowerPoint process, or ``None`` when the process table cannot be read.
+    """PIDs of the PowerPoint processes that share THIS process's Windows session, or ``None`` when unknown.
+
+    PowerPoint is single-instance **per login session** — a second interactive/remote session runs its own
+    ``POWERPNT.EXE``.  COM activation and the Running Object Table are session-local too, so a PowerPoint in
+    another session can never be handed to us and must not block our own activation (PROMPT-041: a machine-wide
+    snapshot made another session's PowerPoint look like the user's and refused a perfectly safe render).
+
+    READ-ONLY and conservative in the safe direction: a PID whose session cannot be read is KEPT (treated as
+    ours), and an unreadable process table is ``None`` = "unknown" = fail closed.  Over-refusing costs fidelity;
+    under-refusing could hand us the user's instance, so every doubt resolves towards "there is one".
+    """
+    pids = _enumerate_powerpoint_pids()
+    if pids is None or not pids:
+        return pids
+    mine = _current_session_id()
+    if mine is None:
+        return pids                                   # cannot tell sessions apart: assume they are all ours
+    return frozenset(pid for pid in pids
+                     if (_process_session_id(pid) in (None, mine)))
+
+
+def _current_session_id() -> Optional[int]:
+    """Windows session id of THIS process, or ``None`` when it cannot be determined."""
+    return _process_session_id(os.getpid())
+
+
+def _process_session_id(pid: int) -> Optional[int]:
+    """Session id of ``pid`` via ``ProcessIdToSessionId`` — a query, not a handle: nothing is opened, signalled
+    or terminated.  ``None`` on non-Windows or any failure."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        k32.ProcessIdToSessionId.restype = wintypes.BOOL
+        sid = wintypes.DWORD(0)
+        if not k32.ProcessIdToSessionId(wintypes.DWORD(int(pid)), ctypes.byref(sid)):
+            return None
+        return int(sid.value)
+    except Exception:  # noqa: BLE001 – unknown session, never "a different session"
+        return None
+
+
+def _enumerate_processes(image_name: Optional[str] = None) -> Optional[FrozenSet[int]]:
+    """PIDs of running processes, optionally filtered by image name, or ``None`` when the table cannot be read.
 
     READ-ONLY: a Toolhelp32 snapshot lists processes without opening a handle to any of them, so this can never
-    affect a user's PowerPoint.  ``None`` (non-Windows, API failure) means "ownership cannot be established" and
-    callers must fail closed."""
+    affect a user's PowerPoint.  ``None`` (non-Windows, API failure) means "unknown", never "nothing running",
+    and callers must fail closed."""
     if sys.platform != "win32":
         return None
     try:
@@ -310,7 +452,7 @@ def _powerpoint_process_ids() -> Optional[FrozenSet[int]]:
             if not ok:
                 return None if ctypes.get_last_error() != 18 else frozenset()   # 18 = ERROR_NO_MORE_FILES
             while ok:
-                if entry.szExeFile.lower() == _POWERPOINT_IMAGE_NAME:
+                if image_name is None or entry.szExeFile.lower() == image_name:
                     pids.add(int(entry.th32ProcessID))
                 ok = k32.Process32NextW(snapshot, ctypes.byref(entry))
             return frozenset(pids)
@@ -320,15 +462,98 @@ def _powerpoint_process_ids() -> Optional[FrozenSet[int]]:
         return None
 
 
-def _running_powerpoint_registered(client) -> bool:
-    """Second, independent signal: is a PowerPoint instance registered in the Running Object Table?  ``GetActiveObject``
-    only ever *looks up* a running object (it never starts one).  The normal "nothing running" answer is an
-    exception; an object means a session exists, so it is released untouched and the caller refuses."""
+def _enumerate_powerpoint_pids() -> Optional[FrozenSet[int]]:
+    """PIDs of every running PowerPoint process on the machine, or ``None`` when the table cannot be read."""
+    return _enumerate_processes(_POWERPOINT_IMAGE_NAME)
+
+
+def _process_table_vouched() -> bool:
+    """Did the process enumeration prove it saw the WHOLE table?
+
+    A successful Toolhelp32 snapshot always contains OUR OWN PID.  If it does not, the enumeration is broken or
+    filtered by something we cannot see, and an "empty" answer must not be believed.  This is the only thing that
+    lets the renderer tell "there really is no PowerPoint here" apart from "the table could not see one" — the
+    distinction the PROMPT-041W false positive turned into a lie about the user's machine.
+
+    ``False`` on non-Windows and on any failure: the caller then fails closed rather than trusting an empty set.
+    """
+    if sys.platform != "win32":
+        return False
+    every = _enumerate_processes(None)
+    return every is not None and os.getpid() in every
+
+
+def _session_filter_is_provable() -> bool:
+    """Can "same Windows session" actually be asserted?  Off Windows there is no session filtering to prove (the
+    reader is the injected one), so the answer stands as-is; on Windows it requires our own session id."""
+    if sys.platform != "win32":
+        return True
+    return _current_session_id() is not None
+
+
+ROT_REGISTERED = "registered"
+ROT_NONE = "none"
+ROT_UNAVAILABLE = "unavailable"
+
+
+def _rot_lookup(client) -> str:
+    """Look a PowerPoint instance up in the Running Object Table.  ``GetActiveObject`` only ever *looks up* a
+    running object (it never starts one) and the returned reference is released untouched.
+
+    Three states, because two of them used to be conflated (PROMPT-041W):
+      ``registered``   an object is registered;
+      ``none``         the lookup ran and found nothing (MK_E_UNAVAILABLE is the normal "nothing running");
+      ``unavailable``  the lookup itself could not be performed at all — which is NOT evidence either way.
+
+    **A ``registered`` answer is NOT proof that a PowerPoint process exists.**  Office registers in the ROT when
+    it loses focus and unregisters on a graceful exit, so a crashed, killed or abandoned instance leaves its
+    entry behind; the lookup performs no liveness check.  It is therefore a *diagnostic* signal here, never a
+    process fact, and never by itself a reason to tell the user their PowerPoint is running.
+    """
     try:
         found = client.GetActiveObject(POWERPOINT_PROGID)
-    except Exception:  # noqa: BLE001 – MK_E_UNAVAILABLE: nothing registered
-        return False
-    return found is not None
+    except Exception:  # noqa: BLE001 – MK_E_UNAVAILABLE (nothing registered) and every other failure land here
+        return ROT_NONE if _is_mk_e_unavailable(sys.exc_info()[1]) else ROT_UNAVAILABLE
+    return ROT_REGISTERED if found is not None else ROT_NONE
+
+
+def _is_mk_e_unavailable(exc: BaseException) -> bool:
+    """MK_E_UNAVAILABLE (0x800401E3) is the ROT's normal "nothing registered" answer; anything else means the
+    lookup could not be performed."""
+    code = getattr(exc, "hresult", None)
+    if not isinstance(code, int):
+        args = getattr(exc, "args", ()) or ()
+        code = args[0] if args and isinstance(args[0], int) else None
+    return isinstance(code, int) and (code & 0xFFFFFFFF) == 0x800401E3
+
+
+def _running_powerpoint_registered(client) -> bool:
+    """Compatibility wrapper: True only when the ROT positively holds a PowerPoint entry."""
+    return _rot_lookup(client) == ROT_REGISTERED
+
+
+def powerpoint_snapshot_facts(include_rot: bool = True, client=None) -> Dict[str, object]:
+    """Everything the Windows acceptance log needs about one ownership decision, in one read-only call.
+
+    Keys: ``pid`` (ours), ``session`` (ours, or ``None``), ``status`` (``readable``/``unreadable``),
+    ``raw`` (every session's POWERPNT PIDs, or ``None``), ``same_session`` (the filtered set, or ``None``),
+    ``vouched`` (the enumeration proved it saw the whole table), ``rot`` (only when ``include_rot``).
+    PIDs and session ids only — no paths, no document names, no user content.
+    """
+    raw = _enumerate_powerpoint_pids()
+    same = _powerpoint_process_ids()
+    facts: Dict[str, object] = {
+        "pid": os.getpid(),
+        "session": _current_session_id(),
+        "status": "unreadable" if same is None else "readable",
+        "raw": None if raw is None else sorted(raw),
+        "same_session": None if same is None else sorted(same),
+        "vouched": _process_table_vouched(),
+        "session_provable": _session_filter_is_provable(),
+    }
+    if include_rot and client is not None:
+        facts["rot"] = _rot_lookup(client)
+    return facts
 
 
 def _is_pristine(app) -> bool:
@@ -347,8 +572,11 @@ def _presentation_count(app) -> Optional[int]:
         return None
 
 
-def _ownership_refusal(reason: str, pptx: Path) -> PowerPointStageError:
-    return PowerPointStageError("ownership", RuntimeError(reason), pptx)
+def _ownership_refusal(reason: str, pptx: Path, code: str = "") -> PowerPointStageError:
+    """Fail closed.  ``stage`` stays ``ownership`` (the PROMPT-035 contract); ``code`` says WHICH ownership
+    question failed so diagnostics can separate "PowerPoint is installed but your session is in the way" from
+    "we could not prove the instance we got is ours" (PROMPT-041)."""
+    return PowerPointStageError("ownership", RuntimeError(reason), pptx, code=code)
 
 
 def _wait_for_process_exit(pid: int) -> bool:
@@ -364,6 +592,33 @@ def _wait_for_process_exit(pid: int) -> bool:
         time.sleep(_PROCESS_POLL_S)
 
 
+def _fmt_pids(value: object) -> str:
+    """A PID list for the log: counts and numbers only, never a path or a document name."""
+    if value is None:
+        return "unknown"
+    return "[" + ",".join(str(int(v)) for v in value) + "]" if value else "[]"
+
+
+def _log_snapshot(facts: Dict[str, object]) -> None:
+    """The full read-only picture behind one ownership decision (PROMPT-041W observability)."""
+    LOG.info("POWERPOINT_SNAPSHOT pid=%s session=%s status=%s raw=%s same_session=%s vouched=%s "
+             "session_provable=%s rot=%s",
+             facts.get("pid"), facts.get("session"), facts.get("status"), _fmt_pids(facts.get("raw")),
+             _fmt_pids(facts.get("same_session")), str(bool(facts.get("vouched"))).lower(),
+             str(bool(facts.get("session_provable"))).lower(), facts.get("rot", "-"))
+
+
+def _log_ownership(decision: str, code: str, created: Optional[FrozenSet[int]], rot: str = "") -> None:
+    LOG.info("POWERPOINT_OWNERSHIP decision=%s reason=%s new_pids=%s rot=%s",
+             decision, code, _fmt_pids(created), rot or "-")
+
+
+def _log_isolation(state: str, code: str, detail: str = "") -> None:
+    """One greppable line per isolation decision (PROMPT-041 diagnostics).  ``state`` is ``created`` / ``refused``.
+    Carries no path and no PID: it is safe to hand to a tester over the phone."""
+    LOG.info("POWERPOINT_ISOLATION state=%s reason=%s detail=%s", state, code, detail or "-")
+
+
 def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Path,
                            width_px: int = 1920) -> Dict[int, Path]:
     """Export COMPLETE authored slides through a PowerPoint instance this call can PROVE it owns (PROMPT-035).
@@ -373,9 +628,21 @@ def render_with_powerpoint(pptx: Path, slide_numbers: Sequence[int], out_dir: Pa
     the next backend.  Only the presentation this call opened is closed, and the Application is quit only when it is
     proven app-created and still exclusively ours.  Cleanup follows the same rules on success, error, timeout and
     cancellation.  CoInitialize / CoUninitialize are balanced.  Every failure raises :class:`PowerPointStageError`
-    naming the stage that failed (cooperative cancellation propagates unchanged)."""
+    naming the stage that failed (cooperative cancellation propagates unchanged).
+
+    PROMPT-041 keeps this refusal and documents why it cannot simply be lifted: PowerPoint is a **Multiuse
+    (Single Instance)** COM server, so within one Windows session ``DispatchEx`` hands back the user's running
+    instance instead of starting a second ``POWERPNT.EXE`` — there is no isolated instance to create.  Every
+    refusal now carries a stable ``code`` (:data:`REASON_USER_SESSION_RUNNING` etc.) so the caller can report the
+    real cause instead of "PowerPoint unavailable"."""
     with _POWERPOINT_LOCK:
-        return _render_with_powerpoint_locked(pptx, slide_numbers, out_dir, width_px)
+        try:
+            return _render_with_powerpoint_locked(pptx, slide_numbers, out_dir, width_px)
+        except PowerPointStageError as exc:
+            if exc.stage == "ownership":
+                _log_isolation("refused", exc.code, exc.reason)
+                _log_ownership("refused", exc.code, None)
+            raise
 
 
 def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out_dir: Path,
@@ -384,7 +651,7 @@ def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out
         import pythoncom  # type: ignore
         import win32com.client  # type: ignore
     except Exception as exc:  # noqa: BLE001
-        raise PowerPointStageError("import", exc, pptx)
+        raise PowerPointStageError("import", exc, pptx, code=REASON_IMPORT)
     out: Dict[int, Path] = {}
     try:
         pythoncom.CoInitialize()
@@ -398,27 +665,56 @@ def _render_with_powerpoint_locked(pptx: Path, slide_numbers: Sequence[int], out
     notes: List[Tuple[str, str]] = []
     try:
         # ---- ownership proof (read-only checks BEFORE anything is activated) -------------------------------------
+        # PROMPT-041W: the PROCESS TABLE is the only source of process facts.  The Running Object Table is a
+        # diagnostic: it can still hold an entry for a PowerPoint that has already exited, so it must never be
+        # turned into "your PowerPoint is running" (that lie is exactly the false positive this prompt fixes).
         before = _powerpoint_process_ids()
+        facts = powerpoint_snapshot_facts(include_rot=True, client=win32com.client)
+        rot = facts.get("rot", ROT_NONE)
+        _log_snapshot(facts)
         if before is None:
-            raise _ownership_refusal("process table unreadable; ownership cannot be established", pptx)
+            raise _ownership_refusal("process table unreadable; ownership cannot be established", pptx,
+                                     code=REASON_PROCESS_TABLE_UNREADABLE)
         if before:
-            raise _ownership_refusal("a PowerPoint session is already running; not attaching to it", pptx)
-        if _running_powerpoint_registered(win32com.client):
-            raise _ownership_refusal("a running PowerPoint instance is registered; not attaching to it", pptx)
+            if not facts.get("session_provable"):
+                # A PowerPoint process was seen but we could not read our OWN session id, so "same session" is
+                # not something we may assert (contract D): fail closed with its own code, never as "user session".
+                raise _ownership_refusal("a PowerPoint process is running but our own Windows session could not "
+                                         "be determined; not attaching to it", pptx,
+                                         code=REASON_SESSION_UNPROVEN)
+            raise _ownership_refusal("a PowerPoint session is already running; not attaching to it", pptx,
+                                     code=REASON_USER_SESSION_RUNNING)
+        if rot == ROT_REGISTERED and not facts.get("vouched"):
+            # The ROT holds an entry AND the process enumeration cannot vouch that it saw the whole table (it
+            # did not even contain our own PID).  The empty answer is not trustworthy, so fail closed rather than
+            # activate.  This is the PROMPT-035 "instance invisible to the process table" case.
+            raise _ownership_refusal("a PowerPoint instance is registered and the process table cannot vouch for "
+                                     "being complete; not attaching to it", pptx,
+                                     code=REASON_REGISTERED_INSTANCE)
+        # Reaching here means the process table vouched for itself and found NO PowerPoint in this session.  A
+        # ROT entry at this point is stale/unbacked, so activation is attempted and the post-dispatch PID proof
+        # is what decides ownership (contract A: an empty snapshot must never refuse as "user session running").
         try:
             app = win32com.client.DispatchEx(POWERPOINT_PROGID)           # may return a USER's instance: unproven
         except Exception as exc:  # noqa: BLE001
             raise PowerPointStageError("dispatch", exc, pptx)
         after = _powerpoint_process_ids()
         created = None if after is None else after - before
+        # NOTE: short-circuit matters — when the PID proof fails, `_is_pristine(app)` is never evaluated, so no
+        # method is ever called on an instance we do not own.
         if created is None or len(created) != 1 or not _is_pristine(app):
-            # Could be a session the user started in the meantime: leave it exactly as it is (owned stays False).
-            raise _ownership_refusal("returned PowerPoint instance is not proven app-created; left untouched", pptx)
+            # Could be a session the user started in the meantime, or a stale ROT entry that COM resolved to a
+            # live server: leave it exactly as it is (owned stays False, nothing was called on it).
+            raise _ownership_refusal("returned PowerPoint instance is not proven app-created; left untouched", pptx,
+                                     code=REASON_OWNERSHIP_UNPROVEN)
         owned, owned_pid = True, next(iter(created))
+        _log_isolation("created", REASON_OK, "exactly one new PowerPoint process, pristine")
+        _log_ownership("created", REASON_OK, created, rot)
         # ---- open only into an instance that is still pristine ---------------------------------------------------
         if not _is_pristine(app):
             owned = False                                                 # someone else arrived: no longer exclusive
-            raise _ownership_refusal("PowerPoint instance is no longer exclusively app-owned; left untouched", pptx)
+            raise _ownership_refusal("PowerPoint instance is no longer exclusively app-owned; left untouched", pptx,
+                                     code=REASON_NOT_EXCLUSIVE)
         try:
             # WithWindow=False keeps it invisible; ReadOnly=True never modifies the source
             pres = app.Presentations.Open(str(pptx.resolve()), True, False, False)
@@ -821,6 +1117,9 @@ class SlideRenderer:
         self.last_purpose = ""
         self.backend_tried: List[str] = []
         self.last_failures: List[Dict[str, str]] = []
+        # PROMPT-041: stable reason codes (see the ``REASON_*`` constants) for every backend that was tried and
+        # failed, in chain order.  The FIRST one is why the preview is not PowerPoint-faithful.
+        self.last_codes: List[str] = []
 
     def availability(self) -> Dict[str, bool]:
         """Per-backend availability for cache identity (PROMPT-027R §30).  Cheap; never starts a renderer."""
@@ -856,6 +1155,7 @@ class SlideRenderer:
         errors: List[str] = []
         self.backend_tried = []
         self.last_failures = []
+        self.last_codes = []
         slide_width = int(report.slide_width or 0)
         slide_height = int(report.slide_height or 0)
         for backend in self.prefer:
@@ -865,7 +1165,7 @@ class SlideRenderer:
                 if backend == "powerpoint":
                     if not powerpoint_available():
                         self._fail(purpose, backend, report, stage="availability", reason="unavailable",
-                                   detail=powerpoint_unavailable_detail())
+                                   detail=powerpoint_unavailable_detail(), code=REASON_UNAVAILABLE)
                         continue
                     res = render_with_powerpoint(report.path, wanted, out_dir, self.width_px)
                 elif backend == "libreoffice":
@@ -896,7 +1196,8 @@ class SlideRenderer:
                 raise                                    # cooperative cancel is never a renderer failure
             except PowerPointStageError as e:
                 self._fail(purpose, backend, report, stage=e.stage, reason=e.reason,
-                           exception_type=e.exception_type, hresult=e.hresult)
+                           exception_type=e.exception_type, hresult=e.hresult,
+                           detail=e.code, code=e.code)
                 errors.append(f"{backend}[{e.stage}]: {e.reason}")
             except Exception as e:  # noqa: BLE001
                 reason = _safe_reason(report, e)
@@ -910,6 +1211,15 @@ class SlideRenderer:
         raise RuntimeError("Không render được slide: " + "; ".join(errors))
 
     @property
+    def preview_reason(self) -> str:
+        """Stable code for WHY this render is not PowerPoint-faithful; ``""`` when it is (or nothing failed).
+
+        The chain is tried in preference order, so the first recorded code is the faithful backend's own answer —
+        :data:`REASON_USER_SESSION_RUNNING` ("PowerPoint is installed, your own session is in the way") is reported
+        as itself and never as "PowerPoint unavailable" (PROMPT-041)."""
+        return self.last_codes[0] if self.last_codes else ""
+
+    @property
     def degraded(self) -> bool:
         """True when a backend that SHOULD have been tried actually failed during the last render (not merely absent).
 
@@ -918,12 +1228,14 @@ class SlideRenderer:
 
     # ------------------------------------------------------------------ diagnostics (PROMPT-027 §3 / 027R §14)
     def _fail(self, purpose: str, backend: str, report: ReportData, stage: str, reason: str,
-              exception_type: str = "", hresult: str = "", detail: str = "") -> None:
+              exception_type: str = "", hresult: str = "", detail: str = "", code: str = "") -> None:
         self.last_failures.append({"backend": backend, "stage": stage, "reason": reason})
+        if code:
+            self.last_codes.append(code)
         LOG.warning("SLIDE_RENDER_BACKEND_FAILED purpose=%s backend=%s stage=%s exception_type=%s hresult=%s "
                     "reason=%s detail=%s report=%s",
                     purpose or "-", backend, stage, exception_type or "-", hresult or "-", reason,
-                    detail or "-", report.filename)
+                    detail or code or "-", report.filename)
 
     @staticmethod
     def _log_render(purpose: str, backend: str, report: ReportData, res: Dict[int, Path],

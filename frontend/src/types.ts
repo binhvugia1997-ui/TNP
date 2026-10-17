@@ -294,6 +294,14 @@ export type ImageCandidate = {
   slidePreviewBackend?: string
   slidePreviewFaithful?: boolean
   /**
+   * PROMPT-041: VÌ SAO ảnh xem trước không trung thực PowerPoint — một slug ổn định do Python gửi,
+   * không phải đường dẫn file, không phải PID. `"powerpoint-user-session-running"` (máy CÓ PowerPoint
+   * nhưng chính phiên PowerPoint của người dùng đang mở nên app không dùng chung) KHÁC
+   * `"powerpoint-unavailable"` (máy không có PowerPoint); báo nhầm cái này thành cái kia sẽ khiến người
+   * dùng đi tìm một bản cài đã có sẵn. `""` khi ảnh đã render trung thực bằng PowerPoint.
+   */
+  slidePreviewReason?: string
+  /**
    * PROMPT-027 §13/§14/§15: VÙNG XUẤT EXCEL — vùng "Sau cải tiến" theo ImprovementItem mà pipeline
    * sản xuất SẼ crop đưa vào Excel nếu xử lý file này ngay bây giờ. Do Python tính từ
    * ImprovementVisualRegion.bbox; React KHÔNG BAO GIỜ tự suy ra từ bounds của ảnh ứng viên.
