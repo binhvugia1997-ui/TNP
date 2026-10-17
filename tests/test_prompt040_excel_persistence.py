@@ -15,8 +15,6 @@ import shutil
 import time
 from pathlib import Path
 
-import pytest
-
 from app.application_service import ApplicationService
 from app.batch_processor import BatchSummary
 from app.bridge import BridgeService
@@ -424,24 +422,43 @@ def test_persisting_a_pick_does_not_open_or_modify_the_workbooks(tmp_path, monke
 
 
 def test_pick_reports_when_the_selection_could_not_be_persisted(tmp_path, monkeypatch):
-    if os.geteuid() == 0:
-        pytest.skip("root ignores directory permissions")
+    """A pick whose config write genuinely fails stays usable and is reported honestly.
+
+    The failure is injected at the real disk boundary — ``AppConfig.save`` raising ``OSError``, exactly what an
+    unwritable or locked ``config/`` folder produces — instead of relying on POSIX directory permissions.
+    That keeps this test identical on Windows, macOS and Linux: Windows has no ``os.geteuid`` at all, and
+    ``chmod`` does not stop file creation inside a directory there.  The production path still runs unmodified:
+    the real ``GuiController.save_settings()`` body, its ``except OSError`` handler, the re-read of
+    ``AppConfig.load(...)`` and the resulting ``persisted: false`` in the DTO.
+    """
     config_path = tmp_path / "config" / "config.json"
     template = tmp_path / "Bieu mau.xlsx"
     shutil.copy2(_template_bytes(tmp_path), template)
     service = make_service(tmp_path, config_path=config_path)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
     bridge = bind_bridge(monkeypatch, service, DialogWindow([str(template)]))
-    original = config_path.parent.stat().st_mode
-    os.chmod(config_path.parent, 0o500)                            # read-only config folder
-    try:
-        picked = bridge.choose_template_file()
-        assert picked["ok"] is True and picked["data"]["path"] == str(template.resolve())
-        state = bridge.get_excel_selection()["data"]
-        assert state["template"]["path"] == str(template)          # used for this session
-        assert state["template"]["persisted"] is False             # and reported honestly
-    finally:
-        os.chmod(config_path.parent, original)
+
+    real_save = AppConfig.save
+
+    def unwritable_save(_self, _path=None):
+        raise PermissionError(13, "config.json không ghi được (mô phỏng thư mục chỉ đọc)")
+
+    monkeypatch.setattr(AppConfig, "save", unwritable_save)
+
+    picked = bridge.choose_template_file()
+    assert picked["ok"] is True and picked["data"]["path"] == str(template.resolve())
+    assert not config_path.exists()                                # the write really did not happen
+    assert not config_path.with_suffix(".json.tmp").exists()       # …not even a leftover temp file
+    assert any("Không lưu được config.json" in line for line in service.controller.log_lines)
+    state = bridge.get_excel_selection()["data"]
+    assert state["template"]["path"] == str(template)              # used for this session
+    assert state["template"]["state"] in EXCEL_STATES
+    assert state["template"]["persisted"] is False                 # and reported honestly
+
+    # The failure is not sticky: once writes succeed again the same selection is persisted for real.
+    monkeypatch.setattr(AppConfig, "save", real_save)
+    repaired = service.persist_excel_selection("template", str(template))
+    assert repaired["template"]["persisted"] is True
+    assert AppConfig.load(config_path).last_template == str(template)
 
 
 # --------------------------------------------------------------------------- 11. other pickers unchanged
