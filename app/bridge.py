@@ -116,10 +116,18 @@ class BridgeService:
 
     # -------------------------------------------------------------- native dialogs for other configured paths
     def choose_template_file(self) -> dict:
-        return self._respond(lambda: self._choose_file(XLSX_FILTER, ".xlsx", "template"))
+        """PROMPT-040: the chosen check workbook is remembered immediately (no second click, no restart loss)."""
+        return self._respond(lambda: self._choose_excel("template"))
 
     def choose_output_file(self) -> dict:
-        return self._respond(lambda: self._choose_save_file("Kiem_chung_Ket_qua.xlsx", XLSX_FILTER, ".xlsx"))
+        return self._respond(lambda: self._choose_excel("output"))
+
+    def get_excel_selection(self) -> dict:
+        """Remembered Excel files, their state and whether they are on disk — never opens a dialog."""
+        return self._respond(self.service.excel_selection)
+
+    def clear_excel_selection(self, kind: str) -> dict:
+        return self._respond(lambda: self.service.clear_excel_selection(self._string(kind, "kind", 16)))
 
     def choose_update_folder(self) -> dict:
         return self._respond(self._choose_report_folder)
@@ -274,6 +282,21 @@ class BridgeService:
         if selected.suffix.lower() != expected_suffix.lower() or not selected.is_file():
             raise ServiceError(f"Chọn một file {expected_suffix} hiện có.", "INVALID_SELECTION")
         return {"cancelled": False, "path": str(selected), "kind": name}
+
+    def _choose_excel(self, kind: str) -> dict:
+        """Native Excel pick + persistence in the existing user config.
+
+        Only the native dialog produces the path (JavaScript never supplies one), so the bridge stays a
+        fixed, backend-owned capability surface.  The response shape of the two pick methods is unchanged.
+        """
+        if kind == "template":
+            selected = self._choose_file(XLSX_FILTER, ".xlsx", "template")
+        else:
+            selected = self._choose_save_file("Kiem_chung_Ket_qua.xlsx", XLSX_FILTER, ".xlsx")
+        if selected.get("cancelled"):
+            return selected
+        self.service.persist_excel_selection(kind, selected["path"])
+        return selected
 
     def _choose_save_file(self, filename: str, file_type: str, expected_suffix: str) -> dict:
         path = self._dialog_path(self._webview_constant("SAVE_DIALOG"), save_filename=filename,
