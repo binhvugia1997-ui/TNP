@@ -265,9 +265,16 @@ export function fidelityHint(reason: string): string {
     case 'powerpoint-user-session-running':
       return ' Máy này CÓ PowerPoint, nhưng bạn đang mở PowerPoint nên app không dùng chung phiên đó'
         + ' (để không đụng tới tài liệu của bạn). Đóng PowerPoint rồi chọn lại ảnh để có bản xem trước trung thực cao.'
+    case 'powerpoint-session-unproven':
+      return ' Có tiến trình PowerPoint nhưng app không đọc được phiên Windows của chính mình nên từ chối dùng'
+        + ' (an toàn cho tài liệu của bạn). Hãy thử render lại.'
     case 'powerpoint-registered-instance':
-      return ' Một phiên PowerPoint đang chạy trên máy này nên app không tạo được phiên riêng.'
-        + ' Đóng PowerPoint rồi chọn lại ảnh.'
+      // PROMPT-041W: this slug used to claim "a PowerPoint session is running on this machine", which is a
+      // process fact the Running Object Table cannot prove — a stale entry survives a PowerPoint that has
+      // already exited. New renders no longer produce it from an empty process snapshot; this wording is kept
+      // for previews persisted before the fix and now says only what is actually known.
+      return ' COM vẫn còn ghi nhận một phiên PowerPoint cũ trong khi không thấy tiến trình POWERPNT nào,'
+        + ' nên app từ chối dùng để an toàn. Hãy thử render lại.'
     case 'powerpoint-process-table-unreadable':
       return ' Không đọc được danh sách tiến trình nên app không chứng minh được phiên PowerPoint là của mình'
         + ' và từ chối dùng (an toàn cho tài liệu của bạn).'

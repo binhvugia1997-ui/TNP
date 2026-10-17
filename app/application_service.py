@@ -43,6 +43,9 @@ LEARNING_PREVIEW_WIDTH_PX = 1600
 # PROMPT-027R §30: a preview rendered while a higher-fidelity backend FAILED (not merely absent) is reused only
 # for this many seconds, so a transient COM failure can never pin the fallback for the whole session.
 DEGRADED_PREVIEW_TTL_S = 15.0
+# How long one read-only PowerPoint capability probe may be reused across the candidates of a single Learning
+# poll, so checking a cached preview for staleness does not take a process-table snapshot per candidate.
+PREVIEW_CAPABILITY_MAX_AGE_S = 1.0
 
 # PROMPT-040: the two Excel files the operator picks once and the app then remembers in the existing user
 # config (``last_template`` / ``last_output_file``).  The DTO below is what the UI uses to show the current
@@ -1612,11 +1615,23 @@ class ApplicationService:
                    *signature)
             cached = self._slide_preview_cache.get(key)
             if cached is not None and not self._preview_expired(cached):
-                return dict(cached)
+                if self._degraded_reason_is_stale(cached):
+                    LOG.info("SLIDE_PREVIEW_CACHE hit=1 source=memory stale_reason=1 cached_backend=%s "
+                             "cached_reason=%s action=discard-and-rerender",
+                             cached.get("backend") or "-", cached.get("reason") or "-")
+                    self._slide_preview_cache.pop(key, None)      # the machine state that produced it is gone
+                else:
+                    LOG.info("SLIDE_PREVIEW_CACHE hit=1 source=memory stale_reason=0 cached_backend=%s "
+                             "cached_reason=%s action=reuse",
+                             cached.get("backend") or "-", cached.get("reason") or "-")
+                    return dict(cached)
             persisted = assets.slide(digest(key), signature) if assets is not None and cached is None else None
             if persisted and not self._preview_expired(persisted):
-                self._remember_preview(key, persisted)
-                return persisted
+                if self._degraded_reason_is_stale(persisted):
+                    persisted = None                              # ditto for a preview restored from disk
+                else:
+                    self._remember_preview(key, persisted)
+                    return persisted
             from .pptx_parser import parse_pptx
             report = parse_pptx(source)
             if report.slide(slide_number) is None:
@@ -1674,6 +1689,27 @@ class ApplicationService:
         model_identity = (str(getattr(model, "trained_at", "")), int(getattr(model, "n_examples", 0) or 0)) \
             if model is not None else None
         return (bool(getattr(learning, "enabled", True)), model_identity, overrides)
+
+    @staticmethod
+    def _degraded_reason_is_stale(entry: Dict[str, Any]) -> bool:
+        """PROMPT-041W contract E: a cached fallback must never keep asserting a machine fact that no longer holds.
+
+        A preview rendered while the user's PowerPoint was open is cached (correctly — it is still a true picture
+        of the slide) together with the reason it is only a fallback.  But that reason is a claim about the
+        machine, and the machine moves on: the moment PowerPoint is no longer in the way, showing "PowerPoint is
+        running" again would be a lie, so the entry is dropped and re-rendered NOW instead of waiting out the
+        degraded TTL.  Anything that is not a PowerPoint-blocked fallback is left alone — the TTL still governs
+        it, so a genuinely broken backend is not hammered on every poll.
+        """
+        if not entry.get("degraded"):
+            return False
+        try:
+            from .qpn_renderer import POWERPOINT_PRESENT_REASONS, powerpoint_render_capability
+            if (entry.get("reason") or "") not in POWERPOINT_PRESENT_REASONS:
+                return False
+            return bool(powerpoint_render_capability(max_age_s=PREVIEW_CAPABILITY_MAX_AGE_S).isolated)
+        except Exception:  # noqa: BLE001 – an unreadable machine state must not break the preview
+            return False
 
     @staticmethod
     def _preview_expired(entry: Dict[str, Any]) -> bool:

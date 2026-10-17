@@ -10,7 +10,8 @@ from . import APP_TITLE, VERSION_LINE
 from .config import AppConfig
 from .excel_writer import validate_template
 from .ollama_client import OllamaClient, OllamaError
-from .qpn_renderer import POWERPOINT_PRESENT_REASONS, powerpoint_render_capability, renderer_status
+from .qpn_renderer import (POWERPOINT_PRESENT_REASONS, REASON_USER_SESSION_RUNNING,
+                            powerpoint_render_capability, renderer_status)
 
 
 def ollama_smoke_rows(server: str, model: str, timeout: int = 180) -> List[Tuple[str, str]]:
@@ -53,9 +54,16 @@ def run_diagnostics(cfg: AppConfig, template: Optional[str] = None,
     capability = powerpoint_render_capability()
     if capability.isolated:
         isolation = "OK – app sẽ tạo và sở hữu một phiên PowerPoint riêng khi render"
-    elif capability.available and capability.reason in POWERPOINT_PRESENT_REASONS:
+    elif capability.available and capability.reason == REASON_USER_SESSION_RUNNING:
         isolation = (f"Không dùng được ({capability.reason}) – PowerPoint CÓ sẵn trên máy; "
                      f"đóng PowerPoint của bạn để có bản xem trước trung thực cao")
+    elif capability.available and capability.reason in POWERPOINT_PRESENT_REASONS:
+        # PROMPT-041W: "close your PowerPoint" is true ONLY for the proven same-session case.  Every other
+        # refusal is about what the app could not PROVE, and telling the tester to close a program that is not
+        # running is exactly the false positive this prompt exists to remove.
+        isolation = (f"Không dùng được ({capability.reason}) – PowerPoint CÓ sẵn trên máy nhưng app không "
+                     f"chứng minh được phiên render là của riêng app; hãy thử render lại (KHÔNG cần đóng "
+                     f"PowerPoint nếu bạn không mở nó)")
     else:
         isolation = f"Không dùng được ({capability.reason})"
     rows.append(("PowerPoint isolation", isolation))
