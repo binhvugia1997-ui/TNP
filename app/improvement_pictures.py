@@ -91,7 +91,12 @@ class Anchor:
 
 @dataclass
 class ItemRegion:
-    """A structural production item or semantic section on a slide."""
+    """A structural production item or semantic section on a slide.
+
+    ``bounds`` is the item's SPAN (heading top .. next boundary) used for ownership and item-scoped text.
+    ``heading_bounds`` is the heading line itself (PROMPT-027R §10): the span is widened later, so a
+    neighbour's heading must be read from here when it acts as an obstacle or a structural separator.
+    """
     slide: int
     owner_id: str
     heading: str
@@ -100,6 +105,7 @@ class ItemRegion:
     semantic_role: str
     confident_defect_ownership: bool
     region_kind: str = "item"   # item | section
+    heading_bounds: Optional[Tuple[int, int, int, int]] = None
 
     @property
     def left(self) -> int:
@@ -124,6 +130,12 @@ class ItemRegion:
     @property
     def bottom(self) -> int:
         return self.top + self.height
+
+    @property
+    def heading_box(self) -> Tuple[int, int, int, int]:
+        """(left, top, right, bottom) of the heading line; falls back to the span when not recorded."""
+        hb = self.heading_bounds or self.bounds
+        return hb[0], hb[1], hb[0] + hb[2], hb[1] + hb[3]
 
 
 @dataclass
@@ -243,6 +255,27 @@ def _visual_row_below(line_top: int, line_bottom: int, visual_tops: Sequence[int
     return any(window_top <= top <= window_bottom for top in visual_tops)
 
 
+def _line_on_visual(line: Tuple[int, int, int, int], content_boxes: Sequence[Tuple[int, int, int, int]]) -> bool:
+    """True when a text line overlaps a content picture: such a line is an annotation of the picture (PROMPT-027R)."""
+    left, top, width, height = line
+    right, bottom = left + width, top + height
+    return any(_overlap(left, right, cl, cr) > 0 and _overlap(top, bottom, ct, cb) > 0
+               for cl, ct, cr, cb in content_boxes)
+
+
+def _label_beneath_picture(line: Tuple[int, int, int, int],
+                           content_boxes: Sequence[Tuple[int, int, int, int]]) -> bool:
+    """PROMPT-027R §10: a short line that sits in a picture's column, at or below the picture's top and not far below
+    its bottom, is that picture's label (a measurement, a note).  Only the weak defect-style heading branch asks this:
+    an explicit colon-terminated item heading is never a picture label."""
+    left, top, width, _height = line
+    right = left + max(1, width)
+    for cl, ct, cr, cb in content_boxes:
+        if _overlap(left, right, cl, cr) >= 0.5 * max(1, width) and ct <= top <= cb + 0.5 * max(1, cb - ct):
+            return True
+    return False
+
+
 def _line_box(block: Block, index: int, n_lines: int) -> Tuple[int, int, int, int]:
     line_h = max(1, int(block.height / max(1, n_lines)))
     return block.left, int(block.top + index * line_h), block.width, line_h
@@ -270,9 +303,11 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
     H = slide.height or 1
     visual_tops: List[int] = [role.block.top for role in roles
                               if role.role == ROLE_CAPTION and role.block.text.strip()]
+    content_boxes: List[Tuple[int, int, int, int]] = []
     for picture in slide.pictures:
         if not is_decorative_picture(picture, W, H):
             visual_tops.append(picture.top)
+            content_boxes.append((picture.left, picture.top, picture.right, picture.bottom))
     visual_tops.sort()
     for role in roles:
         if role.role not in (ROLE_TITLE, ROLE_CONTENT, ROLE_SIDEBAR):
@@ -310,10 +345,12 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
                 owner = f"item:{line_key}" if logical else f"section:S{slide.number}:{block.order}:{i}"
                 if logical and occurrence > 1:
                     owner += f":{occurrence}"
+                line = _line_box(block, i, n_lines)
                 bounds = ((block.left, block.top, block.width, block.height)
-                          if logical and i == 0 else _line_box(block, i, n_lines))
+                          if logical and i == 0 else line)
                 items.append(ItemRegion(slide.number, owner, text, bounds,
-                                        block.order * 100 + i, semantic, logical, region_kind))
+                                        block.order * 100 + i, semantic, logical, region_kind,
+                                        heading_bounds=line))
                 continue
 
             # A defect heading may omit the words "cải tiến" while remaining under an explicit
@@ -326,12 +363,17 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
                 line_key = key.strip(" .:;-_")
                 if not line_key or _generic_production_heading(text):
                     continue
+                if _line_on_visual(_line_box(block, i, n_lines), content_boxes) or \
+                        _label_beneath_picture(_line_box(block, i, n_lines), content_boxes):
+                    continue                 # PROMPT-027R §10: a short label on/under a picture is its label, not a heading
                 occurrence = duplicates.get(line_key, 0) + 1
                 duplicates[line_key] = occurrence
                 owner = f"item:{line_key}" + (f":{occurrence}" if occurrence > 1 else "")
-                bounds = (block.left, block.top, block.width, block.height) if i == 0 else _line_box(block, i, n_lines)
+                line = _line_box(block, i, n_lines)
+                bounds = (block.left, block.top, block.width, block.height) if i == 0 else line
                 items.append(ItemRegion(slide.number, owner, text, bounds,
-                                        block.order * 100 + i, SEMANTIC_PRODUCTION, True, "item"))
+                                        block.order * 100 + i, SEMANTIC_PRODUCTION, True, "item",
+                                        heading_bounds=line))
                 continue
 
             # PROMPT-025 multi-item anchor: colon-terminated production item heading or defect-name
@@ -341,6 +383,8 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
                     and not _generic_production_heading(text)
                     and _is_item_anchor_text(text)):
                 line_box = _line_box(block, i, n_lines)
+                if _line_on_visual(line_box, content_boxes):
+                    continue                 # PROMPT-027R §10: a callout lying on a picture is not an item anchor
                 if _visual_row_below(line_box[1], line_box[1] + line_box[3], visual_tops, H):
                     line_key = key.strip(" .:;-_")
                     occurrence = duplicates.get(line_key, 0) + 1
@@ -349,7 +393,8 @@ def slide_items(slide: SlideData) -> List[ItemRegion]:
                     bounds = ((block.left, block.top, block.width, block.height)
                               if i == 0 else line_box)
                     items.append(ItemRegion(slide.number, owner, text, bounds,
-                                            block.order * 100 + i, SEMANTIC_PRODUCTION, True, "item"))
+                                            block.order * 100 + i, SEMANTIC_PRODUCTION, True, "item",
+                                            heading_bounds=line_box))
                     continue
     items.sort(key=lambda item: (item.source_order, item.bounds[1], item.bounds[0]))
     # An item's content often continues well below its title (inline +Sau rows, grouped paragraphs, or
@@ -666,8 +711,68 @@ def _caption_anchors(roles: Sequence[BlockRole]) -> List[Anchor]:
     return out
 
 
-def _caption_distance(p: Block, a: Anchor, W: int, H: int) -> Optional[float]:
-    """Relative distance between picture and caption when they are geometrically related."""
+Rect = Tuple[int, int, int, int]  # left, top, right, bottom (PPTX EMU)
+
+
+def _rect(obj) -> Rect:
+    return (int(obj.left), int(obj.top), int(obj.right), int(obj.bottom))
+
+
+def _between_rect(a: Rect, b: Rect) -> Optional[Rect]:
+    """The authored gap that lies between two boxes that are separated along one axis (None when they overlap)."""
+    if a[2] <= b[0] or b[2] <= a[0]:                      # separated horizontally -> gap in x, band = y overlap
+        x0, x1 = (a[2], b[0]) if a[2] <= b[0] else (b[2], a[0])
+        y0, y1 = max(a[1], b[1]), min(a[3], b[3])
+        return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
+    if a[3] <= b[1] or b[3] <= a[1]:                      # separated vertically -> gap in y, band = x overlap
+        y0, y1 = (a[3], b[1]) if a[3] <= b[1] else (b[3], a[1])
+        x0, x1 = max(a[0], b[0]), min(a[2], b[2])
+        return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
+    return None
+
+
+def _rect_overlap_area(a: Rect, b: Rect) -> int:
+    return max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+
+
+def gap_is_clear(a: Rect, b: Rect, obstacles: Sequence[Rect]) -> bool:
+    """PROMPT-027R §7/§12: True when no structural object (another picture, caption or item heading) sits in
+    the authored gap between ``a`` and ``b``.  The two boxes themselves never count as obstacles."""
+    if not obstacles:
+        return True
+    gap = _between_rect(a, b)
+    if gap is None:
+        return True
+    return not any(_rect_overlap_area(gap, o) > 0 for o in obstacles if o != a and o != b)
+
+
+def structural_obstacles(slide: SlideData, roles, items: Sequence["ItemRegion"]) -> List[Rect]:
+    """Rectangles that may SEPARATE a caption from its picture or two pictures of different blocks.
+
+    Only structure counts: every content picture, every caption button and every item/section heading line.
+    Free text is deliberately excluded (a body paragraph box must never break an authored caption row).
+    """
+    W, H = slide.width or 1, slide.height or 1
+    out: List[Rect] = []
+    for picture in slide.pictures:
+        if not is_decorative_picture(picture, W, H):
+            out.append(_rect(picture))
+    for role in roles:
+        if role.role == ROLE_CAPTION and role.block.text.strip():
+            out.append(_rect(role.block))
+    for item in items:
+        if item.width > 0 and item.height > 0:
+            out.append(item.heading_box)
+    return out
+
+
+def _caption_distance(p: Block, a: Anchor, W: int, H: int,
+                      obstacles: Optional[Sequence[Rect]] = None) -> Optional[float]:
+    """Relative distance between picture and caption when they are geometrically related.
+
+    PROMPT-027R §5: when ``obstacles`` is given, a caption cannot label a picture across another caption,
+    picture or item heading (the gap between them must be clear).  Without obstacles the rule is unchanged.
+    """
     h_ov = _overlap(p.left, p.right, a.left, a.right)
     v_ov = _overlap(p.top, p.bottom, a.top, a.bottom)
     if h_ov and v_ov:
@@ -676,23 +781,29 @@ def _caption_distance(p: Block, a: Anchor, W: int, H: int) -> Optional[float]:
     min_h = max(1, min(p.height, a.height))
     v_gap = _gap(p.top, p.bottom, a.top, a.bottom) / H
     h_gap = _gap(p.left, p.right, a.left, a.right) / W
+    distance: Optional[float] = None
     if h_ov >= 0.5 * min_w:                              # caption above / below
         if v_gap <= CAPTION_GAP_MAX:
-            return v_gap
-        if a.bottom <= p.top and v_gap <= COLUMN_HEADER_GAP_MAX:     # column header
-            return v_gap + 0.10
-    if v_ov >= 0.5 * min_h and h_gap <= CAPTION_SIDE_GAP_MAX:        # caption beside
-        return h_gap + 0.02
-    return None
+            distance = v_gap
+        elif a.bottom <= p.top and v_gap <= COLUMN_HEADER_GAP_MAX:     # column header
+            distance = v_gap + 0.10
+    if distance is None and v_ov >= 0.5 * min_h and h_gap <= CAPTION_SIDE_GAP_MAX:        # caption beside
+        distance = h_gap + 0.02
+    if distance is None or not obstacles:
+        return distance
+    if not gap_is_clear(_rect(p), (a.left, a.top, a.right, a.bottom), obstacles):
+        return None                                      # something structural stands between them
+    return distance
 
 
-def _claims(pictures: Sequence[Block], captions: Sequence[Anchor], W: int, H: int) -> Dict[int, List[Anchor]]:
+def _claims(pictures: Sequence[Block], captions: Sequence[Anchor], W: int, H: int,
+            obstacles: Optional[Sequence[Rect]] = None) -> Dict[int, List[Anchor]]:
     """Every caption claims the picture it is closest to (a caption labels exactly one picture)."""
     out: Dict[int, List[Anchor]] = {}
     for a in captions:
         best = None
         for p in pictures:
-            d = _caption_distance(p, a, W, H)
+            d = _caption_distance(p, a, W, H, obstacles)
             if d is None:
                 continue
             below = 0 if a.bottom <= p.top + p.height * 0.25 else 1      # a caption labels the picture under it
@@ -706,9 +817,16 @@ def _claims(pictures: Sequence[Block], captions: Sequence[Anchor], W: int, H: in
 
 def classify_picture(p: Block, captions: Sequence[Anchor], inlines: Sequence[Anchor], W: int, H: int,
                      claims: Optional[Dict[int, List[Anchor]]] = None, blue: Optional[Sequence[Anchor]] = None,
-                     arrow_votes: Optional[Dict[int, Tuple[str, str]]] = None) -> Tuple[str, str]:
+                     arrow_votes: Optional[Dict[int, Tuple[str, str]]] = None,
+                     obstacles: Optional[Sequence[Rect]] = None) -> Tuple[str, str]:
     """('after'|'before'|'ambiguous', how).  Evidence priority: caption button → inline '+ Trước/+ Sau' line →
-    blue After text (+ arrow agreement) → arrow destination side → ambiguous (never 'the only picture')."""
+    blue After text (+ arrow agreement) → arrow destination side → ambiguous (never 'the only picture').
+
+    PROMPT-027R §4: an inline '+ Sau:' line owns every picture BELOW it (open-ended ownership).  That reach is
+    too wide on its own, so the inline owner must agree with a structural arrow vote on the same picture; a
+    picture on the arrow's SOURCE side is never reclassified as After by a line far above it.  Disagreement is
+    ambiguous (fail closed) and is resolved only by same-row neighbours, never by the inline line alone.
+    """
     # 1. caption buttons (strongest evidence)
     mine = (claims or {}).get(id(p), [])
     kinds = {a.kind for a in mine}
@@ -718,7 +836,7 @@ def classify_picture(p: Block, captions: Sequence[Anchor], inlines: Sequence[Anc
         return "ambiguous", "captions of both kinds label this picture"
     scored = []
     for a in captions:
-        d = _caption_distance(p, a, W, H)
+        d = _caption_distance(p, a, W, H, obstacles)
         if d is not None:
             above = 0 if a.bottom <= p.top + p.height * 0.25 else 1        # captions usually sit above
             scored.append((d, above, a))
@@ -740,6 +858,9 @@ def classify_picture(p: Block, captions: Sequence[Anchor], inlines: Sequence[Anc
             if a.top - ANCHOR_TOLERANCE * H <= cy and (nxt is None or cy < nxt):
                 owner = a
         if owner is not None:
+            structural = (arrow_votes or {}).get(id(p))
+            if structural is not None and structural[0] != owner.kind:
+                return "ambiguous", (f"inline '{owner.kind}' line conflicts with {structural[1]}")
             return owner.kind, f"inline '{owner.kind}' line"
         inline_note = "picture above the first Trước/Sau line"
     # 3. BLUE After text of the same block, spatially associated (PROMPT-004C evidence 2)
@@ -799,6 +920,15 @@ def _caption_owner_for_picture(picture: Block, after_pictures: Sequence[Block],
     return anchored_owners[0]
 
 
+def _span_owner(picture: Block, items: Sequence[ItemRegion], H: int) -> Optional[ItemRegion]:
+    """The production item whose vertical SPAN strictly contains the picture centre (PROMPT-027R §5)."""
+    cy = picture.top + picture.height / 2
+    for item in items:
+        if item.region_kind == "item" and item.semantic_role == SEMANTIC_PRODUCTION and item.top <= cy < item.bottom:
+            return item
+    return None
+
+
 def _attach_owner(ref: PictureRef, slide: SlideData, items: Sequence[ItemRegion],
                   slide_is_inspection: bool, W: int, H: int, after_pictures: Sequence[Block] = (),
                   claims: Optional[Dict[int, List[Anchor]]] = None) -> None:
@@ -808,7 +938,15 @@ def _attach_owner(ref: PictureRef, slide: SlideData, items: Sequence[ItemRegion]
         if caption_owner is not None:
             caption_is_ambiguous = not caption_owner.confident and "ambiguous" in caption_owner.reason
             if not (caption_is_ambiguous and result.confident and result.region is not None):
-                result = caption_owner
+                # PROMPT-027R §5: a caption may not move a picture into ANOTHER item's span.  A caption-derived
+                # owner that disagrees with the item span containing the picture is ambiguous (fail closed).
+                span_owner = _span_owner(ref.block, items, H)
+                if caption_owner.region is not None and span_owner is not None \
+                        and caption_owner.owner_id != span_owner.owner_id:
+                    result = OwnerResult(None, False, f"caption owner {caption_owner.heading!r} conflicts with the "
+                                                      f"item span of {span_owner.heading!r}", SEMANTIC_OTHER)
+                else:
+                    result = caption_owner
     ref.owner_id = result.owner_id
     ref.owner_heading = result.heading
     ref.confident_owner = result.confident and not slide_is_inspection
@@ -941,7 +1079,8 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
         from .extractor import excluded_bands                      # lazy: extractor imports this module
         bands = excluded_bands(slide, H)
         content_pics = [p for p in slide.pictures if not is_decorative_picture(p, W, H)]
-        claims = _claims(content_pics, captions, W, H)
+        obstacles = structural_obstacles(slide, roles, items)          # PROMPT-027R §5: caption/row separators
+        claims = _claims(content_pics, captions, W, H, obstacles)
         blue = _blue_anchors(roles, inspection_ranges)
         blue = [a for a in blue if not any(y0 <= a.cy < y1 for y0, y1, _k in bands)]
         arrows = [a for a in getattr(slide, "arrows", [])
@@ -974,7 +1113,8 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
             band = next((k for y0, y1, k in bands if y0 <= cy < y1), None)
             if band:
                 band_label = "inspection/control" if band == "inspection" else band
-                band_kind, band_anchor = classify_picture(picture, caps_i, ins_i, W, H, claims_i, ble_i, votes_i)
+                band_kind, band_anchor = classify_picture(picture, caps_i, ins_i, W, H, claims_i, ble_i, votes_i,
+                                                          obstacles)
                 band_temporal = {"after": "AFTER", "before": "BEFORE"}.get(band_kind, "UNKNOWN")
                 working.rejected.append(PictureRef(
                     n, picture, "excluded", f"{band_label} section block (mid-slide heading)", band_anchor,
@@ -983,7 +1123,7 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
             if any(y0 <= cy < y1 for y0, y1 in inspection_ranges) and not captions:
                 working.rejected.append(PictureRef(n, picture, "excluded", "inspection/control item"))
                 continue
-            kind, how = classify_picture(picture, caps_i, ins_i, W, H, claims_i, ble_i, votes_i)
+            kind, how = classify_picture(picture, caps_i, ins_i, W, H, claims_i, ble_i, votes_i, obstacles)
             temporal = {"after": "AFTER", "before": "BEFORE"}.get(kind, "UNKNOWN")
             if kind == "after":
                 working.after.append(PictureRef(n, picture, "after", "", how, temporal_role=temporal))
@@ -1016,6 +1156,15 @@ def select_after_pictures(report: ReportData, slide_numbers: Sequence[int]) -> P
         sel.notes.append(
             f"{ref.label}: {status}; temporal={ref.temporal_role}; semantic={ref.semantic_role}; "
             f"owner={ref.owner_id or 'unknown'} ({ref.owner_heading!r}); {detail}")
+        # PROMPT-027R §5: every picture considered, with the state that decided its fate (before any clustering).
+        group = "/".join(str(part) for part in (getattr(ref.block, "group_path", ()) or ())) or "-"
+        LOG.info("PICTURE_DECISION report=%s scope=%s slide=%s item_id=%s shape=%s source_order=%s "
+                 "bbox=%s temporal=%s semantic=%s logical_item_owner=%s confident_owner=%s excel_output_eligible=%s "
+                 "group=%s how=%r reason=%r",
+                 report.filename, scope_id, ref.slide, ref.owner_id or "-", ref.block.shape_id, ref.source_order,
+                 (ref.block.left, ref.block.top, ref.block.right, ref.block.bottom), ref.temporal_role,
+                 ref.semantic_role, ref.owner_id or "-", ref.confident_owner, ref.excel_output_eligible, group,
+                 ref.anchor, ref.exclusion_reason or "")
     return sel
 
 

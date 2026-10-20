@@ -520,5 +520,5 @@ gói, ZIP, version.json) sẽ chạy bước 12 — `tools/publish_update.py`:
 3. xoá các `ReportExtractor_*.zip` cũ (không đụng file khác trong thư mục).
 Thất bại ở bất kỳ bước nào → in `[PUBLISH] FAILED`, giữ nguyên gói/manifest cũ, build vẫn thành công (mã thoát 3);
 xuất bản lại thủ công: `python tools\publish_update.py`. Đường dẫn đích tập trung trong `tools/publish_update.py`
-(`D:\ReportExtractor_Update`, chia sẻ LAN `\\192.168.103.11\ReportExtractor_Update`), ghi đè bằng biến môi trường
+(`D:\ReportExtractor_Update`, chia sẻ LAN `\\192.168.103.12\ReportExtractor_Update`), ghi đè bằng biến môi trường
 `RE_UPDATE_FOLDER` / `RE_UPDATE_LAN_PATH` hoặc `--publish-dir`; `--no-publish` để bỏ qua.

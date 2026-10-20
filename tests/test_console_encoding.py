@@ -12,8 +12,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
+import console_safe  # noqa: E402
 from console_safe import child_env, configure_console, safe_text  # noqa: E402
 import build_and_publish  # noqa: E402
+
+CHECK = "\u2713"        # ✓  – has an entry in the glyph fallback table
+SQRT = "\u221a"         # √  – has NO fallback entry: only a Unicode-native stream can hold it
+VIET = "Việt Nam"
 
 
 class StrictCp1252:
@@ -142,3 +147,106 @@ def test_console_stream_fallback_preserves_plain_text():
     stream = StrictCp1252()
     assert safe_text("Build 015", stream=stream) == "Build 015"
     assert safe_text("✓", stream=io.StringIO()) == "✓"
+
+
+# ================================================== PROMPT-029W: the fallback must be STREAM-AWARE
+def _host_locale(monkeypatch, name: str):
+    """Pin ``locale.getpreferredencoding()`` so no expectation depends on the machine running pytest (§7)."""
+    monkeypatch.setattr(console_safe.locale, "getpreferredencoding", lambda *a, **k: name)
+    assert console_safe._encoding_for(None) == name
+
+
+def test_unicode_native_stream_keeps_unicode_even_when_the_host_locale_is_cp1252(monkeypatch):
+    """THE reported Windows regression, reproduced deterministically on any host.
+
+    ``io.StringIO`` declares ``encoding is None`` because it stores ``str``, not bytes.  Reading that as
+    "ask the locale" made ``safe_text()`` fall back to ``"[OK]"`` on Windows — whose preferred encoding is
+    cp1252 — while the very same call passed on Linux.  The supplied stream is authoritative (§2) and a
+    Unicode text stream keeps Unicode (§3).
+    """
+    _host_locale(monkeypatch, "cp1252")
+    assert safe_text(CHECK, stream=io.StringIO()) == CHECK
+    assert safe_text(SQRT, stream=io.StringIO()) == SQRT
+    assert safe_text("Build 017", stream=io.StringIO()) == "Build 017", "plain ASCII is never rewritten"
+    assert safe_text(f"{CHECK} {VIET}", stream=io.StringIO()) == f"{CHECK} {VIET}"
+    _host_locale(monkeypatch, "utf-8")
+    assert safe_text(CHECK, stream=io.StringIO()) == CHECK, "and identical on a UTF-8 host"
+
+
+def test_explicit_stream_wins_over_stdout_and_the_locale(monkeypatch):
+    """§2: safety is decided from the supplied stream, never from sys.stdout or a global code page."""
+    _host_locale(monkeypatch, "cp1252")
+    monkeypatch.setattr(sys, "stdout", StrictCp1252())
+    assert safe_text(CHECK, stream=io.StringIO()) == CHECK, "the explicit stream is authoritative"
+    assert safe_text(CHECK) == "[OK]", "with no explicit stream the console/locale answer still applies"
+
+
+def test_strict_cp1252_stream_never_raises_and_falls_back_to_ascii():
+    """§4/§5: the legacy-console guarantee is untouched by the stream-aware contract."""
+    stream = StrictCp1252()
+    result = safe_text(f"{CHECK} Hoàn thành — {VIET}", stream=stream)
+    stream.write(result)                                     # raises UnicodeEncodeError if it were unsafe
+    assert result.encode("ascii", "strict"), "the fallback must be pure ASCII"
+    assert "[OK]" in result and "Hoan thanh" in result and "Viet Nam" in result
+    assert CHECK not in result and "—" not in result and "ệ" not in result
+
+
+def test_utf8_declared_stream_preserves_unicode(monkeypatch):
+    """§4: a stream that DECLARES an encoding able to hold the text keeps it exactly."""
+    _host_locale(monkeypatch, "cp1252")                       # must not leak into this decision
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+    text = f"{CHECK} {SQRT} {VIET}"
+    assert stream.encoding == "utf-8"
+    assert safe_text(text, stream=stream) == text
+    stream.write(text)
+    stream.flush()
+
+
+def test_stream_none_console_path_is_unchanged(monkeypatch):
+    """§6: the stream-less / current-console behaviour must be exactly what it was before."""
+    _host_locale(monkeypatch, "cp1252")
+    assert console_safe._encoding_for(None) == "cp1252"
+    assert safe_text(f"{CHECK} {VIET}") == "[OK] Viet Nam"
+    _host_locale(monkeypatch, "utf-8")
+    assert safe_text(f"{CHECK} {VIET}") == f"{CHECK} {VIET}"
+
+
+def test_safe_text_is_not_an_unconditional_passthrough():
+    """§5: the semantic fallback table is intact — a restricted encoding still maps glyphs."""
+    assert safe_text(CHECK, encoding="cp1252") == "[OK]"
+    assert safe_text("✔", encoding="cp1252") == "[OK]"
+    assert safe_text("✗", encoding="cp1252") == "[FAIL]"
+    assert safe_text("❌", encoding="cp1252") == "[FAIL]"
+    assert safe_text("⚠", encoding="cp1252") == "[WARN]"
+    assert safe_text("○", encoding="cp1252") == "o"
+    assert safe_text(SQRT, encoding="ascii") == "?", "no table entry -> replaced, never raised"
+    assert safe_text("Build 017", encoding="cp1252") == "Build 017"
+
+
+def test_glyphs_a_legacy_console_can_already_show_are_not_needlessly_replaced():
+    """The fallback fires only when the destination genuinely cannot represent the text.
+
+    cp1252 natively encodes the bullet, en/em dash, ellipsis and curly quotes, so on a legacy console those
+    must survive unchanged — replacing them would lose information for no safety gain.  This is also why the
+    stream-aware fix cannot be "always transliterate": the decision belongs to the destination.
+    """
+    for ch in ("•", "–", "—", "…", "‘", "’", "‚", "“", "”", "„"):
+        ch.encode("cp1252", "strict")                       # precondition: representable in cp1252
+        assert safe_text(ch, encoding="cp1252") == ch, ch
+    assert safe_text("• – — …", stream=StrictCp1252()) == "• – — …"
+
+
+def test_console_proxy_keeps_legacy_safety_and_unicode_fidelity(monkeypatch):
+    """§5 end-to-end through configure_console(): cp1252 stays safe, Unicode-native stays faithful."""
+    legacy = StrictCp1252()
+    monkeypatch.setattr(sys, "stdout", legacy)
+    configure_console()
+    print(f"{CHECK} Hoàn thành ở {VIET}")
+    assert "[OK]" in legacy.getvalue() and "Hoan thanh o" in legacy.getvalue()
+
+    native = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", native)
+    configure_console()
+    print(f"{CHECK} Hoàn thành ở {VIET}")
+    assert f"{CHECK} Hoàn thành ở {VIET}" in native.getvalue()
+    assert sys.stdout.encoding is None, "the proxy must stay faithful to a Unicode-native stream"

@@ -1,6 +1,7 @@
 """Configuration persistence (<portable>/config/config.json) and helpers."""
 from __future__ import annotations
 
+import logging
 import re
 
 import json
@@ -9,6 +10,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+LOG = logging.getLogger("report_extractor.config")
 
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:4b"
@@ -96,6 +98,31 @@ def endpoint_problem(host: str, port) -> str:
     return ""
 
 
+# PROMPT-024R §59 (safe, narrowly scoped): pre-PROMPT-023 test runs could leak pytest temp folders
+# (e.g. C:\Users\...\AppData\Local\Temp\pytest-of-ADMINPC\pytest-3\...) into persisted path settings.
+# A value is reset ONLY when a pytest run directory (``pytest-of-...`` / ``pytest-<n>``) sits directly
+# inside a TEMP-ish folder – the exact shape of pytest basetemp output. Legitimate user-selected paths
+# are never touched (a plain Temp folder, a ``pytest-training`` folder, ...): the field simply returns
+# to "chưa chọn" so the user picks it again, and nothing is ever deleted.
+_STALE_PYTEST_PATH_RE = re.compile(r"[/\\][^/\\]*temp[^/\\]*[/\\]pytest-(?:of-|\d)", re.IGNORECASE)
+_STALE_PATH_FIELDS = ("last_report_folder", "last_template", "last_output_folder", "last_output_file",
+                      "update_path")
+
+
+def _clear_stale_pytest_paths(cfg: "AppConfig") -> List[str]:
+    # Never run inside the disposable test runtime: tests legitimately persist state under a pytest root.
+    from .runtime_paths import TEST_RUNTIME_ROOT_ENV
+    if os.environ.get(TEST_RUNTIME_ROOT_ENV, "").strip():
+        return []
+    cleared: List[str] = []
+    for name in _STALE_PATH_FIELDS:
+        value = getattr(cfg, name, "")
+        if isinstance(value, str) and value and _STALE_PYTEST_PATH_RE.search(value):
+            setattr(cfg, name, "")
+            cleared.append(name)
+    return cleared
+
+
 @dataclass
 class AppConfig:
     ollama_server: str = DEFAULT_OLLAMA
@@ -148,6 +175,9 @@ class AppConfig:
                     setattr(cfg, k, v)
                 else:
                     cfg.extra[k] = v
+        stale = _clear_stale_pytest_paths(cfg)
+        if stale:
+            LOG.info("CONFIG_MIGRATION cleared stale pytest temp paths from: %s", ", ".join(stale))
         cfg.ollama_server = normalize_ollama_url(cfg.ollama_server)
         return cfg
 

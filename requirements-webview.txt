@@ -2,3 +2,9 @@
 -r requirements.txt
 pywebview==6.2.1
 pythonnet==3.0.5 ; sys_platform == "win32"
+# pythonnet 3.0.5 declares "clr_loader<0.3.0,>=0.2.7" but nothing pins it, so a reused .venv-build can
+# hold an arbitrary clr-loader.  ClrLoader.dll is the native netfx host that clr_loader.ffi.load_netfx()
+# dlopen()s and that reports "Failed to resolve Python.Runtime.Loader.Initialize" (PROMPT-028R), so its
+# version is part of the build contract.  Pinned to the version pythonnet 3.0.5 is tested against;
+# tools/build_portable.py verifies the installed one still satisfies pythonnet's own requirement.
+clr-loader==0.2.10 ; sys_platform == "win32"

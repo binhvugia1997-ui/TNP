@@ -27,11 +27,12 @@ from .ollama_discovery import (OllamaDiscovery, OllamaDiscoveryResult, discovery
                                model_available)
 from .prescan import (ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD, ACTION_PROCESS,
                       ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, ACTION_FAST_SKIP, AUTO_PERIOD_FAIL_VI,
-                      CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, MasterLookup, PreScanItem,
-                      PreScanResult, ProcessingPeriod, auto_period_from_excel, month_period, normalize_source_path,
-                      prescan, range_period)
+                      CACHE_FILE_NAME, PERIOD_DIFFERS_VI, ALL_PERIOD, FastScanCache, IntrinsicScanCache,
+                      MasterLookup, PreScanItem, PreScanResult, ProcessingPeriod, auto_period_from_excel,
+                      month_period, normalize_source_path, prescan, range_period)
 from .excel_writer import ExcelWriter
 from .scanner import scan_inputs
+from .scan_diagnostics import ScanMetrics
 from . import updater
 from .runtime_paths import portable_root
 from .updater import UpdateCheck, version_label
@@ -48,12 +49,14 @@ STATUS_VI: Dict[str, str] = {
     "not_written": "Cần kiểm tra — Không xác định được Management Number từ tên file",
     "error": "Lỗi",
     "skipped": "Bỏ qua — đã cập nhật",
+    "cancelled": "Đã hủy",          # PROMPT-024R: user cancel-all – a choice, never a processing failure
     "outside_period": "Bỏ qua ngoài thời gian xử lý",
     "source_duplicate": "Trùng Management Number trong folder",
     "fast_skip": "Bỏ qua nhanh — đã xử lý gần đây",
 }
 PRESCAN_STATUSES = ("outside_period", "source_duplicate", "fast_skip")
-FINAL_STATUSES = ("completed", "completed_new", "needs_review", "not_written", "error", "skipped") + PRESCAN_STATUSES
+FINAL_STATUSES = ("completed", "completed_new", "needs_review", "not_written", "error", "skipped",
+                  "cancelled") + PRESCAN_STATUSES
 PERIOD_MODES = ("auto", "month", "range", "all")
 # scanned-file list: Vietnamese label of each pre-scan decision + the manual exclusion
 AUTO_UPDATE_CHECK_KEY = "auto_update_check"            # cfg.extra key (persisted; default enabled)
@@ -219,6 +222,7 @@ class ScanRow:
     run_stage: str = ""               # live/final pipeline stage of the current batch for this file ('' = none)
     vendor: str = ""                  # Vendor known from the current batch (display only)
     note: str = ""                    # batch note (diagnostics only – not a main-table column)
+    normalized_path: str = ""         # computed once while building this view; internal identity only
 
     @property
     def is_candidate(self) -> bool:
@@ -316,15 +320,18 @@ class UiEvent:
     payload: Any = None
 
 
-UPDATE_STAGES_VI = {                      # PROMPT-011 progress window texts (stage -> label)
+UPDATE_STAGES_VI = {                      # shared update progress labels (worker -> UI DTO)
     "PREPARING": "Đang chuẩn bị cập nhật...",
-    "COPYING": "Đang sao chép bản cập nhật...",
-    "VERIFYING": "Đang kiểm tra tính toàn vẹn...",
+    "COPYING": "Đang sao chép gói cập nhật...",
+    "VERIFYING": "Đang xác minh SHA256 và ZIP...",
+    "EXTRACTING": "Đang giải nén an toàn...",
+    "VALIDATING": "Đang kiểm tra gói Portable...",
     "READY": "Gói cập nhật đã được kiểm tra và sẵn sàng.",
+    "HELPER_START": "Đang chuẩn bị cài đặt...",
     "APPLYING": "Đang chuẩn bị cài đặt...",
-    "BACKUP": "Đang sao lưu phiên bản hiện tại...",      # performed by the external updater (after this GUI exits)
-    "INSTALLING": "Đang cài đặt...",                       # idem – never shown with an invented percentage here
-    "HANDOFF": "Gói cập nhật đã sẵn sàng.\nĐang khởi động trình cài đặt...",
+    "BACKUP": "Đang sao lưu phiên bản hiện tại...",
+    "INSTALLING": "Đang cài đặt...",
+    "HANDOFF": "Ứng dụng sẽ khởi động lại...",
     "COMPLETE": "Cập nhật hoàn tất — đang khởi động lại...",
     "ERROR": "Cập nhật thất bại",
 }
@@ -407,21 +414,32 @@ class GuiController:
         self._update_thread: Optional[threading.Thread] = None
         self.update_check_done = threading.Event()   # set when a check has COMPLETED (result published); cleared at start
         self.update_check_done.set()
-        self.update_installing: bool = False         # PROMPT-011: one install at a time (buttons disabled meanwhile)
+        self.update_installing: bool = False         # one install at a time (buttons disabled meanwhile)
+        self.update_handoff_started: bool = False    # true only after the helper process was launched
+        self.update_install_error: str = ""
         self.update_progress = UpdateProgress()
         self._install_thread: Optional[threading.Thread] = None
         self._install_lock = threading.Lock()
+        self._update_file_lock: Optional[updater.UpdateInstallLock] = None
+        self._activity_file_lock: Optional[updater.UpdateInstallLock] = None
+        self._activity_lock_depth = 0
         self.prescan: Optional[PreScanResult] = None
         self.queue_indexes: Optional[set] = None       # indexes that really enter the processing pipeline
         # reviewed scan list (before Start): real pre-scan result + manual exclusions
         self.all_files: List[Path] = []                # every discovered PPT/PPTX (recursive)
         self.input_files_override: Optional[List[Path]] = None  # explicit native file selection, otherwise folder scan
         self.scan_result: Optional[PreScanResult] = None
+        # Session-memory only.  Values contain context-free filename/date facts, never final row decisions.
+        self.intrinsic_scan_cache = IntrinsicScanCache()
         self.scan_stale: bool = False
         self.scan_message: str = ""
         self.excluded_keys: set = set()
         # runtime state
-        self.state: str = "idle"                 # idle | running | stopping
+        # PROMPT-024R job-state model (mirrors BatchProcessor events):
+        #   idle -> running -> stopping          ("Dừng sau file hiện tại": current file finishes atomically)
+        #                  \-> cancelling        ("Dừng tất cả": current file stops at the nearest SAFE boundary)
+        # -> idle. A cancelled report is never a failure; untouched queued reports stay "waiting" (Chưa xử lý).
+        self.state: str = "idle"                 # idle | running | stopping | cancelling
         self.files: List[Path] = []
         self.rows: List[RowState] = []
         self.progress = Progress()
@@ -457,6 +475,8 @@ class GuiController:
         self.learning_dir: Optional[Path] = learning_dir_override
         self._learning = None
         self.review_index = 0
+        self._restored_image_candidates = None
+        self._pending_image_candidates: Dict[str, Any] = {}
         self.pending_labels: Dict[str, str] = {}      # candidate_id -> label chosen in the review window (unsaved)
         self.pending_label_notes: Dict[str, str] = {}
         self.pending_image_reapply: list = []         # saved image labels whose region-crop Excel reapply is still owed
@@ -627,12 +647,23 @@ class GuiController:
 
     def review_candidates(self) -> list:
         """Reviewable pictures of the LAST finished batch (hard-excluded logos/arrows are never offered)."""
-        if self.is_running() or not self.processor:
+        if self.is_running():
             return []
-        out = []
+        from .learning_assets import LearningAssets, review_id
+        if self.processor is None:
+            if self.learning is None:
+                return []
+            if self._restored_image_candidates is None:
+                assets = LearningAssets(self.learning.dir)
+                self._restored_image_candidates = assets.candidates(self.learning.store.latest())
+            return list(self._restored_image_candidates)
+        # A current (even empty) run is authoritative: never append stale archive rows over it (032).
+        out = {}
         for fr in getattr(self.processor, "results", []):
-            out.extend(c for c in getattr(fr, "image_candidates", []) if not c.hard_excluded)
-        return out
+            for candidate in getattr(fr, "image_candidates", []):
+                if not candidate.hard_excluded:
+                    out[review_id(candidate)] = candidate
+        return list(out.values())
 
     def review_summary_text(self) -> str:
         cands = self.review_candidates()
@@ -660,6 +691,7 @@ class GuiController:
             raise ValueError(label)
         self.pending_labels[cand.candidate_id] = label
         self.pending_label_notes[cand.candidate_id] = note
+        self._pending_image_candidates[cand.candidate_id] = cand
 
     def save_confirmations(self, cands) -> Tuple[bool, str]:
         """Persist labels first, then re-apply region crops to the Excel image cells."""
@@ -669,6 +701,8 @@ class GuiController:
         if not self.pending_labels:
             return False, "Chưa chọn nhãn nào."
         by_id = {c.candidate_id: c for c in cands}
+        # Shared classification IDs can have distinct evidence sources. Use the explicitly selected source.
+        by_id.update(self._pending_image_candidates)
         written, touched = 0, []
         for cid, label in list(self.pending_labels.items()):
             c = by_id.get(cid)
@@ -680,6 +714,7 @@ class GuiController:
             touched.append(c)
         self.pending_labels.clear()
         self.pending_label_notes.clear()
+        self._pending_image_candidates.clear()
         # Include reports owed from a previous locked attempt; the label JSONL stays the source of truth.
         by_touched_id = {c.candidate_id: c for c in self.pending_image_reapply}
         by_touched_id.update({c.candidate_id: c for c in touched})
@@ -817,7 +852,7 @@ class GuiController:
         self._invalidate_scan()
         return len(self.all_files)
 
-    def discover(self) -> int:
+    def discover(self, metrics: Optional[ScanMetrics] = None) -> int:
         """Cheap name-only discovery; opens no PPTX and honors an explicit selected file when present."""
         folder = Path(self.report_folder) if self.report_folder else None
         self.scan_rejections: List[Tuple[Path, str]] = []
@@ -825,7 +860,25 @@ class GuiController:
             sources = list(self.input_files_override)
         else:
             sources = [folder] if folder and folder.is_dir() else []
-        self.all_files = scan_inputs(sources, on_reject=lambda p, why: self.scan_rejections.append((p, why)))
+        if metrics is not None:
+            LOG.info("SCAN_ENUMERATE_START sources=%d", len(sources))
+            token, started = metrics.begin("SCAN_ENUMERATE")
+        else:
+            token = started = None
+        try:
+            self.all_files = scan_inputs(sources,
+                                         on_reject=lambda p, why: self.scan_rejections.append((p, why)),
+                                         metrics=metrics)
+        finally:
+            elapsed_ms = metrics.end(token, started) if metrics is not None else 0.0
+        if metrics is not None:
+            metrics.enumerate_ms = elapsed_ms
+            LOG.info("SCAN_ENUMERATE_END elapsed_ms=%.3f entries=%d candidates=%d rejected=%d unrelated=%d "
+                     "directories=%d skipped_directories=%d traversals=%d",
+                     elapsed_ms, metrics.entries_inspected, metrics.candidate_files,
+                     metrics.structural_rejected_files, metrics.unrelated_files,
+                     metrics.directories_inspected, metrics.directories_skipped,
+                     metrics.directory_traversals)
         for p, why in self.scan_rejections:                  # every rejected PowerPoint-like entry is reported
             self.log_lines.append(f"Bỏ qua khi quét thư mục: {p.name} – {why}")
         self._set_files(self.all_files)
@@ -864,13 +917,28 @@ class GuiController:
     def candidate_key(path: Path, mgmt: str) -> str:
         return f"{normalize_source_path(Path(path))}|{(mgmt or '').strip().upper()}"
 
-    def scan(self) -> Optional[PreScanResult]:
+    def scan(self, metrics: Optional[ScanMetrics] = None,
+             on_leaf_complete: Optional[Callable[[PreScanResult, int, int, Path], None]] = None
+             ) -> Optional[PreScanResult]:
+        if self.is_running():
+            return self.scan_result
+        if not self._acquire_activity_file_lock():
+            self.scan_message = updater.MSG["already_installing"]
+            return None
+        try:
+            return self._scan_unlocked(metrics=metrics, on_leaf_complete=on_leaf_complete)
+        finally:
+            self._release_activity_file_lock()
+
+    def _scan_unlocked(self, metrics: Optional[ScanMetrics] = None,
+                       on_leaf_complete: Optional[Callable[[PreScanResult, int, int, Path], None]] = None
+                       ) -> Optional[PreScanResult]:
         """Run the REAL pre-scan (same function the batch uses) on the discovered files with the current folder /
         Excel / period / cache / force settings.  Resets manual exclusions.  Nothing is opened or written.
         Never runs while a batch is active: ``discover()`` would replace the live rows/progress from another thread."""
         if self.is_running():
             return self.scan_result
-        self.discover()
+        self.discover(metrics=metrics)
         per, err = self.effective_period()
         # manual exclusions survive an ordinary rescan of the same folder (keyed by normalised path + Management
         # Number, so a renamed/moved file simply becomes a new candidate); a folder change clears them
@@ -880,25 +948,60 @@ class GuiController:
             return None
         master = None
         writer = None
+        master_started = time.perf_counter()
+        master_token = metrics.begin("SCAN_METADATA", phase="master") if metrics is not None else None
         try:
-            tpl, out = Path(self.template) if self.template else None, Path(self.output) if self.output else None
-            if tpl and tpl.is_file() and out and (self.cfg.row_mode or "match") == "match":
-                writer = ExcelWriter(tpl, out, probe=True)
-                master = MasterLookup.from_writer(writer)
-        except Exception as e:  # noqa: BLE001
-            self.log_lines.append(f"Không đọc được file Excel để quét: {e}")
+            try:
+                tpl, out = Path(self.template) if self.template else None, Path(self.output) if self.output else None
+                if tpl and tpl.is_file() and out and (self.cfg.row_mode or "match") == "match":
+                    writer = ExcelWriter(tpl, out, probe=True)
+                    master = MasterLookup.from_writer(writer)
+            except Exception as e:  # noqa: BLE001
+                self.log_lines.append(f"Không đọc được file Excel để quét: {e}")
+        finally:
+            if metrics is not None:
+                metrics.end(master_token[0], master_token[1])
+                metrics.master_open_ms += (time.perf_counter() - master_started) * 1000.0
         cache = None
         try:
             if self.output:
                 cache = FastScanCache(Path(self.output).parent / "logs" / CACHE_FILE_NAME)
         except Exception:  # noqa: BLE001
             cache = None
+        filter_started = time.perf_counter()
+        filter_token = metrics.begin("SCAN_FILTER") if metrics is not None else None
+        LOG.info("SCAN_FILTER_START candidates=%d sequential=true", len(self.all_files))
+
+        def publish_leaf(partial: PreScanResult, leaf_index: int, leaf_total: int, folder: Path) -> None:
+            # The scan thread owns controller mutation.  Service consumers receive an immutable DTO snapshot;
+            # no worker thread ever calls JavaScript and no per-file event crosses the bridge.
+            self.scan_result = partial
+            if on_leaf_complete is not None:
+                on_leaf_complete(partial, leaf_index, leaf_total, folder)
+
         try:
-            self.scan_result = prescan(self.all_files, per, cache, master, force=self.force_reprocess,
-                                       today=self._today(), on_stage=lambda m: self.log_lines.append(m))
+            result = prescan(self.all_files, per, cache, master, force=self.force_reprocess,
+                             today=self._today(), on_stage=lambda m: self.log_lines.append(m),
+                             metrics=metrics, intrinsic_cache=self.intrinsic_scan_cache,
+                             on_leaf_complete=publish_leaf)
+            self.scan_result = result
         finally:
             if writer is not None:
                 writer.close()
+            if metrics is not None:
+                metrics.end(filter_token[0], filter_token[1])
+                metrics.intrinsic_cache_entries = self.intrinsic_scan_cache.entry_count
+                metrics.intrinsic_cache_evictions = self.intrinsic_scan_cache.evictions
+        filter_ms = (time.perf_counter() - filter_started) * 1000.0
+        if metrics is not None and self.scan_result is not None:
+            metrics.filter_ms = filter_ms
+            metrics.accepted_files = len(self.scan_result.candidates)
+            metrics.status_skipped_files = len(self.scan_result.items) - metrics.accepted_files
+        LOG.info("SCAN_FILTER_END elapsed_ms=%.3f candidates=%d accepted=%d skipped=%d sequential=true",
+                 filter_ms, len(self.all_files),
+                 metrics.accepted_files if metrics is not None else len(self.scan_result.candidates),
+                 metrics.status_skipped_files if metrics is not None else
+                 len(self.scan_result.items) - len(self.scan_result.candidates))
         for line in self.scan_result.summary_lines_vi():
             self.log_lines.append(line)
         return self.scan_result
@@ -922,13 +1025,15 @@ class GuiController:
         rows: List[ScanRow] = []
         live = {normalize_source_path(Path(r.path)): r for r in self.rows} if self.rows else {}
         for it in self.scan_result.items:
-            key = self.candidate_key(it.path, it.management_number)
-            rs = live.get(normalize_source_path(Path(it.path)))
+            normalized = it.normalized_path or normalize_source_path(Path(it.path))
+            key = f"{normalized}|{(it.management_number or '').strip().upper()}"
+            rs = live.get(normalized)
             rows.append(ScanRow(index=it.index, key=key, path=it.path, management_number=it.management_number,
                                 occurrence_date=f"{it.occurrence_date:%d/%m/%Y}" if it.occurrence_date else "",
                                 action=it.action, excluded=key in self.excluded_keys, reason=it.reason,
                                 excel_row=it.excel_row, run_stage=rs.stage if rs else "",
-                                vendor=rs.vendor if rs else "", note=rs.note if rs else ""))
+                                vendor=rs.vendor if rs else "", note=rs.note if rs else "",
+                                normalized_path=normalized))
         if filter_name == SCAN_FILTERS_VI[0]:
             rows = [r for r in rows if (r.is_candidate or r.needs_attention) and not r.excluded]   # problems never hidden
         elif filter_name == SCAN_FILTERS_VI[2]:
@@ -1439,6 +1544,9 @@ class GuiController:
                 return False
         if self.scan_stale:
             return False
+        if not self._acquire_activity_file_lock():
+            self.scan_message = updater.MSG["already_installing"]
+            return False
         # the processing queue = the FINAL reviewed list (manual exclusions never reach the pipeline; a new
         # Excel row is created only when its candidate is actually processed)
         self._set_files([it.path for it in self.final_queue()])
@@ -1455,20 +1563,25 @@ class GuiController:
         self.log_lines.append(self.period_label())
         if self.period_warning():
             self.log_lines.append(self.period_warning())
-        self.processor = self._processor_factory(
-            self.build_options(use_ollama),
-            on_prescan=lambda r: self._queue.put(UiEvent("prescan", r)),
-            on_file=lambda i, s, d: self._queue.put(UiEvent("row", (i, s, d))),
-            on_batch=lambda d, t: self._queue.put(UiEvent("progress", (d, t))),
-            on_done=lambda s: self._queue.put(UiEvent("done", s)),
-            on_log=lambda m: self._queue.put(UiEvent("log", m)),
-        )
-        self.state = "running"
-        if in_thread:
-            self.processor.start()
-        else:
-            self.processor.run()
-        return True
+        try:
+            self.processor = self._processor_factory(
+                self.build_options(use_ollama),
+                on_prescan=lambda r: self._queue.put(UiEvent("prescan", r)),
+                on_file=lambda i, s, d: self._queue.put(UiEvent("row", (i, s, d))),
+                on_batch=lambda d, t: self._queue.put(UiEvent("progress", (d, t))),
+                on_done=lambda s: self._queue.put(UiEvent("done", s)),
+                on_log=lambda m: self._queue.put(UiEvent("log", m)),
+            )
+            self.state = "running"
+            if in_thread:
+                self.processor.start()
+            else:
+                self.processor.run()
+            return True
+        except Exception:
+            self.state = "idle"
+            self._release_activity_file_lock()
+            raise
 
     def request_stop(self) -> bool:
         """Stop AFTER the current report (never in the middle of an Excel write)."""
@@ -1479,8 +1592,23 @@ class GuiController:
         self.log_lines.append("Sẽ dừng sau khi xử lý xong báo cáo hiện tại…")
         return True
 
+    def request_cancel(self) -> bool:
+        """PROMPT-024R: "Dừng tất cả" – cooperative cancel-all.
+
+        The current report stops at the nearest SAFE cancellation point; no queued report starts; the
+        Excel transaction of an already committed report is never rolled back. Idempotent while already
+        stopping/cancelling (duplicate clicks are harmless). Returns False only when nothing is running.
+        """
+        if self.state not in ("running", "stopping") or not self.processor:
+            return False
+        self.processor.request_cancel()
+        self.state = "cancelling"
+        self.log_lines.append("Người dùng yêu cầu dừng tất cả.")
+        self.log_lines.append("Đang hoàn tất thao tác an toàn trước khi dừng…")
+        return True
+
     def is_running(self) -> bool:
-        return self.state in ("running", "stopping")
+        return self.state in ("running", "stopping", "cancelling")
 
     def worker_alive(self) -> bool:
         return bool(self.processor and self.processor.is_running())
@@ -1603,10 +1731,13 @@ class GuiController:
             self.state = "idle"
             for r in self.rows:                      # rows the batch never reached (stopped early)
                 if not r.is_final and r.stage != "waiting":
-                    r.stage = "error"
+                    # A report left mid-pipeline by cancel-all is CANCELLED, never an error (§5/§50);
+                    # untouched queued rows stay "waiting" (Chưa xử lý, §12).
+                    r.stage = "cancelled" if getattr(ev.payload, "cancel_requested", False) else "error"
             self.progress.current_index, self.progress.current_stage, self.progress.current_fraction = None, "", 0.0
             self.progress.done = self._count_done()
             self.progress.finished = True
+            self._release_activity_file_lock()
         elif ev.kind == "ollama":
             self.ollama_ok, self.ollama_status = ev.payload
         elif ev.kind == "models":
@@ -1701,12 +1832,14 @@ class GuiController:
         s = self.summary or BatchSummary(total=len(self.files))
         lines = [f"Tổng: {s.total}", f"Hoàn thành: {s.completed}", f"Cần kiểm tra: {s.needs_review}",
                  f"Management Number mới: {s.new_rows}", f"Chưa ghi: {s.not_written}", f"Lỗi: {s.failed}",
-                 f"Bỏ qua: {s.skipped}"]
+                 f"Bỏ qua: {s.skipped}", f"Đã hủy: {getattr(s, 'cancelled', 0)}"]
         if self.scan_result or self.prescan:
             lines.extend(self.prescan_lines())
         if self.started_at is not None:
             lines.append(f"Tổng thời gian xử lý: {format_elapsed(self.elapsed_seconds())}")
-        if s.stopped:
+        if getattr(s, "cancel_requested", False):
+            lines.insert(0, "Đã dừng toàn bộ xử lý theo yêu cầu (Dừng tất cả).")
+        elif s.stopped:
             lines.insert(0, "Đã dừng theo yêu cầu.")
         return lines
 
@@ -1716,7 +1849,8 @@ class GuiController:
     def counts_text(self) -> str:
         s = self.summary or (self.processor.summary if self.processor else None) or BatchSummary(total=len(self.files))
         return (f"Tổng: {s.total}   Hoàn thành: {s.completed}   Cần kiểm tra: {s.needs_review}   "
-                f"Management Number mới: {s.new_rows}   Chưa ghi: {s.not_written}   Lỗi: {s.failed}   Bỏ qua: {s.skipped}")
+                f"Management Number mới: {s.new_rows}   Chưa ghi: {s.not_written}   Lỗi: {s.failed}   "
+                f"Bỏ qua: {s.skipped}   Đã hủy: {getattr(s, 'cancelled', 0)}")
 
     def output_file(self) -> Optional[Path]:
         p = Path(self.summary.output_file) if self.summary and self.summary.output_file else (Path(self.output) if self.output else None)
@@ -1819,6 +1953,7 @@ class GuiController:
 
     def check_update(self, startup: bool = False) -> UpdateCheck:
         """Synchronous read-only check – reads version.json only, never copies the ZIP (worker thread / tests)."""
+        self.update_install_error = ""
         self.update_busy = True
         self.update_check_startup = bool(startup)
         try:
@@ -1860,44 +1995,121 @@ class GuiController:
             self.update_notice = f"Cập nhật thất bại ({data.get('status')}). {data.get('detail', '')}".strip()
         return self.update_notice
 
-    def install_update(self, spawn=None) -> Tuple[bool, str]:
-        """Synchronous stage + verify + launch of the external updater (tests / CLI).  The GUI uses
-        install_update_async(); both share _install_work.  On success the caller must close the application."""
+    def update_install_disabled_reason(self) -> str:
+        root = portable_root()
+        allowed, reason = updater.production_install_capability(root)
+        if not allowed:
+            return reason
+        return updater.update_lock_problem(root)
+
+    def _acquire_activity_file_lock(self) -> bool:
+        """Serialize packaged scans/batches against a helper replacing this Portable root."""
+        if not updater.is_packaged():
+            return True
+        if self._activity_file_lock is not None and self._activity_file_lock.acquired:
+            self._activity_lock_depth += 1
+            return True
+        try:
+            lock = updater.acquire_update_lock(portable_root(), timeout=0)
+        except OSError:
+            # If this runtime cannot create/open its lock, the helper cannot safely acquire it either.
+            return True
+        if lock is None:
+            return False
+        self._activity_file_lock = lock
+        self._activity_lock_depth = 1
+        return True
+
+    def _release_activity_file_lock(self) -> None:
+        if self._activity_file_lock is None:
+            self._activity_lock_depth = 0
+            return
+        self._activity_lock_depth = max(0, self._activity_lock_depth - 1)
+        if self._activity_lock_depth:
+            return
+        lock, self._activity_file_lock = self._activity_file_lock, None
+        lock.release()
+
+    def _begin_update_install(self) -> Tuple[bool, str]:
         if self.is_running():
             return False, "Đang xử lý báo cáo – hãy đợi xong rồi cập nhật."
         if not self.update_available():
-            return False, "Không có bản cập nhật để cài."
-        with self._install_lock:
-            if self.update_installing:
-                return False, "Đang cập nhật – vui lòng đợi."
-            self.update_installing = True
-        try:
-            return self._install_work(spawn, emit=False)
-        finally:
-            if not (self.update_progress.stage == "HANDOFF"):
-                self.update_installing = False
-
-    def install_update_async(self, spawn=None) -> bool:
-        """Start the install worker (LAN copy / verify / extract off the Tk thread); False when one is already
-        running, nothing is available or a batch is processing.  Progress -> UiEvent('update_progress'),
-        result -> UiEvent('update_done', (ok, msg))."""
-        if self.is_running() or not self.update_available():
-            return False
+            return False, "Không có bản cập nhật mới hợp lệ để cài."
+        allowed, reason = updater.production_install_capability(portable_root())
+        if not allowed:
+            return False, reason
+        if self.update_check is None or not self.update_check.info or self.update_check.info.build <= updater.BUILD_NUMBER:
+            return False, "Bản cập nhật không mới hơn phiên bản đang chạy; không cho phép cài lại hoặc hạ cấp."
         with self._install_lock:
             if self.update_installing or (self._install_thread and self._install_thread.is_alive()):
-                return False
+                return False, updater.MSG["already_installing"]
+            try:
+                file_lock = updater.acquire_update_lock(portable_root(), timeout=0)
+            except OSError:
+                return False, updater.MSG["lock_failed"]
+            if file_lock is None:
+                return False, updater.MSG["already_installing"]
+            self._update_file_lock = file_lock
             self.update_installing = True
-        self.update_progress = UpdateProgress(stage="PREPARING")
-        self.update_dirty = True
+            self.update_handoff_started = False
+            self.update_install_error = ""
+            self.update_progress = UpdateProgress(stage="PREPARING")
+            self.update_dirty = True
+        return True, ""
+
+    def _release_update_file_lock(self) -> None:
+        lock, self._update_file_lock = self._update_file_lock, None
+        if lock is not None:
+            lock.release()
+
+    def install_update(self, spawn=None) -> Tuple[bool, str]:
+        """Synchronous safe install adapter; production closes only after the helper starts successfully."""
+        started, reason = self._begin_update_install()
+        if not started:
+            return False, reason
+        try:
+            result = self._install_work(spawn, emit=False)
+            if not result[0]:
+                self.update_install_error = result[1]
+            return result
+        finally:
+            if not self.update_handoff_started:
+                self.update_installing = False
+                self._release_update_file_lock()
+
+    def install_update_async(self, spawn=None) -> bool:
+        """Run copy/verify/extract/validation off the UI thread with one process-wide install lock."""
+        started, _reason = self._begin_update_install()
+        if not started:
+            return False
 
         def work():
-            ok, msg = self._install_work(spawn, emit=True)
-            if not ok:
-                self.update_installing = False
-                self.update_dirty = True
-            self._queue.put(UiEvent("update_done", (ok, msg)))
-        self._install_thread = threading.Thread(target=work, name="update-install", daemon=True)
-        self._install_thread.start()
+            ok, msg = False, "Cập nhật thất bại; phiên bản hiện tại chưa bị thay đổi."
+            try:
+                ok, msg = self._install_work(spawn, emit=True)
+            except Exception as exc:  # noqa: BLE001 - worker failure must release locks and reach the DTO
+                msg = f"Cập nhật thất bại ({type(exc).__name__}); phiên bản hiện tại chưa bị thay đổi."
+                self.update_progress = UpdateProgress(stage="ERROR", error=msg)
+                LOG.exception("UPDATE_INSTALL_WORKER_FAILED")
+            finally:
+                if not ok:
+                    self.update_install_error = msg
+                    self.update_installing = False
+                    self._release_update_file_lock()
+                    self.update_dirty = True
+                self._queue.put(UiEvent("update_done", (ok, msg)))
+
+        worker = threading.Thread(target=work, name="update-install", daemon=True)
+        self._install_thread = worker
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001
+            self.update_install_error = f"Cập nhật không thể khởi chạy ({type(exc).__name__})."
+            self.update_installing = False
+            self.update_progress = UpdateProgress(stage="ERROR", error=self.update_install_error)
+            self._release_update_file_lock()
+            self.update_dirty = True
+            return False
         return True
 
     def _publish_update_progress(self, stage: str, done: int, total: int, pct: float, emit: bool,
@@ -1908,34 +2120,53 @@ class GuiController:
             t0[0] = now
         elapsed = now - t0[0] if t0[0] is not None else 0.0
         speed = (done / elapsed) if (stage == "COPYING" and elapsed > 0 and done) else 0.0
+        determinate = stage in ("COPYING", "VERIFYING", "READY", "HANDOFF", "COMPLETE")
         snap = UpdateProgress(stage=stage, bytes_copied=int(done), total_bytes=int(total), percent=float(pct),
-                              speed_bps=speed, determinate=(stage in ("COPYING", "VERIFYING", "READY", "HANDOFF",
-                                                                      "COMPLETE")))
+                              speed_bps=speed, determinate=determinate)
         self.update_progress = snap
+        self.update_dirty = True
         if emit:
             self._queue.put(UiEvent("update_progress", snap))
 
     def _install_work(self, spawn, emit: bool) -> Tuple[bool, str]:
         t0: List[Optional[float]] = [None]
+        staged = None
         try:
-            staged = updater.stage_update(self.update_check, portable_root(),
-                                          progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p,
-                                                                                                     emit, t0))
+            staged = updater.stage_update(
+                self.update_check, portable_root(),
+                progress=lambda st, d, t, p: self._publish_update_progress(st, d, t, p, emit, t0),
+                lock=self._update_file_lock,
+            )
             size = Path(staged.zip_path).stat().st_size
-            self._publish_update_progress("HANDOFF", size, size, 100.0, emit, t0)   # verified: 100%, then hand off
-            cmd = updater.launch_updater(staged, spawn) if spawn else updater.launch_updater(staged)
-        except Exception as e:  # noqa: BLE001
-            msg = str(e) or type(e).__name__
-            LOG.error("UPDATE_INSTALL failed: %s", msg)
-            updater.cleanup_staging(portable_root())
+            self._publish_update_progress("HELPER_START", size, size, 100.0, emit, t0)
+            if spawn:
+                updater.launch_updater(staged, spawn)
+            else:
+                updater.launch_updater(staged)
+            # This is the handoff boundary: Popen returned successfully. Only now may the main app exit.
+            self.update_handoff_started = True
+            self._publish_update_progress("HANDOFF", size, size, 100.0, emit, t0)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc) if isinstance(exc, RuntimeError) else f"Cập nhật thất bại ({type(exc).__name__})."
+            LOG.error("UPDATE_INSTALL_FAILED stage=UPDATE_HELPER_START error=%s", type(exc).__name__)
+            if staged is not None:
+                try:
+                    updater.cleanup_staged_update(staged)
+                except OSError:
+                    LOG.warning("UPDATE_STAGE_CLEANUP_FAILED")
             prev = self.update_progress
             self.update_progress = UpdateProgress(stage="ERROR", bytes_copied=prev.bytes_copied,
                                                   total_bytes=prev.total_bytes, percent=prev.percent, error=msg)
+            self.update_dirty = True
             if emit:
                 self._queue.put(UiEvent("update_progress", self.update_progress))
             return False, msg
-        LOG.info("UPDATE_INSTALL updater launched: %s", cmd)
-        return True, f"Đang cài đặt {self.update_check.info.label()} – ứng dụng sẽ tự khởi động lại."
+        LOG.info("UPDATE_HELPER_STARTED build=%s", self.update_check.info.build)
+        return True, f"Đang cài đặt {self.update_check.info.label()} – ứng dụng sẽ khởi động lại."
+
+    def config_storage_path(self) -> Optional[Path]:
+        """Config file this controller persists to (``None`` = the portable ``config/config.json``)."""
+        return self._config_path
 
     def save_settings(self) -> None:
         c = self.cfg

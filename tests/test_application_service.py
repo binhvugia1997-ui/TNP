@@ -324,8 +324,65 @@ def test_configuration_ollama_update_state_and_disabled_install(sample_tree, tmp
     assert calls[-1][1] == {"startup": False}
 
     install = bridge.install_update()
-    assert install["ok"] is True and install["data"]["status"] == "unavailable"
-    assert service.current_config()["app"]["version"] == "1.3.2"
+    assert install["ok"] is False and install["error"]["code"] == "UPDATE_INSTALL_DISABLED"
+    assert service.current_config()["app"]["version"] == "1.3.7"
+
+
+def test_update_install_response_snapshots_actual_progress_state(sample_tree, tmp_path, monkeypatch):
+    import app.updater as updater
+    from app.gui_controller import UpdateProgress
+
+    service, _ = _make_service(sample_tree, tmp_path)
+    controller = service.controller
+    info = updater.UpdateInfo("1.3.7", 20, "ReportExtractor_1.3.7.zip", "0" * 64, 1234)
+    controller.update_check = updater.UpdateCheck("available", "Có phiên bản mới: 1.3.7 — Build 020",
+                                                  str(tmp_path / "Update"), info, "package.zip")
+    monkeypatch.setattr(updater, "production_install_capability", lambda root: (True, ""))
+    monkeypatch.setattr(updater, "update_lock_available", lambda root: True)
+    monkeypatch.setattr(service, "_refresh_update_result", lambda: None)
+
+    def start_install():
+        controller.update_installing = True
+        controller.update_progress = UpdateProgress(stage="COPYING", bytes_copied=500, total_bytes=1000,
+                                                    percent=50, determinate=True)
+        return True
+
+    monkeypatch.setattr(controller, "install_update_async", start_install)
+    result = service.install_update()
+    assert result["status"] == "staging" and result["state"]["status"] == "staging"
+    assert result["state"]["progress"] == 50 and result["state"]["installEnabled"] is False
+    assert result["state"]["available"] == {"version": "1.3.7", "build": "020",
+                                             "package": "ReportExtractor_1.3.7.zip", "size": 1234}
+
+
+def test_failed_update_state_never_advertises_install_enabled(sample_tree, tmp_path, monkeypatch):
+    import app.updater as updater
+
+    service, _ = _make_service(sample_tree, tmp_path)
+    info = updater.UpdateInfo("1.3.7", 20, "ReportExtractor_1.3.7.zip", "0" * 64, 1234)
+    service.controller.update_check = updater.UpdateCheck(
+        "available", "Có phiên bản mới: 1.3.7 — Build 020", str(tmp_path / "Update"), info, "package.zip")
+    monkeypatch.setattr(updater, "production_install_capability", lambda root: (True, ""))
+    monkeypatch.setattr(service, "_refresh_update_result", lambda: None)
+
+    service.controller.update_install_error = "Helper failed before replacement."
+    state = service._update_dto()
+    assert state["status"] == "failed" and state["installEnabled"] is False
+
+    service.controller.update_install_error = ""
+    service._update_result = {"status": "rolled_back", "version": info.version, "build": info.build,
+                              "detail": "Recovered the previous application.", "helper_pid": 0}
+    state = service._update_dto()
+    assert state["status"] == "failed" and state["installEnabled"] is False
+
+
+def test_bridge_close_without_bound_window_does_not_mutate_close_state(sample_tree, tmp_path):
+    service, _ = _make_service(sample_tree, tmp_path)
+    service.controller.update_handoff_started = True
+    bridge = BridgeService(service)
+    result = bridge.close_for_update()
+    assert result["ok"] is False and result["error"]["code"] == "UPDATE_CLOSE_UNAVAILABLE"
+    assert service._update_close_requested is False
 
 
 def test_bridge_native_selection_tokens_dto_validation_and_error_sanitizing(sample_tree, tmp_path, monkeypatch):

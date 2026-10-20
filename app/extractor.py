@@ -13,11 +13,12 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from pathlib import Path
 
 from .classifier import (FOLLOWUP_LINE_RE, Classification, improvement_subkind, is_heading_like, is_long_term_heading,
                          section_kind_of_heading)
+from .cancellation import check_cancelled
 from .pptx_parser import ReportData, SlideData, norm_key, clean_text
 from .improvement_pictures import PictureRef, PictureSelection, select_after_pictures
 from .content_region import (ROLE_CONTENT, ROLE_TITLE, cause_sidebar_regions, classify_blocks,
@@ -764,9 +765,11 @@ def _cause_lines_key(text: str) -> set:
 def extract_record(report: ReportData, cls: Classification,
                    item_mapping: Optional[Dict[str, str]] = None,
                    known_models: Sequence[str] = (), vendors: Optional[List[str]] = None,
-                   learning=None) -> ExtractedRecord:
+                   learning=None, should_cancel: Optional[Callable[[], bool]] = None) -> ExtractedRecord:
     """``learning``: optional :class:`app.image_learning.ImageLearning`; when given (PROMPT-006) the deterministic
-    After-picture selection is refined by user-confirmed labels / the local model.  ``None`` = PROMPT-004C rules."""
+    After-picture selection is refined by user-confirmed labels / the local model.  ``should_cancel`` is checked
+    only at safe stage and item boundaries; cancellation is never interpreted as an extraction error."""
+    check_cancelled(should_cancel)
     rec = ExtractedRecord()
     rec.qpn_slide = cls.qpn_slide
     rec.management_number = extract_management_number(report, cls.management_number)
@@ -775,6 +778,7 @@ def extract_record(report: ReportData, cls: Classification,
     rec.defect_content = extract_defect_content(report, cls)
 
     sections = collect_sections(report, cls)
+    check_cancelled(should_cancel)
     rec.cause_sections = [s for s in sections if s.kind == "cause"]
     rec.improvement_sections = [s for s in sections if s.kind in ("improvement", "standard")]
     rec.excluded_sections = [f"S{s.slide} {s.kind}: {(s.heading or s.lines[0]).strip()[:70]}" for s in sections
@@ -800,11 +804,13 @@ def extract_record(report: ReportData, cls: Classification,
     rec.improvement = join_sections(rec.improvement_sections)
     rec.temporary_excluded = join_sections(tmp_sections)
     if learning is not None:                                   # PROMPT-006B: block-level content corrections
+        check_cancelled(should_cancel)
         from .content_learning import select_content_with_learning
         content_slides = sorted(set(cls.improvement_slides) | {s.slide for s in rec.improvement_sections})
         text, ccands, extra = select_content_with_learning(report, sections, content_slides,
                                                            getattr(learning, "content", None),
                                                            rec.management_number, str(report.path))
+        check_cancelled(should_cancel)
         rec.content_candidates = ccands
         if text is not None:
             rec.improvement = text
@@ -832,16 +838,20 @@ def extract_record(report: ReportData, cls: Classification,
     # improvement pictures: After-only, deterministic geometry (never "all pictures of the slide")
     final_sel = PictureSelection()
     if rec.improvement_image_slides:
+        check_cancelled(should_cancel)
         sel = select_after_pictures(report, rec.improvement_image_slides)
+        check_cancelled(should_cancel)
         rec.after_pictures = list(sel.after)
         rec.after_picture_slides = list(sel.slides_with_after)
         rec.picture_notes = list(sel.notes)
         reasons = list(sel.reasons)
         final_sel = sel
         if learning is not None:
+            check_cancelled(should_cancel)
             from .image_learning import select_with_learning
             refs, cands, extra = select_with_learning(report, rec.improvement_image_slides, sel, learning,
                                                       rec.management_number, str(report.path))
+            check_cancelled(should_cancel)
             rec.after_pictures = refs
             rec.image_candidates = cands
             final_sel = PictureSelection(after=list(refs), rejected=list(sel.rejected),
@@ -866,15 +876,21 @@ def extract_record(report: ReportData, cls: Classification,
     from .improvement_items import attach_selection, segment_report_items
     item_slides = sorted(set(rec.improvement_image_slides) | {s.slide for s in rec.improvement_sections})
     if item_slides:
+        check_cancelled(should_cancel)
         items_by_slide = segment_report_items(report, item_slides)
         attach_selection(items_by_slide, final_sel)
-        rec.improvement_items = [item.summary()
-                                 for items in items_by_slide.values() for item in items]
-        for summary in rec.improvement_items:
-            LOG.info("ITEM_RECORD MN=%s report=%s slide=%s index=%d item=%s heading=%r "
-                     "after=%s before=%s captions=%s", rec.management_number or "-", report.filename,
-                     summary["slide"], summary["index"], summary["itemId"], summary["heading"],
-                     summary["afterPictures"], summary["beforePictures"], summary["captions"])
+        rec.improvement_items = []
+        for items in items_by_slide.values():
+            for item in items:
+                # PROMPT-025 item boundaries are safe cooperative checkpoints. No result is
+                # committed until every item has been processed and the report transaction saves.
+                check_cancelled(should_cancel)
+                summary = item.summary()
+                rec.improvement_items.append(summary)
+                LOG.info("ITEM_RECORD MN=%s report=%s slide=%s index=%d item=%s heading=%r "
+                         "after=%s before=%s captions=%s", rec.management_number or "-", report.filename,
+                         summary["slide"], summary["index"], summary["itemId"], summary["heading"],
+                         summary["afterPictures"], summary["beforePictures"], summary["captions"])
 
     # ambiguous classification -> manual review rather than guessing
     rec.review_reasons.extend(cls.ambiguities)

@@ -92,7 +92,7 @@ def _synthetic(n_inc=12, n_exc=12, schema=CONTENT_FEATURE_SCHEMA):
 
 # ================================================================== §21 features / hard exclusions / baseline
 def test_version_build_007():
-    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_ID == "015"
+    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20 and app.BUILD_ID == "020"
     init = (Path(__file__).resolve().parent.parent / "backup" / "ReportExtractor_v1.0.4_Build004_STABLE" / "app"
             / "__init__.py").read_text(encoding="utf-8")
     assert '__version__ = "1.0.4"' in init and "BUILD_NUMBER = 4" in init
@@ -435,16 +435,14 @@ def test_gui_content_review_window(monkeypatch, tmp_path):
 
 
 def test_updater_preserves_content_learning_files(tmp_path, monkeypatch):
-    from tests.test_updater import make_portable, make_update_folder
-    portable = make_portable(tmp_path / "app")
+    from tests.test_updater import _staged, set_helper_runtime
+    portable, staged = _staged(tmp_path, monkeypatch)
     ld = portable / "learning_data"
     (ld / "model").mkdir(parents=True)
     (ld / "content_labels.jsonl").write_text("{}\n", encoding="utf-8")
     (ld / "image_labels.jsonl").write_text("{}\n", encoding="utf-8")
     (ld / "model" / "content_model.json").write_text("{}", encoding="utf-8")
-    folder = make_update_folder(tmp_path / "Update")
-    check = up.check_for_update(str(folder), current_build=4)
-    staged = up.stage_update(check, portable)
+    set_helper_runtime(monkeypatch, staged)
     assert up.apply_update(Path(staged.manifest_path), alive=lambda pid: False, sleep=lambda s: None,
                            spawn=lambda cmd, **kw: None) == 0
     assert (ld / "content_labels.jsonl").exists() and (ld / "image_labels.jsonl").exists()

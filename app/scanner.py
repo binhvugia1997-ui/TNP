@@ -4,7 +4,10 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Callable, List, Optional, Sequence, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .scan_diagnostics import ScanMetrics
 
 PathLike = Union[str, os.PathLike]
 LOG = logging.getLogger("report_extractor.scanner")
@@ -43,21 +46,39 @@ def _reject(path: Path, why: str, on_reject: RejectHook) -> None:
         on_reject(path, why)
 
 
-def scan_folder(folder: PathLike, on_reject: RejectHook = None) -> List[Path]:
-    """Recursively find every report candidate in ``folder`` (sorted, deterministic).  Every PowerPoint-looking
-    entry that is skipped is logged with its exact reason (``SCAN_REJECT``) – nothing is discarded silently."""
+def scan_folder(folder: PathLike, on_reject: RejectHook = None,
+                metrics: Optional["ScanMetrics"] = None) -> List[Path]:
+    """Recursively find every report candidate in ``folder`` (sorted, deterministic).
+
+    Every PowerPoint-looking entry that is skipped is logged with its exact reason
+    (``SCAN_REJECT``) – nothing is discarded silently.  Optional metrics count work only;
+    they never alter discovery decisions.
+    """
     root = Path(folder)
     if not root.exists():
         return []
     if root.is_file():
+        if metrics is not None:
+            metrics.entries_inspected += 1
         why = rejection_reason(root)
         if why:
+            if metrics is not None:
+                metrics.structural_rejected_files += 1
             _reject(root, why, on_reject)
             return []
+        if metrics is not None:
+            metrics.candidate_files += 1
         return [root]
+    if metrics is not None:
+        metrics.directory_traversals += 1
     found: List[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
+        if metrics is not None:
+            metrics.directories_inspected += 1
+            metrics.entries_inspected += len(dirnames) + len(filenames)
         hidden = [d for d in dirnames if d.startswith(".")]
+        if metrics is not None:
+            metrics.directories_skipped += len(hidden)
         for d in hidden:
             _reject(Path(dirpath) / d, "thư mục ẩn (bắt đầu bằng '.') – không quét", on_reject)
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
@@ -66,17 +87,24 @@ def scan_folder(folder: PathLike, on_reject: RejectHook = None) -> List[Path]:
             why = rejection_reason(p)
             if not why:
                 found.append(p)
+                if metrics is not None:
+                    metrics.candidate_files += 1
             elif _looks_like_powerpoint(fn):
+                if metrics is not None:
+                    metrics.structural_rejected_files += 1
                 _reject(p, why, on_reject)
+            elif metrics is not None:
+                metrics.unrelated_files += 1
     return found
 
 
-def scan_inputs(inputs: Sequence[PathLike], on_reject: RejectHook = None) -> List[Path]:
+def scan_inputs(inputs: Sequence[PathLike], on_reject: RejectHook = None,
+                metrics: Optional["ScanMetrics"] = None) -> List[Path]:
     """Accept a mix of folders and files (e.g. from drag & drop). Dedupe, keep order."""
     seen = set()
     out: List[Path] = []
     for item in inputs:
-        for p in scan_folder(item, on_reject):
+        for p in scan_folder(item, on_reject, metrics=metrics):
             key = str(p.resolve()).lower()
             if key not in seen:
                 seen.add(key)

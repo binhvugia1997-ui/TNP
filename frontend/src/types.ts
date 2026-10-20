@@ -53,6 +53,7 @@ export type StatusKey =
   | 'needs_review'
   | 'error'
   | 'skipped'
+  | 'cancelled'
   | 'outside_period'
   | 'source_duplicate'
   | 'fast_skip'
@@ -66,6 +67,8 @@ export const STATUS_LABEL: Record<StatusKey, string> = {
   needs_review: 'Cần kiểm tra',
   error: 'Lỗi',
   skipped: 'Bỏ qua — đã cập nhật',
+  /** PROMPT-024R: người dùng chọn "Dừng tất cả" — không phải lỗi xử lý. */
+  cancelled: 'Đã hủy',
   outside_period: 'Bỏ qua ngoài thời gian xử lý',
   source_duplicate: 'Trùng Management Number trong folder',
   fast_skip: 'Bỏ qua nhanh — đã xử lý gần đây',
@@ -83,11 +86,52 @@ export const BUCKET_OF: Record<StatusKey, StatBucket | 'other'> = {
   waiting: 'other',
   needs_review: 'needs_review',
   error: 'error',
+  // PROMPT-024R: cancellation is a user choice — never counted in the Lỗi (failure) bucket.
+  cancelled: 'other',
   skipped: 'skipped',
   outside_period: 'skipped',
   source_duplicate: 'skipped',
   fast_skip: 'skipped',
   excluded: 'other',
+}
+
+/**
+ * PROMPT-037 / PROMPT-037R: the ONE authoritative rule for rows shown in “Danh sách báo cáo”.
+ * Every status whose UI meaning is “Bỏ qua” is hidden from the list, its totals, selection and
+ * the active row: `skipped` (“Bỏ qua — đã cập nhật”), `outside_period` (“Bỏ qua ngoài thời gian
+ * xử lý”), `source_duplicate` and `fast_skip` (“Bỏ qua nhanh — đã xử lý gần đây”). The DTO still
+ * carries them: the backend keeps the classification for processing, duplicate handling, scan
+ * decisions and incremental transitions. Presentation-only; nothing is blacklisted by path, so a
+ * later scan that makes a report visible/actionable shows it again.
+ */
+export const HIDDEN_REPORT_STATUSES: ReadonlySet<StatusKey> = new Set<StatusKey>([
+  'skipped',
+  'outside_period',
+  'source_duplicate',
+  'fast_skip',
+])
+
+/**
+ * PROMPT-038: canonical form of a DTO status for the visibility rule. The checked-in backend
+ * already emits exact keys (`outside_period`, …), but the single authoritative predicate must
+ * not silently leak a “Bỏ qua” row if a future DTO pathway emits different casing/whitespace.
+ */
+export function normalizeReportStatus(status: unknown): string {
+  return typeof status === 'string' ? status.trim().toLowerCase() : ''
+}
+
+export function isVisibleReport(report: Pick<Report, 'status'>): boolean {
+  return !HIDDEN_REPORT_STATUSES.has(normalizeReportStatus(report.status) as StatusKey)
+}
+
+/** O(N): visible rows in incoming order, STT renumbered over the visible list only. */
+export function presentReports(list: readonly Report[]): Report[] {
+  const out: Report[] = []
+  for (const report of list) {
+    if (!isVisibleReport(report)) continue
+    out.push(report.stt === out.length + 1 ? report : { ...report, stt: out.length + 1 })
+  }
+  return out
 }
 
 export type QpnImage = {
@@ -165,6 +209,37 @@ export type DiagnosticRow = {
   state: 'ok' | 'warn' | 'error' | 'idle'
 }
 
+/* ---------------------------------------------------------------- Excel mặc định (PROMPT-040) */
+
+export type ExcelKind = 'template' | 'output'
+
+/** `unconfigured` = chưa từng chọn; `checking` = đang kiểm tra hợp lệ; các trạng thái còn lại là lỗi thật. */
+export type ExcelState = 'unconfigured' | 'checking' | 'ok' | 'missing' | 'inaccessible' | 'invalid'
+
+/** Một file Excel đã được chọn một lần và ghi vào config người dùng (không dùng localStorage). */
+export type ExcelKindState = {
+  kind: ExcelKind
+  label: string
+  path: string
+  name: string
+  folder: string
+  state: ExcelState
+  message: string
+  /** false = giá trị trong config.json chưa khớp lựa chọn hiện tại (ví dụ thư mục config chỉ đọc). */
+  persisted: boolean
+}
+
+export type ExcelSelectionState = { template: ExcelKindState; output: ExcelKindState }
+
+export const EXCEL_STATE_LABEL: Record<ExcelState, string> = {
+  unconfigured: 'Chưa chọn',
+  checking: 'Đang kiểm tra',
+  ok: 'Dùng được',
+  missing: 'Không tìm thấy',
+  inaccessible: 'Không truy cập được',
+  invalid: 'Không hợp lệ',
+}
+
 /* ---------------------------------------------------------------- Học cải tiến */
 
 export type LabelValue = 'UNLABELED' | string
@@ -189,6 +264,10 @@ export const CONFIDENCE_LABEL: Record<'high' | 'medium' | 'low', string> = {
 }
 
 export type ImageCandidate = {
+  /** Scoped evidence identity; canonical `id` remains backward-compatible in the Python DTO. */
+  reviewId?: string
+  reportScope?: string
+  persisted?: boolean
   id: string
   sourceFile: string
   managementNumber: string
@@ -197,6 +276,51 @@ export type ImageCandidate = {
   src: string
   /** Khung ảnh trên slide, tính theo % kích thước slide. */
   bounds: { x: number; y: number; w: number; h: number }
+  /** PROMPT-024R: kích thước slide gốc (EMU) + khung mục tiêu EMU để map toạ độ chính xác. */
+  slideWidth?: number
+  slideHeight?: number
+  targetBbox?: { x: number; y: number; width: number; height: number }
+  targetBboxPct?: { x: number; y: number; w: number; h: number }
+  targetKind?: string
+  /** PROMPT-024R: ảnh TOÀN slide đã render (data URI) — nền ngữ cảnh cho vị trí thật của mục tiêu. */
+  slidePreview?: string
+  slidePreviewWidth?: number
+  slidePreviewHeight?: number
+  /**
+   * PROMPT-027 §4/§6: backend ĐÃ thật sự render ảnh xem trước ("powerpoint" | "libreoffice" | "builtin").
+   * Chỉ PowerPoint là trung thực từng điểm ảnh với slide gốc; backend dự phòng phải được báo rõ để UI
+   * hiện cảnh báo giảm độ trung thực thay vì giả vờ là kết quả PowerPoint. Không chứa đường dẫn file.
+   */
+  slidePreviewBackend?: string
+  slidePreviewFaithful?: boolean
+  /**
+   * PROMPT-041: VÌ SAO ảnh xem trước không trung thực PowerPoint — một slug ổn định do Python gửi,
+   * không phải đường dẫn file, không phải PID. `"powerpoint-user-session-running"` (máy CÓ PowerPoint
+   * nhưng chính phiên PowerPoint của người dùng đang mở nên app không dùng chung) KHÁC
+   * `"powerpoint-unavailable"` (máy không có PowerPoint); báo nhầm cái này thành cái kia sẽ khiến người
+   * dùng đi tìm một bản cài đã có sẵn. `""` khi ảnh đã render trung thực bằng PowerPoint.
+   */
+  slidePreviewReason?: string
+  /**
+   * PROMPT-027 §13/§14/§15: VÙNG XUẤT EXCEL — vùng "Sau cải tiến" theo ImprovementItem mà pipeline
+   * sản xuất SẼ crop đưa vào Excel nếu xử lý file này ngay bây giờ. Do Python tính từ
+   * ImprovementVisualRegion.bbox; React KHÔNG BAO GIỜ tự suy ra từ bounds của ảnh ứng viên.
+   * Một vùng có thể chứa nhiều ảnh After + caption + chú thích; null khi ảnh này không thuộc vùng nào.
+   */
+  evidenceRegionBbox?: { x: number; y: number; width: number; height: number } | null
+  evidenceRegionBboxPct?: { x: number; y: number; w: number; h: number } | null
+  evidenceRegionKind?: string
+  evidenceRegionItemId?: string
+  evidenceRegionItemIndex?: number
+  evidenceRegionItemHeading?: string
+  evidenceRegionPictureCount?: number
+  /** PROMPT-027R §24: shape ids of the pictures that form the production region — display/debug only; React never
+   *  derives any geometry from them. */
+  evidenceRegionPictureIds?: number[]
+  evidenceRegionId?: string
+  evidenceRegionBlockIndex?: number
+  evidenceRegionBoundarySource?: string
+  evidenceRegionNextHeadingTop?: number | null
   /** PROMPT-025: định danh mục cải tiến (một slide có thể có nhiều mục). */
   itemId?: string
   itemIndex?: number
@@ -233,7 +357,8 @@ export type ContentCandidate = {
 }
 
 export type ProcessingRun = {
-  status: 'idle' | 'processing' | 'stopping' | 'done'
+  /** PROMPT-024R: "cancelling" = "Dừng tất cả" đã yêu cầu, chờ worker xác nhận ở điểm an toàn. */
+  status: 'idle' | 'processing' | 'stopping' | 'cancelling' | 'done'
   queue: string[]
   /** Chỉ số báo cáo đang xử lý trong hàng đợi. */
   index: number
@@ -249,4 +374,7 @@ export type ProcessingRun = {
   /** true khi ít nhất một báo cáo đã kết thúc trong phiên này (để hiển thị ETA). */
   hasSamples: boolean
   stopped?: boolean
+  /** PROMPT-024R: lượt chạy này có yêu cầu "Dừng tất cả" hay không + số báo cáo đã hủy. */
+  cancelRequested?: boolean
+  cancelledCount?: number
 }

@@ -12,6 +12,12 @@ LẦN CHẠY ĐẦU TIÊN – REPORT EXTRACTOR {version}
 3. Lần đầu chạy, chương trình tự tạo các thư mục config\, logs\, Output\ bên cạnh
    ReportExtractor.exe. Không có gì được ghi vào _internal\.
 
+3b. Máy đích KHÔNG cần Python, Node.js, npm hay Git. Cần Microsoft Edge WebView2 Runtime
+   (thường có sẵn) và .NET Framework 4.7.2+ (Windows 10 1803+/Windows 11 có sẵn) —
+   pywebview tạo cửa sổ qua pythonnet, không phải qua tkinter. Microsoft PowerPoint là TÙY CHỌN: không có thì chương trình vẫn chạy
+   và tự dùng backend render dự phòng, có báo rõ trong tab "Học cải tiến".
+   Kiểm tra phiên bản đang chạy ngay trên thanh tiêu đề trước khi báo lỗi.
+
 4. Ollama là TÙY CHỌN:
    - Không có Ollama: chương trình vẫn xử lý báo cáo (heuristic).
    - Muốn dùng AI phân loại slide: chạy Install_Ollama_Optional.bat (cài trên máy này)

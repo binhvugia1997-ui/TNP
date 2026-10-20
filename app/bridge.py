@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -24,10 +26,33 @@ class BridgeService:
 
     def __init__(self, service: Optional[ApplicationService] = None):
         self.service = service or ApplicationService()
-        self.window = None
+        # PROMPT-036R: kept PRIVATE (leading underscore) on purpose. This ``BridgeService`` instance is the
+        # exact object pywebview hands to ``webview.util.get_functions()`` to build the JS method manifest at
+        # startup (``js_api=bridge`` in ``app/desktop.py``), and that walker only skips names starting with
+        # ``_`` — every OTHER public, non-callable attribute (with a ``__module__``) is recursively reflected
+        # into, with no cycle protection beyond ``id()`` identity.
+        # A bound pywebview ``Window`` is not a plain value: once the native window exists, ``window.gui`` /
+        # ``window.native`` resolve (on Windows) to pythonnet-wrapped WinForms/WebView2 CLR objects whose
+        # struct-typed properties (``Size``, ``Padding``, ``Font`` … ) expose a static ``Empty`` field that
+        # returns a BRAND NEW wrapper object on every access. Two different wrapper objects representing the
+        # same logical value never compare equal by ``id()``, so that reflection walk cannot detect the
+        # cycle and recurses down ``...Empty.Empty.Empty...`` until Python's recursion limit is hit. pywebview
+        # catches that ``RecursionError`` per attribute (it wraps every visit in its own ``try/except``), so
+        # it does not crash outright — but it DOES burn a full stack's worth of recursive Python/CLR calls,
+        # once per struct-typed property reachable from the window (there are dozens on a real WinForms
+        # control), spamming exactly the "Error while processing ...Empty.Empty.Empty...: maximum recursion
+        # depth exceeded" lines captured in the bug report while starving the native message loop long enough
+        # to explain both the "(Not Responding)" window and the frontend timing out into BRIDGE_UNAVAILABLE
+        # even though "before_load"/"_pywebviewready" debug lines already logged (those print before pywebview
+        # attempts this reflection, not after it finishes). See tests/test_prompt036r_bridge_hang.py for a
+        # deterministic, non-Windows reproduction of this exact mechanism. Exposing the live window as
+        # ``self.window`` put it one public attribute away from that walk; keeping it as ``self._window``
+        # removes it from the reflected surface entirely while changing nothing about the explicit,
+        # intentional bridge contract (``get_app_version``, ``ping``, …) the frontend relies on.
+        self._window = None
 
     def bind_window(self, window) -> None:
-        self.window = window
+        self._window = window
 
     # -------------------------------------------------------------- required bridge contract
     def get_app_version(self) -> dict:
@@ -50,8 +75,15 @@ class BridgeService:
         return self._respond(lambda: self.service.save_configuration(self._bounded_object(dto, "configuration")))
 
     def scan_reports(self, dto: Any, input_file_token: str = "") -> dict:
-        return self._respond(lambda: self.service.scan_reports(self._bounded_object(dto, "configuration"),
-                                                              self._string(input_file_token, "inputFileToken", 128)))
+        started = time.perf_counter()
+        result = self._respond(lambda: self.service.scan_reports(self._bounded_object(dto, "configuration"),
+                                                                 self._string(input_file_token, "inputFileToken", 128)))
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        # pywebview serializes the returned envelope only after this Python method returns.  Mark that
+        # boundary honestly; timing it here would measure a second json.dumps, not the real transport.
+        LOG.info("SCAN_SERIALIZE elapsed_ms=unavailable boundary=pywebview_after_python_return")
+        LOG.info("SCAN_RETURN elapsed_ms=%.3f ok=%s bridge_calls=1", elapsed_ms, bool(result.get("ok")))
+        return result
 
     def get_report_details(self, report_id: str) -> dict:
         return self._respond(lambda: self.service.report_details(self._string(report_id, "reportId", 24)))
@@ -64,6 +96,10 @@ class BridgeService:
 
     def stop_after_current(self) -> dict:
         return self._respond(self.service.stop_after_current)
+
+    def cancel_all(self) -> dict:
+        """PROMPT-024R: cooperative "Dừng tất cả" (never kills threads/processes)."""
+        return self._respond(self.service.cancel_all)
 
     def exclude_reports(self, report_ids: Any) -> dict:
         return self._respond(lambda: self.service.exclude_reports(self._string_list(report_ids, "reportIds"), False))
@@ -80,10 +116,18 @@ class BridgeService:
 
     # -------------------------------------------------------------- native dialogs for other configured paths
     def choose_template_file(self) -> dict:
-        return self._respond(lambda: self._choose_file(XLSX_FILTER, ".xlsx", "template"))
+        """PROMPT-040: the chosen check workbook is remembered immediately (no second click, no restart loss)."""
+        return self._respond(lambda: self._choose_excel("template"))
 
     def choose_output_file(self) -> dict:
-        return self._respond(lambda: self._choose_save_file("Kiem_chung_Ket_qua.xlsx", XLSX_FILTER, ".xlsx"))
+        return self._respond(lambda: self._choose_excel("output"))
+
+    def get_excel_selection(self) -> dict:
+        """Remembered Excel files, their state and whether they are on disk — never opens a dialog."""
+        return self._respond(self.service.excel_selection)
+
+    def clear_excel_selection(self, kind: str) -> dict:
+        return self._respond(lambda: self.service.clear_excel_selection(self._string(kind, "kind", 16)))
 
     def choose_update_folder(self) -> dict:
         return self._respond(self._choose_report_folder)
@@ -123,6 +167,25 @@ class BridgeService:
     def install_update(self) -> dict:
         return self._respond(self.service.install_update)
 
+    def close_for_update(self) -> dict:
+        def call():
+            if self._window is None:
+                raise ServiceError("Không thể đóng cửa sổ ứng dụng để chuyển sang trình cập nhật.",
+                                   "UPDATE_CLOSE_UNAVAILABLE")
+            result = self.service.close_for_update()
+
+            def destroy_after_response():
+                try:
+                    self._window.destroy()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("UPDATE_WINDOW_CLOSE_FAILED")
+
+            timer = threading.Timer(0.2, destroy_after_response)
+            timer.daemon = True
+            timer.start()
+            return result
+        return self._respond(call)
+
     def run_diagnostics(self) -> dict:
         return self._respond(self.service.run_diagnostics)
 
@@ -134,6 +197,23 @@ class BridgeService:
         return self._respond(lambda: self.service.set_learning_label(
             self._string(kind, "kind", 16), self._string(candidate_id, "candidateId", 512),
             self._string(label, "label", 64), self._string(note, "note", 1000)))
+
+    def set_learning_label_fast(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: same pending-label write as ``set_learning_label``, minimal ack (no full state)."""
+        return self._respond(lambda: self.service.set_learning_label_fast(
+            self._string(kind, "kind", 16), self._string(candidate_id, "candidateId", 512),
+            self._string(label, "label", 64), self._string(note, "note", 1000)))
+
+    def save_learning_candidate(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: atomic set+save of one candidate (replaces the set→save two-call sequence)."""
+        return self._respond(lambda: self.service.save_learning_candidate(
+            self._string(kind, "kind", 16), self._string(candidate_id, "candidateId", 512),
+            self._string(label, "label", 64), self._string(note, "note", 1000)))
+
+    def save_learning_images(self, candidate_ids: Any, label: str, notes: Any = None) -> dict:
+        return self._respond(lambda: self.service.save_learning_images(
+            candidate_ids, self._string(label, "label", 64),
+            self._bounded_object(notes if notes is not None else {}, "learningNotes")))
 
     def save_learning_labels(self, kind: str, notes: Any = None) -> dict:
         if notes is None:
@@ -203,6 +283,21 @@ class BridgeService:
             raise ServiceError(f"Chọn một file {expected_suffix} hiện có.", "INVALID_SELECTION")
         return {"cancelled": False, "path": str(selected), "kind": name}
 
+    def _choose_excel(self, kind: str) -> dict:
+        """Native Excel pick + persistence in the existing user config.
+
+        Only the native dialog produces the path (JavaScript never supplies one), so the bridge stays a
+        fixed, backend-owned capability surface.  The response shape of the two pick methods is unchanged.
+        """
+        if kind == "template":
+            selected = self._choose_file(XLSX_FILTER, ".xlsx", "template")
+        else:
+            selected = self._choose_save_file("Kiem_chung_Ket_qua.xlsx", XLSX_FILTER, ".xlsx")
+        if selected.get("cancelled"):
+            return selected
+        self.service.persist_excel_selection(kind, selected["path"])
+        return selected
+
     def _choose_save_file(self, filename: str, file_type: str, expected_suffix: str) -> dict:
         path = self._dialog_path(self._webview_constant("SAVE_DIALOG"), save_filename=filename,
                                  file_types=(file_type,))
@@ -214,9 +309,9 @@ class BridgeService:
         return {"cancelled": False, "path": str(selected)}
 
     def _dialog_path(self, dialog_type: Any, **kwargs) -> str:
-        if self.window is None:
+        if self._window is None:
             raise ServiceError("Cửa sổ native chưa sẵn sàng để mở hộp thoại.", "DIALOG_UNAVAILABLE")
-        result = self.window.create_file_dialog(dialog_type, **kwargs)
+        result = self._window.create_file_dialog(dialog_type, **kwargs)
         if not result:
             return ""
         if isinstance(result, (tuple, list)):

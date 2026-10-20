@@ -27,7 +27,16 @@ if not defined PY (
 )
 echo Dung Python: %PY%
 
-rem --- 2..11: the Python builder does the rest (venv, pyflakes, pytest, PyInstaller, docs, validate, zip, sha256) ---
+rem --- 2. the React UI must be buildable: npm is needed on the BUILD machine only (never on the target) ---
+where npm >nul 2>nul
+if errorlevel 1 (
+    echo CANH BAO: khong tim thay npm. UI React khong the build lai trong lan chay nay.
+    echo           Cai Node.js LTS de build frontend/dist, hoac chay: build_portable.bat --no-publish --skip-frontend
+    echo           ^(chi dung --skip-frontend khi frontend\dist da duoc build san^)
+    echo.
+)
+
+rem --- 3..13: the Python builder does the rest (venv, pyflakes, pytest, npm build, PyInstaller, docs, validate, zip, sha256) ---
 %PY% -c "import sys; print(sys.executable)" > "%TEMP%\re_build_py.txt"
 set /p PYEXE=<"%TEMP%\re_build_py.txt"
 del "%TEMP%\re_build_py.txt" >nul 2>nul

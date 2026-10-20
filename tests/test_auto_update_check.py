@@ -12,10 +12,10 @@ import app.updater as up
 from app.config import AppConfig
 from app.gui_controller import AUTO_CHECK_FAILED_VI, AUTO_UPDATE_CHECK_KEY, GuiController
 from tests.test_gui_redesign import _make_app
-from tests.test_updater import make_update_folder
+from tests.test_updater import make_portable, make_update_folder
 
 SRC = Path(app.__file__).with_name("gui.py").read_text(encoding="utf-8")
-CUR = app.BUILD_NUMBER                      # 11
+CUR = app.BUILD_NUMBER                      # the canonical current build – numeric ordering is authoritative
 
 
 def _ctl(tmp_path, path="", extra=None):
@@ -36,6 +36,15 @@ def _startup(a):
     fn()
     _join(a.ctl)
     a._poll()
+
+
+def _make_production_runtime(monkeypatch, tmp_path):
+    import app.gui_controller as gc
+    portable = make_portable(tmp_path / "app")
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    monkeypatch.setattr(up.sys, "executable", str(portable / up.APP_EXE))
+    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    return portable
 
 
 # ------------------------------------------------------------------ 1-3 setting
@@ -176,8 +185,10 @@ def test_manual_check_still_reports_explicit_errors(monkeypatch, tmp_path):
 
 
 # ------------------------------------------------------------------ 12-14 notification once / Để sau / Cập nhật ngay
-def _gui_with_update(monkeypatch, tmp_path, build=CUR + 1):
+def _gui_with_update(monkeypatch, tmp_path, build=CUR + 1, packaged=False):
     folder = make_update_folder(tmp_path / "Update", version="1.2.2", build=build)
+    if packaged:
+        _make_production_runtime(monkeypatch, tmp_path)
     cfg = AppConfig(update_path=str(folder))
     monkeypatch.setattr("tests.test_gui_redesign.AppConfig", lambda **k: cfg)
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
@@ -189,22 +200,23 @@ def test_startup_detects_newer_build_and_offers_once(monkeypatch, tmp_path):
     offers = []
     monkeypatch.setattr(a, "_confirm_update", lambda label: offers.append(label) or False)   # user: Để sau
     _startup(a)
-    assert offers == ["1.2.2 — Build 016"]
-    assert a.lbl_update.cfg["text"] == "Có phiên bản mới: 1.2.2 — Build 016"
-    assert a.btn_install_update.cfg["state"] == "normal"
+    assert offers == [f"1.2.2 — Build {up.format_build(CUR + 1)}"]
+    assert a.lbl_update.cfg["text"].startswith(f"Có phiên bản mới: 1.2.2 — Build {up.format_build(CUR + 1)}")
+    assert "Chỉ có thể cài đặt cập nhật" in a.lbl_update.cfg["text"]
+    assert a.btn_install_update.cfg["state"] == "disabled"  # update checks remain available in development
     for _ in range(3):                                                  # polls / re-renders: no repeated popup
         a._poll()
         a._render_update()
     a.check_update()                                                    # manual check of the same build
     _join(a.ctl)
     a._poll()
-    assert offers == ["1.2.2 — Build 016"] and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
+    assert offers == [f"1.2.2 — Build {up.format_build(CUR + 1)}"] and a.lbl_update.cfg["text"].startswith("Có phiên bản mới")
     # a NEWER remote build published later in the same session is announced again (once)
     make_update_folder(folder, version="1.2.2", build=CUR + 2)
     a.check_update()
     _join(a.ctl)
     a._poll()
-    assert offers == ["1.2.2 — Build 016", "1.2.2 — Build 017"]
+    assert offers == [f"1.2.2 — Build {up.format_build(CUR + 1)}", f"1.2.2 — Build {up.format_build(CUR + 2)}"]
 
 
 def test_same_or_older_build_is_not_offered(monkeypatch, tmp_path):
@@ -217,7 +229,7 @@ def test_same_or_older_build_is_not_offered(monkeypatch, tmp_path):
 
 
 def test_update_now_routes_into_existing_installer(monkeypatch, tmp_path):
-    gui, a, reg, folder = _gui_with_update(monkeypatch, tmp_path)
+    gui, a, reg, folder = _gui_with_update(monkeypatch, tmp_path, packaged=True)
     monkeypatch.setattr(a, "_confirm_update", lambda label: True)       # user: Cập nhật ngay
     calls = []
     monkeypatch.setattr(a.ctl, "install_update_async", lambda *x, **k: calls.append(1) or True)
@@ -261,8 +273,8 @@ def test_update_card_layout_and_build_009(monkeypatch, tmp_path):
     body = a.cfg_cards["update"]
     rows = {w.grid_info_.get("row") for w in reg["widgets"] if getattr(w, "master", None) is body and w.grid_info_}
     assert rows == {0, 1, 2, 3, 4, 5} and a.chk_auto_update.grid_info_["row"] == 2 < a.lbl_update.grid_info_["row"]
-    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.3.2 — Build 015"
-    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_LABEL == "Build 015"
+    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.3.7 — Build 020"
+    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20 and app.BUILD_LABEL == "Build 020"
     assert a.cfg_page.row_weights == {3: 1}                             # responsive settings page unchanged
 
 
@@ -296,6 +308,6 @@ def test_legacy_beta_client_sees_1_2_0_build_011_as_normal_update(tmp_path):
     assert up.check_for_update(str(folder), current_build=11, current_version="1.2.0").status == "latest"
     assert up.check_for_update(str(folder), current_build=12, current_version="1.2.2").status == "older"
     assert up.check_for_update(str(folder), current_build=12, current_version="1.2.1").status == "older"
-    assert up.version_label() == "1.3.2 — Build 015"
+    assert up.version_label() == "1.3.7 — Build 020"
     import build_portable as bp
-    assert bp.package_name(app.__version__) == "ReportExtractor_1.3.2.zip" and bp._version() == ("1.3.2", "015")
+    assert bp.package_name(app.__version__) == "ReportExtractor_1.3.7.zip" and bp._version() == ("1.3.7", "020")

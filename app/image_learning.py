@@ -29,7 +29,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from .content_region import ROLE_CAPTION, ROLE_CONTENT, classify_blocks, title_text
 from .improvement_pictures import (PictureRef, PictureSelection, _arrow_usable, _arrow_votes, _blue_anchors,
                                    _caption_anchors, _caption_distance, _claims, _INSPECTION_RE, _inline_anchors,
-                                   is_decorative_picture)
+                                   is_decorative_picture, structural_obstacles)
 from .pptx_parser import Block, ReportData, SlideData, norm_key
 
 LOG = logging.getLogger("report_extractor.image_learning")
@@ -263,7 +263,8 @@ def build_candidates(report: ReportData, slide_numbers: Sequence[int], sel: Pict
         from .extractor import excluded_bands
         bands = excluded_bands(s, H)
         content = [p for p in s.pictures if not is_decorative_picture(p, W, H)]
-        claims = _claims(content, captions, W, H)
+        obstacles = structural_obstacles(s, roles, slide_item_regions)     # same separators as production
+        claims = _claims(content, captions, W, H, obstacles)
         blue = [a for a in _blue_anchors(roles, inspection_ranges) if not any(y0 <= a.cy < y1 for y0, y1, _k in bands)]
         arrows = [a for a in getattr(s, "arrows", []) if _arrow_usable(a, W, H, bands, inspection_ranges, roles)]
         votes = _arrow_votes(content, arrows, W, H)
@@ -278,7 +279,7 @@ def build_candidates(report: ReportData, slide_numbers: Sequence[int], sel: Pict
             mine = claims.get(id(p), [])
             near_cap = None
             for a in captions:
-                d = _caption_distance(p, a, W, H)
+                d = _caption_distance(p, a, W, H, obstacles)
                 if d is not None and (near_cap is None or d < near_cap[0]):
                     near_cap = (d, a)
             cap_kind = mine[0].kind if len({a.kind for a in mine}) == 1 else (near_cap[1].kind if near_cap else "")

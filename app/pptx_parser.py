@@ -12,7 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -66,6 +66,39 @@ class Block:
     line_width: int = 0                                    # EMU
     line_endpoints: Optional[Tuple[int, int, int, int]] = None  # absolute EMU for straight connectors
     shape_type: str = ""                                  # python-pptx shape kind for visual rendering/diagnostics
+    # PROMPT-027 §7/§8: explicit OOXML style semantics.  ``*_visible`` must mean "PowerPoint paints
+    # pixels here", never "a colour happens to be known".  ``no_fill``/``no_line`` record that the
+    # author EXPLICITLY chose No Fill / No Line (<a:noFill/>), which is different from an unspecified
+    # or theme-inherited style — only the latter may fall back to a style reference.
+    fill_explicit_none: bool = False                      # <a:noFill/> on the shape body
+    line_explicit_none: bool = False                      # <a:ln><a:noFill/></a:ln>
+    # PROMPT-027 §11: authored text-frame layout.  Without these the built-in renderer pins every run
+    # to the TOP-LEFT of its box, so content authored with a centred/bottom anchor, large insets or
+    # paragraph spacing is drawn too HIGH — the "shifted upward" preview.  Insets are EMU, spacing pt.
+    vertical_anchor: str = "t"                            # <a:bodyPr anchor=> "t" | "ctr" | "b"
+    wrap: str = "square"                                  # <a:bodyPr wrap=> "square" | "none" | ...
+    inset_left: int = 91440                               # lIns, PowerPoint default 0.1"
+    inset_top: int = 45720                                # tIns, PowerPoint default 0.05"
+    inset_right: int = 91440                              # rIns
+    inset_bottom: int = 45720                             # bIns
+    autofit_scale: float = 1.0                            # <a:normAutofit fontScale=> (1.0 = absent)
+    line_spacing: List[Optional[float]] = field(default_factory=list)   # per paragraph, multiple of line
+    space_before: List[float] = field(default_factory=list)             # per paragraph, points
+    space_after: List[float] = field(default_factory=list)              # per paragraph, points
+    # PROMPT-027R §8: structural group ancestry.  Ordinals of every enclosing ``p:grpSp`` on this slide, outermost
+    # first, in document order (empty for top-level shapes).  Association evidence only: geometry is unchanged and
+    # group membership never overrides semantic eligibility.
+    group_path: Tuple[int, ...] = ()
+
+    @property
+    def parent_group_id(self) -> int:
+        """Ordinal of the innermost enclosing group (0 = not grouped)."""
+        return self.group_path[-1] if self.group_path else 0
+
+    @property
+    def group_root_id(self) -> int:
+        """Ordinal of the outermost enclosing group (0 = not grouped)."""
+        return self.group_path[0] if self.group_path else 0
 
     @property
     def is_text(self) -> bool:
@@ -243,14 +276,21 @@ def shape_geometry(shape, offset) -> Tuple[int, int, int, int]:
     return int(shape.left or 0) + dx, int(shape.top or 0) + dy, int(shape.width or 0), int(shape.height or 0)
 
 
-def _iter_shapes(shapes, offset=None) -> Iterator[Tuple[Any, GroupXform]]:
-    """Yield (shape, GroupXform) flattening groups recursively (nested groups compose their transforms)."""
+def _iter_shapes(shapes, offset=None, path: Tuple[int, ...] = (),
+                 counter: Optional[List[int]] = None) -> Iterator[Tuple[Any, GroupXform, Tuple[int, ...]]]:
+    """Yield (shape, GroupXform, group_path) flattening groups recursively (nested groups compose their transforms).
+
+    ``group_path`` is the ordinal of every enclosing group, outermost first (PROMPT-027R §8).  Ordinals follow the
+    document order of one slide, so they are stable for one file and never alter geometry.
+    """
     xf = offset if isinstance(offset, GroupXform) else GroupXform.IDENTITY
+    counter = counter if counter is not None else [0]
     for shape in shapes:
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            yield from _iter_shapes(shape.shapes, xf.child(shape))
+            counter[0] += 1
+            yield from _iter_shapes(shape.shapes, xf.child(shape), path + (counter[0],), counter)
         else:
-            yield shape, xf
+            yield shape, xf, path
 
 
 _THEME_SLOTS = {"TEXT_1": "dk1", "DARK_1": "dk1", "BACKGROUND_1": "lt1", "LIGHT_1": "lt1", "TEXT_2": "dk2",
@@ -451,51 +491,167 @@ def _style_reference_color(shape, ref_name: str, theme: dict) -> Tuple[bool, str
     return False, ""
 
 
+@dataclass
+class ShapeStyle:
+    """Resolved paint semantics of one shape (PROMPT-027 §7/§8).
+
+    ``*_visible`` answers exactly one question: *does PowerPoint paint pixels for this paint slot?*
+    It never means "a colour is known".  ``*_explicit_none`` records an authored ``No Fill`` / ``No
+    Line`` (``<a:noFill/>``), which must WIN over every inherited/theme fallback — that is the
+    difference between "the author hid this" and "the author did not say", and confusing the two is
+    what produced black frames around intentionally invisible content shapes.
+    """
+    fill_visible: bool = False
+    fill_color: str = ""
+    fill_explicit_none: bool = False
+    line_visible: bool = False
+    line_color: str = ""
+    line_width: int = 0
+    line_explicit_none: bool = False
+
+
+def _sp_pr(shape):
+    try:
+        return shape._element.find("{%s}spPr" % _NS_P)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _has_child(sp_pr, tag: str) -> bool:
+    return sp_pr is not None and sp_pr.find("{%s}%s" % (_NS_A, tag)) is not None
+
+
+def _shape_style(shape, theme: dict) -> ShapeStyle:
+    """Resolve fill/line paint of ``shape``, honouring explicit No Fill / No Line above inheritance.
+
+    python-pptx reports an authored ``<a:noFill/>`` as ``MSO_FILL.BACKGROUND`` — which is *not* ``None``.
+    Testing only ``is not None`` therefore reads "No Line" as "line visible", and with no explicit colour
+    the renderer then invents black.  BACKGROUND is treated as "paints nothing" for BOTH slots.
+    """
+    style = ShapeStyle()
+    sp_pr = _sp_pr(shape)
+    try:
+        from pptx.enum.dml import MSO_FILL
+        fill_type = shape.fill.type
+        if fill_type == MSO_FILL.BACKGROUND:
+            style.fill_explicit_none = True                    # authored No Fill -> never paint
+        elif fill_type == MSO_FILL.GROUP:
+            pass                                               # grpFill: inherits, resolved below
+        elif fill_type is not None:
+            style.fill_visible = True
+            style.fill_color = _color_hex(shape.fill.fore_color, theme)
+        explicit_fill = any(_has_child(sp_pr, tag) for tag in
+                            ("solidFill", "noFill", "gradFill", "blipFill", "pattFill", "grpFill"))
+        if not style.fill_visible and not style.fill_explicit_none and not explicit_fill:
+            # Nothing authored on the shape itself: an Office theme style reference may still paint it.
+            style.fill_visible, style.fill_color = _style_reference_color(shape, "fillRef", theme)
+        elif not style.fill_visible and not style.fill_explicit_none and _has_child(sp_pr, "grpFill"):
+            style.fill_visible, style.fill_color = _style_reference_color(shape, "fillRef", theme)
+    except Exception:  # noqa: BLE001 – style must never break parsing
+        pass
+    try:
+        from pptx.enum.dml import MSO_FILL
+        line = shape.line
+        line_type = line.fill.type
+        line_element = sp_pr.find("{%s}ln" % _NS_A) if sp_pr is not None else None
+        style.line_explicit_none = (line_type == MSO_FILL.BACKGROUND
+                                    or (line_element is not None
+                                        and line_element.find("{%s}noFill" % _NS_A) is not None))
+        if style.line_explicit_none:
+            style.line_visible = False                         # authored No Line -> never stroke
+        elif line_type is not None:
+            style.line_visible = True
+            style.line_color = _color_hex(line.color, theme)
+            style.line_width = int(line.width or 0)
+        else:
+            style.line_visible, style.line_color = _style_reference_color(shape, "lnRef", theme)
+            style.line_width = 12700 if style.line_visible else 0
+    except Exception:  # noqa: BLE001
+        pass
+    return style
+
+
+# PowerPoint's documented text-body defaults (ECMA-376 §21.1.2.3.3); used when @lIns etc. are absent.
+_DEFAULT_INSETS = {"left": 91440, "top": 45720, "right": 91440, "bottom": 45720}
+
+
+def _text_frame_layout(shape) -> Dict[str, object]:
+    """Authored text-frame layout of ``shape`` (PROMPT-027 §11).
+
+    Captures the properties that decide WHERE text sits inside its box: vertical anchor, the four text
+    insets, wrap mode, ``normAutofit`` font scale and per-paragraph line/paragraph spacing.  The built-in
+    renderer uses these instead of pinning every run to the top-left corner, which is what made real
+    slides look vertically shifted upward.  This is deliberately NOT a font-engine reimplementation.
+    """
+    layout: Dict[str, object] = {
+        "vertical_anchor": "t", "wrap": "square", "autofit_scale": 1.0,
+        "inset_left": _DEFAULT_INSETS["left"], "inset_top": _DEFAULT_INSETS["top"],
+        "inset_right": _DEFAULT_INSETS["right"], "inset_bottom": _DEFAULT_INSETS["bottom"],
+        "line_spacing": [], "space_before": [], "space_after": [],
+    }
+    try:
+        if not getattr(shape, "has_text_frame", False):
+            return layout
+        tf = shape.text_frame
+        from pptx.enum.text import MSO_ANCHOR
+        anchor = tf.vertical_anchor
+        layout["vertical_anchor"] = {MSO_ANCHOR.MIDDLE: "ctr", MSO_ANCHOR.BOTTOM: "b"}.get(anchor, "t")
+        wrap = tf.word_wrap
+        layout["wrap"] = "none" if wrap is False else "square"
+        for key, attr in (("inset_left", "margin_left"), ("inset_top", "margin_top"),
+                          ("inset_right", "margin_right"), ("inset_bottom", "margin_bottom")):
+            value = getattr(tf, attr, None)
+            if value is not None:
+                layout[key] = max(0, int(value))
+        body_pr = tf._txBody.find("{%s}bodyPr" % _NS_A)
+        if body_pr is not None:
+            auto_fit = body_pr.find("{%s}normAutofit" % _NS_A)
+            if auto_fit is not None and auto_fit.get("fontScale"):
+                # fontScale is thousandths of a percent: 85000 -> 0.85
+                scale = int(auto_fit.get("fontScale")) / 100000.0
+                if 0.1 <= scale <= 1.0:
+                    layout["autofit_scale"] = scale
+        spacing, before, after = [], [], []
+        for paragraph in tf.paragraphs:
+            line_spacing = paragraph.line_spacing
+            if isinstance(line_spacing, (int, float)):
+                spacing.append(max(0.5, float(line_spacing)))
+            elif line_spacing is not None:                     # absolute Length -> multiple of font size
+                spacing.append(None)
+            else:
+                spacing.append(None)
+            before.append(float(paragraph.space_before.pt) if paragraph.space_before is not None else 0.0)
+            after.append(float(paragraph.space_after.pt) if paragraph.space_after is not None else 0.0)
+        layout["line_spacing"], layout["space_before"], layout["space_after"] = spacing, before, after
+    except Exception:  # noqa: BLE001 – layout is a rendering hint only
+        pass
+    return layout
+
+
 def _annotation_block(shape, offset, prst: str, rotation: float, z_order: int, theme: dict) -> Block:
     """Geometry/style record for one non-picture visual object; excluded from semantic text classification."""
     left, top, width, height = shape_geometry(shape, offset)
-    fill_color, fill_visible = "", False
-    line_color, line_visible, line_width = "", False, 0
     visual_text = ""
     try:
         visual_text = clean_text(shape.text_frame.text) if shape.has_text_frame else ""
     except Exception:
         pass
-    try:
-        from pptx.enum.dml import MSO_FILL
-        fill = shape.fill
-        fill_visible = fill.type is not None and fill.type != MSO_FILL.BACKGROUND
-        if fill_visible:
-            fill_color = _color_hex(fill.fore_color, theme)
-        if not fill_visible:
-            sp_pr = shape._element.find("{%s}spPr" % _NS_P)
-            explicit_fill = (sp_pr is not None and any(sp_pr.find("{%s}%s" % (_NS_A, tag)) is not None
-                                                       for tag in ("solidFill", "noFill", "gradFill", "blipFill",
-                                                                   "pattFill", "grpFill")))
-            if not explicit_fill:
-                fill_visible, fill_color = _style_reference_color(shape, "fillRef", theme)
-    except Exception:
-        pass
-    try:
-        line = shape.line
-        line_visible = line.fill.type is not None
-        line_color = _color_hex(line.color, theme) if line_visible else ""
-        line_width = int(line.width or 0) if line_visible else 0
-        sp_pr = shape._element.find("{%s}spPr" % _NS_P)
-        line_element = sp_pr.find("{%s}ln" % _NS_A) if sp_pr is not None else None
-        explicit_no_line = (line_element is not None and line_element.find("{%s}noFill" % _NS_A) is not None)
-        if not line_visible and not explicit_no_line:
-            line_visible, line_color = _style_reference_color(shape, "lnRef", theme)
-            line_width = 12700 if line_visible else 0
-    except Exception:
-        pass
+    style = _shape_style(shape, theme)
+    layout = _text_frame_layout(shape)
     return Block(
         kind="visual", text=visual_text, left=left, top=top, width=width, height=height,
         shape_id=getattr(shape, "shape_id", 0), shape_name=getattr(shape, "name", ""),
-        prst=prst, rotation=rotation, z_order=z_order, fill_color=fill_color, line_color=line_color,
-        fill_visible=fill_visible, line_visible=line_visible, line_width=line_width,
+        prst=prst, rotation=rotation, z_order=z_order, fill_color=style.fill_color, line_color=style.line_color,
+        fill_visible=style.fill_visible, line_visible=style.line_visible, line_width=style.line_width,
+        fill_explicit_none=style.fill_explicit_none, line_explicit_none=style.line_explicit_none,
         line_endpoints=_line_endpoints(shape, offset, left, top, width, height, rotation, prst),
         shape_type=str(getattr(shape, "shape_type", "")),
+        vertical_anchor=str(layout["vertical_anchor"]), wrap=str(layout["wrap"]),
+        inset_left=int(layout["inset_left"]), inset_top=int(layout["inset_top"]),
+        inset_right=int(layout["inset_right"]), inset_bottom=int(layout["inset_bottom"]),
+        autofit_scale=float(layout["autofit_scale"]),
+        line_spacing=list(layout["line_spacing"]), space_before=list(layout["space_before"]),
+        space_after=list(layout["space_after"]),
     )
 
 
@@ -521,6 +677,7 @@ def _frame_blocks(shape, offset, is_title: bool, theme: Optional[dict] = None) -
     text = "\n".join(t for t, *_ in lines)
     if not text.strip():
         return blocks
+    layout = _text_frame_layout(shape)
     b = Block(
         kind="title" if is_title else "paragraph",
         text=text,
@@ -535,6 +692,19 @@ def _frame_blocks(shape, offset, is_title: bool, theme: Optional[dict] = None) -
         level=lines[0][1] if lines else 0,
         n_lines=len(lines),
         line_colors=colors,
+        # PROMPT-027 §11: authored vertical position of the text INSIDE its box.  Without this the
+        # built-in renderer pins text to the top-left and vertically-centred slide content is drawn
+        # too high, so the preview no longer matches PowerPoint.
+        vertical_anchor=str(layout["vertical_anchor"]),
+        wrap=str(layout["wrap"]),
+        inset_left=int(layout["inset_left"]),
+        inset_top=int(layout["inset_top"]),
+        inset_right=int(layout["inset_right"]),
+        inset_bottom=int(layout["inset_bottom"]),
+        autofit_scale=float(layout["autofit_scale"]),
+        line_spacing=list(layout["line_spacing"]),
+        space_before=list(layout["space_before"]),
+        space_after=list(layout["space_after"]),
     )
     b.prst, b.rotation = _shape_geometry(shape)
     blocks.append(b)
@@ -802,7 +972,7 @@ def parse_pptx(path: str | Path) -> ReportData:
                 title_shape_id = slide.shapes.title.shape_id
         except Exception:
             title_shape_id = None
-        for z_order, (shape, offset) in enumerate(_iter_shapes(slide.shapes)):
+        for z_order, (shape, offset, group_path) in enumerate(_iter_shapes(slide.shapes)):
             try:
                 is_picture = (shape.shape_type in (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE)
                               or (shape.shape_type == MSO_SHAPE_TYPE.PLACEHOLDER and hasattr(shape, "image")))
@@ -810,16 +980,19 @@ def parse_pptx(path: str | Path) -> ReportData:
                     pb = _picture_block(shape, offset)
                     if pb:
                         pb.z_order = z_order
+                        pb.group_path = group_path
                         blocks.append(pb)
                     continue
                 prst, rot = _shape_geometry(shape)
                 is_table = getattr(shape, "has_table", False) and shape.has_table
                 visual = _annotation_block(shape, offset, prst, rot, z_order, theme)
+                visual.group_path = group_path
                 annotations.append(visual)
                 if is_table:
                     tb = _table_block(shape, offset)
                     if tb:
                         tb.z_order = z_order
+                        tb.group_path = group_path
                         visual.text = tb.text
                         blocks.append(tb)
                     continue
@@ -828,12 +1001,14 @@ def parse_pptx(path: str | Path) -> ReportData:
                     ab = arrow_block(shape, offset, prst, rot)
                     if ab is not None:
                         ab.z_order = z_order
+                        ab.group_path = group_path
                         visual.direction = ab.direction
                         arrows.append(ab)
                 if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
                     text_blocks = _frame_blocks(shape, offset, shape.shape_id == title_shape_id, theme)
                     for text_block in text_blocks:
                         text_block.z_order = z_order
+                        text_block.group_path = group_path
                     blocks.extend(text_blocks)
                     continue
             except Exception:

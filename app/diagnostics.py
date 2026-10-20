@@ -10,7 +10,8 @@ from . import APP_TITLE, VERSION_LINE
 from .config import AppConfig
 from .excel_writer import validate_template
 from .ollama_client import OllamaClient, OllamaError
-from .qpn_renderer import renderer_status
+from .qpn_renderer import (POWERPOINT_PRESENT_REASONS, REASON_USER_SESSION_RUNNING,
+                            powerpoint_render_capability, renderer_status)
 
 
 def ollama_smoke_rows(server: str, model: str, timeout: int = 180) -> List[Tuple[str, str]]:
@@ -47,6 +48,25 @@ def run_diagnostics(cfg: AppConfig, template: Optional[str] = None,
         rows.append(("Thư viện", f"LỖI: {e}"))
     rs = renderer_status()
     rows.append(("PowerPoint renderer", rs["powerpoint"]))
+    # PROMPT-041: "OK" above only means PowerPoint is INSTALLED.  This says whether a faithful render can
+    # actually happen right now, and why not — support must never have to guess between "this PC has no
+    # PowerPoint" and "your own PowerPoint session is in the way", which have opposite remedies.
+    capability = powerpoint_render_capability()
+    if capability.isolated:
+        isolation = "OK – app sẽ tạo và sở hữu một phiên PowerPoint riêng khi render"
+    elif capability.available and capability.reason == REASON_USER_SESSION_RUNNING:
+        isolation = (f"Không dùng được ({capability.reason}) – PowerPoint CÓ sẵn trên máy; "
+                     f"đóng PowerPoint của bạn để có bản xem trước trung thực cao")
+    elif capability.available and capability.reason in POWERPOINT_PRESENT_REASONS:
+        # PROMPT-041W: "close your PowerPoint" is true ONLY for the proven same-session case.  Every other
+        # refusal is about what the app could not PROVE, and telling the tester to close a program that is not
+        # running is exactly the false positive this prompt exists to remove.
+        isolation = (f"Không dùng được ({capability.reason}) – PowerPoint CÓ sẵn trên máy nhưng app không "
+                     f"chứng minh được phiên render là của riêng app; hãy thử render lại (KHÔNG cần đóng "
+                     f"PowerPoint nếu bạn không mở nó)")
+    else:
+        isolation = f"Không dùng được ({capability.reason})"
+    rows.append(("PowerPoint isolation", isolation))
     rows.append(("LibreOffice renderer", rs["libreoffice"]))
     rows.append(("Built-in renderer", rs["builtin"]))
 

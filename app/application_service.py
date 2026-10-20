@@ -7,6 +7,7 @@ backend.  The browser receives bounded DTOs and opaque IDs; it never receives an
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -16,20 +17,70 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from . import APP_NAME, APP_TITLE, BUILD_ID, BUILD_NUMBER, __version__
-from .excel_writer import ExcelLockedError, ExcelWriter, TemplateError
+from . import APP_NAME, APP_TITLE, BUILD_ID, BUILD_NUMBER, __version__, updater
+from .config import AppConfig
+from .excel_writer import ExcelLockedError, ExcelWriter, TemplateError, validate_template
 from .gui_controller import GuiController
 from .extractor import management_number_from_filename
 from .prescan import (ACTION_FAST_SKIP, ACTION_INVALID_MGMT, ACTION_MASTER_COMPLETE, ACTION_OUTSIDE_PERIOD,
                       ACTION_PROCESS, ACTION_PROCESS_NEW_ROW, ACTION_SOURCE_DUPLICATE, normalize_source_path)
-from .runtime_paths import config_dir, logs_dir
+from .preview_geometry import slide_fraction_box
+from .runtime_paths import config_dir, is_packaged, logs_dir, portable_root
+from .scan_diagnostics import ScanMetrics
 
 LOG = logging.getLogger("report_extractor.webview")
+
+# PROMPT-027 §5: the Learning full-slide preview renders the COMPLETE authored slide at this width.
+# The image is never trimmed, white-balanced or repositioned, so its pixel plane stays a linear map of
+# the slide coordinate plane (x=0,y=0 .. slide_width,slide_height) for both overlay geometries (§27).
+LEARNING_PREVIEW_WIDTH_PX = 1600
+# PROMPT-027R §30: a preview rendered while a higher-fidelity backend FAILED (not merely absent) is reused only
+# for this many seconds, so a transient COM failure can never pin the fallback for the whole session.
+DEGRADED_PREVIEW_TTL_S = 15.0
+# How long one read-only PowerPoint capability probe may be reused across the candidates of a single Learning
+# poll, so checking a cached preview for staleness does not take a process-table snapshot per candidate.
+PREVIEW_CAPABILITY_MAX_AGE_S = 1.0
+
+# PROMPT-040: the two Excel files the operator picks once and the app then remembers in the existing user
+# config (``last_template`` / ``last_output_file``).  The DTO below is what the UI uses to show the current
+# default and to explain when it cannot be used any more — it never substitutes another file silently.
+EXCEL_KINDS = ("template", "output")
+EXCEL_STATES = ("unconfigured", "checking", "ok", "missing", "inaccessible", "invalid")
+_EXCEL_LABELS = {"template": "File kiểm chứng Excel", "output": "File kết quả Excel"}
+_EXCEL_UNCONFIGURED = {"template": "Chưa chọn File kiểm chứng Excel.",
+                       "output": "Chưa chọn File kết quả Excel."}
+_TEMPLATE_MISSING = "File kiểm chứng đã lưu không còn tồn tại. Hãy chọn lại file."
+_TEMPLATE_INACCESSIBLE = "Không truy cập được File kiểm chứng đã lưu. Kiểm tra ổ đĩa hoặc quyền truy cập."
+_TEMPLATE_CHECKING = "Đang kiểm tra File kiểm chứng đã lưu…"
+_OUTPUT_OK = "Đang dùng File kết quả đã lưu."
+_OUTPUT_FOLDER_NOTE = "Thư mục kết quả chưa tồn tại — sẽ được tạo khi ghi."
+
+
+class _SourcePathRedactor:
+    """One response-scoped, lexical path sanitizer.
+
+    Building the old replacement list once per output string made list construction
+    quadratic and repeatedly touched the source filesystem through ``Path.resolve``.
+    This object is built once per dashboard response, performs no filesystem access,
+    and scans each output string once with one compiled pattern.
+    """
+
+    def __init__(self, replacements: Dict[str, str]):
+        self.replacements = {source.casefold(): name for source, name in replacements.items() if source}
+        variants = sorted(replacements, key=len, reverse=True)
+        self.pattern = re.compile("|".join(re.escape(source) for source in variants), re.IGNORECASE) if variants else None
+
+    def redact(self, value: Any) -> str:
+        text = str(value)
+        if self.pattern is None:
+            return text
+        return self.pattern.sub(lambda match: self.replacements.get(match.group(0).casefold(), match.group(0)), text)
 
 
 class ServiceError(RuntimeError):
@@ -69,13 +120,47 @@ class ApplicationService:
         self._server_apply_message = ""
         self._server_apply_thread: Optional[threading.Thread] = None
         self._preview_cache: Dict[str, str] = {}
+        # PROMPT-024R/027: FULL rendered slide per (report scope, path, slide, mtime, renderer identity,
+        # render schema) for the review workspace.  Rendered once and shared by every candidate of that
+        # report+slide; never shared across reports (§40/§54).  Value: {"src", "width", "height",
+        # "backend", "faithful", "reason", "regions"} — see :meth:`_slide_preview_for`.  "reason" (PROMPT-041) is
+        # the stable slug saying WHY the render is not PowerPoint-faithful; "" when it is faithful.
+        self._slide_preview_cache: Dict[tuple, Dict[str, Any]] = {}
+        # PROMPT-032: Learning is polled while its tab is open.  Emit one diagnostic only when the lifecycle/count
+        # signature changes, never one per poll; values are counts/states only and contain no paths or payloads.
+        self._last_learning_diag_signature: Optional[tuple] = None
+        # PROMPT-040: cached result of the one-shot workbook contract check for the remembered check file, plus
+        # the last verified on-disk persistence flags for the two remembered Excel paths.
+        self._excel_deep_cache: Dict[str, dict] = {}
+        self._excel_check_thread: Optional[threading.Thread] = None
+        self._excel_persisted_key: Optional[tuple] = None
+        self._excel_persisted_flags: Dict[str, bool] = {"template": False, "output": False}
+        self._last_scan_metrics: Optional[ScanMetrics] = None  # bounded diagnostics for the most recent Quét call
+        # PROMPT-031R: scan work remains one synchronous bridge operation, while the existing bounded dashboard
+        # poll reads immutable snapshots published once per completed containing folder.
+        self._scan_active = False
+        self._scan_generation = 0
+        self._scan_revision = 0
+        self._scan_snapshot: Optional[dict] = None
+        self._scan_pending_reports: List[dict] = []
+        self._scan_redactor: Optional[_SourcePathRedactor] = None
+        self._update_result: Optional[dict] = None
+        self._update_close_requested = False
         self._load_manual_fields()
+        if is_packaged() and updater.production_install_capability(portable_root())[0]:
+            self._refresh_update_result()
+        # The React/pywebview default runtime uses the same persisted startup-check policy as the legacy GUI.
+        # This is a single asynchronous read-only check, not a new polling loop.
+        if self.controller.auto_update_check:
+            self.controller.check_update_async(startup=True)
 
     # ------------------------------------------------------------------ static app/config DTOs
-    @staticmethod
-    def app_version() -> dict:
+    def app_version(self) -> dict:
+        capable, _reason = updater.production_install_capability(portable_root())
         return {"name": APP_NAME, "title": APP_TITLE, "version": __version__,
-                "build": BUILD_ID, "buildNumber": BUILD_NUMBER, "runtime": "pywebview-development"}
+                "build": BUILD_ID, "buildNumber": BUILD_NUMBER,
+                "runtime": "pyinstaller-portable" if is_packaged() else "pywebview-development",
+                "updateInstallCapable": bool(capable)}
 
     def current_config(self) -> dict:
         with self._lock:
@@ -135,6 +220,161 @@ class ApplicationService:
             c.save_settings()
             return self.current_config()
 
+    # ------------------------------------------------------------------ remembered Excel selection (PROMPT-040)
+    def excel_selection(self) -> dict:
+        """Remembered Excel files + whether they are still usable.  Cheap, read-only, never opens a dialog."""
+        with self._lock:
+            return self._excel_selection_unlocked()
+
+    def persist_excel_selection(self, kind: str, path: str) -> dict:
+        """Persist one native-dialog Excel choice through the existing config contract.
+
+        Called only by the bridge, with the path the native dialog itself returned — JavaScript never
+        supplies a path here.  The controller keeps its own scan-invalidation semantics for
+        ``set_template`` / ``set_output``; persistence reuses ``GuiController.save_settings()`` and the
+        existing ``AppConfig.last_template`` / ``last_output_file`` fields (no schema change, no migration).
+        """
+        if kind not in EXCEL_KINDS:
+            raise ServiceError("Loại file Excel không hợp lệ.", "INVALID_SELECTION")
+        text = self._text(path, "path", 32767)
+        selected = Path(text).expanduser()
+        if not text or not self._excel_path_allowed(kind, selected):
+            raise ServiceError(f"Chọn một file {'.xlsx' if kind == 'template' else '.xlsx/.xlsm'} hiện có.",
+                               "INVALID_SELECTION")
+        with self._lock:
+            c = self.controller
+            if kind == "template":
+                c.set_template(str(selected))
+            else:
+                c.set_output(str(selected))
+            self._excel_deep_cache.pop(kind, None)
+            self._persist_excel_settings_unlocked(kind)
+            return self._excel_selection_unlocked()
+
+    def clear_excel_selection(self, kind: str) -> dict:
+        """Forget one remembered Excel file (UI “Xóa lựa chọn”); idempotent and persisted the same way."""
+        if kind not in EXCEL_KINDS:
+            raise ServiceError("Loại file Excel không hợp lệ.", "INVALID_SELECTION")
+        with self._lock:
+            c = self.controller
+            if kind == "template":
+                c.set_template("")
+            else:
+                c.set_output("")
+            self._excel_deep_cache.pop(kind, None)
+            self._persist_excel_settings_unlocked(kind)
+            return self._excel_selection_unlocked()
+
+    @staticmethod
+    def _excel_path_allowed(kind: str, path: Path) -> bool:
+        """Selection-time shape checks — identical to what the native dialog already enforced."""
+        if kind == "template":
+            return path.suffix.lower() == ".xlsx" and path.is_file()
+        return path.suffix.lower() in (".xlsx", ".xlsm") and not path.is_dir()
+
+    def _persist_excel_settings_unlocked(self, kind: str) -> bool:
+        """Write the in-memory selection through the existing config mechanism and verify the result."""
+        if self.controller.is_running():
+            # A processing run owns the config write at its start; changing files mid-run is reported, not hidden.
+            self._excel_persisted_key = None
+            return False
+        self.controller.save_settings()
+        self._excel_persisted_key = None                     # re-read the file, never trust memory
+        return bool(self._excel_persisted_unlocked().get(kind))
+
+    def _persisted_excel_flags(self) -> dict:
+        c = self.controller
+        try:
+            stored = AppConfig.load(c.config_storage_path())
+        except Exception:                                    # unreadable config: report "not persisted"
+            LOG.warning("EXCEL_SELECTION_PERSIST_CHECK_FAILED")
+            return {"template": False, "output": False}
+        return {"template": (stored.last_template or "") == (c.template or ""),
+                "output": (stored.last_output_file or "") == (c.output or "")}
+
+    def _excel_persisted_unlocked(self) -> dict:
+        c = self.controller
+        key = (c.template or "", c.output or "")
+        if self._excel_persisted_key != key:
+            self._excel_persisted_key = key
+            self._excel_persisted_flags = self._persisted_excel_flags()
+        return self._excel_persisted_flags
+
+    def _excel_selection_unlocked(self) -> dict:
+        c = self.controller
+        persisted = self._excel_persisted_unlocked()
+        return {"template": self._excel_kind_dto("template", c.template, persisted["template"]),
+                "output": self._excel_kind_dto("output", c.output, persisted["output"])}
+
+    def _excel_kind_dto(self, kind: str, raw_path: str, persisted: bool) -> dict:
+        text = (raw_path or "").strip()
+        dto = {"kind": kind, "label": _EXCEL_LABELS[kind], "path": "", "name": "", "folder": "",
+               "state": "unconfigured", "message": _EXCEL_UNCONFIGURED[kind], "persisted": bool(persisted)}
+        if not text:
+            return dto
+        path = Path(text)
+        dto.update({"path": text, "name": path.name, "folder": str(path.parent)})
+        if kind == "template":
+            state, message = self._template_excel_state(path)
+        else:
+            state, message = self._output_excel_state(path)
+        dto.update({"state": state, "message": message})
+        return dto
+
+    def _template_excel_state(self, path: Path) -> tuple:
+        """Structural state + the cached workbook-contract check for the picked check file."""
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return "missing", _TEMPLATE_MISSING
+        except OSError:
+            return "inaccessible", _TEMPLATE_INACCESSIBLE
+        if not path.is_file():
+            return "missing", _TEMPLATE_MISSING
+        key = (str(path), info.st_mtime_ns, info.st_size)
+        cached = self._excel_deep_cache.get("template")
+        if cached is None or cached["key"] != key:
+            self._start_excel_deep_check(key, path)
+            return "checking", _TEMPLATE_CHECKING
+        if cached["ok"]:
+            return "ok", f"Hợp lệ: {cached['message']}"
+        return "invalid", f"Không hợp lệ: {cached['message']}"
+
+    def _output_excel_state(self, path: Path) -> tuple:
+        """Result file: it may not exist yet, so only the write contract can be checked cheaply."""
+        if path.suffix.lower() not in (".xlsx", ".xlsm"):
+            return "invalid", "File kết quả phải có đuôi .xlsx hoặc .xlsm."
+        if path.is_dir():
+            return "invalid", "Đường dẫn File kết quả đang là thư mục, không phải tệp .xlsx."
+        template = (self.controller.template or "").strip()
+        if template:
+            try:
+                same = path.expanduser().resolve() == Path(template).expanduser().resolve()
+            except OSError:
+                same = str(path) == template
+            if same:
+                return "invalid", "File kết quả không được trùng với file Kiểm chứng gốc."
+        if not path.parent.is_dir():
+            return "ok", _OUTPUT_FOLDER_NOTE
+        return "ok", _OUTPUT_OK
+
+    def _start_excel_deep_check(self, key: tuple, path: Path) -> None:
+        """One workbook-contract check per selection, off the request thread, cached by (path, mtime, size)."""
+        thread = self._excel_check_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._excel_check_thread = threading.Thread(target=self._run_excel_deep_check, args=(key, path),
+                                                    name="webview-excel-check", daemon=True)
+        self._excel_check_thread.start()
+
+    def _run_excel_deep_check(self, key: tuple, path: Path) -> None:
+        try:
+            ok, message = validate_template(Path(path))
+        except Exception as exc:  # noqa: BLE001 - a broken workbook must never break the dashboard
+            ok, message = False, f"Không kiểm tra được file: {exc}"
+        with self._lock:
+            self._excel_deep_cache["template"] = {"key": key, "ok": bool(ok), "message": message}
+
     # ------------------------------------------------------------------ file-selection capabilities
     def register_pptx_selection(self, selected_path: str) -> dict:
         path = Path(selected_path).expanduser()
@@ -156,94 +396,255 @@ class ApplicationService:
     # ------------------------------------------------------------------ scan and reports
     def scan_reports(self, config: dict, input_file_token: str = "") -> dict:
         data = self._object(config, "configuration")
-        with self._lock:
-            self._assert_idle("Không thể quét trong khi đang xử lý báo cáo.")
-            self._apply_configuration_for_scan(data)
-            selected: Optional[Path] = None
-            if input_file_token:
-                token = self._text(input_file_token, "inputFileToken", 128)
-                selected = self._file_tokens.get(token)
-                if selected is None or token != self._active_file_token:
-                    raise ServiceError("Lựa chọn file đã hết hạn. Hãy chọn lại file PPTX.", "INVALID_SELECTION")
-                if selected.suffix.lower() != ".pptx" or not selected.is_file():
-                    raise ServiceError("File PPTX đã chọn không còn tồn tại.", "INVALID_SELECTION")
-                self.controller.input_files_override = [selected]
-                self.controller.report_folder = str(selected.parent)
-            else:
-                self.controller.input_files_override = None
-                folder = Path(self.controller.report_folder).expanduser() if self.controller.report_folder else None
-                if folder is None or not folder.is_dir():
-                    raise ServiceError("Thư mục báo cáo không tồn tại hoặc chưa được chọn.", "INVALID_REPORT_FOLDER")
-                self.controller.report_folder = str(folder.resolve())
-            result = self.controller.scan()
+        metrics = ScanMetrics()
+        self._last_scan_metrics = metrics
+        metrics.start_watchdog()
+        period_dto = data.get("period", {})
+        period_mode = period_dto.get("mode", "") if isinstance(period_dto, dict) else "invalid"
+        LOG.info("SCAN_START period_mode=%s single_file=%s", period_mode, bool(input_file_token))
+        finished = False
+        response_count = 0
+        generation = 0
+        try:
+            # Configure and publish an empty generation under one short lock.  The expensive sequential scan runs
+            # outside this lock, allowing the existing 750-ms dashboard poll to read immutable leaf snapshots.
+            with self._lock:
+                self._assert_idle("Không thể quét trong khi đang xử lý báo cáo.")
+                self._apply_configuration_for_scan(data)
+                selected: Optional[Path] = None
+                if input_file_token:
+                    token = self._text(input_file_token, "inputFileToken", 128)
+                    selected = self._file_tokens.get(token)
+                    if selected is None or token != self._active_file_token:
+                        raise ServiceError("Lựa chọn file đã hết hạn. Hãy chọn lại file PPTX.", "INVALID_SELECTION")
+                    if selected.suffix.lower() != ".pptx" or not selected.is_file():
+                        raise ServiceError("File PPTX đã chọn không còn tồn tại.", "INVALID_SELECTION")
+                    self.controller.input_files_override = [selected]
+                    self.controller.report_folder = str(selected.parent)
+                else:
+                    self.controller.input_files_override = None
+                    folder = Path(self.controller.report_folder).expanduser() if self.controller.report_folder else None
+                    if folder is None or not folder.is_dir():
+                        raise ServiceError("Thư mục báo cáo không tồn tại hoặc chưa được chọn.", "INVALID_REPORT_FOLDER")
+                    self.controller.report_folder = str(folder.resolve())
+                self._scan_generation += 1
+                generation = self._scan_generation
+                self._scan_revision = 0
+                self._scan_active = True
+                self._scan_redactor = None
+                self._scan_pending_reports = []
+                self.controller.scan_result = None
+                self._scan_snapshot = self._dashboard_state_unlocked(
+                    message_override="Đang quét danh sách bằng bộ quét Python…",
+                    scan_meta={"generation": generation, "revision": 0, "inProgress": True,
+                               "incremental": True, "completedLeaves": 0, "totalLeaves": 0,
+                               "firstLeafMs": None})
+
+            def publish_leaf(_partial, leaf_index: int, leaf_total: int, _folder: Path) -> None:
+                with self._lock:
+                    if not self._scan_active or generation != self._scan_generation:
+                        return
+                    if self._scan_redactor is None:
+                        # One scan-wide lexical context is reused by every leaf snapshot and the final response;
+                        # never rebuild all N source variants once per leaf (the PROMPT-031 O(N²) regression).
+                        self._scan_redactor = self._source_path_redactor(metrics)
+                    self._scan_revision += 1
+                    revision = self._scan_revision
+                    snapshot = self._dashboard_state_unlocked(
+                        message_override=f"Đã hoàn tất {leaf_index}/{leaf_total} thư mục chứa báo cáo.",
+                        scan_meta={"generation": generation, "revision": revision, "inProgress": True,
+                                   "incremental": True, "completedLeaves": leaf_index,
+                                   "totalLeaves": leaf_total, "firstLeafMs": metrics.first_leaf_ms},
+                        redactor_override=self._scan_redactor)
+                    leaf_reports = snapshot.get("reports", [])
+                    delivered_ms = metrics.record_leaf_delivery(len(leaf_reports))
+                    snapshot["scan"]["firstLeafMs"] = metrics.first_leaf_ms
+                    self._scan_pending_reports.extend(leaf_reports)
+                    self._scan_snapshot = snapshot  # immutable-by-replacement; readers never see a torn build
+                    LOG.info("SCAN_LEAF_DELIVER index=%d total=%d rows=%d elapsed_ms=%.3f generation=%d revision=%d",
+                             leaf_index, leaf_total, len(snapshot.get("reports", [])), delivered_ms,
+                             generation, revision)
+
+            result = self.controller.scan(metrics=metrics, on_leaf_complete=publish_leaf)
             self.controller.save_settings()
             if result is None:
                 message = self.controller.scan_message or "Không thể hoàn tất bước quét trước xử lý."
             else:
                 message = self.controller.queue_text()
             LOG.info("WEBVIEW_SCAN finished=%s files=%d", bool(result), len(self.controller.all_files))
-            return self.dashboard_state(message_override=message)
+            LOG.info("SCAN_BUILD_RESPONSE_START files=%d", len(self.controller.all_files))
+            build_started = time.perf_counter()
+            build_token = metrics.begin("SCAN_BUILD_RESPONSE")
+            try:
+                with self._lock:
+                    if self._scan_redactor is None:
+                        self._scan_redactor = self._source_path_redactor(metrics)
+                    self._scan_revision += 1
+                    response = self._dashboard_state_unlocked(
+                        message_override=message,
+                        scan_meta={"generation": generation, "revision": self._scan_revision,
+                                   "inProgress": False, "incremental": False,
+                                   "completedLeaves": metrics.leaf_completed,
+                                   "totalLeaves": metrics.leaf_folders, "firstLeafMs": metrics.first_leaf_ms},
+                        redactor_override=self._scan_redactor)
+                    self._scan_snapshot = response
+                    self._scan_pending_reports = []
+                    self._scan_active = False
+            finally:
+                metrics.end(build_token[0], build_token[1])
+                metrics.build_response_ms = (time.perf_counter() - build_started) * 1000.0
+            response_count = len(response.get("reports", []))
+            LOG.info("SCAN_BUILD_RESPONSE_END elapsed_ms=%.3f files=%d redaction_contexts=%d redaction_sources=%d",
+                     metrics.build_response_ms, response_count, metrics.redaction_context_builds,
+                     metrics.redaction_sources)
+            finished = True
+            return response
+        except Exception:
+            # A failed/cancelled scan generation never leaves a partial list looking final.  The next dashboard
+            # read rebuilds a non-scanned state; already published snapshots cannot overwrite a future generation.
+            with self._lock:
+                if generation and generation == self._scan_generation:
+                    self.controller.scan_result = None
+                    self._report_paths = {}
+                    self._scan_active = False
+                    self._scan_snapshot = None
+                    self._scan_pending_reports = []
+                    self._scan_redactor = None
+            raise
+        finally:
+            metrics.stop_watchdog()
+            LOG.info("SCAN_CACHE_SUMMARY hits=%d misses=%d invalidations=%d unavailable=%d stores=%d entries=%d "
+                     "evictions=%d intrinsic_derivations=%d",
+                     metrics.intrinsic_cache_hits, metrics.intrinsic_cache_misses,
+                     metrics.intrinsic_cache_invalidations, metrics.intrinsic_cache_unavailable,
+                     metrics.intrinsic_cache_stores, metrics.intrinsic_cache_entries,
+                     metrics.intrinsic_cache_evictions, metrics.intrinsic_derivations)
+            LOG.info("SCAN_INCREMENTAL_SUMMARY leaf_folders=%d leaf_completed=%d leaf_deliveries=%d "
+                     "rows_delivered=%d first_leaf_ms=%s leaf_ms=%.3f",
+                     metrics.leaf_folders, metrics.leaf_completed, metrics.leaf_deliveries,
+                     metrics.leaf_rows_delivered,
+                     f"{metrics.first_leaf_ms:.3f}" if metrics.first_leaf_ms is not None else "unavailable",
+                     metrics.leaf_ms)
+            LOG.info("SCAN_PER_FILE elapsed_ms=%.3f operations=%d sequential=true",
+                     metrics.per_file_ms, metrics.per_file_operations)
+            LOG.info("SCAN_METADATA elapsed_ms=%.3f reads=%d errors=%d master_open_ms=%.3f",
+                     metrics.metadata_ms + metrics.master_open_ms, metrics.metadata_reads,
+                     metrics.metadata_errors, metrics.master_open_ms)
+            LOG.info("SCAN_PARSE_PPTX elapsed_ms=%.3f opens=%d", metrics.parse_pptx_ms, metrics.pptx_opens)
+            LOG.info("SCAN_POWERPOINT_COM elapsed_ms=%.3f starts=%d",
+                     metrics.powerpoint_com_ms, metrics.powerpoint_com_starts)
+            for rank, (elapsed_ms, phase, index, label) in enumerate(metrics.slowest_operations(), 1):
+                LOG.info("SCAN_SLOW_OP rank=%d phase=%s index=%d file=%s elapsed_ms=%.3f",
+                         rank, phase, index, label, elapsed_ms)
+            LOG.info("SCAN_TOTAL elapsed_ms=%.3f finished=%s entries=%d candidates=%d accepted=%d "
+                     "rejected=%d unrelated=%d status_skipped=%d returned=%d traversals=%d largest_measured_stage=%s",
+                     metrics.elapsed_ms, finished, metrics.entries_inspected, metrics.candidate_files,
+                     metrics.accepted_files, metrics.structural_rejected_files, metrics.unrelated_files,
+                     metrics.status_skipped_files, response_count, metrics.directory_traversals,
+                     self._largest_scan_stage(metrics))
 
-    def dashboard_state(self, message_override: Optional[str] = None) -> dict:
+    @staticmethod
+    def _largest_scan_stage(metrics: ScanMetrics) -> str:
+        stages = (("SCAN_ENUMERATE", metrics.enumerate_ms),
+                  ("SCAN_FILTER", metrics.filter_ms),
+                  ("SCAN_BUILD_RESPONSE", metrics.build_response_ms))
+        return max(stages, key=lambda item: item[1])[0]
+
+    def dashboard_state(self, message_override: Optional[str] = None,
+                        scan_metrics: Optional[ScanMetrics] = None) -> dict:
         with self._lock:
-            c = self.controller
-            c.pump()
-            c.reconcile()
-            c.pump()
-            self._collect_logs()
-            rows = c.scan_rows("Tất cả file đã quét")
-            reports = []
-            self._report_paths = {}
-            for row in rows:
-                report_id = str(row.index)
-                self._report_paths[report_id] = Path(row.path)
-                self._manual_fields.setdefault(normalize_source_path(Path(row.path)), {})
-                fields = self._manual_fields.get(normalize_source_path(Path(row.path)), {})
-                result = self._result_for_path(Path(row.path))
-                reports.append(self._report_dto(report_id, row, result, fields, len(reports) + 1))
-            progress = c.progress
-            run_status = "stopping" if c.state == "stopping" else "processing" if c.state == "running" else (
-                "done" if progress.finished else "idle")
-            current_name = ""
-            if progress.current_index is not None and 0 <= progress.current_index < len(c.rows):
-                current_name = c.rows[progress.current_index].path.name
-            candidate_ids = [str(row.index) for row in rows
-                             if row.action in (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW) and not row.excluded]
-            done_at = int(c.finished_at * 1000) if c.finished_at is not None else None
-            started_at = int(c.started_at * 1000) if c.started_at is not None else None
-            return {
-                "app": self.app_version(),
-                "config": self.current_config(),
-                "scan": {"scanned": c.scan_result is not None,
-                         "message": self._redact_source_paths(message_override or c.scan_message or
-                                                             (c.queue_text() if c.scan_result else "Chưa quét thư mục."))},
-                "reports": reports,
-                "job": {"status": run_status, "queue": candidate_ids if run_status == "idle" else
-                        [str(i) for i in range(progress.total)],
-                        "index": (progress.current_index or 0), "doneCount": progress.done,
-                        "stage": progress.current_stage or "waiting", "percent": progress.percent,
-                        "currentFile": current_name, "elapsedSec": c.elapsed_seconds(),
-                        "remainSec": c.eta_seconds(), "startedAt": started_at, "finishedAt": done_at,
-                        "hasSamples": c.average_report_seconds() is not None,
-                        "stopped": bool(c.summary and c.summary.stopped),
-                        "error": self._redact_source_paths(c.worker_failure or "")},
-                "logs": list(self._log_entries[-500:]),
-                "ollama": {"host": c.host, "port": c.port, "model": c.model,
-                           "checked": "ok" if c.ollama_ok is True else "fail" if c.ollama_ok is False else "unchecked",
-                           "message": c.ollama_status or c.ai_status_text(), "aiStatus": c.ai_status_text(),
-                           "models": list(c.available_models), "discovering": c.discovery_running,
-                           "discoveryMessage": c.discovery_progress_text(),
-                           "discoveryResults": [self._discovery_dto(x) for x in c.discovery_results],
-                           "discoveryChecked": c.discovery_checked, "discoveryTotal": c.discovery_total,
-                           "serverApplyRunning": self._server_apply_running,
-                           "serverApplyMessage": self._server_apply_message},
-                "update": self._update_dto(),
-                "diagnostics": {"running": self._diagnostics_running,
-                                "rows": [{**row, "label": self._redact_source_paths(row.get("label", "")),
-                                          "value": self._redact_source_paths(row.get("value", ""))}
-                                         for row in self._diagnostics],
-                                "error": self._redact_source_paths(self._diagnostics_error)},
-            }
+            if self._scan_active and self._scan_snapshot is not None:
+                # Coalesce every completed leaf since the previous bounded poll.  Each row DTO is built once at
+                # leaf completion, so many one-file folders cannot reintroduce cumulative O(N²) response work.
+                response = {**self._scan_snapshot, "reports": list(self._scan_pending_reports)}
+                self._scan_pending_reports.clear()
+                return response
+            return self._dashboard_state_unlocked(message_override=message_override, scan_metrics=scan_metrics)
+
+    def _dashboard_state_unlocked(self, message_override: Optional[str] = None,
+                                  scan_metrics: Optional[ScanMetrics] = None,
+                                  scan_meta: Optional[dict] = None,
+                                  redactor_override: Optional[_SourcePathRedactor] = None) -> dict:
+        c = self.controller
+        c.pump()
+        c.reconcile()
+        c.pump()
+        self._report_paths = {}  # drop the previous scan before building this response's sanitizer
+        rows = c.scan_rows("Tất cả file đã quét")
+        redactor = redactor_override or self._source_path_redactor(
+            scan_metrics, normalized_paths=[(row.normalized_path, row.path.name) for row in rows])
+        self._collect_logs(redactor)
+        reports = []
+        for row in rows:
+            report_id = str(row.index)
+            self._report_paths[report_id] = Path(row.path)
+            source_key = row.normalized_path or normalize_source_path(Path(row.path))
+            self._manual_fields.setdefault(source_key, {})
+            fields = self._manual_fields.get(source_key, {})
+            result = self._result_for_path(Path(row.path))
+            reports.append(self._report_dto(report_id, row, result, fields, len(reports) + 1,
+                                            source_key=source_key, redactor=redactor))
+        progress = c.progress
+        # PROMPT-024R: distinct job states for the two stop modes. "cancelling" is shown while the
+        # worker has not yet acknowledged cancel-all; the UI only shows "Đã dừng" after "done".
+        run_status = ("cancelling" if c.state == "cancelling" else
+                      "stopping" if c.state == "stopping" else
+                      "processing" if c.state == "running" else
+                      ("done" if progress.finished else "idle"))
+        current_name = ""
+        if progress.current_index is not None and 0 <= progress.current_index < len(c.rows):
+            current_name = c.rows[progress.current_index].path.name
+        candidate_ids = [str(row.index) for row in rows
+                         if row.action in (ACTION_PROCESS, ACTION_PROCESS_NEW_ROW) and not row.excluded]
+        done_at = int(c.finished_at * 1000) if c.finished_at is not None else None
+        started_at = int(c.started_at * 1000) if c.started_at is not None else None
+        scan_state = {"scanned": c.scan_result is not None,
+                      "message": self._redact_source_paths(message_override or c.scan_message or
+                                                          (c.queue_text() if c.scan_result else "Chưa quét thư mục."),
+                                                          redactor),
+                      "generation": self._scan_generation, "revision": self._scan_revision,
+                      "inProgress": False, "incremental": False,
+                      "completedLeaves": 0, "totalLeaves": 0,
+                      "firstLeafMs": None}
+        scan_state.update(scan_meta or {})
+        return {
+            "app": self.app_version(),
+            "config": self.current_config(),
+            # PROMPT-040: the remembered Excel files travel with every dashboard response (cheap stat + cache),
+            # so the UI can show the current default and its state without an extra round trip or a picker.
+            "excel": self._excel_selection_unlocked(),
+            "scan": scan_state,
+            "reports": reports,
+            "job": {"status": run_status, "queue": candidate_ids if run_status == "idle" else
+                    [str(i) for i in range(progress.total)],
+                    "index": (progress.current_index or 0), "doneCount": progress.done,
+                    "stage": progress.current_stage or "waiting", "percent": progress.percent,
+                    "currentFile": current_name, "elapsedSec": c.elapsed_seconds(),
+                    "remainSec": c.eta_seconds(), "startedAt": started_at, "finishedAt": done_at,
+                    "hasSamples": c.average_report_seconds() is not None,
+                    "stopped": bool(c.summary and c.summary.stopped),
+                    # PROMPT-024R: cancel-all acknowledgement is surfaced separately from graceful stop.
+                    "cancelRequested": (c.state == "cancelling"
+                                        or bool(c.summary and getattr(c.summary, "cancel_requested", False))),
+                    "cancelledCount": int(getattr(c.summary, "cancelled", 0)) if c.summary else 0,
+                    "error": self._redact_source_paths(c.worker_failure or "", redactor)},
+            "logs": list(self._log_entries[-500:]),
+            "ollama": {"host": c.host, "port": c.port, "model": c.model,
+                       "checked": "ok" if c.ollama_ok is True else "fail" if c.ollama_ok is False else "unchecked",
+                       "message": c.ollama_status or c.ai_status_text(), "aiStatus": c.ai_status_text(),
+                       "models": list(c.available_models), "discovering": c.discovery_running,
+                       "discoveryMessage": c.discovery_progress_text(),
+                       "discoveryResults": [self._discovery_dto(x) for x in c.discovery_results],
+                       "discoveryChecked": c.discovery_checked, "discoveryTotal": c.discovery_total,
+                       "serverApplyRunning": self._server_apply_running,
+                       "serverApplyMessage": self._server_apply_message},
+            "update": self._update_dto(),
+            "diagnostics": {"running": self._diagnostics_running,
+                            "rows": [{**row, "label": self._redact_source_paths(row.get("label", ""), redactor),
+                                      "value": self._redact_source_paths(row.get("value", ""), redactor)}
+                                     for row in self._diagnostics],
+                            "error": self._redact_source_paths(self._diagnostics_error, redactor)},
+        }
 
     def _apply_configuration_for_scan(self, data: dict) -> None:
         c = self.controller
@@ -269,7 +670,8 @@ class ApplicationService:
         c.set_update_path(self._text(update.get("path", c.update_path), "update.path", 32767))
         c.set_auto_update_check(self._boolean(update.get("autoCheck", c.auto_update_check), "update.autoCheck"))
 
-    def _report_dto(self, report_id: str, row, fr, manual_fields: dict, stt: int) -> dict:
+    def _report_dto(self, report_id: str, row, fr, manual_fields: dict, stt: int,
+                    source_key: str = "", redactor: Optional[_SourcePathRedactor] = None) -> dict:
         status = self._status_key(row.action, row.excluded, row.run_stage)
         warning = row.reason or row.note or ""
         if fr is not None and fr.review_reasons:
@@ -291,12 +693,13 @@ class ApplicationService:
                 short = "; ".join(fr.review_reasons)
             elif fr.status == "skipped":
                 short = fr.error or short
-        short = self._redact_source_paths(short)
-        warning = self._redact_source_paths(warning)
+        short = self._redact_source_paths(short, redactor)
+        warning = self._redact_source_paths(warning, redactor)
         return {"id": report_id, "stt": stt, "managementNumber": row.management_number,
                 "fileName": row.path.name, "path": "", "occurrenceDate": date_text,
                 "manualFields": {k: v for k, v in manual_fields.items()},
-                "manualPending": normalize_source_path(Path(row.path)) in self._pending_manual, "vendor": vendor_text,
+                "manualPending": (source_key or normalize_source_path(Path(row.path))) in self._pending_manual,
+                "vendor": vendor_text,
                 "slides": fr.slide_count if fr is not None else 0, "status": status,
                 "shortResult": short, "warning": warning or None,
                 "processedAt": getattr(fr, "finished_at", "") if fr is not None else "",
@@ -312,6 +715,8 @@ class ApplicationService:
             return "excluded"
         final_map = {"completed": "completed", "completed_new": "completed", "needs_review": "needs_review",
                      "not_written": "needs_review", "error": "error", "skipped": "skipped",
+                     # PROMPT-024R: user cancellation is its own terminal status – never mapped to "error".
+                     "cancelled": "cancelled",
                      "outside_period": "outside_period", "source_duplicate": "source_duplicate", "fast_skip": "fast_skip"}
         if run_stage in final_map:
             return final_map[run_stage]
@@ -348,6 +753,19 @@ class ApplicationService:
                 raise ServiceError("Không có file nào đang được xử lý.", "NOT_RUNNING")
             return self.dashboard_state()
 
+    def cancel_all(self) -> dict:
+        """PROMPT-024R "Dừng tất cả": cooperative cancel-all.
+
+        Returns a JSON-safe acknowledgement. Cancel while idle is harmless and deterministic (§49);
+        duplicate cancel clicks are idempotent (§48). No threading primitive ever crosses the bridge.
+        """
+        with self._lock:
+            requested = self.controller.request_cancel()
+            if requested:
+                LOG.info("WEBVIEW_CANCEL_ALL_REQUESTED")
+            return {"ok": True, "requested": bool(requested), "mode": "cancel_all",
+                    **self.dashboard_state()}
+
     def exclude_reports(self, report_ids: Iterable[str], restore: bool = False) -> dict:
         with self._lock:
             self._assert_idle("Không thể đổi hàng đợi khi đang xử lý báo cáo.")
@@ -360,6 +778,8 @@ class ApplicationService:
 
     def report_details(self, report_id: str) -> dict:
         with self._lock:
+            if self._scan_active:
+                raise ServiceError("Danh sách đang được quét. Hãy đợi thư mục hiện tại hoàn tất.", "BUSY")
             rid = self._text(report_id, "reportId", 24)
             if not rid.isdigit() or rid not in self._report_paths:
                 raise ServiceError("Báo cáo không còn trong danh sách đã quét.", "REPORT_NOT_FOUND")
@@ -639,19 +1059,56 @@ class ApplicationService:
 
     def check_update(self) -> dict:
         with self._lock:
+            self._update_result = None
             self.controller.check_update_async(startup=False)
             return self.dashboard_state()
 
     def install_update(self) -> dict:
-        return {"status": "unavailable", "message":
-                "Cài đặt bản cập nhật bị tắt trong tích hợp phát triển; không thay thế hay khởi động lại ứng dụng.",
-                "state": self.dashboard_state()}
+        with self._lock:
+            capable, reason = updater.production_install_capability(portable_root())
+            if not capable:
+                raise ServiceError(reason, "UPDATE_INSTALL_DISABLED")
+            try:
+                self._assert_idle(updater.MSG["busy"])
+            except ServiceError as exc:
+                raise ServiceError(str(exc), "UPDATE_BUSY") from exc
+            if not self.controller.update_available():
+                raise ServiceError("Không có bản cập nhật mới hợp lệ để cài.", "UPDATE_NOT_AVAILABLE")
+            if self.controller.update_installing:
+                raise ServiceError(updater.MSG["already_installing"], "UPDATE_ALREADY_RUNNING")
+            if not self.controller.install_update_async():
+                reason = (self.controller.update_install_disabled_reason()
+                          or updater.MSG["already_installing"])
+                raise ServiceError(reason, "UPDATE_INSTALL_REJECTED")
+            state = self._update_dto()
+            return {"status": state["status"], "message": state["message"], "state": state}
+
+    def close_for_update(self) -> dict:
+        with self._lock:
+            if not self.controller.update_handoff_started:
+                raise ServiceError("Trình cập nhật chưa được khởi chạy; ứng dụng chưa thể thoát.",
+                                   "UPDATE_HANDOFF_NOT_READY")
+            self._update_close_requested = True
+            return {"status": "closing", "message": "Ứng dụng sẽ khởi động lại sau khi cài đặt."}
 
     # ------------------------------------------------------------------ learning: real candidates, labels, Excel reapply, model training
     def learning_state(self) -> dict:
         with self._lock:
             c = self.controller
+            # PROMPT-032: this read is authoritative on its own.  Worker completion is delivered through the
+            # controller queue, so waiting for an unrelated dashboard poll could otherwise leave a dead worker
+            # marked "running" and make both review methods suppress already-retained candidates.
+            c.pump()
+            c.reconcile()
+            c.pump()
+
+            processor = c.processor
+            results = list(getattr(processor, "results", []) or []) if processor is not None else []
+            raw_image_count = sum(len(getattr(result, "image_candidates", []) or []) for result in results)
+            raw_content_count = sum(len(getattr(result, "content_candidates", []) or []) for result in results)
             lrn = c.learning
+            image_candidates: list = []
+            content_candidates: list = []
             if lrn is None:
                 image_status, content_status = "Không khả dụng.", "Không khả dụng."
                 images: List[dict] = []
@@ -660,6 +1117,10 @@ class ApplicationService:
                 image_labeled_ids: set = set()
                 content_total_ids: set = set()
                 content_labeled_ids: set = set()
+                candidate_status = {
+                    "image": self._learning_candidate_status("unavailable", "unavailable", 0, "image"),
+                    "content": self._learning_candidate_status("unavailable", "unavailable", 0, "content"),
+                }
             else:
                 image_status = self._model_status(lrn.model, lrn.model_status, "ảnh")
                 content_status = self._model_status(lrn.content.model, lrn.content.model_status, "nội dung")
@@ -673,8 +1134,44 @@ class ApplicationService:
                 content_labeled_ids = saved_content_ids | set(c.pending_content_labels)
                 image_total_ids = saved_image_ids | {x.candidate_id for x in image_candidates}
                 content_total_ids = saved_content_ids | {x.candidate_id for x in content_candidates}
+                if c.is_running():
+                    state, reason = "processing", "processing"
+                elif processor is None:
+                    state, reason = "no_run", "no_run"
+                else:
+                    state, reason = "ready", "available"
+                candidate_status = {
+                    "image": self._learning_candidate_status(
+                        "ready" if images else state,
+                        "available" if images else ("empty" if state == "ready" else reason), len(images), "image"),
+                    "content": self._learning_candidate_status(
+                        state, "empty" if state == "ready" and not contents else reason, len(contents), "content"),
+                }
+                if images and processor is None:
+                    candidate_status["image"]["message"] = f"Đã khôi phục {len(images)} ảnh ứng viên từ learning_data."
+
+            is_running_method = getattr(processor, "is_running", None) if processor is not None else None
+            worker_alive = bool(is_running_method()) if callable(is_running_method) else False
+            diagnostic = (
+                c.state, worker_alive, len(results), raw_image_count, raw_content_count,
+                len(image_candidates), len(content_candidates),
+                candidate_status["image"]["state"], candidate_status["image"]["reason"],
+                candidate_status["content"]["state"], candidate_status["content"]["reason"],
+            )
+            if diagnostic != self._last_learning_diag_signature:
+                LOG.info(
+                    "LEARNING_STATE lifecycle=%s worker_alive=%s reports=%d image_raw=%d image_reviewable=%d "
+                    "content_raw=%d content_reviewable=%d image_state=%s image_reason=%s "
+                    "content_state=%s content_reason=%s",
+                    c.state, worker_alive, len(results), raw_image_count, len(image_candidates),
+                    raw_content_count, len(content_candidates), candidate_status["image"]["state"],
+                    candidate_status["image"]["reason"], candidate_status["content"]["state"],
+                    candidate_status["content"]["reason"],
+                )
+                self._last_learning_diag_signature = diagnostic
+
             pending = c.image_reapply_pending + c.content_reapply_pending
-            return {"images": images, "contents": contents,
+            return {"images": images, "contents": contents, "candidateStatus": candidate_status,
                     "counts": {"image": {"total": len(image_total_ids), "labeled": len(image_labeled_ids)},
                                "content": {"total": len(content_total_ids), "labeled": len(content_labeled_ids)}},
                     "modelStatus": {"image": image_status, "content": content_status},
@@ -682,52 +1179,162 @@ class ApplicationService:
                     "training": self._training, "trainingMessage": self._training_message,
                     "reviewSummary": c.review_summary_text(), "contentReviewSummary": c.content_review_summary_text()}
 
+    @staticmethod
+    def _learning_candidate_status(state: str, reason: str, count: int, kind: str) -> dict:
+        """JSON-safe availability separate from candidate arrays (valid empty is not a transport failure)."""
+        noun = "ảnh ứng viên" if kind == "image" else "khối nội dung"
+        if state == "processing":
+            message = "Đang xử lý báo cáo; danh sách học sẽ cập nhật khi lượt chạy hoàn tất."
+        elif state == "no_run":
+            message = f"Chưa có lượt xử lý hoàn tất để tạo {noun}."
+        elif state == "unavailable":
+            message = "Dữ liệu học cục bộ không khả dụng. Hãy kiểm tra nhật ký ứng dụng."
+        elif count:
+            message = f"Đã tải {count} {noun} từ lượt xử lý hiện tại."
+        else:
+            message = f"Lượt xử lý hiện tại không có {noun} cần kiểm tra."
+        return {"state": state, "reason": reason, "count": int(count), "message": message}
+
+    def _review_image(self, candidate_id: str):
+        from .learning_assets import review_id
+        candidates = self.controller.review_candidates()
+        scoped = next((item for item in candidates if review_id(item) == candidate_id), None)
+        if scoped is not None:
+            return scoped
+        legacy = [item for item in candidates if item.candidate_id == candidate_id]
+        if len(legacy) > 1:
+            raise ServiceError("Có nhiều nguồn cho ảnh này; chọn lại ảnh trong Learning.", "AMBIGUOUS_CANDIDATE")
+        return legacy[0] if legacy else None
+
+    def _set_pending_label_unlocked(self, kind: str, candidate_id: str, label: str, note: str) -> None:
+        """Validate + record one pending label. Caller holds ``self._lock`` and has asserted idle."""
+        c = self.controller
+        if kind == "image":
+            candidate = self._review_image(candidate_id)
+            if candidate is None:
+                raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
+            c.set_pending_label(candidate, label, note)
+        else:
+            candidate = next((item for item in c.review_content_candidates()
+                              if item.candidate_id == candidate_id), None)
+            if candidate is None:
+                raise ServiceError("Khối nội dung này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
+            c.set_pending_content_label(candidate, label, note)
+
     def set_learning_label(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
         kind = self._choice(kind, "kind", {"image", "content"})
         candidate_id = self._text(candidate_id, "candidateId", 512)
         note = self._text(note, "note", 1000)
         with self._lock:
             self._assert_idle("Không thể gán nhãn trong khi đang xử lý báo cáo.")
-            c = self.controller
-            if kind == "image":
-                candidate = next((item for item in c.review_candidates() if item.candidate_id == candidate_id), None)
-                if candidate is None:
-                    raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
-                c.set_pending_label(candidate, label, note)
-            else:
-                candidate = next((item for item in c.review_content_candidates()
-                                  if item.candidate_id == candidate_id), None)
-                if candidate is None:
-                    raise ServiceError("Khối nội dung này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
-                c.set_pending_content_label(candidate, label, note)
+            self._set_pending_label_unlocked(kind, candidate_id, label, note)
             return self.learning_state()
+
+    def set_learning_label_fast(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: identical pending-label write to :meth:`set_learning_label`, minimal ack.
+
+        The full-state variant above is kept for its existing contract; this path exists because a
+        single label click must not rebuild/serialize the entire LearningState (measured multi-MB
+        payloads and cold slide-preview renders per click — see
+        ``.specify/bugs/prompt036s-learning-latency/assessment.md``). The pending write itself is the
+        same O(1) controller operation, so the service lock is held only for that write.
+        """
+        kind = self._choice(kind, "kind", {"image", "content"})
+        candidate_id = self._text(candidate_id, "candidateId", 512)
+        note = self._text(note, "note", 1000)
+        with self._lock:
+            self._assert_idle("Không thể gán nhãn trong khi đang xử lý báo cáo.")
+            self._set_pending_label_unlocked(kind, candidate_id, label, note)
+            return {"kind": kind, "candidateId": candidate_id, "label": label, "labelPending": True}
+
+    def _save_learning_labels_unlocked(self, kind: str, notes: dict) -> tuple:
+        """The exact ``save_learning_labels`` persistence flow. Caller holds ``self._lock``.
+
+        Returns ``(message, excel_pending)``; raises ``ServiceError`` on failure exactly as before.
+        """
+        c = self.controller
+        if kind == "image":
+            from .learning_assets import review_id
+            for candidate_id in c.pending_labels:
+                candidate = c._pending_image_candidates.get(candidate_id)
+                key = review_id(candidate) if candidate is not None and review_id(candidate) in notes else candidate_id
+                if key in notes:
+                    c.pending_label_notes[candidate_id] = self._text(notes[key], "note", 1000)
+        else:
+            for candidate_id in c.pending_content_labels:
+                if candidate_id in notes:
+                    c.pending_content_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
+        if kind == "image":
+            ok, message = c.save_confirmations(c.review_candidates())
+            pending = c.image_reapply_pending
+        else:
+            ok, message = c.save_content_confirmations(c.review_content_candidates())
+            pending = c.content_reapply_pending
+        if not ok:
+            raise ServiceError(message, "LABEL_SAVE_FAILED")
+        status = "locked" if pending or "chưa cập nhật được Excel" in message.lower() or "đang được sử dụng" in message.lower() else "ok"
+        self._last_excel_result = {"kind": status, "message": message}
+        LOG.info("WEBVIEW_LABELS_SAVED kind=%s pending_excel=%d", kind, pending)
+        return message, pending
 
     def save_learning_labels(self, kind: str, notes: Optional[dict] = None) -> dict:
         kind = self._choice(kind, "kind", {"image", "content"})
         notes = self._object(notes or {}, "learningNotes")
         with self._lock:
             self._assert_idle("Không thể lưu nhãn trong khi đang xử lý báo cáo.")
-            c = self.controller
-            if kind == "image":
-                for candidate_id in c.pending_labels:
-                    if candidate_id in notes:
-                        c.pending_label_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
-            else:
-                for candidate_id in c.pending_content_labels:
-                    if candidate_id in notes:
-                        c.pending_content_notes[candidate_id] = self._text(notes[candidate_id], "note", 1000)
-            if kind == "image":
-                ok, message = c.save_confirmations(c.review_candidates())
-                pending = c.image_reapply_pending
-            else:
-                ok, message = c.save_content_confirmations(c.review_content_candidates())
-                pending = c.content_reapply_pending
-            if not ok:
-                raise ServiceError(message, "LABEL_SAVE_FAILED")
-            status = "locked" if pending or "chưa cập nhật được Excel" in message.lower() or "đang được sử dụng" in message.lower() else "ok"
-            self._last_excel_result = {"kind": status, "message": message}
-            LOG.info("WEBVIEW_LABELS_SAVED kind=%s pending_excel=%d", kind, pending)
+            message, _pending = self._save_learning_labels_unlocked(kind, notes)
             return {"message": message, "state": self.learning_state()}
+
+    def save_learning_candidate(self, kind: str, candidate_id: str, label: str, note: str = "") -> dict:
+        """PROMPT-036S: atomic set-pending + save for one candidate in ONE bridge call.
+
+        Replaces the frontend's former sequential ``set_learning_label`` →
+        ``save_learning_labels`` pair (two full-state round trips) with the identical
+        persistence sequence under a single lock hold: this candidate's pending label is
+        set, then every pending label of the kind is committed exactly as
+        :meth:`save_learning_labels` does (labels JSONL first, Excel reapply second,
+        pending-Excel retry state preserved). Returns a minimal ack, not the full state.
+        """
+        kind = self._choice(kind, "kind", {"image", "content"})
+        candidate_id = self._text(candidate_id, "candidateId", 512)
+        note = self._text(note, "note", 1000)
+        with self._lock:
+            self._assert_idle("Không thể lưu nhãn trong khi đang xử lý báo cáo.")
+            self._set_pending_label_unlocked(kind, candidate_id, label, note)
+            message, pending = self._save_learning_labels_unlocked(kind, {candidate_id: note})
+            return {"message": message, "kind": kind, "candidateId": candidate_id, "label": label,
+                    "labelPending": False, "excelPending": pending,
+                    "excelLastResult": dict(self._last_excel_result)}
+
+    def save_learning_images(self, candidate_ids: list, label: str, notes: Optional[dict] = None) -> dict:
+        """One bounded bulk ack, same labels-first/Excel retry contract as the 036S single save.
+
+        Validate the entire request and its report+slide scope before touching pending labels.
+        Disk failures propagate; pending choices remain retryable, never a false success.
+        """
+        from .image_learning import LABELS
+        from .learning_assets import review_id
+        from .report_identity import report_scope_key
+        if not isinstance(candidate_ids, list) or not 1 <= len(candidate_ids) <= 500:
+            raise ServiceError("Chọn từ 1 đến 500 ảnh cùng slide.", "INVALID_ARGUMENT")
+        ids = list(dict.fromkeys(self._text(cid, "candidateId", 512) for cid in candidate_ids))
+        label = self._choice(label, "label", set(LABELS))
+        notes = self._object(notes or {}, "learningNotes")
+        clean_notes = {cid: self._text(notes.get(cid, ""), "note", 1000) for cid in ids}
+        with self._lock:
+            self._assert_idle("Không thể lưu nhãn trong khi đang xử lý báo cáo.")
+            candidates = [self._review_image(cid) for cid in ids]
+            if any(candidate is None for candidate in candidates):
+                raise ServiceError("Ảnh này không còn trong danh sách học hiện tại.", "CANDIDATE_NOT_FOUND")
+            scopes = {(report_scope_key(c.source_file) or review_id(c), c.source_name, c.slide) for c in candidates}
+            if len(scopes) != 1:
+                raise ServiceError("Chỉ xác nhận nhiều ảnh trong cùng báo cáo và slide.", "CROSS_SLIDE_SELECTION")
+            for cid, candidate in zip(ids, candidates):
+                self.controller.set_pending_label(candidate, label, clean_notes[cid])
+            message, pending = self._save_learning_labels_unlocked(
+                "image", {review_id(c): clean_notes[cid] for cid, c in zip(ids, candidates)})
+            return {"message": message, "candidateIds": ids, "label": label, "labelPending": False,
+                    "excelPending": pending, "excelLastResult": dict(self._last_excel_result)}
 
     def dismiss_learning_excel_notice(self) -> dict:
         """Clear only the transient result message; preserve saved labels and any pending Excel retry."""
@@ -861,14 +1468,20 @@ class ApplicationService:
     # ------------------------------------------------------------------ close/log helpers
     def close_requested(self) -> tuple[bool, str]:
         with self._lock:
+            if self.controller.update_handoff_started and self._update_close_requested:
+                return True, ""
+            if self.controller.update_installing:
+                return False, "Đang chuẩn bị cập nhật. Hãy đợi thông báo chuyển sang khởi động lại."
             if self.controller.is_running():
                 self.controller.request_stop()
                 return False, "Đã yêu cầu dừng sau báo cáo hiện tại. Hãy đợi xử lý kết thúc rồi đóng cửa sổ."
+            if self._scan_active:
+                return False, "Đang quét thư mục. Hãy đợi danh sách hoàn tất rồi đóng cửa sổ."
             if self._training or self._diagnostics_running or self._server_apply_running:
                 return False, "Một tác vụ nền đang chạy. Hãy đợi tác vụ hoàn tất rồi đóng cửa sổ."
             return True, ""
 
-    def _collect_logs(self) -> None:
+    def _collect_logs(self, redactor: Optional[_SourcePathRedactor] = None) -> None:
         lines = self.controller.log_lines
         if self._log_cursor > len(lines):
             self._log_cursor = 0
@@ -879,33 +1492,51 @@ class ApplicationService:
                 "WARN" if "WARN" in upper or "WARNING" in upper or "CẢNH BÁO" in upper else "INFO")
             self._log_sequence += 1
             self._log_entries.append({"id": self._log_sequence, "time": datetime.now().strftime("%H:%M:%S"),
-                                     "level": level, "text": self._redact_source_paths(line)})
+                                     "level": level, "text": self._redact_source_paths(line, redactor)})
         self._log_cursor = len(lines)
         if len(self._log_entries) > 1000:
             del self._log_entries[:-1000]
 
-    def _redact_source_paths(self, value: Any) -> str:
-        """Keep user-selected PPTX source paths in Python; expose filenames, never absolute paths, to React."""
-        text = str(value)
+    def _source_path_redactor(self, metrics: Optional[ScanMetrics] = None,
+                              normalized_paths: Optional[Sequence[tuple[str, str]]] = None) -> _SourcePathRedactor:
+        """Build one lexical, filesystem-free sanitizer for the current dashboard response."""
         paths = list(self._report_paths.values())
         paths.extend(Path(path) for path in getattr(self.controller, "all_files", []))
-        replacements = set()
+        replacements: Dict[str, str] = {}
         for source in paths:
             try:
                 path = Path(source)
                 name = path.name
                 if not name:
                     continue
-                variants = {str(path), path.as_posix(), str(path.resolve()), path.resolve().as_posix()}
+                # ``abspath``/``normpath`` are lexical.  Unlike ``Path.resolve`` they do not issue
+                # lstat/stat calls against a UNC, removable, or otherwise slow source folder.
+                raw = str(path)
+                absolute = os.path.abspath(os.path.expanduser(raw))
+                variants = {raw, path.as_posix(), absolute, Path(absolute).as_posix()}
                 variants.update(item.replace("/", chr(92)) for item in tuple(variants))
                 for variant in variants:
                     if variant:
-                        replacements.add((variant, name))
+                        replacements.setdefault(variant, name)
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
-        for source, name in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
-            text = re.sub(re.escape(source), lambda _match, replacement=name: replacement, text, flags=re.IGNORECASE)
-        return text
+        # ``scan_rows`` already computed canonical identities once for report isolation/manual
+        # fields.  Reuse those strings to cover symlink/canonical path variants without another
+        # filesystem lookup solely for redaction.
+        for normalized, name in normalized_paths or ():
+            if not normalized or not name:
+                continue
+            replacements.setdefault(str(normalized), str(name))
+            replacements.setdefault(str(normalized).replace("/", chr(92)), str(name))
+        if metrics is not None:
+            metrics.redaction_context_builds += 1
+            metrics.redaction_sources = len({str(Path(path)) for path in paths})
+        return _SourcePathRedactor(replacements)
+
+    def _redact_source_paths(self, value: Any,
+                             redactor: Optional[_SourcePathRedactor] = None) -> str:
+        """Keep user-selected PPTX source paths in Python; expose filenames, never absolute paths, to React."""
+        return (redactor or self._source_path_redactor()).redact(value)
 
     # ------------------------------------------------------------------ DTO helpers
     def _result_for_path(self, path: Path):
@@ -947,12 +1578,227 @@ class ApplicationService:
             LOG.debug("WEBVIEW_IMAGE_PREVIEW_UNAVAILABLE file=%s error=%s", path.name, exc)
             return ""
 
+    # ------------------------------------------------------------------ PROMPT-024R learning workspace
+    def _slide_preview_for(self, candidate, learning=None) -> Dict[str, Any]:
+        """FULL authored slide of one candidate + the slide's authoritative After evidence regions.
+
+        Rendered ONCE per (report, slide, file identity, renderer identity) and shared by every candidate of that slide;
+        two reports with identical layouts never share a preview (§54). No filesystem path ever reaches the browser
+        (§39). Evidence bytes / Excel crops are untouched — this is review UI only.
+
+        PROMPT-027 §29: the cache identity carries the renderer preference chain, the render width and
+        :data:`RENDER_SCHEMA_VERSION`.  PROMPT-027R §30: it also carries the file size and nanosecond mtime AND the
+        availability of every backend in the chain, so a PowerPoint that becomes available is a NEW identity and a stale
+        fallback is never reused.  A preview produced while a faithful backend FAILED is marked degraded and expires
+        after :data:`DEGRADED_PREVIEW_TTL_S`, so recovery is never hidden.  §15: the evidence regions returned here are
+        the SAME :class:`ImprovementVisualRegion` objects the production Excel pipeline crops from.
+        """
+        empty = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "reason": "", "regions": []}
+        regions: List[Dict[str, Any]] = []
+        try:
+            from .qpn_renderer import RENDER_SCHEMA_VERSION, SlideRenderer, is_faithful_backend
+            from .report_identity import report_scope_key
+            from .learning_assets import LearningAssets, digest
+            owner = learning or getattr(getattr(self, "controller", None), "learning", None)
+            assets = LearningAssets(owner.dir) if owner is not None else None
+            source = Path(candidate.source_file)
+            slide_number = int(candidate.slide)
+            renderer = SlideRenderer(width_px=LEARNING_PREVIEW_WIDTH_PX)  # same chain as production
+            signature = (tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION,
+                         tuple(sorted(renderer.availability().items())), self._learning_identity(learning))
+            if getattr(candidate, "_snapshot_changed", False):
+                return empty  # retained label/snapshot is not evidence for the changed live source
+            if not candidate.source_file or not source.is_file():
+                return (assets.offline_slide(candidate, signature) if assets is not None else None) or empty
+            stat = source.stat()
+            key = (report_scope_key(source), str(source), slide_number, int(stat.st_mtime_ns), int(stat.st_size),
+                   *signature)
+            cached = self._slide_preview_cache.get(key)
+            if cached is not None and not self._preview_expired(cached):
+                if self._degraded_reason_is_stale(cached):
+                    LOG.info("SLIDE_PREVIEW_CACHE hit=1 source=memory stale_reason=1 cached_backend=%s "
+                             "cached_reason=%s action=discard-and-rerender",
+                             cached.get("backend") or "-", cached.get("reason") or "-")
+                    self._slide_preview_cache.pop(key, None)      # the machine state that produced it is gone
+                else:
+                    LOG.info("SLIDE_PREVIEW_CACHE hit=1 source=memory stale_reason=0 cached_backend=%s "
+                             "cached_reason=%s action=reuse",
+                             cached.get("backend") or "-", cached.get("reason") or "-")
+                    return dict(cached)
+            persisted = assets.slide(digest(key), signature) if assets is not None and cached is None else None
+            if persisted and not self._preview_expired(persisted):
+                if self._degraded_reason_is_stale(persisted):
+                    persisted = None                              # ditto for a preview restored from disk
+                else:
+                    self._remember_preview(key, persisted)
+                    return persisted
+            from .pptx_parser import parse_pptx
+            report = parse_pptx(source)
+            if report.slide(slide_number) is None:
+                self._remember_preview(key, empty)
+                return dict(empty)
+            # §15: the authoritative item-scoped After regions of this slide, from the SAME builder the
+            # Excel pipeline uses.  Resolved BEFORE rendering so a failed/reduced preview still reports
+            # the true evidence geometry instead of implying the picture belongs to no region at all.
+            regions = self._slide_evidence_regions(report, slide_number, candidate, learning)
+            result = {**empty, "regions": regions}
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="re_learning_slide_") as tmp:
+                paths = renderer.render(report, [slide_number], Path(tmp), purpose="learning_preview")
+                degraded = renderer.degraded
+                # PROMPT-041: the STABLE reason the preview is not PowerPoint-faithful (a slug, never a path),
+                # so the UI can say "your own PowerPoint is open" instead of "PowerPoint is unavailable".
+                reason = renderer.preview_reason
+                rendered = paths.get(slide_number)
+                if rendered is None or not Path(rendered).exists():
+                    result["reason"] = reason
+                    self._remember_preview(key, {**result, "degraded": True, "created": time.monotonic()})
+                    return result                            # no bitmap, but the region truth is kept
+                from PIL import Image
+                with Image.open(rendered) as im:
+                    image = im.convert("RGB")
+                    width, height = image.size
+                    buf = io.BytesIO()
+                    image.save(buf, format="JPEG", quality=82, optimize=True)
+            result.update({"src": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii"),
+                           "width": width, "height": height,
+                           "backend": renderer.last_backend or "",
+                           "faithful": is_faithful_backend(renderer.last_backend),
+                           "reason": reason,
+                           "degraded": degraded, "created": time.monotonic()})
+            if assets is not None:
+                result = assets.remember_slide(key, result)
+            self._remember_preview(key, result)
+            return result
+        except Exception as exc:  # noqa: BLE001 – preview is display-only; never break the review state
+            LOG.debug("WEBVIEW_SLIDE_PREVIEW_UNAVAILABLE candidate=%s error=%s",
+                      getattr(candidate, "candidate_id", "?"), exc)
+            return {**empty, "regions": regions}             # not cached: the render is retried later
+
+    @staticmethod
+    def _learning_identity(learning) -> tuple:
+        """What the production decision depends on from the learning state (PROMPT-027R §25): the saved labels and the
+        trained model.  A label change or retrain changes the identity, so no preview region can outlive its decision."""
+        if learning is None:
+            return ("none",)
+        try:
+            overrides = tuple(sorted((str(k), str(v)) for k, v in learning.overrides().items()))
+        except Exception:  # noqa: BLE001 – an unreadable label file is treated as no overrides
+            overrides = ()
+        model = getattr(learning, "model", None)
+        model_identity = (str(getattr(model, "trained_at", "")), int(getattr(model, "n_examples", 0) or 0)) \
+            if model is not None else None
+        return (bool(getattr(learning, "enabled", True)), model_identity, overrides)
+
+    @staticmethod
+    def _degraded_reason_is_stale(entry: Dict[str, Any]) -> bool:
+        """PROMPT-041W contract E: a cached fallback must never keep asserting a machine fact that no longer holds.
+
+        A preview rendered while the user's PowerPoint was open is cached (correctly — it is still a true picture
+        of the slide) together with the reason it is only a fallback.  But that reason is a claim about the
+        machine, and the machine moves on: the moment PowerPoint is no longer in the way, showing "PowerPoint is
+        running" again would be a lie, so the entry is dropped and re-rendered NOW instead of waiting out the
+        degraded TTL.  Anything that is not a PowerPoint-blocked fallback is left alone — the TTL still governs
+        it, so a genuinely broken backend is not hammered on every poll.
+        """
+        if not entry.get("degraded"):
+            return False
+        try:
+            from .qpn_renderer import POWERPOINT_PRESENT_REASONS, powerpoint_render_capability
+            if (entry.get("reason") or "") not in POWERPOINT_PRESENT_REASONS:
+                return False
+            return bool(powerpoint_render_capability(max_age_s=PREVIEW_CAPABILITY_MAX_AGE_S).isolated)
+        except Exception:  # noqa: BLE001 – an unreadable machine state must not break the preview
+            return False
+
+    @staticmethod
+    def _preview_expired(entry: Dict[str, Any]) -> bool:
+        """Only a degraded preview (a faithful backend failed while rendering it) expires; everything else is reused."""
+        if not entry.get("degraded"):
+            return False
+        return (time.monotonic() - float(entry.get("created", 0.0))) > DEGRADED_PREVIEW_TTL_S
+
+    def _remember_preview(self, key: tuple, value: Dict[str, Any]) -> None:
+        self._slide_preview_cache[key] = dict(value)
+        if len(self._slide_preview_cache) > 48:
+            self._slide_preview_cache.pop(next(iter(self._slide_preview_cache)))
+
+    @staticmethod
+    def _slide_evidence_regions(report, slide_number: int, candidate, learning=None) -> List[Dict[str, Any]]:
+        """Every item-scoped After evidence region of one slide, as JSON-safe primitives (§14/§20/§21).
+
+        This is the production region builder, unchanged: one region per (logical item, After block), each
+        possibly spanning several After pictures plus their associated caption/annotation.  Each region
+        records the shape ids of the pictures it owns so the UI can pick the region that owns the CURRENT
+        candidate without ever guessing from pixels or proximity.
+        """
+        try:
+            from .improvement_pictures import select_after_pictures
+            from .improvement_visual import build_improvement_visual_regions
+            selection = select_after_pictures(report, [slide_number])
+            refs = selection.after
+            if learning is not None:
+                # PROMPT-027R §25: exactly the eligible refs the Excel pipeline would crop (labels/model applied)
+                from .image_learning import select_with_learning
+                refs, _candidates, _reasons = select_with_learning(
+                    report, [slide_number], selection, learning, candidate.management_number, candidate.source_file)
+            regions = build_improvement_visual_regions(report, refs, management_number=candidate.management_number)
+        except Exception as exc:  # noqa: BLE001 – a region failure must not remove the slide preview
+            LOG.debug("WEBVIEW_EVIDENCE_REGIONS_UNAVAILABLE slide=%s error=%s", slide_number, exc)
+            return []
+        out: List[Dict[str, Any]] = []
+        for region in regions:
+            left, top, right, bottom = region.bbox
+            out.append({"itemId": region.improvement_item_id, "itemIndex": region.item_index,
+                        "itemHeading": region.improvement_heading,
+                        "afterBlockIndex": int(region.after_block_index),
+                        "regionId": region.block_id,
+                        "bbox": {"x": int(left), "y": int(top),
+                                 "width": max(0, int(right - left)), "height": max(0, int(bottom - top))},
+                        "pictureShapeIds": [int(ref.block.shape_id) for ref in region.pictures],
+                        "excelEligible": bool(region.excel_output_eligible),
+                        # PROMPT-027R §10: the boundary that actually limited this region (display/debug only)
+                        "boundarySource": region.boundary_source or "",
+                        "nextHeadingTop": int(region.boundary_top) if region.boundary_top is not None else None})
+        return out
+
+    @staticmethod
+    def _evidence_region_for(candidate, regions: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The ONE production region that owns this candidate picture, or None when it owns nothing.
+
+        Ownership is decided by the region's own picture list, so a candidate of Mục #2 can never resolve
+        to the region of Mục #1 or Mục #3 (§20), and switching between two candidates of the same item
+        keeps that item's region (§13).
+        """
+        try:
+            shape_id = int(candidate.picture_id)
+        except (TypeError, ValueError):
+            return None
+        owner_id = getattr(candidate, "logical_item_owner", "") or ""
+        matches = [r for r in regions if shape_id in r.get("pictureShapeIds", [])]
+        if not matches:
+            return None
+        if owner_id and len(matches) > 1:                    # prefer the candidate's own logical item
+            scoped = [r for r in matches if r.get("itemId") == owner_id]
+            if scoped:
+                matches = scoped
+        return min(matches, key=lambda r: int(r.get("afterBlockIndex", 0)))
+
     def _image_candidate_dto(self, candidate, learning) -> dict:
-        src = self._preview_cache.get(candidate.candidate_id)
-        if src is None:
-            blob = self.controller.candidate_blob(candidate) or b""
-            src = self._bytes_data_uri(blob)
-            self._preview_cache[candidate.candidate_id] = src
+        from .learning_assets import LearningAssets, asset_key, digest, review_id, source_name, source_version
+        from .report_identity import report_scope_key
+        assets = LearningAssets(learning.dir)
+        current_version = source_version(candidate.source_file)
+        if hasattr(candidate, "_snapshot_version") and current_version is not None:
+            candidate._snapshot_changed = current_version != candidate._snapshot_version
+        cache_key = digest((asset_key(candidate), source_version(candidate.source_file)))
+        src = self._preview_cache.get(cache_key)
+        if not src:
+            src = assets.candidate_src(candidate)
+            if not src and not getattr(candidate, "_snapshot_changed", False):
+                blob = self.controller.candidate_blob(candidate) or b""
+                src = self._bytes_data_uri(blob)
+            self._preview_cache[cache_key] = src
             if len(self._preview_cache) > 128:
                 self._preview_cache.pop(next(iter(self._preview_cache)))
         bw = max(1, int(candidate.slide_size[0] or 1))
@@ -961,18 +1807,76 @@ class ApplicationService:
         label = self.controller.pending_labels.get(candidate.candidate_id) or learning.store.current_label(candidate.candidate_id)
         latest = learning.store.latest().get(candidate.candidate_id, {})
         pending_note = self.controller.pending_label_notes.get(candidate.candidate_id)
-        return {"id": candidate.candidate_id, "sourceFile": candidate.source_name,
+        # PROMPT-024R: full-slide context + authoritative target geometry for the review workspace.
+        fx, fy, fw, fh = slide_fraction_box((x, y, w, h), bw, bh)
+        try:
+            preview = self._slide_preview_for(candidate, learning)
+        except Exception as exc:  # noqa: BLE001 – display-only preview must never erase truthful metadata
+            opaque_id = hashlib.sha256(str(candidate.candidate_id).encode("utf-8")).hexdigest()[:12]
+            LOG.warning("LEARNING_IMAGE_PREVIEW_FAILED candidate=%s error=%s", opaque_id, type(exc).__name__)
+            preview = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "reason": "",
+                       "regions": []}
+        if not getattr(candidate, "_snapshot_changed", False):
+            assets.remember_candidate(candidate, src, preview)
+        # PROMPT-027 §13/§15: the picture candidate and the FINAL Excel evidence region are two different
+        # review geometries.  The region below is the production ImprovementVisualRegion that owns this
+        # candidate — never a React-side derivation from candidate.bounds.
+        region = self._evidence_region_for(candidate, preview.get("regions") or [])
+        evidence_bbox = evidence_pct = None
+        if region is not None:
+            rx, ry = int(region["bbox"]["x"]), int(region["bbox"]["y"])
+            rw, rh = int(region["bbox"]["width"]), int(region["bbox"]["height"])
+            ex, ey, ew, eh = slide_fraction_box((rx, ry, rw, rh), bw, bh)
+            evidence_bbox = {"x": rx, "y": ry, "width": rw, "height": rh}
+            evidence_pct = {"x": round(ex * 100, 3), "y": round(ey * 100, 3),
+                            "w": round(ew * 100, 3), "h": round(eh * 100, 3)}
+        return {"id": candidate.candidate_id, "reviewId": review_id(candidate),
+                "reportScope": report_scope_key(candidate.source_file) or asset_key(candidate),
+                "persisted": bool(getattr(candidate, "_persisted", False)), "sourceFile": source_name(candidate.source_name),
                 "managementNumber": candidate.management_number, "slide": candidate.slide,
                 "pictureId": str(candidate.picture_id), "src": src,
                 "bounds": {"x": round(x / bw * 100, 2), "y": round(y / bh * 100, 2),
                            "w": round(w / bw * 100, 2), "h": round(h / bh * 100, 2)},
+                # Authoritative PPTX geometry (EMU + fractions) so the UI never guesses coordinates (§27/§38)
+                "slideWidth": bw, "slideHeight": bh,
+                "targetBbox": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)},
+                "targetBboxPct": {"x": round(fx * 100, 3), "y": round(fy * 100, 3),
+                                  "w": round(fw * 100, 3), "h": round(fh * 100, 3)},
+                "targetKind": "picture",
+                # Full authored slide rendered once per report+slide (review display only, §40)
+                "slidePreview": preview["src"],
+                "slidePreviewWidth": preview["width"], "slidePreviewHeight": preview["height"],
+                # PROMPT-027 §4/§6: which renderer actually produced this preview, and whether it is
+                # pixel-faithful PowerPoint output.  Drives the reduced-fidelity notice — never a path.
+                "slidePreviewBackend": preview.get("backend") or "",
+                "slidePreviewFaithful": bool(preview.get("faithful")),
+                # PROMPT-041: WHY it is not faithful, as a stable slug the UI can turn into an actionable hint
+                # ("powerpoint-user-session-running" ≠ "powerpoint-unavailable").  Never a path, never a PID.
+                "slidePreviewReason": preview.get("reason") or "",
+                # PROMPT-027 §14: the FINAL After evidence region production would export to Excel
+                "evidenceRegionBbox": evidence_bbox,
+                "evidenceRegionBboxPct": evidence_pct,
+                "evidenceRegionKind": "after_region" if evidence_bbox else "",
+                "evidenceRegionItemId": region["itemId"] if region else "",
+                "evidenceRegionItemIndex": region["itemIndex"] if region else -1,
+                "evidenceRegionItemHeading": region["itemHeading"] if region else "",
+                "evidenceRegionPictureCount": len(region["pictureShapeIds"]) if region else 0,
+                # PROMPT-027R §24: which pictures form the production region (display/debug only; React never
+                # derives geometry from these ids) and the region identity both overlays and Excel share.
+                "evidenceRegionPictureIds": [int(v) for v in region["pictureShapeIds"]] if region else [],
+                "evidenceRegionId": region["regionId"] if region else "",
+                "evidenceRegionBlockIndex": int(region["afterBlockIndex"]) if region else -1,
+                "evidenceRegionBoundarySource": region.get("boundarySource", "") if region else "",
+                "evidenceRegionNextHeadingTop": region.get("nextHeadingTop") if region else None,
                 # PROMPT-025: logical improvement-item identity for the per-item learning preview
                 "itemId": candidate.logical_item_owner, "itemIndex": candidate.item_index,
                 "itemHeading": candidate.owner_heading,
                 "decision": candidate.decision, "confidenceBand": candidate.confidence_band,
                 "confidence": float(candidate.confidence), "evidence": list(candidate.evidence),
-                "excelEligible": bool(candidate.excel_output_eligible),
-                "eligibilityReason": candidate.eligibility_reason, "nearbyText": candidate.nearby_text,
+                "excelEligible": bool(candidate.excel_output_eligible) and not getattr(candidate, "_snapshot_changed", False),
+                "eligibilityReason": ("Nguồn đã thay đổi; chạy xử lý lại để cập nhật preview."
+                                      if getattr(candidate, "_snapshot_changed", False) else candidate.eligibility_reason),
+                "nearbyText": candidate.nearby_text,
                 "userLabel": label, "labelPending": candidate.candidate_id in self.controller.pending_labels,
                 "note": str(pending_note if pending_note is not None else latest.get("note", ""))}
 
@@ -1014,19 +1918,98 @@ class ApplicationService:
             return f"Mô hình {kind} không khả dụng ({state}); backend tiếp tục dùng quy tắc hiện tại."
         return f"Chưa huấn luyện mô hình {kind}; backend tiếp tục dùng quy tắc hiện tại."
 
+    def _refresh_update_result(self) -> None:
+        """Observe a helper result until its process exits, then consume it and safely clean its stage."""
+        data = updater.read_update_result(portable_root())
+        if not data:
+            return
+        status = data.get("status")
+        if status in ("installing", "restarting"):
+            return
+        self._update_result = data
+        helper_pid = int(data.get("helper_pid") or 0)
+        if not helper_pid or not updater.process_alive(helper_pid):
+            consumed = updater.consume_result(portable_root())
+            if consumed:
+                self._update_result = consumed
+            updater.cleanup_staging(portable_root())
+
     def _update_dto(self) -> dict:
         c = self.controller
         check = c.update_check
         info = check.info if check else None
-        status = "checking" if c.update_busy else (
-            "available" if check and check.available else "latest" if check and check.status == "latest" else
-            "error" if check and check.status not in ("no_path", "older") else "idle")
+        capable, install_reason = updater.production_install_capability(portable_root())
+        if capable:
+            self._refresh_update_result()
+
+        lock_problem = updater.update_lock_problem(portable_root()) if capable else ""
+        lock_available = capable and not lock_problem
+        busy = (c.is_running() or self._scan_active or self._training or self._diagnostics_running
+                or self._server_apply_running or (capable and not lock_available))
+        progress_stage = c.update_progress.stage
+        error = ""
+        if c.update_installing:
+            if c.update_handoff_started:
+                status = "ready_to_restart"
+                message = "Ứng dụng sẽ khởi động lại sau khi trình cài đặt đã được khởi chạy."
+            elif progress_stage == "VERIFYING":
+                status, message = "verifying", c.update_progress.label
+            else:
+                status, message = "staging", c.update_progress.label or "Đang chuẩn bị cập nhật..."
+        elif self._update_result:
+            result = self._update_result
+            result_status = result.get("status")
+            if result_status == "ok":
+                status = "installed"
+                message = f"Cập nhật thành công lên {result.get('version', '')} — Build {int(result.get('build') or 0):03d}."
+            elif result_status == "rolled_back":
+                status = "failed"
+                message = ("Cập nhật không thành công; đã khôi phục phiên bản trước. "
+                           + str(result.get("detail") or "")).strip()
+                error = message
+            else:
+                status = "failed"
+                message = str(result.get("detail") or "Cập nhật thất bại.")
+                error = message
+        elif c.update_install_error:
+            status, message = "failed", c.update_install_error
+            error = c.update_install_error
+        elif c.update_busy:
+            status, message = "checking", "Đang kiểm tra cập nhật..."
+        elif check and check.available:
+            status, message = "available", check.message
+        elif check and check.status == "latest":
+            status, message = "latest", check.message
+        elif check and check.status == "older":
+            status, message = "older", check.message
+        elif check and check.status not in ("no_path",):
+            status, message = "error", check.message
+            error = check.message
+        else:
+            status, message = "idle", c.update_status_text()
+
+        available = None
+        if info is not None:
+            available = {"version": info.version, "build": f"{info.build:03d}",
+                         "package": info.package, "size": info.size}
+        can_install = bool(capable)
+        install_enabled = bool(status == "available" and check and check.available and capable and not busy
+                               and not c.update_busy and not c.update_installing and not c.update_handoff_started)
+        if not capable:
+            install_reason = install_reason or updater.MSG["development_only"]
+        elif not lock_available:
+            install_reason = lock_problem
+        elif busy:
+            install_reason = updater.MSG["busy"]
+        elif not (check and check.available):
+            install_reason = "Không có bản cập nhật mới hợp lệ để cài."
+        elif c.update_installing:
+            install_reason = updater.MSG["already_installing"]
         return {"path": c.update_path, "autoCheck": bool(c.auto_update_check), "status": status,
-                "message": c.update_status_text(),
-                "available": ({"version": info.version, "build": f"{info.build:03d}",
-                               "package": info.package, "size": ""} if info else None),
-                "progress": float(c.update_progress.percent), "progressStage": c.update_progress.label,
-                "installEnabled": False}
+                "message": message, "available": available,
+                "progress": float(c.update_progress.percent), "progressStage": progress_stage,
+                "installEnabled": install_enabled, "canInstall": can_install,
+                "installDisabledReason": install_reason, "error": error}
 
     @staticmethod
     def _discovery_dto(result) -> dict:
@@ -1152,5 +2135,6 @@ class ApplicationService:
         return ids
 
     def _assert_idle(self, message: str) -> None:
-        if self.controller.is_running() or self._training or self._diagnostics_running or self._server_apply_running:
+        if (self._scan_active or self.controller.is_running() or self._training
+                or self._diagnostics_running or self._server_apply_running):
             raise ServiceError(message, "BUSY")

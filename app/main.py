@@ -1,6 +1,7 @@
 """Entry point.
 
-    ReportExtractor.exe                 -> GUI
+    ReportExtractor.exe                 -> React + pywebview UI (same as `python -m app.desktop`)
+    ReportExtractor.exe --legacy-gui    -> classic Tk GUI (fallback when pywebview/bundle is missing)
     ReportExtractor.exe --diag          -> print diagnostics
     ReportExtractor.exe --cli FOLDER --template T.xlsx --output OUT.xlsx [--server ..] [--model ..]
                                         -> headless batch (same pipeline as the GUI)
@@ -91,6 +92,8 @@ def _cli(args) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ReportExtractor", description="Report Extractor – PPTX → Excel kiểm chứng")
     parser.add_argument("--diag", action="store_true", help="in chẩn đoán hệ thống rồi thoát")
+    parser.add_argument("--legacy-gui", action="store_true",
+                        help="mở giao diện Tk cổ điển thay vì ứng dụng React + pywebview")
     parser.add_argument("--no-ollama-check", action="store_true")
     parser.add_argument("--ollama-test", action="store_true",
                         help="gửi 1 yêu cầu JSON nhỏ tới Ollama (cùng mã nguồn với xử lý thật) và in thời gian")
@@ -156,7 +159,9 @@ def main(argv=None) -> int:
             parser.error("--cli cần --template và --output")
         return _cli(args)
 
-    return launch_gui()
+    if args.legacy_gui:
+        return launch_gui()
+    return launch_ui()
 
 
 STARTUP_ERROR_LOG = "startup_error.log"
@@ -206,6 +211,60 @@ def _show_startup_error_dialog() -> None:
         root.destroy()
     except Exception:  # noqa: BLE001
         print(STARTUP_ERROR_VI, file=sys.stderr)
+
+
+def launch_desktop() -> int:
+    """Launch the React + pywebview application — the SAME UI as ``python -m app.desktop``.
+
+    This is what ``ReportExtractor.exe`` runs when double-clicked with no arguments (PROMPT-028 §1): the
+    frozen executable and the source runtime share one code path, one bridge and one frontend bundle.
+    Returns ``None``-safe non-zero codes so :func:`launch_ui` can fall back to the classic Tk GUI when
+    pywebview or the built bundle is unavailable, instead of showing the user nothing at all.
+    """
+    try:
+        _startup_logging()
+        from . import desktop
+        dist_dir = desktop.frontend_dist_dir()
+        if dist_dir is None:                       # no built bundle: let the caller fall back
+            return DESKTOP_UNAVAILABLE
+        import webview  # noqa: F401               # fail fast BEFORE any window/service work
+    except ImportError as e:
+        record_startup_error(e)
+        return DESKTOP_UNAVAILABLE
+    except Exception as e:  # noqa: BLE001 – never leave a double-clicked exe silent
+        record_startup_error(e)
+        _show_startup_error_dialog()
+        return 4
+    try:
+        return desktop.main([])
+    except SystemExit as e:                        # argparse errors exit(2) – treat as "cannot launch"
+        code = e.code if isinstance(e.code, int) else 2
+        return DESKTOP_UNAVAILABLE if code == 2 else code
+    except Exception as e:  # noqa: BLE001
+        from .logger import LOG
+        LOG.exception("DESKTOP_FATAL %s", e)
+        record_startup_error(e)
+        _show_startup_error_dialog()
+        return 4
+
+
+#: ``launch_desktop`` could not run (pywebview or the React bundle missing) – caller may fall back to Tk.
+DESKTOP_UNAVAILABLE = 5
+
+
+def launch_ui() -> int:
+    """Default no-argument UI: the React desktop app, falling back to the classic Tk GUI.
+
+    PowerPoint is NOT required here (rendering degrades through the renderer chain), but pywebview and the
+    built ``frontend/dist`` bundle are: without them the classic GUI still gives the user a working app
+    rather than a window that never appears.
+    """
+    code = launch_desktop()
+    if code == DESKTOP_UNAVAILABLE:
+        from .logger import LOG
+        LOG.warning("DESKTOP_UNAVAILABLE falling back to the classic Tk GUI")
+        return launch_gui()
+    return code
 
 
 def launch_gui() -> int:

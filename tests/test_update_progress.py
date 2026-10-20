@@ -48,6 +48,12 @@ def _ctl(tmp_path, folder):
     return GuiController(AppConfig(update_path=str(folder)), config_path=tmp_path / "cfg" / "config.json")
 
 
+def _package_runtime(monkeypatch, portable):
+    monkeypatch.setattr(up, "is_packaged", lambda: True)
+    monkeypatch.setattr(up.sys, "executable", str(portable / up.APP_EXE))
+    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+
+
 # ------------------------------------------------------------------ 1-3 real byte progress (updater layer)
 def test_copy_with_progress_reports_real_monotonic_bytes(tmp_path):
     src = tmp_path / "pkg.bin"
@@ -65,13 +71,19 @@ def test_copy_with_progress_reports_real_monotonic_bytes(tmp_path):
     assert all(abs(p - d * 100.0 / t) < 1e-6 for d, t, p in events)                    # percent derived from bytes
 
 
-def test_stage_update_emits_prepare_copy_verify_ready_in_order(tmp_path):
+def test_stage_update_emits_prepare_copy_verify_ready_in_order(tmp_path, monkeypatch):
     folder, pkg = _big_update_folder(tmp_path)
     portable = make_portable(tmp_path / "app")
+    _package_runtime(monkeypatch, portable)
     chk = up.check_for_update(str(folder), current_build=app.BUILD_NUMBER)
     assert chk.available
     stages = []
-    staged = up.stage_update(chk, portable, progress=lambda st, d, t, p: stages.append((st, d, t, p)))
+    lock = up.acquire_update_lock(portable, timeout=0)
+    assert lock is not None
+    try:
+        staged = up.stage_update(chk, portable, progress=lambda st, d, t, p: stages.append((st, d, t, p)), lock=lock)
+    finally:
+        lock.release()
     names = [s[0] for s in stages]
     assert names[0] == "PREPARING" and names[-1] == "READY"
     assert names.index("COPYING") < names.index("VERIFYING") < names.index("READY")      # verify AFTER copy
@@ -86,7 +98,7 @@ def test_stage_update_emits_prepare_copy_verify_ready_in_order(tmp_path):
 def test_install_async_publishes_snapshots_from_worker_without_tk(tmp_path, monkeypatch):
     folder, pkg = _big_update_folder(tmp_path)
     portable = make_portable(tmp_path / "app")
-    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    _package_runtime(monkeypatch, portable)
     c = _ctl(tmp_path, folder)
     c.check_update()
     clock = _TestClock(start=100.0, step=1.0)  # deterministic, measurable intervals in the worker
@@ -122,6 +134,7 @@ def test_install_async_publishes_snapshots_from_worker_without_tk(tmp_path, monk
         assert abs(snapshot.speed_bps - expected_speed) < 1e-6  # bytes / measured time, not a fabricated rate
     # handoff happened strictly after READY (verified) – the spawn call is the last thing the worker did
     assert events[-2].payload.stage == "HANDOFF"
+    c._release_update_file_lock()  # production keeps this until process shutdown after the helper handoff
 
 
 def test_copy_speed_handles_a_zero_monotonic_origin(tmp_path):
@@ -140,7 +153,7 @@ def test_fast_small_update_has_no_invented_speed_when_clock_does_not_advance(tmp
     folder, pkg = _big_update_folder(tmp_path, size_mb=0)
     assert pkg.stat().st_size < 1 << 20
     portable = make_portable(tmp_path / "app")
-    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    _package_runtime(monkeypatch, portable)
     c = _ctl(tmp_path, folder)
     c.check_update()
     c._clock = _TestClock(start=50.0, step=0.0)
@@ -160,12 +173,13 @@ def test_fast_small_update_has_no_invented_speed_when_clock_does_not_advance(tmp
     assert copying[-1].bytes_copied == pkg.stat().st_size and copying[-1].percent == 100.0
     assert all(s.speed_bps == 0.0 for s in copying)  # no elapsed tick -> unavailable, not a guessed rate
     assert snaps[-1].bytes_copied == pkg.stat().st_size and snaps[-1].percent == 100.0
+    c._release_update_file_lock()
 
 
 def test_copy_failure_shows_error_and_never_hands_off(tmp_path, monkeypatch):
     folder, pkg = _big_update_folder(tmp_path)
     portable = make_portable(tmp_path / "app")
-    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    _package_runtime(monkeypatch, portable)
     c = _ctl(tmp_path, folder)
     c.check_update()
     real = up.copy_with_progress
@@ -186,10 +200,10 @@ def test_copy_failure_shows_error_and_never_hands_off(tmp_path, monkeypatch):
     c._install_thread.join(30)
     events = c.pump()
     assert events[-1].kind == "update_done" and events[-1].payload[0] is False
-    assert "Không sao chép được" in events[-1].payload[1]
+    assert events[-1].payload[1] == "Cập nhật thất bại ở bước chuẩn bị (OSError)."
     assert events[-2].payload.stage == "ERROR" and events[-2].payload.error
     assert spawned == [] and not c.update_installing and c.update_available()          # can retry later
-    assert not (portable / up.STAGING_DIR).exists()                                     # staging cleaned
+    assert not list((portable / up.STAGING_DIR).glob("stage-*"))                       # failed stage cleaned
 
 
 def test_sha_mismatch_never_proceeds_to_apply(tmp_path, monkeypatch):
@@ -198,7 +212,7 @@ def test_sha_mismatch_never_proceeds_to_apply(tmp_path, monkeypatch):
     m["sha256"] = "0" * 64
     (folder / "version.json").write_text(json.dumps(m), encoding="utf-8")
     portable = make_portable(tmp_path / "app")
-    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    _package_runtime(monkeypatch, portable)
     c = _ctl(tmp_path, folder)
     c.check_update()
     spawned = []
@@ -214,19 +228,20 @@ def test_sha_mismatch_never_proceeds_to_apply(tmp_path, monkeypatch):
 def test_sync_install_update_still_works_for_cli_and_tests(tmp_path, monkeypatch):
     folder, pkg = _big_update_folder(tmp_path, size_mb=1)
     portable = make_portable(tmp_path / "app")
-    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    _package_runtime(monkeypatch, portable)
     c = _ctl(tmp_path, folder)
     c.check_update()
     spawned = []
     ok, msg = c.install_update(spawn=lambda cmd, **k: spawned.append(cmd))
     assert ok and spawned and c.update_progress.stage == "HANDOFF" and c.update_progress.percent == 100.0
+    c._release_update_file_lock()
 
 
 # ------------------------------------------------------------------ 5, 9-10 GUI: window, buttons, close behaviour
 def _gui(monkeypatch, tmp_path):
     folder, pkg = _big_update_folder(tmp_path)
     portable = make_portable(tmp_path / "app")
-    monkeypatch.setattr(gc, "portable_root", lambda: portable)
+    _package_runtime(monkeypatch, portable)
     cfg = AppConfig(update_path=str(folder))
     monkeypatch.setattr("tests.test_gui_redesign.AppConfig", lambda **k: cfg)
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
@@ -265,6 +280,7 @@ def test_gui_progress_window_and_buttons_during_update(monkeypatch, tmp_path):
     assert format_bytes(pkg.stat().st_size) in a.lbl_upd_bytes.cfg["text"] and "100%" in a.lbl_upd_bytes.cfg["text"]
     assert spawned and (300, a.root.destroy) in a.root.scheduled     # handoff only after verified staging
     assert (portable / up.APP_EXE).read_bytes() == b"MZ-old"           # running EXE never touched by the GUI
+    a.ctl._release_update_file_lock()
 
 
 def test_gui_error_path_reenables_buttons(monkeypatch, tmp_path):
@@ -277,7 +293,8 @@ def test_gui_error_path_reenables_buttons(monkeypatch, tmp_path):
     a.install_update()
     a.ctl._install_thread.join(30)
     a._poll()
-    assert errors and "Cập nhật thất bại" in errors[-1][1] and "LAN lost" in errors[-1][1]
+    assert errors and "Cập nhật thất bại" in errors[-1][1] and "OSError" in errors[-1][1]
+    assert "LAN lost" not in errors[-1][1]  # raw filesystem/share errors are not exposed
     assert a.lbl_upd_stage.cfg["style"] == "Error.TLabel" and a.btn_upd_close.cfg["state"] == "normal"
     assert a.btn_install_update.cfg["state"] == "normal" and not a.ctl.update_installing
     assert (300, a.root.destroy) not in a.root.scheduled               # application stays open
@@ -292,16 +309,16 @@ def test_progress_rendering_is_confined_to_tk_thread_code():
     assert 'ev.kind == "update_progress"' in render and 'ev.kind == "update_done"' in render
     assert "time.sleep" not in SRC[SRC.index("def _open_update_progress("):SRC.index("def _render_event(")]
     stage_src = up.__file__ and Path(up.__file__).read_text(encoding="utf-8")
-    copy_src = stage_src[stage_src.index("def copy_with_progress("):stage_src.index("def stage_update(")]
+    copy_src = stage_src[stage_src.index("def copy_with_progress("):stage_src.index("def _safe_managed_dir(")]
     assert "progress(copied, total" in copy_src and "time." not in copy_src and "sleep" not in copy_src
 
 
 def test_labels_and_build_011():
     for key in ("PREPARING", "COPYING", "VERIFYING", "READY", "APPLYING", "BACKUP", "INSTALLING", "COMPLETE", "ERROR"):
         assert UPDATE_STAGES_VI[key]
-    assert UPDATE_STAGES_VI["COPYING"] == "Đang sao chép bản cập nhật..." and UPDATE_STAGES_VI["ERROR"] == "Cập nhật thất bại"
+    assert UPDATE_STAGES_VI["COPYING"] == "Đang sao chép gói cập nhật..." and UPDATE_STAGES_VI["ERROR"] == "Cập nhật thất bại"
     assert format_bytes(87.1 * (1 << 20)) == "87.1 MB" and format_bytes(11.2 * (1 << 20)) == "11.2 MB"
     p = UpdateProgress(stage="COPYING", bytes_copied=int(58.4 * (1 << 20)), total_bytes=int(87.1 * (1 << 20)),
                        percent=67.0, speed_bps=11.2 * (1 << 20))
     assert p.bytes_text == "58.4 MB / 87.1 MB" and p.speed_text == "Tốc độ: 11.2 MB/s"
-    assert app.__version__ == "1.3.2" and app.BUILD_NUMBER == 15 and app.BUILD_LABEL == "Build 015"
+    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20 and app.BUILD_LABEL == "Build 020"
