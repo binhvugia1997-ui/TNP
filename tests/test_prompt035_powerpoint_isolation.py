@@ -201,6 +201,12 @@ class FakeMachine:
         monkeypatch.setitem(sys.modules, "win32com.client", client)
         # seams introduced by the fix (raising=False: they do not exist in the unsafe implementation)
         monkeypatch.setattr(qrn, "_powerpoint_process_ids", self.process_ids, raising=False)
+        # The fake box's process table cannot vouch for itself: pin the fail-closed default so the suite
+        # models the same machine on every host.  (Left unpinned, a real Windows host vouches for real —
+        # its Toolhelp snapshot works and contains the test process — and the ROT scenarios below take the
+        # activation path instead of the pre-dispatch refusal.)  Suites that model a vouching table
+        # override this AFTER install().
+        monkeypatch.setattr(qrn, "_process_table_vouched", lambda: False, raising=False)
         monkeypatch.setattr(qrn, "_PROCESS_EXIT_TIMEOUT_S", 2.0, raising=False)
         monkeypatch.setattr(qrn, "_PROCESS_POLL_S", 0.0, raising=False)
         # ANY attempt to end a process from the renderer is a test failure

@@ -43,6 +43,9 @@ LEARNING_PREVIEW_WIDTH_PX = 1600
 # PROMPT-027R §30: a preview rendered while a higher-fidelity backend FAILED (not merely absent) is reused only
 # for this many seconds, so a transient COM failure can never pin the fallback for the whole session.
 DEGRADED_PREVIEW_TTL_S = 15.0
+# How long one read-only PowerPoint capability probe may be reused across the candidates of a single Learning
+# poll, so checking a cached preview for staleness does not take a process-table snapshot per candidate.
+PREVIEW_CAPABILITY_MAX_AGE_S = 1.0
 
 # PROMPT-040: the two Excel files the operator picks once and the app then remembers in the existing user
 # config (``last_template`` / ``last_output_file``).  The DTO below is what the UI uses to show the current
@@ -120,7 +123,8 @@ class ApplicationService:
         # PROMPT-024R/027: FULL rendered slide per (report scope, path, slide, mtime, renderer identity,
         # render schema) for the review workspace.  Rendered once and shared by every candidate of that
         # report+slide; never shared across reports (§40/§54).  Value: {"src", "width", "height",
-        # "backend", "faithful", "regions"} — see :meth:`_slide_preview_for`.
+        # "backend", "faithful", "reason", "regions"} — see :meth:`_slide_preview_for`.  "reason" (PROMPT-041) is
+        # the stable slug saying WHY the render is not PowerPoint-faithful; "" when it is faithful.
         self._slide_preview_cache: Dict[tuple, Dict[str, Any]] = {}
         # PROMPT-032: Learning is polled while its tab is open.  Emit one diagnostic only when the lifecycle/count
         # signature changes, never one per poll; values are counts/states only and contain no paths or payloads.
@@ -1589,7 +1593,7 @@ class ApplicationService:
         after :data:`DEGRADED_PREVIEW_TTL_S`, so recovery is never hidden.  §15: the evidence regions returned here are
         the SAME :class:`ImprovementVisualRegion` objects the production Excel pipeline crops from.
         """
-        empty = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "regions": []}
+        empty = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "reason": "", "regions": []}
         regions: List[Dict[str, Any]] = []
         try:
             from .qpn_renderer import RENDER_SCHEMA_VERSION, SlideRenderer, is_faithful_backend
@@ -1611,11 +1615,23 @@ class ApplicationService:
                    *signature)
             cached = self._slide_preview_cache.get(key)
             if cached is not None and not self._preview_expired(cached):
-                return dict(cached)
+                if self._degraded_reason_is_stale(cached):
+                    LOG.info("SLIDE_PREVIEW_CACHE hit=1 source=memory stale_reason=1 cached_backend=%s "
+                             "cached_reason=%s action=discard-and-rerender",
+                             cached.get("backend") or "-", cached.get("reason") or "-")
+                    self._slide_preview_cache.pop(key, None)      # the machine state that produced it is gone
+                else:
+                    LOG.info("SLIDE_PREVIEW_CACHE hit=1 source=memory stale_reason=0 cached_backend=%s "
+                             "cached_reason=%s action=reuse",
+                             cached.get("backend") or "-", cached.get("reason") or "-")
+                    return dict(cached)
             persisted = assets.slide(digest(key), signature) if assets is not None and cached is None else None
             if persisted and not self._preview_expired(persisted):
-                self._remember_preview(key, persisted)
-                return persisted
+                if self._degraded_reason_is_stale(persisted):
+                    persisted = None                              # ditto for a preview restored from disk
+                else:
+                    self._remember_preview(key, persisted)
+                    return persisted
             from .pptx_parser import parse_pptx
             report = parse_pptx(source)
             if report.slide(slide_number) is None:
@@ -1630,8 +1646,12 @@ class ApplicationService:
             with tempfile.TemporaryDirectory(prefix="re_learning_slide_") as tmp:
                 paths = renderer.render(report, [slide_number], Path(tmp), purpose="learning_preview")
                 degraded = renderer.degraded
+                # PROMPT-041: the STABLE reason the preview is not PowerPoint-faithful (a slug, never a path),
+                # so the UI can say "your own PowerPoint is open" instead of "PowerPoint is unavailable".
+                reason = renderer.preview_reason
                 rendered = paths.get(slide_number)
                 if rendered is None or not Path(rendered).exists():
+                    result["reason"] = reason
                     self._remember_preview(key, {**result, "degraded": True, "created": time.monotonic()})
                     return result                            # no bitmap, but the region truth is kept
                 from PIL import Image
@@ -1644,6 +1664,7 @@ class ApplicationService:
                            "width": width, "height": height,
                            "backend": renderer.last_backend or "",
                            "faithful": is_faithful_backend(renderer.last_backend),
+                           "reason": reason,
                            "degraded": degraded, "created": time.monotonic()})
             if assets is not None:
                 result = assets.remember_slide(key, result)
@@ -1668,6 +1689,27 @@ class ApplicationService:
         model_identity = (str(getattr(model, "trained_at", "")), int(getattr(model, "n_examples", 0) or 0)) \
             if model is not None else None
         return (bool(getattr(learning, "enabled", True)), model_identity, overrides)
+
+    @staticmethod
+    def _degraded_reason_is_stale(entry: Dict[str, Any]) -> bool:
+        """PROMPT-041W contract E: a cached fallback must never keep asserting a machine fact that no longer holds.
+
+        A preview rendered while the user's PowerPoint was open is cached (correctly — it is still a true picture
+        of the slide) together with the reason it is only a fallback.  But that reason is a claim about the
+        machine, and the machine moves on: the moment PowerPoint is no longer in the way, showing "PowerPoint is
+        running" again would be a lie, so the entry is dropped and re-rendered NOW instead of waiting out the
+        degraded TTL.  Anything that is not a PowerPoint-blocked fallback is left alone — the TTL still governs
+        it, so a genuinely broken backend is not hammered on every poll.
+        """
+        if not entry.get("degraded"):
+            return False
+        try:
+            from .qpn_renderer import POWERPOINT_PRESENT_REASONS, powerpoint_render_capability
+            if (entry.get("reason") or "") not in POWERPOINT_PRESENT_REASONS:
+                return False
+            return bool(powerpoint_render_capability(max_age_s=PREVIEW_CAPABILITY_MAX_AGE_S).isolated)
+        except Exception:  # noqa: BLE001 – an unreadable machine state must not break the preview
+            return False
 
     @staticmethod
     def _preview_expired(entry: Dict[str, Any]) -> bool:
@@ -1772,7 +1814,8 @@ class ApplicationService:
         except Exception as exc:  # noqa: BLE001 – display-only preview must never erase truthful metadata
             opaque_id = hashlib.sha256(str(candidate.candidate_id).encode("utf-8")).hexdigest()[:12]
             LOG.warning("LEARNING_IMAGE_PREVIEW_FAILED candidate=%s error=%s", opaque_id, type(exc).__name__)
-            preview = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "regions": []}
+            preview = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "reason": "",
+                       "regions": []}
         if not getattr(candidate, "_snapshot_changed", False):
             assets.remember_candidate(candidate, src, preview)
         # PROMPT-027 §13/§15: the picture candidate and the FINAL Excel evidence region are two different
@@ -1807,6 +1850,9 @@ class ApplicationService:
                 # pixel-faithful PowerPoint output.  Drives the reduced-fidelity notice — never a path.
                 "slidePreviewBackend": preview.get("backend") or "",
                 "slidePreviewFaithful": bool(preview.get("faithful")),
+                # PROMPT-041: WHY it is not faithful, as a stable slug the UI can turn into an actionable hint
+                # ("powerpoint-user-session-running" ≠ "powerpoint-unavailable").  Never a path, never a PID.
+                "slidePreviewReason": preview.get("reason") or "",
                 # PROMPT-027 §14: the FINAL After evidence region production would export to Excel
                 "evidenceRegionBbox": evidence_bbox,
                 "evidenceRegionBboxPct": evidence_pct,
