@@ -750,3 +750,24 @@ trước khi UI hiện ra.
 - KHÔNG đổi: version/build (vẫn 1.3.4 / Build 017), logic trích xuất, `ImprovementItem` / `AfterVisualRegion`,
   renderer, React UI, `ReportExtractor.spec`, `backup/…STABLE/`. KHÔNG merge PR #7, KHÔNG xuất bản LAN,
   KHÔNG tạo ZIP phát hành, KHÔNG chạy `BUILD_AND_PUBLISH.bat`, KHÔNG force push.
+
+## PROMPT-041 / PROMPT-041W — PowerPoint isolation diagnostics + ROT false positive (merged to main 20/10/2026)
+- PROMPT-041: PowerPoint is a Multiuse (Single Instance) COM server, so an isolated second instance in the user's
+  session cannot be created; the renderer keeps the PROMPT-035 fail-closed refusal but now carries stable reason
+  codes end to end (snapshot/ownership/isolation log lines + Learning DTO reason), so "PowerPoint installed but
+  the user's session is in the way" is never reported as "PowerPoint unavailable".
+- PROMPT-041W: the process table is the ONLY source of process facts. A stale Running Object Table entry (left
+  behind after a crash/kill) is diagnostic only and no longer becomes the claim "a PowerPoint session is running"
+  when the vouched process table is empty; activation is then attempted and the post-dispatch PID proof decides
+  ownership (`powerpoint-ownership-unproven` when it cannot be proven).
+- Windows acceptance (GD1, by owner on a real Windows box): manual Scenario A (no POWERPNT process) and
+  Scenario B (user PowerPoint open, unsaved edits untouched) verified. Targeted suites initially failed 3 on
+  Windows (89/92) — all three were test-side environment pinning, not production defects: the shared FakeMachine
+  did not pin `_process_table_vouched`, so a real Windows host (whose Toolhelp snapshot legitimately vouches)
+  took the activation path the Linux sandbox never takes, and `test_08b` asserted an off-Windows-only ambient
+  default. Fixed test-only in 91653c7 (pin the vouch in `FakeMachine.install`; platform-gate the ambient
+  assertion) — no production code changed, no safety assertion weakened. Windows re-run: 92/92 passed.
+- Independent Linux verification: targeted 92/92; full suite 1385 passed / 13 skipped / 5 failed, the 5 failures
+  (test_prompt027/027r/028) reproduce identically on the integration base, so they pre-date this work.
+- Merged: PR #17 → integration (ffb54de), then integration → main via PR #18 (700c3a7). Version/build unchanged
+  (v1.3.7 / Build 020). No LAN publish.
