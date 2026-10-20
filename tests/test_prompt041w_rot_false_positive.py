@@ -295,7 +295,10 @@ def test_08_empty_set_and_none_are_never_confused(monkeypatch):
 
 def test_08b_the_vouch_is_what_separates_truly_empty_from_could_not_see(monkeypatch):
     """A snapshot missing our own PID did not see the whole table, so its empty answer is worthless."""
-    assert qrn._process_table_vouched() is False, "off Windows nothing vouches: the fail-closed default"
+    if qrn.sys.platform != "win32":
+        assert qrn._process_table_vouched() is False, "off Windows nothing vouches: the fail-closed default"
+    # (on a real Windows host the ambient answer is legitimately True — the snapshot works and contains
+    # our own PID — so only the synthetic-table logic below is asserted there)
     monkeypatch.setattr(qrn.sys, "platform", "win32")
     monkeypatch.setattr(qrn, "_enumerate_processes", lambda image_name=None: frozenset({111, 222}))
     monkeypatch.setattr(qrn.os, "getpid", lambda: 999)
