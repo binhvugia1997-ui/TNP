@@ -34,3 +34,6 @@ learning_data/
 /README.txt
 /_internal/
 /SHA256SUMS.txt
+
+# Separate project repository
+/TAT_QPN_PHASE6/
