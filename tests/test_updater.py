@@ -141,16 +141,16 @@ def _ctl(tmp_path, update_path=""):
 
 # ---------------------------------------------------------------------------- version identity (§21/§23)
 def test_numeric_build_display_and_constants():
-    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20
-    assert app.BUILD_ID == "020" and app.BUILD_LABEL == "Build 020" and app.APP_TITLE == "Report Extractor v1.3.7"
+    assert app.__version__ == "1.4.0" and app.BUILD_NUMBER == 21
+    assert app.BUILD_ID == "021" and app.BUILD_LABEL == "Build 021" and app.APP_TITLE == "Report Extractor v1.4.0"
     assert app.format_build(4) == "004" and app.format_build(5) == "005" and app.format_build(15) == "015"
     assert app.format_build(1234) == "1234"
-    assert up.version_label() == "1.3.7 — Build 020" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
+    assert up.version_label() == "1.4.0 — Build 021" and up.version_label("1.0.5", 5) == "1.0.5 — Build 005"
     assert "git" not in app.BUILD_ID.lower() and app.BUILD_ID.isdigit()
 
 
 def test_build_script_uses_the_same_constants():
-    assert bp._version() == ("1.3.7", "020") and bp.build_number() == 20
+    assert bp._version() == ("1.4.0", "021") and bp.build_number() == 21
     assert bp.package_name("1.0.5") == "ReportExtractor_1.0.5.zip"
 
 
@@ -798,7 +798,7 @@ def test_update_path_persisted_in_config(tmp_path):
 def test_controller_check_async_and_status_texts(tmp_path):
     folder = make_update_folder(tmp_path / "Update", version=V_NEWER, build=B_NEWER)
     c = _ctl(tmp_path, str(folder))
-    assert c.current_version_text() == "Phiên bản hiện tại: 1.3.7 — Build 020" == f"Phiên bản hiện tại: {app.VERSION_LABEL}"
+    assert c.current_version_text() == "Phiên bản hiện tại: 1.4.0 — Build 021" == f"Phiên bản hiện tại: {app.VERSION_LABEL}"
     assert c.update_status_text() == "Chưa kiểm tra cập nhật."
     assert c.check_update_async(startup=True)
     c._update_thread.join(10)
@@ -861,8 +861,8 @@ def test_gui_update_card_controls(monkeypatch, tmp_path):
     btn_texts = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Button"}
     assert {"Chọn...", "Kiểm tra cập nhật", "Cập nhật ngay"} <= btn_texts
     labels = {w.cfg.get("text") for w in reg["widgets"] if type(w).__name__ == "Label"}
-    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.3.7 — Build 020" in labels
-    assert a.lbl_build.cfg["text"] == "Build 020"
+    assert "Đường dẫn cập nhật:" in labels and "Phiên bản hiện tại: 1.4.0 — Build 021" in labels
+    assert a.lbl_build.cfg["text"] == "Build 021"
     assert a.btn_install_update.cfg["state"] == "disabled"
     # startup check scheduled asynchronously (after), not inline
     assert any(ms == gui.STARTUP_UPDATE_DELAY_MS for ms, _ in a.root.scheduled) and 2000 <= gui.STARTUP_UPDATE_DELAY_MS <= 5000

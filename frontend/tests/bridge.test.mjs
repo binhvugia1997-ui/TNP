@@ -359,7 +359,7 @@ test('normal ready path pings, loads version/config/dashboard, and adds no start
     fakeWindow.pywebview = {
       api: {
         ping: async () => { calls.push('ping'); return { ok: true, data: 'Python bridge OK' } },
-        get_app_version: async () => { calls.push('get_app_version'); return { ok: true, data: { version: '1.3.7', build: '020' } } },
+        get_app_version: async () => { calls.push('get_app_version'); return { ok: true, data: { version: '1.4.0', build: '021' } } },
         get_current_config: async () => { calls.push('get_current_config'); return { ok: true, data: { config: true } } },
         get_dashboard_state: async () => { calls.push('get_dashboard_state'); return { ok: true, data: { dashboard: true } } },
       },
@@ -369,7 +369,7 @@ test('normal ready path pings, loads version/config/dashboard, and adds no start
 
     assert.deepEqual(calls, ['ping', 'get_app_version', 'get_current_config', 'get_dashboard_state'])
     assert.deepEqual(initial, {
-      version: { version: '1.3.7', build: '020' },
+      version: { version: '1.4.0', build: '021' },
       config: { config: true },
       dashboard: { dashboard: true },
     })
@@ -388,7 +388,7 @@ test('a slow-but-successful dashboard call during startup resolves instead of be
     fakeWindow.pywebview = {
       api: {
         ping: async () => ({ ok: true, data: 'Python bridge OK' }),
-        get_app_version: async () => ({ ok: true, data: { version: '1.3.7', build: '020' } }),
+        get_app_version: async () => ({ ok: true, data: { version: '1.4.0', build: '021' } }),
         get_current_config: async () => ({ ok: true, data: { config: true } }),
         get_dashboard_state: async () => {
           await delay(150) // simulates a genuinely slow, but healthy, dashboard_state() build

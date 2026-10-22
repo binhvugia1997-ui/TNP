@@ -273,8 +273,8 @@ def test_update_card_layout_and_build_009(monkeypatch, tmp_path):
     body = a.cfg_cards["update"]
     rows = {w.grid_info_.get("row") for w in reg["widgets"] if getattr(w, "master", None) is body and w.grid_info_}
     assert rows == {0, 1, 2, 3, 4, 5} and a.chk_auto_update.grid_info_["row"] == 2 < a.lbl_update.grid_info_["row"]
-    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.3.7 — Build 020"
-    assert app.__version__ == "1.3.7" and app.BUILD_NUMBER == 20 and app.BUILD_LABEL == "Build 020"
+    assert a.lbl_cur_version.cfg["text"] == "Phiên bản hiện tại: 1.4.0 — Build 021"
+    assert app.__version__ == "1.4.0" and app.BUILD_NUMBER == 21 and app.BUILD_LABEL == "Build 021"
     assert a.cfg_page.row_weights == {3: 1}                             # responsive settings page unchanged
 
 
@@ -308,6 +308,6 @@ def test_legacy_beta_client_sees_1_2_0_build_011_as_normal_update(tmp_path):
     assert up.check_for_update(str(folder), current_build=11, current_version="1.2.0").status == "latest"
     assert up.check_for_update(str(folder), current_build=12, current_version="1.2.2").status == "older"
     assert up.check_for_update(str(folder), current_build=12, current_version="1.2.1").status == "older"
-    assert up.version_label() == "1.3.7 — Build 020"
+    assert up.version_label() == "1.4.0 — Build 021"
     import build_portable as bp
-    assert bp.package_name(app.__version__) == "ReportExtractor_1.3.7.zip" and bp._version() == ("1.3.7", "020")
+    assert bp.package_name(app.__version__) == "ReportExtractor_1.4.0.zip" and bp._version() == ("1.4.0", "021")

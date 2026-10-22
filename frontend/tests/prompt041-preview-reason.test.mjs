@@ -22,8 +22,8 @@ import { fileURLToPath } from 'node:url'
 const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
 const delay = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms))
 
-const APP_VERSION = '1.3.7'
-const APP_BUILD = '020'
+const APP_VERSION = '1.4.0'
+const APP_BUILD = '021'
 const SLIDE_W = 9144000
 const SLIDE_H = 5143500
 const PREVIEW = 'data:image/svg+xml;base64,PHN2ZyBpZD0ic2xpZGUiLz4='
