@@ -1,0 +1,58 @@
+# Build ReportExtractor Windows Portable on GitHub's Windows runner.
+# Manual only (workflow_dispatch): no install on Gia's company PC, no LAN publish.
+# Runs the repo's own builder: tools/build_portable.py --no-publish
+# (pyflakes + pytest + npm build + PyInstaller + package validation + ZIP/SHA256/version.json).
+# Output: release/ReportExtractor_1.4.0.zip (+ SHA256SUMS.txt, version.json) as a workflow artifact.
+name: Build Windows Portable (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-portable:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12 (64-bit)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Set up Node 20 (frontend build only, target PC needs no Node)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Show tool versions
+        run: |
+          python --version
+          node --version
+          npm --version
+          git --version
+
+      - name: Build portable (repo's own builder, no LAN publish)
+        run: |
+          $py = (Get-Command python).Source
+          python tools/build_portable.py --python "$py" --no-publish
+
+      - name: List release output
+        if: always()
+        run: |
+          if (Test-Path release) { Get-ChildItem -Recurse release | Select-Object FullName, Length }
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReportExtractor_v1.4.0_Build021_portable
+          path: |
+            release/ReportExtractor_1.4.0.zip
+            release/SHA256SUMS.txt
+            release/version.json
+          if-no-files-found: error
+          retention-days: 30
