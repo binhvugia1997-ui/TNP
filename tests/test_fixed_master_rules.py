@@ -36,7 +36,9 @@ def _run(files, template, out, **kw):
     events = []
     opts = BatchOptions(files=[Path(f) for f in files], template=template, output_file=out, use_ollama=False, **kw)
     proc = BatchProcessor(opts, on_file=lambda i, s, d: events.append((i, s, d)))
-    return proc.run(), events, proc
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        return proc.run(), events, proc
 
 
 def _images_at(ws, row, col):

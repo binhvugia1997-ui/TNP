@@ -20,6 +20,14 @@ from app.preview_geometry import (fit_slide_box, map_fraction_box_to_px, map_sli
 from tests.test_application_service import _learning_candidates, _make_service, _scan
 from tests.test_prompt025_multi_item import NAME, _deck, _two_item_slide
 
+
+@pytest.fixture(autouse=True)
+def _stub_powerpoint_render(monkeypatch):
+    # Learning previews are PowerPoint-only (fail-closed); stub the COM export on Linux.
+    # No test in this file asserts degraded/fallback preview behavior.
+    from tests.powerpoint_render_stub import stub_powerpoint_render
+    stub_powerpoint_render(monkeypatch)
+
 EMU_PER_INCH = 914400
 
 

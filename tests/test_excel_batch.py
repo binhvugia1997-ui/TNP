@@ -132,7 +132,9 @@ def _run_batch(files, template, out, **kw):
     events = []
     opts = BatchOptions(files=[Path(f) for f in files], template=template, output_file=out, use_ollama=False, row_mode="append", **kw)
     proc = BatchProcessor(opts, on_file=lambda i, s, d: events.append((i, s, d)))
-    summary = proc.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = proc.run()
     return summary, events, proc
 
 
@@ -190,7 +192,9 @@ def test_stop_after_current_file(sample_tree, tmp_path):
     opts = BatchOptions(files=list(sample_tree["files"]), template=sample_tree["template"], output_file=out, use_ollama=False, row_mode="append")
     proc = BatchProcessor(opts)
     proc.on_file = lambda i, s, d: proc.request_stop() if (i == 0 and s == "reading") else None
-    summary = proc.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = proc.run()
     assert summary.stopped is True
     assert summary.completed + summary.needs_review == 1
     assert out.exists()
@@ -201,9 +205,11 @@ def test_batch_runs_in_worker_thread(sample_tree, tmp_path):
     done = threading.Event()
     opts = BatchOptions(files=[sample_tree["files"][0]], template=sample_tree["template"], output_file=out, use_ollama=False, row_mode="append")
     proc = BatchProcessor(opts, on_done=lambda s: done.set())
-    t = proc.start()
-    assert t is not threading.current_thread()
-    assert done.wait(60)
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        t = proc.start()
+        assert t is not threading.current_thread()
+        assert done.wait(60)
     assert proc.summary.completed == 1
 
 

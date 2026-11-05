@@ -94,7 +94,9 @@ def _run(files, template, out, **kw):
     opts = BatchOptions(files=[Path(f) for f in files], template=template, output_file=out, use_ollama=False,
                         **{"today": RUN_TODAY, **kw})
     proc = BatchProcessor(opts, on_file=lambda i, s, d: events.append((i, s, d)))
-    summary = proc.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = proc.run()
     return summary, events, proc
 
 
@@ -511,8 +513,10 @@ def test_gui_counters_progress_denominator_and_eta(sample_tree, tmp_path, monkey
     assert ctl.period_label() == "Thời gian xử lý: 01/09/2026 → 30/09/2026 (từ tên file Excel)"   # 63
     assert ctl.validate() == []
     assert len(ctl.all_files) == 7
-    assert ctl.start(use_ollama=False)                      # no reviewed list yet -> the real pre-scan runs first
-    ctl.processor._thread.join(120)
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        assert ctl.start(use_ollama=False)                      # no reviewed list yet -> the real pre-scan runs first
+        ctl.processor._thread.join(120)
     events = ctl.pump()
     kinds = [e.kind for e in events]
     assert kinds.index("prescan") < kinds.index("row")                                 # counters first

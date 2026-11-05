@@ -187,7 +187,9 @@ def _run_batch(files, template, output, **kw):
     processor = BatchProcessor(BatchOptions(
         files=[Path(f) for f in files], template=template, output_file=output,
         use_ollama=False, use_fast_cache=False, use_image_learning=False, **kw))
-    summary = processor.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = processor.run()
     assert summary.failed == 0
     return processor
 
@@ -499,7 +501,9 @@ def test_stop_after_current_file_keeps_multi_item_row_complete(tmp_path):
                         use_ollama=False, use_fast_cache=False, use_image_learning=False)
     proc = BatchProcessor(opts, on_file=lambda i, s, d: events.append((i, s, d)))
     proc.on_file = lambda i, s, d: (events.append((i, s, d)), proc.request_stop()) if (i == 0 and s == "reading") else events.append((i, s, d))
-    summary = proc.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = proc.run()
     assert summary.stopped is True
     assert summary.completed + summary.needs_review == 1        # current file finished, batch stopped
     assert out.exists()

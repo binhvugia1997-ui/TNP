@@ -105,7 +105,9 @@ def _run_batch(files, template: Path, output: Path):
         files=[Path(path) for path in files], template=template, output_file=output,
         use_ollama=False, use_fast_cache=False, use_image_learning=False,
     ))
-    summary = processor.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = processor.run()
     assert summary.failed == 0
     return processor
 
@@ -246,7 +248,9 @@ def test_force_reprocess_replaces_only_the_matching_management_number_images(tmp
         files=[path_a], template=template, output_file=output, use_ollama=False,
         use_fast_cache=False, use_image_learning=False, force_reprocess=True,
     ))
-    summary = forced.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = forced.run()
     assert summary.failed == 0
     assert forced.results[0].management_number == MN_A and forced.results[0].excel_row == 4
     saved = load_workbook(output)[SHEET]

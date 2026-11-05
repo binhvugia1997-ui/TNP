@@ -43,7 +43,9 @@ def test_stop_after_current_completes_multi_item_report_and_queue_never_starts(s
             proc.request_stop()
 
     proc.on_file = lambda i, s, d: (_stop_once(i, s, d), events.append((i, s, d)))
-    summary = proc.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        summary = proc.run()
 
     assert summary.stopped is True and summary.cancel_requested is False
     assert summary.cancelled == 0 and summary.failed == 0

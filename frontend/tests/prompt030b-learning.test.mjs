@@ -139,7 +139,7 @@ test('labels are first in right panel; single click only focuses; no-label doubl
   } finally { await h.cleanup() }
 })
 
-test('native double-click sequence confirms once in StrictMode via the 036S atomic API', async () => {
+test('double-click stages without saving; Save confirms once in StrictMode via the 036S atomic API', async () => {
   const h = await harness([candidate('a1')])
   try {
     await h.event(h.label('Sau cải tiến'))
@@ -149,7 +149,10 @@ test('native double-click sequence confirms once in StrictMode via the 036S atom
     await h.event(h.item(0), 'click', { detail: 2 })
     await h.event(h.item(0), 'dblclick', { detail: 2 })
     await h.event(h.item(0), 'dblclick', { detail: 2 })
-    assert.equal(h.state.single.length, 1)
+    assert.equal(h.state.single.length, 0, 'double-click must stage only, never save')
+    assert.equal(h.state.bulk.length, 0)
+    await h.event(h.label('Lưu nhãn & ghi chú'))
+    assert.equal(h.state.single.length, 1, 'only the Save button persists the staged label')
     assert.equal(h.state.bulk.length, 0)
     await h.settle(true)
     assert.match(h.container.textContent, /Đã xác nhận 1 ảnh/)
@@ -183,10 +186,15 @@ test('bulk save is optimistic, bounded to one ack, defers polling and retains un
   try {
     await h.event(h.item(0))
     await h.event(h.item(1), 'click', { ctrlKey: true })
-    h.state.defer = true
+    // Label click stages both candidates only — no save until the Save button is pressed.
     await h.event(h.label('Sau cải tiến'))
-    assert.equal(h.state.bulk.length, 1)
+    assert.equal(h.state.bulk.length, 0, 'label click must stage only, never save')
+    assert.equal(h.state.single.length, 0)
+    assert.equal(h.state.fast.length, 2, 'one staged fast write per selected candidate')
     assert.deepEqual(h.state.store.learning.images.map((c) => [c.userLabel, c.labelPending]), [['AFTER', true], ['AFTER', true]])
+    h.state.defer = true
+    await h.event(h.label('Lưu nhãn & ghi chú'))
+    assert.equal(h.state.bulk.length, 1, 'only the Save button starts the bulk save')
     const fullBefore = h.state.fullCalls
     await React.act(async () => { await h.state.store.refreshLearning() })
     assert.equal(h.state.fullCalls, fullBefore, 'poll must defer while saving')
@@ -195,16 +203,16 @@ test('bulk save is optimistic, bounded to one ack, defers polling and retains un
     assert.deepEqual(h.state.store.learning.images.map((c) => [c.userLabel, c.labelPending]), [['AFTER', true], ['AFTER', true]])
     assert.equal(h.container.querySelectorAll('[data-selected="true"]').length, 2)
     h.state.defer = false
-    await h.event(h.label('Sau cải tiến'))
+    await h.event(h.label('Lưu nhãn & ghi chú'))
     await waitFor(() => h.state.store.learning.images.every((c) => c.labelPending === false), 'bulk retry saved')
     assert.equal(h.state.bulk.length, 2)
-    assert.equal(h.state.fast.length + h.state.legacy.length + h.state.single.length, 0)
+    assert.equal(h.state.legacy.length + h.state.single.length, 0)
     assert.deepEqual(h.state.bulk[1].notes, { 'review:report-a:a1': 'note-a1', 'review:report-a:a2': 'note-a2' })
     assert.equal(h.state.store.learning.counts.image.labeled, 2)
   } finally { await h.cleanup() }
 })
 
-test('double-click preserves existing multi-selection through both native clicks and makes one bulk save', async () => {
+test('double-click preserves existing multi-selection and stages both; Save makes one bulk save', async () => {
   const h = await harness([candidate('a1'), candidate('a2')])
   try {
     await h.event(h.label('Sau cải tiến')) // explicit active label, single optimistic fast set only
@@ -213,7 +221,11 @@ test('double-click preserves existing multi-selection through both native clicks
     await h.event(h.item(1), 'click', { detail: 1 })
     await h.event(h.item(1), 'click', { detail: 2 })
     await h.event(h.item(1), 'dblclick', { detail: 2 })
-    await waitFor(() => h.state.bulk.length === 1, 'one bulk quick confirmation')
+    assert.equal(h.state.bulk.length, 0, 'double-click must stage only, never save')
+    assert.equal(h.state.single.length, 0)
+    assert.equal(h.container.querySelectorAll('[data-selected="true"]').length, 2, 'selection survives staging')
+    await h.event(h.label('Lưu nhãn & ghi chú'))
+    await waitFor(() => h.state.bulk.length === 1, 'one bulk save from the Save button')
     assert.equal(h.state.bulk[0].ids.length, 2)
     assert.equal(h.state.single.length, 0)
     assert.equal(h.state.legacy.length, 0)

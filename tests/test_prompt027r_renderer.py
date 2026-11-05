@@ -17,8 +17,8 @@ from PIL import Image
 import app.application_service as svc
 import app.qpn_renderer as qrn
 from app.pptx_parser import parse_pptx
-from app.qpn_renderer import (FAITHFUL_BACKENDS, PowerPointStageError, SlideRenderer, is_faithful_backend,
-                              powerpoint_probe, render_with_powerpoint)
+from app.qpn_renderer import (FAITHFUL_BACKENDS, REASON_UNAVAILABLE, PowerPointStageError, SlideRenderer,
+                              is_faithful_backend, powerpoint_probe, render_with_powerpoint)
 from tests.test_after_evidence import _deck, _pics
 from tests.test_prompt027_rendering import _candidate, _preview_service, _simple_slide
 from tests.test_prompt025_multi_item import NAME, _two_item_slide
@@ -483,7 +483,11 @@ def test_preview_identity_includes_backend_availability(tmp_path, monkeypatch):
     monkeypatch.setattr(qrn, "powerpoint_available", lambda: False)
     monkeypatch.setattr(qrn, "find_soffice", lambda: None)
     fallback = service._slide_preview_for(candidate)
-    assert fallback["backend"] == "builtin" and fallback["faithful"] is False
+    # PowerPoint-only preview: no PowerPoint, no fallback bitmap — an empty preview carrying the
+    # stable reason instead of a silently degraded builtin render.
+    assert fallback["src"] == "" and fallback["backend"] == "" and fallback["faithful"] is False
+    assert fallback["reason"] == REASON_UNAVAILABLE
+    assert len(service._slide_preview_cache) == 0, "a failed preview is never cached"
 
     def export(pptx, slide_numbers, out_dir, width_px=1920):
         out = {}
@@ -496,11 +500,16 @@ def test_preview_identity_includes_backend_availability(tmp_path, monkeypatch):
     monkeypatch.setattr(qrn, "powerpoint_available", lambda: True)
     monkeypatch.setattr(qrn, "render_with_powerpoint", export)
     recovered = service._slide_preview_for(candidate)
-    assert len(service._slide_preview_cache) == 2, "a newly available backend is a new identity, not a stale hit"
+    # the failed preview was never cached, so the recovered render is the first cache entry — and it
+    # is a real render, never a stale empty hit
+    assert len(service._slide_preview_cache) == 1, "a newly available backend renders anew, not a stale hit"
     assert recovered["backend"] == "powerpoint" and recovered["faithful"] is True
 
 
-def test_degraded_fallback_is_retried_after_the_ttl_and_then_recovers(tmp_path, monkeypatch):
+def test_powerpoint_only_preview_is_retried_on_every_access_and_recovers(tmp_path, monkeypatch):
+    """Fail-closed contract (replaces the degraded-fallback TTL contract): a PowerPoint failure
+    yields an EMPTY preview with the stable reason and is never cached, so every access retries
+    the render and recovery is immediate — no TTL wait, no stale fallback bitmap."""
     deck = _two_item_slide_deck(tmp_path)
     service = _preview_service()
     candidate = _candidate(deck)
@@ -522,13 +531,14 @@ def test_degraded_fallback_is_retried_after_the_ttl_and_then_recovers(tmp_path, 
     monkeypatch.setattr(qrn, "powerpoint_available", lambda: True)
     monkeypatch.setattr(qrn, "render_with_powerpoint", flaky)
     first = service._slide_preview_for(candidate)
-    assert first["backend"] == "builtin" and first["degraded"] is True and state["renders"] == 1
+    assert first["src"] == "" and first["backend"] == "" and first["degraded"] is True
+    assert first["reason"] == "powerpoint-slide-export" and state["renders"] == 1
     service._slide_preview_for(candidate)
-    assert state["renders"] == 1, "within the TTL a degraded preview is reused (no re-render per candidate)"
+    assert state["renders"] == 2, "a failed preview is never cached: the next access retries at once"
     clock["now"] += svc.DEGRADED_PREVIEW_TTL_S + 1
     state["broken"] = False                                   # COM recovered
     recovered = service._slide_preview_for(candidate)
-    assert state["renders"] == 2
+    assert state["renders"] == 3
     assert recovered["backend"] == "powerpoint" and recovered["degraded"] is False
 
 

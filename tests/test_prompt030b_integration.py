@@ -57,7 +57,9 @@ def _deterministic_backend(monkeypatch):
     monkeypatch.setattr(renderer_module, "find_soffice", lambda: None)
 
 
-def test_real_production_flow_restores_unlabeled_and_confirmed_offline_with_geometry(tmp_path):
+def test_real_production_flow_restores_unlabeled_and_confirmed_offline_with_geometry(tmp_path, monkeypatch):
+    from tests.powerpoint_render_stub import stub_powerpoint_render
+    stub_powerpoint_render(monkeypatch)  # production previews are PowerPoint-only; stub COM on Linux
     service, controller, _processor, deck = _finished_production_service(tmp_path)
     first = service.learning_state()
     assert first["images"]
@@ -65,7 +67,7 @@ def test_real_production_flow_restores_unlabeled_and_confirmed_offline_with_geom
     assert row["src"].startswith("data:image/jpeg;base64,")
     assert row["slidePreview"].startswith("data:image/jpeg;base64,")
     assert row["slidePreviewWidth"] == 1600 and row["slidePreviewHeight"] > 100
-    assert row["slidePreviewBackend"] == "builtin" and not row["slidePreviewFaithful"]
+    assert row["slidePreviewBackend"] == "powerpoint" and row["slidePreviewFaithful"]
     assert row["evidenceRegionBbox"] and row["itemIndex"] == 0
 
     # No label required: actual candidates are durable too, not just their eventual training rows.
@@ -134,6 +136,8 @@ def test_scoped_pixels_review_identity_and_restart_dedup_do_not_change_classifie
 
 
 def test_multiple_candidates_share_one_slide_asset_and_polls_do_not_rewrite(tmp_path, monkeypatch):
+    from tests.powerpoint_render_stub import stub_powerpoint_render
+    stub_powerpoint_render(monkeypatch)  # production previews are PowerPoint-only; stub COM on Linux
     deck = _deck(tmp_path / "in" / NAME, [_two_item_slide()])
     service = _service(tmp_path)
     a, b = _candidate(deck), _candidate(deck, shape=12)
@@ -152,6 +156,8 @@ def test_multiple_candidates_share_one_slide_asset_and_polls_do_not_rewrite(tmp_
 
 @pytest.mark.parametrize("change", ["mtime", "size", "schema", "width", "availability", "label", "model"])
 def test_persistent_cache_uses_accepted_identity_across_service_restart(tmp_path, monkeypatch, change):
+    from tests.powerpoint_render_stub import stub_powerpoint_render
+    stub_powerpoint_render(monkeypatch)  # production previews are PowerPoint-only; stub COM on Linux
     deck = _deck(tmp_path / "in" / NAME, [_two_item_slide()])
     candidate = _candidate(deck)
     original = renderer_module.SlideRenderer.render
@@ -176,22 +182,31 @@ def test_persistent_cache_uses_accepted_identity_across_service_restart(tmp_path
     elif change == "width":
         monkeypatch.setattr(service_module, "LEARNING_PREVIEW_WIDTH_PX", 1400)
     elif change == "availability":
-        monkeypatch.setattr(renderer_module, "powerpoint_available", lambda: True)
-        # A simulated failure (not a fake real-host availability claim) must cause a truthful fallback.
-        def refuse(*args, **kwargs):
-            raise renderer_module.PowerPointStageError("ownership", RuntimeError("test refusal"))
-        monkeypatch.setattr(renderer_module, "render_with_powerpoint", refuse)
+        # Flip availability True -> False (the COM stub starts True): the accepted identity
+        # must change, so the cached pixels are not reused; the fresh attempt then fails
+        # closed with the stable unavailable reason instead of a fallback bitmap.
+        monkeypatch.setattr(renderer_module, "powerpoint_available", lambda: False)
     elif change == "label":
         second.controller.learning.store.label(candidate, "BEFORE")
     else:
         second.controller.learning.model = SimpleNamespace(trained_at="2026-10-16T01:00:00", n_examples=12)
     result = second._slide_preview_for(candidate, second.controller.learning)
-    assert result["src"] and len(calls) == 2, "a changed accepted identity must not reuse disk pixels/regions"
     if change == "availability":
-        assert result["backend"] == "builtin" and not result["faithful"] and result["degraded"]
+        # Fail-closed contract (no degraded fallback bitmap): a refused PowerPoint render
+        # yields an EMPTY preview with the stable reason — the fresh attempt still happened
+        # (calls == 2), so the changed identity did not reuse disk pixels.
+        assert result["src"] == "" and result["backend"] == ""
+        assert result["reason"] == "powerpoint-unavailable" and result["degraded"]
+        assert len(calls) == 2
+    else:
+        assert result["src"] and len(calls) == 2, "a changed accepted identity must not reuse disk pixels/regions"
 
 
-def test_ownership_refusal_diagnostic_and_degraded_ttl_survive_restart_then_recover(tmp_path, monkeypatch, caplog):
+def test_ownership_refusal_diagnostic_and_retry_survive_restart_then_recover(tmp_path, monkeypatch, caplog):
+    """Fail-closed contract (replaces the degraded-fallback TTL contract): an ownership
+    refusal yields an EMPTY preview with the stable reason, is never cached (every access
+    retries), and recovers immediately once PowerPoint renders — no TTL wait, no stale
+    fallback bitmap.  The diagnostic (stage + reason) still survives a service restart."""
     deck = _deck(tmp_path / "in" / NAME, [_two_item_slide()])
     candidate = _candidate(deck)
     clock = {"now": 1000.0, "wall": 1000000.0}
@@ -211,17 +226,18 @@ def test_ownership_refusal_diagnostic_and_degraded_ttl_survive_restart_then_reco
     caplog.set_level("INFO")
     first = _service(tmp_path)
     result = first._slide_preview_for(candidate, first.controller.learning)
-    assert result["backend"] == "builtin" and result["degraded"] and not result["faithful"]
+    assert result["src"] == "" and result["backend"] == "" and result["degraded"]
+    assert result["reason"] == "powerpoint-ownership"
     assert "stage=ownership" in caplog.text and "user instance; refused" in caplog.text
     second = _service(tmp_path)
     second._slide_preview_for(candidate, second.controller.learning)
-    assert len(calls) == 1
+    assert len(calls) == 2, "a failed preview is never cached: the next access retries at once"
     clock["now"] += service_module.DEGRADED_PREVIEW_TTL_S + 1
     clock["wall"] += service_module.DEGRADED_PREVIEW_TTL_S + 1
     broken["value"] = False
     third = _service(tmp_path)
     recovered = third._slide_preview_for(candidate, third.controller.learning)
-    assert len(calls) == 2 and recovered["backend"] == "powerpoint" and recovered["faithful"]
+    assert len(calls) == 3 and recovered["backend"] == "powerpoint" and recovered["faithful"]
     assert not recovered["degraded"]
 
 

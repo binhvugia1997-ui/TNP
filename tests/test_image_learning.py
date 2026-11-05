@@ -270,7 +270,9 @@ def test_26_batch_pipeline_uses_labels_and_reapply_updates_only_image_cell(templ
     lrn_dir = tmp_path / "lrn"
     opts = BatchOptions(files=[deck], template=template, output_file=out, use_ollama=False, learning_dir=lrn_dir)
     proc = BatchProcessor(opts)
-    proc.run()
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        proc.run()
     fr = proc.results[0]
     assert fr.image_candidates and any(c.decision == "review" for c in fr.image_candidates)
     ws = load_workbook(out)[SHEET]
@@ -284,7 +286,9 @@ def test_26_batch_pipeline_uses_labels_and_reapply_updates_only_image_cell(templ
     amb = next(c for c in fr.image_candidates if c.decision == "review")
     lrn.store.label(amb, "AFTER")
     before_cells = {c.coordinate: c.value for c in ws[4] if c.column != COL["image"]}
-    res = reapply_labels(template, out, [amb], lrn)
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # re-apply renders through the PowerPoint-only renderer; stub COM on Linux
+        res = reapply_labels(template, out, [amb], lrn)
     assert res.ok and res.updated_rows == [4] and res.pictures == 1, res.errors
     ws2 = load_workbook(out)[SHEET]
     imgs = _images_at(ws2, 4, COL["image"])
@@ -340,14 +344,17 @@ def test_26_controller_pending_image_retry_regenerates_region_crop(template, tmp
     monkeypatch.setattr(review, "_commit", lock_first_commit)
     monkeypatch.setattr(review, "export_after_pictures", track_region_export)
 
-    ok, msg = ctl.save_confirmations(cands)
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # re-apply renders through the PowerPoint-only renderer; stub COM on Linux
+        ok, msg = ctl.save_confirmations(cands)
     assert ok and "Thử lại cập nhật ảnh đã lưu" in msg
     assert ctl.image_reapply_pending == 1 and len(exports) == 1
     crop_files = list((out.parent / "assets").glob("*_IMPROVEMENT_regions/region_*.png"))
     assert len(crop_files) == 1 and _image_has_rgb(crop_files[0], AFTER_RGB)
     assert len(_images_at(load_workbook(out)[SHEET], 4, COL["image"])) == 0
 
-    ok, msg = ctl.retry_image_reapply()
+    with powerpoint_render_stubbed():
+        ok, msg = ctl.retry_image_reapply()
     assert ok and "đã lưu" in msg and ctl.image_reapply_pending == 0 and len(exports) == 2
     saved = load_workbook(out)[SHEET]
     imgs = _images_at(saved, 4, COL["image"])
