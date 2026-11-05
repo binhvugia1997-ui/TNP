@@ -95,7 +95,7 @@ test('Learning labels: optimistic click, coalesced persist, stale-poll guard, vi
       update: { path: '', autoCheck: true },
     }
     const dashboard = {
-      app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.4.0', build: '021', buildNumber: 21 },
+      app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.4.0', build: '022', buildNumber: 22 },
       config,
       scan: { scanned: false, message: 'No reports selected.' },
       reports: [],

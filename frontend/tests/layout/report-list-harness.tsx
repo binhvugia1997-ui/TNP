@@ -57,8 +57,8 @@ const appDto = () => ({
   name: 'Report Extractor',
   title: 'Report Extractor',
   version: '1.4.0',
-  build: '021',
-  buildNumber: 21,
+  build: '022',
+  buildNumber: 22,
 })
 
 const configDto = () => ({

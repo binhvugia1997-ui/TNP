@@ -168,15 +168,15 @@ def _scan_tree_names(app_):
 
 # ------------------------------------------------------------------ 1 version
 def test_canonical_version_release018():
-    assert app.__version__ == "1.4.0" and app.BUILD_ID == "021" and app.BUILD_LABEL == "Build 021"
-    assert app.APP_TITLE == "Report Extractor v1.4.0" and app.VERSION_LINE == "version=1.4.0 build=021"
+    assert app.__version__ == "1.4.0" and app.BUILD_ID == "022" and app.BUILD_LABEL == "Build 022"
+    assert app.APP_TITLE == "Report Extractor v1.4.0" and app.VERSION_LINE == "version=1.4.0 build=022"
     assert "1.4.0" not in SRC and "Build 014" not in SRC.split('"""', 2)[2]   # header imports the constants
 
 
 def test_window_title_and_header_use_constants(monkeypatch, tmp_path):
     gui, a, reg, _ = _make_app(monkeypatch, tmp_path)
     assert a.root.title_.startswith("Report Extractor v1.4.0")
-    assert a.lbl_version.cfg["text"] == "v1.4.0" and a.lbl_build.cfg["text"] == "Build 021"   # numeric build only
+    assert a.lbl_version.cfg["text"] == "v1.4.0" and a.lbl_build.cfg["text"] == "Build 022"   # numeric build only
     assert a.root.geometry_ == "1400x850" and a.root.minsize_ == (880, 540)
 
 

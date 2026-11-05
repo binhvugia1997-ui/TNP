@@ -84,7 +84,7 @@ async function harness(images) {
     update: { path: '', autoCheck: false },
   }
   const dashboard = {
-    app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.4.0', build: '021', buildNumber: 21 },
+    app: { name: 'Report Extractor', title: 'Report Extractor', version: '1.4.0', build: '022', buildNumber: 22 },
     config, scan: { scanned: false, message: '' }, reports: [],
     job: { status: 'idle', queue: [], index: 0, doneCount: 0, stage: 'waiting', percent: 0, currentFile: '', elapsedSec: 0, remainSec: null, startedAt: null, finishedAt: null, hasSamples: false },
     logs: [], ollama: { ...config.ollama, aiStatus: '', discovering: false, discoveryMessage: '', discoveryResults: [], discoveryChecked: 0, discoveryTotal: 0, serverApplyRunning: false, serverApplyMessage: '' },

@@ -21,7 +21,7 @@ const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
 const delay = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms))
 
 const APP_VERSION = '1.4.0'
-const APP_BUILD = '021'
+const APP_BUILD = '022'
 
 const SLIDE_W = 9144000
 const SLIDE_H = 5143500
@@ -501,7 +501,7 @@ test('the header shows version AND build so a stale Windows checkout is obvious'
     const badge = harness.container.querySelector('[data-testid="app-version-badge"]')
     assert.ok(badge, 'the version badge must render')
     assert.equal(badge.textContent, `v${APP_VERSION} · Build ${APP_BUILD}`)
-    assert.match(badge.textContent, /v1\.4\.0 · Build 021/)
+    assert.match(badge.textContent, /v1\.4\.0 · Build 022/)
     // no duplicated version text in the product title next to it
     assert.equal(harness.container.querySelector('h1').textContent, 'Report Extractor')
   } finally {
