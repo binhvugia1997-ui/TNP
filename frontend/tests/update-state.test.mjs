@@ -23,8 +23,8 @@ after(async () => {
 
 const available = (overrides = {}) => ({
   path: 'configured-update', autoCheck: true, status: 'available',
-  message: 'Có phiên bản mới: 1.4.0 — Build 021',
-  available: { version: '1.4.0', build: '021', package: 'ReportExtractor_1.4.0.zip', size: 1_234_567 },
+  message: 'Có phiên bản mới: 1.4.0 — Build 022',
+  available: { version: '1.4.0', build: '022', package: 'ReportExtractor_1.4.0.zip', size: 1_234_567 },
   progress: 0, progressStage: '', installEnabled: true, canInstall: true,
   installDisabledReason: '', error: '', ...overrides,
 })
@@ -34,7 +34,7 @@ test('a valid production update DTO preserves backend install permission and pac
   assert.equal(result.status, 'available')
   assert.equal(result.installEnabled, true)
   assert.equal(result.canInstall, true)
-  assert.equal(result.available.build, '021')
+  assert.equal(result.available.build, '022')
   assert.equal(result.available.package, 'ReportExtractor_1.4.0.zip')
 })
 

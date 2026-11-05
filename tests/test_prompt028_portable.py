@@ -1090,9 +1090,9 @@ def test_builder_can_recreate_the_build_venv_and_reports_dependency_versions():
 def test_canonical_version_after_release018_authorization():
     """RELEASE-021 supersedes the prior 1.3.7 / Build 020 identity everywhere current metadata lives."""
     import app as app_pkg
-    assert (app_pkg.__version__, app_pkg.BUILD_NUMBER, app_pkg.BUILD_ID) == ("1.4.0", 21, "021")
-    assert app_pkg.BUILD_LABEL == "Build 021"
-    assert app_pkg.VERSION_LABEL == "1.4.0 — Build 021"
+    assert (app_pkg.__version__, app_pkg.BUILD_NUMBER, app_pkg.BUILD_ID) == ("1.4.0", 22, "022")
+    assert app_pkg.BUILD_LABEL == "Build 022"
+    assert app_pkg.VERSION_LABEL == "1.4.0 — Build 022"
     meta = json.loads((ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
     assert meta["version"] == "1.4.0", "the React bundle must agree with the backend version"
 
