@@ -495,6 +495,10 @@ function useStoreValue() {
   const labelWritesInFlightRef = useRef(0)
   const labelWriteEpochRef = useRef(0)
   const learningRefreshQueuedRef = useRef(false)
+  // Last user labeling activity (epoch ms). The background bridge poll skips its Learning
+  // refresh while the user is actively labeling, so a full-state reload never lands on top
+  // of label clicks; explicit refreshes (Save, refresh button, tab switch) are unaffected.
+  const lastLabelActivityRef = useRef(0)
   const learningStateRef = useRef<LearningState>(EMPTY_LEARNING)
   const bridgeReadyRef = useRef(false)
   const bridgeLifetimeRef = useRef<AbortController | null>(null)
@@ -792,7 +796,11 @@ function useStoreValue() {
       connect: (signal) => startAppBridge<typeof appInfo, NativeConfig, DashboardDTO>(signal),
       poll: async (signal) => {
         const tasks: Promise<void>[] = [loadDashboard(signal)]
-        if (tabRef.current === 'learning' && Date.now() - lastLearningRefresh.current > 1400) {
+        // Background poll only: never reload the Learning state while the user is actively
+        // labeling (same 1400 ms throttle as the refresh itself). The next quiet poll tick
+        // picks up external changes; explicit refreshes always run immediately.
+        if (tabRef.current === 'learning' && Date.now() - lastLearningRefresh.current > 1400
+          && Date.now() - lastLabelActivityRef.current > 1400) {
           tasks.push(refreshLearning(signal))
         }
         await Promise.all(tasks)
@@ -1210,6 +1218,7 @@ function useStoreValue() {
   // state therefore never waits for a backend round trip, however slow the bridge is.
   const applyLocalLabel = useCallback((kind: 'image' | 'content', id: string, label: string) => {
     labelWriteEpochRef.current += 1
+    lastLabelActivityRef.current = Date.now()
     const key = `${kind}:${id}`
     const existing = localLabelsRef.current.get(key)
     const candidate = (kind === 'image' ? learningStateRef.current.images : learningStateRef.current.contents)

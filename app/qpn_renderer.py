@@ -131,6 +131,7 @@ REASON_NOT_EXCLUSIVE = "powerpoint-not-exclusive"
 # "same session" is not a fact we can assert.  Distinct from REASON_USER_SESSION_RUNNING on purpose — contract D
 # forbids dressing an unprovable session up as "the user's PowerPoint is open".
 REASON_SESSION_UNPROVEN = "powerpoint-session-unproven"
+REASON_RENDER_FAILED = "powerpoint-render-failed"           # PowerPoint COM ran but the render itself failed
 
 #: Reasons that mean "PowerPoint exists here, this render just could not own an instance of it".  A cached
 #: fallback carrying one of these is re-checked against the live machine state before it is shown again
@@ -139,6 +140,52 @@ POWERPOINT_PRESENT_REASONS = frozenset({
     REASON_PROCESS_TABLE_UNREADABLE, REASON_USER_SESSION_RUNNING, REASON_REGISTERED_INSTANCE,
     REASON_OWNERSHIP_UNPROVEN, REASON_NOT_EXCLUSIVE, REASON_SESSION_UNPROVEN,
 })
+
+
+def powerpoint_remedy(code: str) -> str:
+    """Actionable remedy for a stable PowerPoint reason code (user-facing, Vietnamese).
+
+    The distinction that matters: "no PowerPoint on this machine" and "PowerPoint IS here but a user
+    session is in the way" have opposite remedies, and reporting the first when the second is true
+    sends the user looking for an install that is already there (PROMPT-041)."""
+    if code == REASON_USER_SESSION_RUNNING:
+        return ("Máy này có PowerPoint nhưng bạn đang mở PowerPoint. "
+                "Đóng tất cả cửa sổ PowerPoint rồi thử lại.")
+    if code == REASON_REGISTERED_INSTANCE:
+        return ("COM vẫn ghi nhận một phiên PowerPoint cũ. "
+                "Đóng tất cả cửa sổ PowerPoint rồi thử lại.")
+    if code == REASON_SESSION_UNPROVEN:
+        return ("Có tiến trình PowerPoint nhưng không xác định được phiên Windows của ứng dụng. "
+                "Đóng tất cả cửa sổ PowerPoint rồi thử lại.")
+    if code == REASON_PROCESS_TABLE_UNREADABLE:
+        return ("Không đọc được danh sách tiến trình để chứng minh phiên PowerPoint là của ứng dụng. "
+                "Đóng tất cả cửa sổ PowerPoint rồi thử lại.")
+    if code in (REASON_OWNERSHIP_UNPROVEN, REASON_NOT_EXCLUSIVE):
+        return ("Không chứng minh được phiên PowerPoint là do ứng dụng tạo. "
+                "Đóng tất cả cửa sổ PowerPoint rồi thử lại.")
+    if code == REASON_UNAVAILABLE:
+        return ("Máy này chưa cài đặt Microsoft PowerPoint hoặc COM của PowerPoint chưa được đăng ký. "
+                "Cài đặt PowerPoint rồi thử lại.")
+    if code == REASON_IMPORT:
+        return ("Thiếu thư viện pywin32 (pythoncom/win32com). "
+                "Cài đặt lại bản portable đầy đủ của ứng dụng.")
+    return ("Đóng tất cả cửa sổ PowerPoint rồi thử lại. "
+            "Nếu vẫn lỗi, gửi file log cho bộ phận hỗ trợ.")
+
+
+class PowerPointUnavailableError(RuntimeError):
+    """Fail-closed PowerPoint-only render failure: PowerPoint could not be used and NO fallback
+    render was produced.  ``code`` is a stable ``REASON_*`` slug; ``remedy`` is the user-facing
+    action for that code.  The ownership guard is untouched — this error never attaches to or
+    kills the user's PowerPoint; it only reports that an app-owned render was not possible."""
+
+    def __init__(self, code: str, detail: str = ""):
+        self.code = code
+        self.remedy = powerpoint_remedy(code)
+        message = f"Không render được slide bằng PowerPoint [{code}]. {self.remedy}"
+        if detail:
+            message += f" ({detail})"
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -1106,11 +1153,19 @@ class SlideRenderer:
     produced the preview and why a higher-fidelity backend was not used.  Only ``powerpoint`` is pixel-faithful to
     PowerPoint (:data:`FAITHFUL_BACKENDS`); LibreOffice and the built-in renderer are honest fallbacks and are reported
     as reduced fidelity rather than pretending to be PowerPoint output (§6).  No failure is silently skipped.
+
+    ``powerpoint_only=True`` (the production entry points: learning preview, batch evidence, re-apply) makes
+    rendering FAIL CLOSED: when PowerPoint cannot be used for any reason — missing install, missing pywin32,
+    or the ownership guard refusing because the user's own PowerPoint session is running — :meth:`render`
+    raises :class:`PowerPointUnavailableError` carrying the stable reason code and the remedy, and NO
+    LibreOffice/built-in output is produced.  The ownership guard itself is unchanged.  The default
+    ``powerpoint_only=False`` chain is kept only for direct/test use of the fallback implementations.
     """
 
     def __init__(self, prefer: Sequence[str] = ("powerpoint", "libreoffice", "builtin"),
-                 width_px: int = 1920, dpi: int = 150):
+                 width_px: int = 1920, dpi: int = 150, powerpoint_only: bool = False):
         self.prefer = list(prefer)
+        self.powerpoint_only = bool(powerpoint_only)
         self.width_px = width_px
         self.dpi = dpi
         self.last_backend = ""
@@ -1145,6 +1200,10 @@ class SlideRenderer:
 
         ``purpose`` labels the consumer (``learning_preview`` / ``after_evidence`` / ``qpn_panel``) in
         the structured ``SLIDE_RENDER`` diagnostics; it never changes rendering behaviour.
+
+        With ``powerpoint_only=True`` the chain is PowerPoint alone: any PowerPoint failure raises
+        :class:`PowerPointUnavailableError` (stable code + remedy) instead of falling through to
+        LibreOffice/builtin.
         """
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1158,14 +1217,19 @@ class SlideRenderer:
         self.last_codes = []
         slide_width = int(report.slide_width or 0)
         slide_height = int(report.slide_height or 0)
-        for backend in self.prefer:
+        chain = ["powerpoint"] if self.powerpoint_only else self.prefer
+        for backend in chain:
             check_cancelled(should_cancel)
             self.backend_tried.append(backend)
             try:
                 if backend == "powerpoint":
                     if not powerpoint_available():
+                        stage = powerpoint_probe()[1]
+                        code = REASON_IMPORT if stage == "import" else REASON_UNAVAILABLE
                         self._fail(purpose, backend, report, stage="availability", reason="unavailable",
-                                   detail=powerpoint_unavailable_detail(), code=REASON_UNAVAILABLE)
+                                   detail=powerpoint_unavailable_detail(), code=code)
+                        if self.powerpoint_only:
+                            self._raise_powerpoint_only(purpose, report, code)
                         continue
                     res = render_with_powerpoint(report.path, wanted, out_dir, self.width_px)
                 elif backend == "libreoffice":
@@ -1192,6 +1256,8 @@ class SlideRenderer:
                     return res
                 self._fail(purpose, backend, report, stage="render", reason="incomplete-result")
                 errors.append(f"{backend}: incomplete result")
+            except PowerPointUnavailableError:
+                raise                                    # fail-closed raise from the availability branch: never re-caught
             except CancellationRequested:
                 raise                                    # cooperative cancel is never a renderer failure
             except PowerPointStageError as e:
@@ -1199,12 +1265,16 @@ class SlideRenderer:
                            exception_type=e.exception_type, hresult=e.hresult,
                            detail=e.code, code=e.code)
                 errors.append(f"{backend}[{e.stage}]: {e.reason}")
+                if self.powerpoint_only and backend == "powerpoint":
+                    self._raise_powerpoint_only(purpose, report, e.code, detail=e.reason)
             except Exception as e:  # noqa: BLE001
                 reason = _safe_reason(report, e)
                 LOG.warning("Renderer %s failed for %s: %s", backend, report.filename, reason)
                 self._fail(purpose, backend, report, stage="render", reason=reason,
                            exception_type=type(e).__name__)
                 errors.append(f"{backend}: {reason}")
+                if self.powerpoint_only and backend == "powerpoint":
+                    self._raise_powerpoint_only(purpose, report, REASON_RENDER_FAILED, detail=reason)
         LOG.error("SLIDE_RENDER_FAILED purpose=%s report=%s slides=%s tried=%s errors=%s",
                   purpose or "-", report.filename, wanted, ",".join(self.backend_tried) or "-",
                   "; ".join(errors) or "-")
@@ -1225,6 +1295,14 @@ class SlideRenderer:
 
         A degraded preview is reused only briefly, so a transient COM failure cannot pin the fallback (§30)."""
         return any(failure.get("stage") not in ("availability", "") for failure in self.last_failures)
+
+    def _raise_powerpoint_only(self, purpose: str, report: ReportData, code: str,
+                               detail: str = "") -> None:
+        """Log + raise the fail-closed PowerPoint-only error.  Always raises; the ``-> None`` return
+        type only serves the call sites that use it as a statement."""
+        LOG.error("SLIDE_RENDER_POWERPOINT_ONLY_FAILED purpose=%s report=%s code=%s",
+                  purpose or "-", report.filename, code)
+        raise PowerPointUnavailableError(code, detail=detail)
 
     # ------------------------------------------------------------------ diagnostics (PROMPT-027 §3 / 027R §14)
     def _fail(self, purpose: str, backend: str, report: ReportData, stage: str, reason: str,

@@ -84,8 +84,10 @@ def _spies(monkeypatch):
 
 
 def _run(ctl):
-    assert ctl.start(use_ollama=False)
-    ctl.processor._thread.join(120)
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        assert ctl.start(use_ollama=False)
+        ctl.processor._thread.join(120)
     ctl.pump()
 
 

@@ -255,9 +255,10 @@ DESKTOP_UNAVAILABLE = 5
 def launch_ui() -> int:
     """Default no-argument UI: the React desktop app, falling back to the classic Tk GUI.
 
-    PowerPoint is NOT required here (rendering degrades through the renderer chain), but pywebview and the
-    built ``frontend/dist`` bundle are: without them the classic GUI still gives the user a working app
-    rather than a window that never appears.
+    PowerPoint IS required for rendering (the renderer fails closed with the reason + remedy instead of
+    degrading to the built-in renderer); pywebview and the built ``frontend/dist`` bundle are required
+    for the desktop UI: without them the classic GUI still gives the user a working app rather than a
+    window that never appears.
     """
     code = launch_desktop()
     if code == DESKTOP_UNAVAILABLE:

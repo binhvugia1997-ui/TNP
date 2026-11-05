@@ -16,8 +16,8 @@ from datetime import date
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from pathlib import Path
 
-from .classifier import (FOLLOWUP_LINE_RE, Classification, improvement_subkind, is_heading_like, is_long_term_heading,
-                         section_kind_of_heading)
+from .classifier import (FOLLOWUP_LINE_RE, Classification, first_heading_kind, improvement_subkind, is_heading_like,
+                         is_long_term_heading, section_kind_of_heading)
 from .cancellation import check_cancelled
 from .pptx_parser import ReportData, SlideData, norm_key, clean_text
 from .improvement_pictures import PictureRef, PictureSelection, select_after_pictures
@@ -145,9 +145,33 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
     section, so excluded blocks (inspection / follow-up / verify) never leak into the production text.
     """
     sections: List[Section] = []
-    cur = Section(kind=default_kind, slide=slide.number)
+    # Title-led exclusion is decided BEFORE the loop: classify_blocks preserves document
+    # order, so a title placeholder ordered after a body shape would otherwise arrive too
+    # late to protect the lines already consumed.  The FIRST title block decides: when it
+    # declares an excluded section, the whole slide starts in that kind.
+    roles = list(classify_blocks(slide))
+    # Only a REAL title placeholder decides the whole slide.  A header-band textbox
+    # (classify_blocks also labels those ROLE_TITLE) is merely the slide's first
+    # heading: later headings on the same slide still split sections (e.g. an
+    # effectiveness heading followed by a long-term countermeasure heading — the
+    # A1285 shape — where only the first block is excluded).
+    title_excluded_kind: Optional[str] = None
+    for _role in roles:
+        if _role.role == ROLE_TITLE and _role.block.kind == "title":
+            _tk = _semantic_kind(_first_line_of(_role.block))
+            if _tk:
+                title_excluded_kind = _tk if _tk in EXCLUDED_SECTION_KINDS else None
+            break
+    cur = Section(kind=title_excluded_kind or default_kind, slide=slide.number)
+    # When the slide TITLE declares an excluded section (verify / follow-up / ...), the
+    # whole slide is that section — body headings that merely restate the countermeasure
+    # ("Đối sách cải tiến:", "Sau cải tiến: ...") are body text of the excluded section,
+    # not new improvement sections.  (Without this, an effectiveness slide titled
+    # "Hiệu quả cải tiến" loses its verify kind to its first body heading and leaks into
+    # the improvement text.)  A later title block with a non-excluded kind clears the
+    # stickiness; excluded-kind headings still open their own excluded sections.
     first_content = True
-    for role in classify_blocks(slide):
+    for role in roles:
         b = role.block
         if role.role == ROLE_TITLE:
             kind = _semantic_kind(_first_line_of(b))
@@ -155,6 +179,8 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
                 if cur.lines:
                     sections.append(cur)
                 cur = Section(kind=kind, slide=slide.number, heading=_first_line_of(b).strip())
+                if b.kind == "title":
+                    title_excluded_kind = kind if kind in EXCLUDED_SECTION_KINDS else None
             continue
         if role.role != ROLE_CONTENT:
             continue
@@ -167,6 +193,11 @@ def split_sections(slide: SlideData, default_kind: str = "other") -> List[Sectio
             heading = is_heading_like(ln, b.bold if i == 0 else False, b.size_pt if i == 0 else None)
             kind = _semantic_kind(ln) if heading else None
             if kind:
+                if title_excluded_kind is not None and kind not in EXCLUDED_SECTION_KINDS:
+                    # Body heading inside a title-led excluded slide: keep it (and its
+                    # following lines) inside the excluded section.
+                    cur.add(ln.strip(), b.shape_id)
+                    continue
                 # every heading starts a new section (even of the same kind) so
                 # sub-sections such as "Nguyên nhân trong kiểm tra" stay separate
                 if cur.lines:
@@ -206,6 +237,15 @@ def excluded_bands(slide: SlideData, H: int) -> List[Tuple[int, int, str]]:
     bands: List[Tuple[int, int, str]] = []
     open_kind: Optional[str] = None
     open_y = 0
+    # Mirror of the split_sections title-led exclusion: a band opened by an excluded
+    # slide TITLE (a real title placeholder) covers the whole slide — body headings
+    # that merely restate the countermeasure never close it, otherwise pictures below
+    # the first improvement-like heading of an effectiveness slide would escape the
+    # excluded band.  Bands opened by a MID-SLIDE excluded heading keep the old rule
+    # (the next heading closes them): only the title decides the whole slide.  A
+    # header-band textbox title is a heading, not a placeholder title, so it opens a
+    # band under the old rule too.
+    band_title_led = False
     first_content = True
     roles = classify_blocks(slide)
     for role in roles:
@@ -214,9 +254,11 @@ def excluded_bands(slide: SlideData, H: int) -> List[Tuple[int, int, str]]:
             kind = _semantic_kind(_first_line_of(b))
             if kind in EXCLUDED_SECTION_KINDS and open_kind is None:
                 open_kind, open_y = kind, b.bottom
+                band_title_led = b.kind == "title"
             elif kind and kind not in EXCLUDED_SECTION_KINDS and open_kind:
                 bands.append((open_y, b.top, open_kind))
                 open_kind = None
+                band_title_led = False
             continue
         if role.role != ROLE_CONTENT or not b.is_text:
             continue
@@ -236,7 +278,8 @@ def excluded_bands(slide: SlideData, H: int) -> List[Tuple[int, int, str]]:
             if kind in EXCLUDED_SECTION_KINDS:
                 if open_kind is None:
                     open_kind, open_y = kind, y
-            elif open_kind:
+                    band_title_led = False
+            elif open_kind and not band_title_led:
                 bands.append((open_y, y, open_kind))
                 open_kind = None
         first_content = False
@@ -263,7 +306,14 @@ def collect_sections(report: ReportData, cls: Classification) -> List[Section]:
         in_imp = n in cls.improvement_slides
         in_tmp = n in cls.temporary_slides
         in_ver = n in cls.verify_slides
-        if in_tmp and not in_imp and not in_cause:
+        # A verify-led slide (its first heading is verify/follow-up) defaults to that
+        # excluded kind even when the classifier also lists it as an improvement slide:
+        # content before the first recognised heading (e.g. body shapes ordered ahead
+        # of the title) belongs to the effectiveness section, not to the improvement text.
+        first_kind = first_heading_kind(s)
+        if in_ver and first_kind in ("verify", "followup"):
+            default = first_kind
+        elif in_tmp and not in_imp and not in_cause:
             default = "temporary"
         elif in_cause and not in_imp:
             default = "cause"

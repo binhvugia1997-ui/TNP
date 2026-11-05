@@ -32,10 +32,12 @@ def _prefill(template: Path, keys):
 
 
 def _run_to_end(ctl, use_ollama=False, timeout=120):
-    assert ctl.start(use_ollama=use_ollama)
-    assert ctl.state == "running" and not ctl.controls_enabled()
-    t = ctl.processor._thread
-    t.join(timeout)
+    from tests.powerpoint_render_stub import powerpoint_render_stubbed
+    with powerpoint_render_stubbed():  # production rendering is PowerPoint-only; stub COM on Linux
+        assert ctl.start(use_ollama=use_ollama)
+        assert ctl.state == "running" and not ctl.controls_enabled()
+        t = ctl.processor._thread
+        t.join(timeout)
     events = ctl.pump()
     return events
 

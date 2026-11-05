@@ -213,7 +213,7 @@ class BatchProcessor:
             self.on_done(self.summary)
             return self.summary
 
-        renderer = SlideRenderer(width_px=opts.render_width)
+        renderer = SlideRenderer(width_px=opts.render_width, powerpoint_only=True)
         seq = writer.used_count()
         done = 0
         try:

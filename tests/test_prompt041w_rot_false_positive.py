@@ -346,39 +346,43 @@ def test_08d_the_three_rot_states_are_distinguishable():
 
 # ============================================ REQUIRED 7 — a cached refusal must not outlive its cause
 def test_09_a_cached_ownership_refusal_is_dropped_the_moment_powerpoint_disappears(monkeypatch, tmp_path):
+    # Fail-closed contract: a blocked preview is EMPTY (no fallback bitmap) and never cached, so it
+    # cannot keep asserting a stale refusal — every access re-checks the live machine state.
     _preview_env(monkeypatch, blocked=True)
     service = _preview_service()
     candidate = _candidate(_two_item_slide_deck(tmp_path))
 
     first = service._slide_preview_for(candidate)
-    assert first["backend"] == "builtin" and first["reason"] == REASON_USER_SESSION_RUNNING
+    assert first["src"] == "" and first["backend"] == "" and first["reason"] == REASON_USER_SESSION_RUNNING
 
-    # still open, inside the 15 s TTL -> the cached entry is honestly reused
+    # still open -> the empty preview is re-attempted (never cached) and still carries the live reason
     again = service._slide_preview_for(candidate)
-    assert (again["backend"], again["reason"]) == ("builtin", REASON_USER_SESSION_RUNNING)
+    assert (again["src"], again["backend"], again["reason"]) == ("", "", REASON_USER_SESSION_RUNNING)
 
-    # the user closes PowerPoint: the cached fallback must NOT keep asserting it, and must re-render NOW
+    # the user closes PowerPoint: the preview must NOT keep asserting it, and must render NOW
     _preview_env(monkeypatch, blocked=False)
     recovered = service._slide_preview_for(candidate)
     assert recovered["backend"] == "powerpoint" and recovered["faithful"] is True
     assert recovered["reason"] == "", "a faithful render carries no reason"
 
 
-def test_09b_a_non_powerpoint_fallback_is_not_retried_on_every_poll(monkeypatch, tmp_path):
-    """Contract E must not become a COM hammer: only PowerPoint-blocked fallbacks get the live re-check."""
+def test_09b_an_unavailable_powerpoint_preview_never_claims_a_fallback_render(monkeypatch, tmp_path):
+    """Contract E under fail-closed rendering: with no PowerPoint there is no fallback bitmap at
+    all — only an empty preview with the stable reason — and no cached entry exists that could
+    trigger a machine re-probe on every poll."""
     monkeypatch.setattr(qrn, "powerpoint_probe", lambda: (False, "availability", "not-windows"))
     monkeypatch.setattr(qrn, "find_soffice", lambda: None)
     service = _preview_service()
     candidate = _candidate(_two_item_slide_deck(tmp_path))
     first = service._slide_preview_for(candidate)
-    assert first["backend"] == "builtin" and first["reason"] == REASON_UNAVAILABLE
+    assert first["src"] == "" and first["backend"] == "" and first["reason"] == REASON_UNAVAILABLE
 
     calls = []
     monkeypatch.setattr(qrn, "powerpoint_render_capability",
                         lambda max_age_s=0.0: calls.append(1) or qrn.PowerPointCapability(False, False, "x"))
     second = service._slide_preview_for(candidate)
-    assert second["backend"] == "builtin"
-    assert calls == [], "an unavailable-backend fallback must not re-probe the machine on every hit"
+    assert second["src"] == "" and second["backend"] == ""
+    assert calls == [], "no cached degraded entry exists, so the capability probe must not fire on a hit"
 
 
 def test_09c_the_stale_check_only_fires_for_a_powerpoint_blocked_degraded_entry(monkeypatch):
@@ -520,8 +524,7 @@ def test_14b_a_refusal_is_also_fully_logged(machine, deck, tmp_path, caplog):
 def test_14c_the_cache_line_says_whether_the_preview_came_from_cache_and_with_which_reason(monkeypatch, tmp_path,
                                                                                            caplog):
     caplog.set_level(logging.INFO, logger="report_extractor.webview")
-    monkeypatch.setattr(qrn, "powerpoint_probe", lambda: (False, "availability", "not-windows"))
-    monkeypatch.setattr(qrn, "find_soffice", lambda: None)
+    _preview_env(monkeypatch, blocked=False)
     service = _preview_service()
     candidate = _candidate(_two_item_slide_deck(tmp_path))
     service._slide_preview_for(candidate)
@@ -529,7 +532,7 @@ def test_14c_the_cache_line_says_whether_the_preview_came_from_cache_and_with_wh
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("SLIDE_PREVIEW_CACHE")]
     assert lines and all("cached_backend=" in line and "cached_reason=" in line and "hit=1" in line
                          for line in lines)
-    assert any("action=reuse" in line for line in lines)
+    assert any("action=reuse" in line and "cached_backend=powerpoint" in line for line in lines)
 
 
 # ================================================================================== static safety contracts

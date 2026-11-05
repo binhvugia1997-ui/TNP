@@ -1596,15 +1596,17 @@ class ApplicationService:
         empty = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "reason": "", "regions": []}
         regions: List[Dict[str, Any]] = []
         try:
-            from .qpn_renderer import RENDER_SCHEMA_VERSION, SlideRenderer, is_faithful_backend
+            from .qpn_renderer import (RENDER_SCHEMA_VERSION, SlideRenderer,
+                                      PowerPointUnavailableError, is_faithful_backend)
             from .report_identity import report_scope_key
             from .learning_assets import LearningAssets, digest
             owner = learning or getattr(getattr(self, "controller", None), "learning", None)
             assets = LearningAssets(owner.dir) if owner is not None else None
             source = Path(candidate.source_file)
             slide_number = int(candidate.slide)
-            renderer = SlideRenderer(width_px=LEARNING_PREVIEW_WIDTH_PX)  # same chain as production
-            signature = (tuple(renderer.prefer), renderer.width_px, RENDER_SCHEMA_VERSION,
+            renderer = SlideRenderer(width_px=LEARNING_PREVIEW_WIDTH_PX,
+                                     powerpoint_only=True)  # PowerPoint-only: fail closed, never builtin
+            signature = (tuple(renderer.prefer), renderer.powerpoint_only, renderer.width_px, RENDER_SCHEMA_VERSION,
                          tuple(sorted(renderer.availability().items())), self._learning_identity(learning))
             if getattr(candidate, "_snapshot_changed", False):
                 return empty  # retained label/snapshot is not evidence for the changed live source
@@ -1670,6 +1672,11 @@ class ApplicationService:
                 result = assets.remember_slide(key, result)
             self._remember_preview(key, result)
             return result
+        except PowerPointUnavailableError as exc:  # fail-closed render: keep the stable code, retry later
+            LOG.debug("WEBVIEW_SLIDE_PREVIEW_UNAVAILABLE candidate=%s error=%s code=%s",
+                      getattr(candidate, "candidate_id", "?"), exc, exc.code)
+            return {**empty, "regions": regions, "reason": exc.code,
+                    "degraded": True}  # not cached: the render is retried later
         except Exception as exc:  # noqa: BLE001 – preview is display-only; never break the review state
             LOG.debug("WEBVIEW_SLIDE_PREVIEW_UNAVAILABLE candidate=%s error=%s",
                       getattr(candidate, "candidate_id", "?"), exc)
@@ -1813,8 +1820,11 @@ class ApplicationService:
             preview = self._slide_preview_for(candidate, learning)
         except Exception as exc:  # noqa: BLE001 – display-only preview must never erase truthful metadata
             opaque_id = hashlib.sha256(str(candidate.candidate_id).encode("utf-8")).hexdigest()[:12]
-            LOG.warning("LEARNING_IMAGE_PREVIEW_FAILED candidate=%s error=%s", opaque_id, type(exc).__name__)
-            preview = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "reason": "",
+            from .qpn_renderer import PowerPointUnavailableError
+            reason = exc.code if isinstance(exc, PowerPointUnavailableError) else ""
+            LOG.warning("LEARNING_IMAGE_PREVIEW_FAILED candidate=%s error=%s reason=%s",
+                        opaque_id, type(exc).__name__, reason or "-")
+            preview = {"src": "", "width": 0, "height": 0, "backend": "", "faithful": False, "reason": reason,
                        "regions": []}
         if not getattr(candidate, "_snapshot_changed", False):
             assets.remember_candidate(candidate, src, preview)

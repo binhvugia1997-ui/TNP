@@ -788,14 +788,33 @@ def _preview_service():
     return service
 
 
-def test_preview_cache_survives_renderer_schema_and_backend_change(tmp_path):
+def _fake_powerpoint(monkeypatch):
+    """Stand in for the Windows-only PowerPoint COM backend: the real ``SlideRenderer.render``
+    loop runs (including the PowerPoint-only chain), but the COM call itself is a white PNG.
+    Production previews fail closed without PowerPoint, so on Linux the cache/DTO contracts
+    below are exercised through the production path with this stand-in, never through the
+    built-in fallback — which the production preview no longer uses."""
+    def export(pptx, slide_numbers, out_dir, width_px=1920):
+        out = {}
+        for n in slide_numbers:
+            target = Path(out_dir) / f"slide_{n:03d}.png"
+            Image.new("RGB", (int(width_px), int(width_px * 540 / 960)), "white").save(target)
+            out[n] = target
+        return out
+
+    monkeypatch.setattr(qrn, "powerpoint_available", lambda: True)
+    monkeypatch.setattr(qrn, "render_with_powerpoint", export)
+
+
+def test_preview_cache_survives_renderer_schema_and_backend_change(tmp_path, monkeypatch):
     """§29: a preview rendered by older geometry must never be reused after a renderer/backend change."""
+    _fake_powerpoint(monkeypatch)
     deck = _deck(tmp_path / "in" / NAME, [_two_item_slide()])
     service = _preview_service()
     candidate = _candidate(deck)
 
     first = service._slide_preview_for(candidate)
-    assert first["src"].startswith("data:image/jpeg;base64,") and first["backend"] == "builtin"
+    assert first["src"].startswith("data:image/jpeg;base64,") and first["backend"] == "powerpoint"
     assert len(service._slide_preview_cache) == 1
     assert service._slide_preview_for(candidate)["src"] == first["src"]       # cache hit, same bytes
     assert len(service._slide_preview_cache) == 1
@@ -820,8 +839,9 @@ def test_preview_cache_survives_renderer_schema_and_backend_change(tmp_path):
     assert svc.LEARNING_PREVIEW_WIDTH_PX == 1600
 
 
-def test_preview_cache_isolated_per_report_and_invalidated_by_mtime(tmp_path):
+def test_preview_cache_isolated_per_report_and_invalidated_by_mtime(tmp_path, monkeypatch):
     """§29/§39 + PROMPT-020: identical layouts in different reports never share a cached render."""
+    _fake_powerpoint(monkeypatch)
     deck_a = _deck(tmp_path / "a" / NAME, [_two_item_slide()])
     deck_b = _deck(tmp_path / "b" / NAME, [_two_item_slide()])
     service = _preview_service()
@@ -856,6 +876,7 @@ def test_evidence_region_truth_survives_a_failed_preview_render(tmp_path, monkey
     monkeypatch.setattr(SlideRenderer, "render", boom)
     preview = service._slide_preview_for(candidate)
     assert preview["src"] == "" and preview["backend"] == "" and preview["faithful"] is False
+    assert preview["reason"] == "", "a non-PowerPoint render-loop failure carries no stable code"
     assert preview["regions"], "the region truth must survive a render failure"
     region = service._evidence_region_for(candidate, preview["regions"])
     assert region is not None
@@ -866,6 +887,7 @@ def test_evidence_region_truth_survives_a_failed_preview_render(tmp_path, monkey
     assert len(service._slide_preview_cache) == 0
 
     monkeypatch.undo()
+    _fake_powerpoint(monkeypatch)   # the recovered backend is PowerPoint (fail-closed: no builtin preview)
     recovered = service._slide_preview_for(candidate)
     assert recovered["src"].startswith("data:image/jpeg;base64,")
     assert recovered["regions"] == preview["regions"]
@@ -883,9 +905,10 @@ def test_preview_cache_never_leaks_a_filesystem_path(tmp_path):
 
 
 # ================================================================== §13/§15 candidate vs evidence in the DTO
-def test_dto_exposes_backend_and_authoritative_evidence_region(sample_tree, tmp_path):
+def test_dto_exposes_backend_and_authoritative_evidence_region(sample_tree, tmp_path, monkeypatch):
     from tests.test_prompt024r_learning_workspace import _service_with_candidates
 
+    _fake_powerpoint(monkeypatch)
     deck = _deck(tmp_path / "in" / NAME, [_two_item_slide()])
     report = _report(deck)
     _, _, selection = _selection(report)
@@ -897,8 +920,9 @@ def test_dto_exposes_backend_and_authoritative_evidence_region(sample_tree, tmp_
     dto = service.learning_state()["images"][0]
 
     # §4/§6: backend metadata, and builtin must be flagged as NOT pixel-faithful
-    assert dto["slidePreviewBackend"] == "builtin"
-    assert dto["slidePreviewFaithful"] is False
+    # §4/§6: backend metadata, and PowerPoint output is flagged as pixel-faithful
+    assert dto["slidePreviewBackend"] == "powerpoint"
+    assert dto["slidePreviewFaithful"] is True
     assert dto["slidePreview"].startswith("data:image/jpeg;base64,")
 
     # §14/§15: the evidence region is the production ImprovementVisualRegion bbox, in EMU and in %
@@ -1087,8 +1111,9 @@ def test_stable_backup_is_untouched():
 
 
 # ================================================================== §18 preview never mutates evidence
-def test_learning_preview_does_not_modify_evidence_or_region_geometry(tmp_path):
+def test_learning_preview_does_not_modify_evidence_or_region_geometry(tmp_path, monkeypatch):
     """§18: dim/blur is UI only — building a preview leaves the production region bytes/geometry intact."""
+    _fake_powerpoint(monkeypatch)
     deck = _deck(tmp_path / "in" / NAME, [_two_item_slide()])
     report = _report(deck)
     _, _, selection = _selection(report)

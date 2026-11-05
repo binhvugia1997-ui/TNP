@@ -17,6 +17,7 @@ from .content_learning import ContentCandidate, select_content_with_learning
 from .excel_writer import ExcelLockedError, ExcelWriter
 from .extractor import collect_sections, join_sections
 from .image_extractor import export_after_pictures
+from .qpn_renderer import SlideRenderer
 from .image_learning import ImageCandidate, ImageLearning, select_with_learning
 from .improvement_pictures import select_after_pictures
 from .pptx_parser import parse_pptx
@@ -124,7 +125,8 @@ def reapply_labels(template: Path, output: Path, cands: Sequence[ImageCandidate]
             row = rows[0]                                             # canonical = topmost (PROMPT-004 rule)
             scope = report_scope_key(src)
             report_assets = assets_dir / f"{Path(src).stem}_{scope}_IMPROVEMENT_regions"
-            paths, problems = export_after_pictures(report, refs, report_assets, management_number=mn)
+            paths, problems = export_after_pictures(report, refs, report_assets, management_number=mn,
+                                                  renderer=SlideRenderer(powerpoint_only=True))
             try:
                 n = writer.replace_improvement_images(row, paths)
             except Exception as e:  # noqa: BLE001

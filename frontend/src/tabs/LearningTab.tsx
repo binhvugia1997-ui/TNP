@@ -407,17 +407,19 @@ function ImageReview() {
       setSelectedIds(next)
       anchorId.current = clicked.id
     } else {
-      // Focusing a member keeps a multi-selection intact for click/click/dblclick quick confirmation.
+      // Focusing a member keeps a multi-selection intact for click/click/dblclick staging.
       if (!selectedIds.has(clicked.id)) setSelectedIds(new Set([clicked.id]))
       anchorId.current = clicked.id
     }
     s.setImageReviewIndex(idx)
   }
   const selectedOnSlide = list.filter((c) => selectedIds.has(c.id) && imageSlideScope(c) === scope)
+  // Explicit-save flow: this is the ONLY path that persists labels (the Save button).
+  // Label buttons and double-click only STAGE the choice in memory (see labelImage staging below).
   const confirm = async (candidates: ImageCandidate[], label: string) => {
     if (confirmInFlight.current || s.locked || !candidates.length) return
     if (!label || label === 'UNLABELED') {
-      setHint('Vui lòng chọn nhãn trước khi xác nhận nhanh (double-click).')
+      setHint('Vui lòng chọn nhãn trước khi lưu.')
       return
     }
     confirmInFlight.current = true
@@ -433,12 +435,20 @@ function ImageReview() {
       setConfirming(false)
     }
   }
+  // Double-click STAGES the active label on the clicked / selected candidates; it never
+  // saves. Only the Save button ("Lưu nhãn & ghi chú") persists staged labels.
   const handleDoubleClick = (idx: number) => {
     const clicked = list[idx]
     if (!clicked) return
+    const label = activeLabel || (clicked.userLabel !== 'UNLABELED' ? clicked.userLabel : '')
+    if (!label) {
+      setHint('Vui lòng chọn nhãn trước khi gắn nhãn nhanh (double-click).')
+      return
+    }
     const same = list.filter((c) => selectedIds.has(c.id) && imageSlideScope(c) === imageSlideScope(clicked))
-    void confirm(same.length > 1 && selectedIds.has(clicked.id) ? same : [clicked],
-      activeLabel || (clicked.userLabel !== 'UNLABELED' ? clicked.userLabel : ''))
+    const targets = same.length > 1 && selectedIds.has(clicked.id) ? same : [clicked]
+    setHint('')
+    for (const c of targets) s.labelImage(c.id, label)
   }
 
   const emptyFeedback = candidateFeedback(s.connected, s.learningLoad, s.learning.candidateStatus.image)
@@ -686,7 +696,14 @@ function ImageReview() {
             </p>
           </div>
         ) : (
-          <p className="text-base2 text-muted">Preview không khả dụng.</p>
+          <div className="flex flex-col items-center gap-2 p-4">
+            <p className="max-w-[460px] text-center text-base2 text-muted">Preview không khả dụng.</p>
+            {previewReason ? (
+              <p className="max-w-[460px] text-center text-xs2 text-warn-600">
+                Không render được bằng PowerPoint ({previewReason}).{fidelityHint(previewReason)}
+              </p>
+            ) : null}
+          </div>
         )}
       </div>
       <div className="border-t border-lineSoft px-3 py-1.5 text-xxs leading-[15px] text-muted">
@@ -728,8 +745,9 @@ function ImageReview() {
                 onClick={() => {
                   setActiveLabel(l.key)
                   setHint('')
-                  if (selectedOnSlide.length > 1) void confirm(selectedOnSlide, l.key)
-                  else s.labelImage(cand.id, l.key)
+                  // Staging only: label buttons never persist. The Save button persists.
+                  const targets = selectedOnSlide.length > 1 ? selectedOnSlide : [cand]
+                  for (const c of targets) s.labelImage(c.id, l.key)
                 }}>
                 {l.label}
               </Button>
