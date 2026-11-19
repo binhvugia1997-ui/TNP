@@ -157,14 +157,58 @@ class BatchProcessor:
         self.stop_event = threading.Event()
         self.cancel_event = threading.Event()
         self.summary = BatchSummary(total=len(opts.files))
+        self._done_sent = False
         self.results: List[FileResult] = []
         self._thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     def start(self) -> threading.Thread:
-        self._thread = threading.Thread(target=self.run, name="batch-worker", daemon=True)
+        # Build 024: the thread target is guarded so the worker can never die silently.
+        # run() calls on_done() in its finally block, but the points OUTSIDE that
+        # try/finally (SlideRenderer init, writer.used_count()) and the unguarded
+        # calls INSIDE the finally (writer.close(), result_log.finish()) can still
+        # raise out of run() — then no done event is ever delivered, the GUI only
+        # learns about it from reconcile(), and the run looks frozen mid-queue.
+        self._thread = threading.Thread(target=self._run_guarded, name="batch-worker", daemon=True)
         self._thread.start()
         return self._thread
+
+    def _emit_done(self) -> None:
+        """Deliver the done event exactly once, even if run() and the guard both reach it."""
+        if self._done_sent:
+            return
+        self._done_sent = True
+        self.on_done(self.summary)
+
+    def _run_guarded(self) -> None:
+        try:
+            self.run()
+        except CancellationRequested:
+            # Cooperative cancel that escaped the per-file handling (e.g. from
+            # prescan): run()'s finally already delivered done with the
+            # cancelled counts. A user choice is never a worker failure (VI).
+            LOG.info("WORKER_CANCELLED: batch worker ended by user cancellation")
+        except BaseException as exc:  # noqa: BLE001 – the thread must never die silently
+            # Build 025: the Build 024 guard caught Exception only, so a
+            # BaseException (SystemExit / KeyboardInterrupt / GeneratorExit, or
+            # one raised by a dependency / COM callback) killed the worker with
+            # no WORKER_FAILED and no done event (19/11, 7/61). This is a daemon
+            # worker thread — SIGINT cannot be delivered here — so converting
+            # the death into a failed batch + done event is the safe outcome.
+            LOG.exception("WORKER_FAILED: batch worker died outside the guarded run loop: %s", exc)
+            # Everything not already accounted for (completed / needs_review / failed /
+            # skipped / not_written / cancelled) never ran, so it counts as failed.
+            accounted = (self.summary.completed + self.summary.needs_review + self.summary.failed
+                         + self.summary.skipped + self.summary.not_written + self.summary.cancelled)
+            self.summary.failed += max(0, self.summary.total - accounted)
+            self.summary.errors.append(
+                {"file": "", "error": f"WORKER_FAILED: {type(exc).__name__}: {exc}"})
+            self._log(f"LỖI worker: {type(exc).__name__}: {exc} – lượt chạy đã kết thúc, "
+                      f"xem logs/app.log để biết chi tiết.")
+            try:
+                self._emit_done()
+            except Exception:  # noqa: BLE001 – a failing done callback must not kill the guard
+                LOG.exception("WORKER_FAILED: on_done failed after worker death")
 
     def request_stop(self) -> None:
         self.stop_event.set()
@@ -210,7 +254,7 @@ class BatchProcessor:
             self.summary.failed = len(opts.files)
             self.summary.errors.append({"file": "", "error": str(e)})
             result_log.finish(self.summary.as_dict())
-            self.on_done(self.summary)
+            self._emit_done()
             return self.summary
 
         renderer = SlideRenderer(width_px=opts.render_width, powerpoint_only=True)
@@ -236,11 +280,29 @@ class BatchProcessor:
                     self._log("Đã dừng theo yêu cầu (trước file tiếp theo).")
                     break
                 seq += 1
-                fr = self._process_one(idx, Path(path), seq, writer, renderer, client, history, assets)
-                self.results.append(fr)
-                result_log.add(fr)
-                done += 1
-                self.on_batch(done, total)
+                try:
+                    fr = self._process_one(idx, Path(path), seq, writer, renderer, client, history, assets)
+                    self.results.append(fr)
+                    result_log.add(fr)
+                    done += 1
+                    self.on_batch(done, total)
+                except CancellationRequested:
+                    raise                       # cooperative cancel is never a file error (VI)
+                except BaseException as exc:  # noqa: BLE001 – one file must never kill the batch (Build 025)
+                    fr = self._error_result(idx, Path(path), exc)
+                    self.results.append(fr)
+                    try:
+                        result_log.add(fr)
+                    except Exception:  # noqa: BLE001 – the result is already in memory; log and continue
+                        LOG.error("result_log.add failed for %s", path)
+                    done += 1
+                    self.on_batch(done, total)
+            # --- Build 025 retry pass: error files get exactly one second chance ---
+            # First-pass errors are provisional: a file that succeeds on retry leaves
+            # the final error list; only a file that still fails is a real error.
+            # The pass runs inside this run (before the finally below), so the final
+            # save, batch_result.json and the done event all cover the retry results.
+            seq = self._retry_errors(queue, writer, renderer, client, history, assets, result_log, seq)
         finally:
             try:
                 writer.save()
@@ -252,7 +314,10 @@ class BatchProcessor:
             writer.close()
             order = {str(p): i for i, p in enumerate(opts.files)}
             self.results.sort(key=lambda r: order.get(r.source_file, len(order)))   # file order, like the GUI table
-            result_log.finish(self.summary.as_dict())
+            try:
+                result_log.finish(self.summary.as_dict())
+            except Exception as e:  # noqa: BLE001 – Build 025: a failing finish must not skip the done event
+                LOG.error("result_log.finish failed: %s", e)
             try:
                 write_review_report(self.results, logs / "review_report.txt", self.summary)
             except Exception as e:  # noqa: BLE001
@@ -261,8 +326,93 @@ class BatchProcessor:
                       f"Cần kiểm tra: {self.summary.needs_review}  Chưa ghi: {self.summary.not_written}  "
                       f"Lỗi: {self.summary.failed}  Bỏ qua: {self.summary.skipped}  "
                       f"Đã hủy: {self.summary.cancelled}")
-            self.on_done(self.summary)
+            try:
+                self._emit_done()
+            except Exception as e:  # noqa: BLE001 – Build 025: done must be attempted even if it fails
+                LOG.error("on_done failed at end of run: %s", e)
         return self.summary
+
+    def _error_result(self, idx: int, path: Path, exc: BaseException) -> FileResult:
+        """Build the error result for a file whose processing escaped `_process_one`.
+
+        Used by the per-file guards (first pass and retry pass). Cancellation is
+        never converted here — `CancellationRequested` is re-raised by the callers.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        fr = FileResult(source_file=str(path), started_at=now, finished_at=now)
+        try:
+            fr.management_number = management_number_from_filename(path.name) or ""
+        except Exception:  # noqa: BLE001 – best effort only
+            pass
+        fr.status = "error"
+        fr.error = f"{type(exc).__name__}: {exc}"
+        self.summary.failed += 1
+        self.summary.errors.append({"file": str(path), "error": fr.error})
+        LOG.error("%s: %s\n%s", path.name, fr.error, traceback.format_exc())
+        self.on_file(idx, "error", fr.error)
+        return fr
+
+    def _retry_errors(self, queue, writer: ExcelWriter, renderer: SlideRenderer,
+                      client: Optional[OllamaClient], history: History, assets: Path,
+                      result_log: BatchResultLog, seq: int) -> int:
+        """One retry pass over first-pass error files (Build 025).
+
+        Only `error` files are retried — never `needs_review`, `not_written`,
+        `skipped` or `cancelled`. Exactly one pass; the pass is skipped entirely
+        when Stop / Stop-all was requested (checked before the pass and before
+        each retried file). Each retried file's first-pass accounting is undone
+        first, so the final summary counts every file exactly once, by its LAST
+        outcome. Returns the updated `seq` (asset filename counter).
+        """
+        if self.stop_event.is_set() or self.cancel_event.is_set():
+            # The stop arrived while the last report was still running, so the
+            # main loop never broke on it — record it here, like the loop does.
+            self.summary.stopped = True
+            if self.cancel_event.is_set():
+                self.summary.cancel_requested = True
+            self._log("Đã dừng theo yêu cầu – không chạy lại các báo cáo lỗi.")
+            return seq
+        failed = [fr for fr in self.results if fr.status == "error"]
+        if not failed:
+            return seq
+        by_source = {str(it.path): it.index for it in queue}
+        self._log(f"Chạy lại {len(failed)} báo cáo lỗi (1 lượt duy nhất)...")
+        for old in failed:
+            if self.cancel_event.is_set():
+                self.summary.stopped = True
+                self.summary.cancel_requested = True
+                self._log("Đã dừng toàn bộ xử lý. Các báo cáo còn lại không được xử lý.")
+                break
+            if self.stop_event.is_set():
+                self.summary.stopped = True
+                self._log("Đã dừng theo yêu cầu (trước file tiếp theo).")
+                break
+            idx = by_source.get(old.source_file)
+            if idx is None:
+                continue
+            self.summary.failed = max(0, self.summary.failed - 1)
+            self.summary.errors = [e for e in self.summary.errors
+                                   if e.get("file") != old.source_file]
+            seq += 1
+            try:
+                fr = self._process_one(idx, Path(old.source_file), seq, writer, renderer,
+                                       client, history, assets)
+            except CancellationRequested:
+                raise                       # cooperative cancel is never a file error (VI)
+            except BaseException as exc:  # noqa: BLE001 – same per-file guard as the first pass
+                fr = self._error_result(idx, Path(old.source_file), exc)
+            fr.retried = True
+            pos = next((i for i, r in enumerate(self.results)
+                        if r.source_file == old.source_file), None)
+            if pos is not None:
+                self.results[pos] = fr
+            else:
+                self.results.append(fr)
+            try:
+                result_log.update(fr)
+            except Exception:  # noqa: BLE001 – the result is already in memory; log and continue
+                LOG.error("result_log.update failed for %s", old.source_file)
+        return seq
 
     # ------------------------------------------------------------------
     def _prescan(self, writer: ExcelWriter, logs: Path, result_log: BatchResultLog) -> List[PreScanItem]:

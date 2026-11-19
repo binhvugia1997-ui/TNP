@@ -13,10 +13,12 @@ evidence only and is never Windows / real-PowerPoint acceptance (constitution §
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -524,3 +526,30 @@ def test_8c_cleanup_never_iterates_or_closes_every_presentation_and_never_attach
     assert not re.search(r"for\s+\w+\s+in\s+\w*\.?Presentations\b", code), "must not enumerate/close all presentations"
     assert "ActivePresentation" not in code and "GetObject" not in code
     assert not re.search(r"win32com\.client\.Dispatch\(", code), "attaching Dispatch() is forbidden; only DispatchEx"
+
+
+# ================================================================== flaky-learning-candidates-test
+def test_cleanup_exit_wait_is_bounded_below_the_train_window():
+    """The cleanup wait is observation-only (Quit is already sent), so it must
+    stay well under the 5 s train handshake in the learning test — a stalled
+    render must never eat the whole window.  This pins the PRODUCTION
+    constant: it deliberately takes no ``machine`` fixture, because that
+    fixture monkeypatches the value to 2.0 s for the fake machine."""
+    assert qrn._PROCESS_EXIT_TIMEOUT_S < 5.0
+
+
+def test_render_returns_promptly_when_quit_process_never_exits(machine, deck, tmp_path, caplog):
+    """A PowerPoint that ignores Quit (its process lingers in the table
+    forever) must not stall the caller for the whole exit wait: the render
+    returns after the bounded wait, the export is intact, and the timeout is
+    only a diagnostic note — never a kill (PROMPT-041 still holds)."""
+    caplog.set_level(logging.INFO, logger="report_extractor.renderer")
+    machine.quit_lingers_polls = 10**9          # the quit instance never leaves the table
+    started = time.monotonic()
+    out = _render(deck, tmp_path)
+    elapsed = time.monotonic() - started
+    assert out[1].exists(), "the export must succeed even when the quit process lingers"
+    assert elapsed < qrn._PROCESS_EXIT_TIMEOUT_S + 3.0, (
+        f"a lingering PowerPoint stalled the render for {elapsed:.1f}s")
+    assert "app-exit-wait-timeout" in caplog.text
+    assert machine.calls("App.Quit", "app") != []

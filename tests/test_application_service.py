@@ -334,8 +334,8 @@ def test_update_install_response_snapshots_actual_progress_state(sample_tree, tm
 
     service, _ = _make_service(sample_tree, tmp_path)
     controller = service.controller
-    info = updater.UpdateInfo("1.4.0", 22, "ReportExtractor_1.4.0.zip", "0" * 64, 1234)
-    controller.update_check = updater.UpdateCheck("available", "Có phiên bản mới: 1.4.0 — Build 022",
+    info = updater.UpdateInfo("1.4.0", 25, "ReportExtractor_1.4.0.zip", "0" * 64, 1234)
+    controller.update_check = updater.UpdateCheck("available", "Có phiên bản mới: 1.4.0 — Build 025",
                                                   str(tmp_path / "Update"), info, "package.zip")
     monkeypatch.setattr(updater, "production_install_capability", lambda root: (True, ""))
     monkeypatch.setattr(updater, "update_lock_available", lambda root: True)
@@ -351,7 +351,7 @@ def test_update_install_response_snapshots_actual_progress_state(sample_tree, tm
     result = service.install_update()
     assert result["status"] == "staging" and result["state"]["status"] == "staging"
     assert result["state"]["progress"] == 50 and result["state"]["installEnabled"] is False
-    assert result["state"]["available"] == {"version": "1.4.0", "build": "022",
+    assert result["state"]["available"] == {"version": "1.4.0", "build": "025",
                                              "package": "ReportExtractor_1.4.0.zip", "size": 1234}
 
 
@@ -359,9 +359,9 @@ def test_failed_update_state_never_advertises_install_enabled(sample_tree, tmp_p
     import app.updater as updater
 
     service, _ = _make_service(sample_tree, tmp_path)
-    info = updater.UpdateInfo("1.4.0", 22, "ReportExtractor_1.4.0.zip", "0" * 64, 1234)
+    info = updater.UpdateInfo("1.4.0", 25, "ReportExtractor_1.4.0.zip", "0" * 64, 1234)
     service.controller.update_check = updater.UpdateCheck(
-        "available", "Có phiên bản mới: 1.4.0 — Build 022", str(tmp_path / "Update"), info, "package.zip")
+        "available", "Có phiên bản mới: 1.4.0 — Build 025", str(tmp_path / "Update"), info, "package.zip")
     monkeypatch.setattr(updater, "production_install_capability", lambda root: (True, ""))
     monkeypatch.setattr(service, "_refresh_update_result", lambda: None)
 
@@ -707,6 +707,13 @@ def test_learning_candidates_counts_label_review_saved_reapply_retry_and_model_u
         assert json.loads(archive.read("image_labels.jsonl"))["label"] == "AFTER"
         assert json.loads(archive.read("content_labels.jsonl"))["label"] == "IMPROVEMENT_CONTENT"
         assert str(sample_tree["files"][0]) not in archive.read("image_labels.jsonl").decode("utf-8")
+
+    # flaky-learning-candidates-test: warm the slide-preview cache before the
+    # 5 s train handshake, so the learning_state() calls inside the window are
+    # cache hits instead of fresh PowerPoint renders.  Best-effort only — a
+    # degraded warm-up simply leaves the cache cold; the bounded cleanup wait
+    # (qpn_renderer._PROCESS_EXIT_TIMEOUT_S) is what caps a slow render.
+    service.learning_state()
 
     entered, release = threading.Event(), threading.Event()
 

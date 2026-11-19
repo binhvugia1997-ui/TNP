@@ -245,6 +245,6 @@ def test_build_and_publish_bat_exists_and_wires_everything():
 
 
 def test_identity_build_018():
-    assert app.__version__ == "1.4.0" and app.BUILD_NUMBER == 22 and app.BUILD_LABEL == "Build 022"
+    assert app.__version__ == "1.4.0" and app.BUILD_NUMBER == 25 and app.BUILD_LABEL == "Build 025"
     import build_portable as bp
-    assert bp.package_name(app.__version__) == "ReportExtractor_1.4.0.zip" and bp._version() == ("1.4.0", "022")
+    assert bp.package_name(app.__version__) == "ReportExtractor_1.4.0.zip" and bp._version() == ("1.4.0", "025")

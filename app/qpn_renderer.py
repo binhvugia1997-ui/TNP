@@ -410,7 +410,13 @@ def _com_reason(exc: BaseException, pptx: Optional[Path]) -> str:
 # (Toolhelp snapshot — no process handle is opened, so nothing can be signalled).
 _POWERPOINT_LOCK = threading.Lock()          # serialises the whole COM lifecycle: in-process jobs cannot collide
 _POWERPOINT_IMAGE_NAME = "powerpnt.exe"
-_PROCESS_EXIT_TIMEOUT_S = 15.0               # bounded wait for OUR quit instance to disappear (never escalates)
+_PROCESS_EXIT_TIMEOUT_S = 2.0                # bounded wait for OUR quit instance to disappear (never escalates).
+                                              # Observation-only: Quit is already sent, so waiting never makes
+                                              # PowerPoint exit faster — it only stalls the caller.  The old 15 s
+                                              # bound let one stalled render block its caller for 15 s (3x the 5 s
+                                              # train handshake in the learning test; ~60 s across that test's
+                                              # four renders on 19/11, flaky-learning-candidates-test).  2.0 s is
+                                              # the value the PROMPT-035 harness already pins for its fake machine.
 _PROCESS_POLL_S = 0.1
 
 

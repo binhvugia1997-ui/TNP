@@ -91,6 +91,7 @@ class FileResult:
     classifier_notes: List[str] = field(default_factory=list)
     confidence: Optional[float] = None
     error: str = ""
+    retried: bool = False              # Build 025: True when this result came from the retry pass
     classifier: str = ""               # "qwen" | "qwen+heuristic" | "heuristic"
     qpn_source: str = ""               # explicit_text | metadata | qpn_heading | defect_structure | structural | llm
     qpn_override: str = ""             # why an LLM QPN suggestion was rejected
@@ -124,6 +125,19 @@ class BatchResultLog:
     def add(self, result: FileResult) -> None:
         with self._lock:
             self._results.append(result.to_dict())
+            self._flush()
+
+    def update(self, result: FileResult) -> None:
+        """Replace the stored entry for the same source_file (Build 025 retry pass),
+        else append. Keeps exactly one entry per file in batch_result.json."""
+        with self._lock:
+            new = result.to_dict()
+            for i, old in enumerate(self._results):
+                if old.get("source_file") == new.get("source_file"):
+                    self._results[i] = new
+                    break
+            else:
+                self._results.append(new)
             self._flush()
 
     def finish(self, summary: Dict[str, Any]) -> None:
