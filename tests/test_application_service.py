@@ -708,6 +708,13 @@ def test_learning_candidates_counts_label_review_saved_reapply_retry_and_model_u
         assert json.loads(archive.read("content_labels.jsonl"))["label"] == "IMPROVEMENT_CONTENT"
         assert str(sample_tree["files"][0]) not in archive.read("image_labels.jsonl").decode("utf-8")
 
+    # flaky-learning-candidates-test: warm the slide-preview cache before the
+    # 5 s train handshake, so the learning_state() calls inside the window are
+    # cache hits instead of fresh PowerPoint renders.  Best-effort only — a
+    # degraded warm-up simply leaves the cache cold; the bounded cleanup wait
+    # (qpn_renderer._PROCESS_EXIT_TIMEOUT_S) is what caps a slow render.
+    service.learning_state()
+
     entered, release = threading.Event(), threading.Event()
 
     def slow_train_models():
