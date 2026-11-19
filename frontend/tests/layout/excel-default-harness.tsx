@@ -64,8 +64,8 @@ const unconfigured = (kind: 'template' | 'output'): ExcelKindState => ({
 
 const envelope = (data: unknown): NativeEnvelope => ({ ok: true, data })
 
-const appDto = () => ({ name: 'Report Extractor', title: 'Report Extractor', version: '1.4.0', build: '022',
-  buildNumber: 22, runtime: 'pywebview-development', updateInstallCapable: false })
+const appDto = () => ({ name: 'Report Extractor', title: 'Report Extractor', version: '1.4.0', build: '025',
+  buildNumber: 25, runtime: 'pywebview-development', updateInstallCapable: false })
 
 const configDto = () => ({
   paths: { reportFolder: 'D:\\Reports', template: excel.template.path, output: excel.output.path },
